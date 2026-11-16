@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   issues-ai-filter:
-    if: ${{ !github.event.issue.pull_request }}
+    if: ${{ github.repository == 'alvr-org/ALVR' && !github.event.issue.pull_request }}
     runs-on: ubuntu-latest
     steps:
       - uses: mattmayberry/assay-action@v1

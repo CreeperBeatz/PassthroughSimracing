@@ -5,6 +5,7 @@ on:
 
 jobs:
   stale:
+    if: github.repository == 'alvr-org/ALVR'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/stale@v10
