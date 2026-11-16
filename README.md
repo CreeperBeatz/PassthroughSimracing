@@ -1,89 +1,120 @@
-<p align="center"> <img width="500" src="resources/ALVR-Grey.svg"/> </p>
+# PassthroughSimracing
 
-# ALVR - Air Light VR
+**Mixed-reality sim racing on Quest 3: sit in the virtual car, but see your real hands, steering wheel and body.**
 
-[![badge-discord][]][link-discord] [![badge-matrix][]][link-matrix] [![badge-opencollective][]][link-opencollective]
+Racing sims in VR are incredibly immersive, until you reach for a button box, a shifter, or your
+drink and can't see your own hands. This project streams the game from your PC (Assetto Corsa,
+BeamNG.drive, or any SteamVR title) and blends in the real world on the headset, **per pixel, using
+depth**:
 
-Stream VR games from your PC to your headset over Wi-Fi.  
-This is a fork of [ALVR](https://github.com/polygraphene/ALVR).
+- Anything physically close to you (your hands, arms, legs, the wheel, the rig) is shown as the real
+  world.
+- Everything else is the game: the cockpit, the track, the world outside.
+- Wave a hand in front of your face and you see it, with the game still rendered behind it.
 
-### Direct download (latest version):
-### [Windows Launcher](https://github.com/alvr-org/ALVR/releases/latest/download/alvr_launcher_windows.zip) | [Linux Launcher](https://github.com/alvr-org/ALVR/releases/latest/download/alvr_launcher_linux.tar.gz)
+## Why depth instead of a cut-out?
 
-## Compatibility
+Existing tools (for example Virtual Desktop's passthrough cut-outs) remove a fixed plane or region of
+the image. That works for a keyboard on a desk, but in a cockpit it breaks down. Your hands move in
+3D, cross in front of the dash, and come towards your face.
 
-|          VR Headset          |                                        Support                                         |
-| :--------------------------: | :------------------------------------------------------------------------------------: |
-|       Apple Vision Pro       |    :heavy_check_mark: ([store link](https://apps.apple.com/app/alvr/id6479728026))     |
-|      Quest 1/2/3/3S/Pro      | :heavy_check_mark: ([store link](https://www.meta.com/experiences/7674846229245715) *) |
-|     Pico Neo 3/4/4 Ultra     |                                   :heavy_check_mark:                                   |
-|    Play For Dream YVR 1/2/MR |                                   :heavy_check_mark:                                   |
-| Vive Focus 3/Vision/XR Elite |                                   :heavy_check_mark:                                   |
-|     PhoneVR (smartphone)     |     :heavy_check_mark: ** ([repo](https://github.com/PhoneVR-Developers/PhoneVR))      |
-|        Android/Monado        |                                   :warning: **                                         |
-|           Lynx R1            |                                   :warning: ***                                        |
-|          Oculus Go           |                 :x: ([old repo](https://github.com/polygraphene/ALVR))                 |
+This project uses the Quest 3 depth sensor ([Meta Depth API](https://developers.meta.com/horizon/documentation/native/android/mobile-depth/))
+instead. For every pixel, it finds the real surface you're looking at and decides whether that
+surface belongs to "you and your rig" or to the background. The mask follows your hands
+automatically.
 
-\* ALVR for Quest 1 is not available through the Meta store.  
-\** Works on some smartphones, but has not been extensively tested.
-\*** Temporarily removed, last supported on version [20.14.1](https://github.com/alvr-org/ALVR/releases/tag/v20.14.1).
+## How it works
 
-|     PC OS      |                                    Support                                    |
-| :------------: | :---------------------------------------------------------------------------: |
-| Windows 10/11  | :heavy_check_mark: ([store link](https://store.steampowered.com/app/3312710)) |
-| Windows XP/7/8 |                                      :x:                                      |
-|     Linux      |                             :heavy_check_mark:****                            |
-|     macOS      |                                      :x:                                      |
+```
+PC (SteamVR + game)                          Quest 3
+───────────────────                          ─────────────────────────────────────────────
+Renders the game only     ── video ──▶     decode stream
+(no extra load)                             │
+                                            ├─ read the depth map (XR_META_environment_depth)
+                                            ├─ per pixel: find the real surface along the ray
+                                            ├─ inside the "keep real" region? → cut out the game
+                                            └─ composite over the passthrough camera layer
+```
 
-\**** Please check the wiki for detailed compatibility information.
+All of the masking runs **on the headset**, inside the streaming client. That has two benefits:
 
-### Requirements
+- The PC only renders the game, at no extra cost.
+- The real world is composited with the headset's native passthrough latency, not the streaming
+  latency. Your hands don't lag behind the stream.
 
--   A supported standalone VR headset (see compatibility table above).
--   SteamVR.
--   A high-end gaming PC:
-    -   See the OS compatibility table above.
-    -   NVIDIA GPU with NVENC support (GTX 1000 series or newer), an AMD GPU with AMF VCE support, or an INTEL GPU with VPL support (Arc, Tiger Lake or newer), with the latest drivers.
-    -   On laptops with both an integrated GPU (Intel HD, AMD iGPU) and a dedicated GPU (NVIDIA GTX/RTX, AMD HD/R5/R7), make sure to assign the dedicated GPU (or "high performance graphics adapter") to ALVR and SteamVR for the best performance and compatibility.  
-        (NVIDIA: Nvidia Control Panel → 3D Settings → Application Settings; AMD: similar method)
+The streaming itself is built on [ALVR](https://github.com/alvr-org/ALVR), the open-source PC VR
+streamer. On Quest, only one immersive app can run at a time, so the masking has to live inside
+the streaming client. ALVR is the only open-source client where that is possible.
 
--   Network:
-    -   802.11ac 5 GHz Wi-Fi for the headset, and wired Ethernet for the PC is recommended.
-    -   The PC and the headset must be connected to the same router (or use a routed connection as described [here](https://github.com/alvr-org/ALVR/wiki/ALVR-v14-and-Above)).
+### Keep-real region
 
-## Installation
+| Mode | What is shown as real | Setup |
+| --- | --- | --- |
+| **Distance** | Every surface closer than *N* metres to your eyes | None |
+| **Cockpit volume** | Every surface inside a box around your rig | Box position and size (calibration planned) |
 
-Follow the [installation guide](https://github.com/alvr-org/ALVR/wiki/Installation-guide).
+### Lighting the real world from the game
 
-## Troubleshooting
+A real body that stays fully lit while the car drives into a tunnel breaks the illusion. With
+lighting enabled, the client builds a small map of the game's lighting from the streamed image and
+dims your real body and rig to match: tunnels, night driving and, with *locality*, regional shadows
+such as a window frame.
 
--   See the [Troubleshooting](https://github.com/alvr-org/ALVR/wiki/Troubleshooting) page, and [Linux Troubleshooting](https://github.com/alvr-org/ALVR/wiki/Linux-Troubleshooting) if applicable.
--   Configuration recommendations and additional information can be found [here](https://github.com/alvr-org/ALVR/wiki/Information-and-Recommendations).
+The headset can only darken the passthrough image per pixel, not tint it. A base brightness below 1
+leaves headroom so that bright game scenes can still make the passthrough brighter.
 
-## Uninstallation
+## Status
 
-Open `ALVR Dashboard.exe`, go to the `Installation` tab, then press `Remove firewall rules`.  
-Close the ALVR window and delete the ALVR folder.
+> **Early development. Not yet tested on a headset.**
 
-## Build from Source
+| Feature | State |
+| --- | --- |
+| Depth passthrough mode (distance / cockpit box) | Implemented, shader-tested on desktop GPU |
+| Game-driven lighting (global + local) | Implemented, shader-tested on desktop GPU |
+| Debug views (depth visualization, mask tint) | Implemented |
+| First on-device test | **Next** |
+| Rig calibration (markers on the rig or controller touch points, spatial anchors) | Planned |
+| Tracked hand mesh merged into the mask (sharper fingers) | Planned |
+| Static rig geometry in the mask (stable wheel edges) | Planned |
+| Per-region colour tint from the game (passthrough colour LUT) | Idea |
+| Motion rig support | Idea |
 
-Follow the [build guide](https://github.com/alvr-org/ALVR/wiki/Building-From-Source).
+## Requirements
 
-## License
+- **Meta Quest 3 or 3S.** The depth map comes from Meta's Depth API.
+- A Windows PC that can run SteamVR and ALVR (NVIDIA/AMD/Intel GPU with hardware encoding).
+- A reasonably lit room. Passthrough and depth estimation both get worse in the dark.
 
-ALVR is licensed under the [MIT License](LICENSE).
+## Getting a build
 
-## Privacy Policy
+Every push builds through GitHub Actions
+([Depth passthrough build](https://github.com/CreeperBeatz/PassthroughSimracing/actions/workflows/depth-passthrough.yml)). Each run produces two
+artifacts:
 
-ALVR apps do not directly collect any personal data.
+- `alvr-client-quest-apk`: install on the Quest with SideQuest or `adb install`.
+- `alvr-streamer-windows`: the PC streamer and dashboard. Use this instead of official ALVR: the
+  depth passthrough settings only exist in this build.
 
-## Donate
+Then, in the dashboard, go to **Settings → Video → Passthrough** and select **Depth (Quest 3)**.
+Accept the *spatial data* permission prompt on the headset.
 
-If you would like to support this project, you can donate through our [Open Source Collective account](https://opencollective.com/alvr).
+To build locally, follow ALVR's [build guide](https://github.com/alvr-org/ALVR/wiki/Building-From-Source).
 
-[badge-discord]: https://img.shields.io/discord/720612397580025886?style=for-the-badge&logo=discord&color=5865F2 "Join us on Discord"
-[link-discord]: https://discord.gg/ALVR
-[badge-matrix]: https://img.shields.io/static/v1?label=chat&message=%23alvr&style=for-the-badge&logo=matrix&color=blueviolet "Join us on Matrix"
-[link-matrix]: https://matrix.to/#/#alvr:ckie.dev?via=ckie.dev
-[badge-opencollective]: https://img.shields.io/opencollective/all/alvr?style=for-the-badge&logo=opencollective&color=79a3e6 "Donate"
-[link-opencollective]: https://opencollective.com/alvr
+## Where the code is
+
+| Path | What |
+| --- | --- |
+| `alvr/graphics/resources/stream.wgsl` | Per-pixel depth mask and lighting (fragment shader) |
+| `alvr/graphics/resources/light_probe_*.wgsl` | Game lighting probe passes |
+| `alvr/graphics/src/depth_mask.rs` | Uniforms: rays, depth views, cockpit box |
+| `alvr/graphics/src/tests.rs` | GPU tests with a synthetic depth scene, GLSL ES translation tests |
+| `alvr/client_openxr/src/extra_extensions/environment_depth_meta.rs` | `XR_META_environment_depth` wrapper |
+| `alvr/session/src/settings.rs` | `PassthroughMode::Depth` settings |
+
+## Credits and license
+
+This project is a fork of [ALVR](https://github.com/alvr-org/ALVR) by alvr-org and contributors,
+which does all of the heavy lifting for streaming. For general ALVR setup and troubleshooting, see
+the [ALVR wiki](https://github.com/alvr-org/ALVR/wiki).
+
+Licensed under the [MIT License](LICENSE), the same as ALVR.
