@@ -226,6 +226,7 @@ pub fn entry_point() {
     selected_exts.meta_body_tracking_full_body = true;
     selected_exts.meta_simultaneous_hands_and_controllers = true;
     selected_exts.meta_detached_controllers = true;
+    selected_exts.meta_environment_depth = true;
     selected_exts.other = [
         META_BODY_TRACKING_FIDELITY_EXTENSION_NAME,
         BD_MOTION_TRACKING_EXTENSION_NAME,
@@ -361,6 +362,13 @@ pub fn entry_point() {
                         }
                         _ => {}
                     }
+                }
+
+                // Spatial data permission, needed for the environment depth (depth passthrough)
+                if selected_exts.meta_environment_depth
+                    && matches!(platform, Platform::Quest3 | Platform::Quest3S)
+                {
+                    permissions.push("com.oculus.permission.USE_SCENE");
                 }
 
                 permissions

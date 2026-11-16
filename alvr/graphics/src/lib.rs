@@ -1,7 +1,12 @@
+mod depth_mask;
 mod lobby;
 mod staging;
 mod stream;
 
+#[cfg(test)]
+mod tests;
+
+pub use depth_mask::*;
 pub use lobby::*;
 pub use stream::*;
 
@@ -186,6 +191,68 @@ fn create_texture_from_gles(_: &Device, _: u32, _: UVec2, _: TextureFormat) -> T
     unimplemented!()
 }
 
+/// Wrap an externally owned GL_DEPTH_COMPONENT16 2D array texture (e.g. the OpenXR environment
+/// depth swapchain) so it can be sampled with textureLoad.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn create_depth_array_from_gles(
+    device: &Device,
+    texture: u32,
+    resolution: UVec2,
+    layers: u32,
+) -> Texture {
+    use std::num::NonZeroU32;
+    use wgpu::{
+        TextureUses,
+        hal::{self, MemoryFlags, api},
+    };
+
+    let size = Extent3d {
+        width: resolution.x,
+        height: resolution.y,
+        depth_or_array_layers: layers,
+    };
+    let format = TextureFormat::Depth16Unorm;
+
+    unsafe {
+        let hal_device = device.as_hal::<hal::api::Gles>();
+        let hal_texture = hal_device.unwrap().texture_from_raw(
+            NonZeroU32::new(texture).unwrap(),
+            &hal::TextureDescriptor {
+                label: Some("environment depth"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format,
+                usage: TextureUses::RESOURCE,
+                memory_flags: MemoryFlags::empty(),
+                view_formats: vec![],
+            },
+            // The texture is owned by the OpenXR runtime
+            Some(Box::new(|| ())),
+        );
+
+        device.create_texture_from_hal::<api::Gles>(
+            hal_texture,
+            &TextureDescriptor {
+                label: Some("environment depth"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format,
+                usage: TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            },
+        )
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn create_depth_array_from_gles(_: &Device, _: u32, _: UVec2, _: u32) -> Texture {
+    unimplemented!()
+}
+
 // This is used to convert OpenXR swapchains to wgpu
 pub fn create_gl_swapchain(
     device: &Device,
@@ -367,6 +434,42 @@ impl GraphicsContext {
                 )
                 .unwrap();
         };
+    }
+
+    /// Make sure an external depth texture array can be read with texelFetch: no depth comparison
+    /// (required for non-shadow samplers) and no mipmapping (texture completeness).
+    pub fn prepare_external_depth_texture(&self, texture: u32) {
+        let Some(texture) = std::num::NonZeroU32::new(texture) else {
+            return;
+        };
+        let gl = &self.gl_context;
+
+        unsafe {
+            gl.bind_texture(gl::TEXTURE_2D_ARRAY, Some(gl::NativeTexture(texture)));
+            gl.tex_parameter_i32(
+                gl::TEXTURE_2D_ARRAY,
+                gl::TEXTURE_COMPARE_MODE,
+                gl::NONE as i32,
+            );
+            gl.tex_parameter_i32(
+                gl::TEXTURE_2D_ARRAY,
+                gl::TEXTURE_MIN_FILTER,
+                gl::NEAREST as i32,
+            );
+            gl.tex_parameter_i32(
+                gl::TEXTURE_2D_ARRAY,
+                gl::TEXTURE_MAG_FILTER,
+                gl::NEAREST as i32,
+            );
+            gl.tex_parameter_i32(gl::TEXTURE_2D_ARRAY, gl::TEXTURE_MAX_LEVEL, 0);
+            gl.bind_texture(gl::TEXTURE_2D_ARRAY, None);
+
+            // Not fatal: the runtime may have created an immutable texture with suitable state
+            let err = gl.get_error();
+            if err != glow::NO_ERROR {
+                alvr_common::warn!("gl error {err} while preparing environment depth texture");
+            }
+        }
     }
 
     /// # Safety

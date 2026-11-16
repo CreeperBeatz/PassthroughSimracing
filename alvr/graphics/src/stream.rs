@@ -1,19 +1,22 @@
 use super::{GraphicsContext, MAX_IMMEDIATE_SIZE, staging::StagingRenderer};
+use crate::depth_mask::{self, DEPTH_UNIFORMS_SIZE, DepthRenderInput};
 use alvr_common::{
     AlvrFoveatedEncodingParams, ViewParams,
     glam::{Mat4, UVec2, Vec2, Vec3, Vec4},
 };
-use alvr_session::{PassthroughMode, UpscalingConfig};
-use std::{cell::Cell, ffi::c_void, iter, mem, rc::Rc};
+use alvr_session::{DepthPassthroughConfig, PassthroughMode, UpscalingConfig};
+use std::{borrow::Cow, cell::Cell, ffi::c_void, iter, mem, rc::Rc};
 use wgpu::{
-    BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
-    BindGroupLayoutEntry, BindingResource, BindingType, Buffer, BufferBindingType,
-    BufferDescriptor, BufferUsages, Color, ColorTargetState, ColorWrites, FragmentState, LoadOp,
+    BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
+    BindGroupLayoutEntry, BindingResource, BindingType, BlendComponent, BlendFactor,
+    BlendOperation, BlendState, Buffer, BufferBindingType, BufferDescriptor, BufferUsages, Color,
+    ColorTargetState, ColorWrites, Device, Extent3d, FragmentState, LoadOp,
     PipelineCompilationOptions, PipelineLayoutDescriptor, PrimitiveState, PrimitiveTopology,
     RenderPass, RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline,
-    RenderPipelineDescriptor, SamplerBindingType, SamplerDescriptor, ShaderStages, StoreOp,
-    TextureSampleType, TextureView, TextureViewDescriptor, TextureViewDimension, VertexState,
-    include_wgsl,
+    RenderPipelineDescriptor, Sampler, SamplerBindingType, SamplerDescriptor, ShaderModule,
+    ShaderModuleDescriptor, ShaderSource, ShaderStages, StoreOp, Texture, TextureDescriptor,
+    TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureView,
+    TextureViewDescriptor, TextureViewDimension, VertexState,
 };
 
 const FLOAT_SIZE: u32 = mem::size_of::<f32>() as u32;
@@ -29,13 +32,354 @@ const CK_CHANNEL0_CONST_OFFSET: u32 = ALPHA_CONST_OFFSET + FLOAT_SIZE + U32_SIZE
 const CK_CHANNEL1_CONST_OFFSET: u32 = CK_CHANNEL0_CONST_OFFSET + VEC4_SIZE;
 const CK_CHANNEL2_CONST_OFFSET: u32 = CK_CHANNEL1_CONST_OFFSET + VEC4_SIZE;
 const IMMEDIATE_SIZE: u32 = CK_CHANNEL2_CONST_OFFSET + VEC4_SIZE;
+const PROBE_IMMEDIATE_SIZE: u32 = U32_SIZE;
 const FOVEATION_EYE_UNIFORM_VEC4_COUNT: usize = 5;
 const FOVEATION_UNIFORM_VEC4_COUNT: usize = 1 + FOVEATION_EYE_UNIFORM_VEC4_COUNT * 2;
-const FOVEATION_UNIFORM_SIZE: usize = FOVEATION_UNIFORM_VEC4_COUNT * mem::size_of::<Vec4>();
+pub(crate) const FOVEATION_UNIFORM_SIZE: usize =
+    FOVEATION_UNIFORM_VEC4_COUNT * mem::size_of::<Vec4>();
 const _: () = assert!(
     IMMEDIATE_SIZE <= MAX_IMMEDIATE_SIZE,
     "Immediate size exceeds the maximum size"
 );
+
+const PASSTHROUGH_MODE_DEPTH: u32 = 3;
+
+pub const LIGHT_PROBE_SIZE: u32 = 16;
+pub const LIGHT_PROBE_FORMAT: TextureFormat = TextureFormat::Rgba16Float;
+
+const FOVEATION_COMMON_WGSL: &str = include_str!("../resources/foveation_common.wgsl");
+const STREAM_WGSL: &str = include_str!("../resources/stream.wgsl");
+const LIGHT_PROBE_LOCAL_WGSL: &str = include_str!("../resources/light_probe_local.wgsl");
+const LIGHT_PROBE_GLOBAL_WGSL: &str = include_str!("../resources/light_probe_global.wgsl");
+
+pub(crate) fn stream_shader_source() -> String {
+    format!("{FOVEATION_COMMON_WGSL}\n{STREAM_WGSL}")
+}
+
+pub(crate) fn light_probe_local_shader_source() -> String {
+    format!("{FOVEATION_COMMON_WGSL}\n{LIGHT_PROBE_LOCAL_WGSL}")
+}
+
+pub(crate) fn light_probe_global_shader_source() -> String {
+    LIGHT_PROBE_GLOBAL_WGSL.to_owned()
+}
+
+fn shader_module(device: &Device, label: &str, source: String) -> ShaderModule {
+    device.create_shader_module(ShaderModuleDescriptor {
+        label: Some(label),
+        source: ShaderSource::Wgsl(Cow::Owned(source)),
+    })
+}
+
+fn texture_entry(
+    binding: u32,
+    filterable: bool,
+    dimension: TextureViewDimension,
+) -> BindGroupLayoutEntry {
+    BindGroupLayoutEntry {
+        binding,
+        visibility: ShaderStages::FRAGMENT,
+        ty: BindingType::Texture {
+            sample_type: TextureSampleType::Float { filterable },
+            view_dimension: dimension,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn sampler_entry(binding: u32) -> BindGroupLayoutEntry {
+    BindGroupLayoutEntry {
+        binding,
+        visibility: ShaderStages::FRAGMENT,
+        ty: BindingType::Sampler(SamplerBindingType::Filtering),
+        count: None,
+    }
+}
+
+fn uniform_entry(binding: u32) -> BindGroupLayoutEntry {
+    BindGroupLayoutEntry {
+        binding,
+        visibility: ShaderStages::FRAGMENT,
+        ty: BindingType::Buffer {
+            ty: BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+/// Pipelines and layouts of the stream renderer. Separated from `StreamRenderer` so they can be
+/// built on any wgpu backend (tests run them on the desktop GPU).
+pub(crate) struct StreamPipelines {
+    /// stream texture, sampler, foveation uniforms, local light probe, global light probe
+    pub view_layout: BindGroupLayout,
+    /// depth uniforms, depth texture array
+    pub depth_layout: BindGroupLayout,
+    pub main: RenderPipeline,
+    /// stream texture, sampler, foveation uniforms
+    pub probe_local_layout: BindGroupLayout,
+    pub probe_local: RenderPipeline,
+    /// local light probe
+    pub probe_global_layout: BindGroupLayout,
+    pub probe_global: RenderPipeline,
+}
+
+impl StreamPipelines {
+    pub fn new(
+        device: &Device,
+        target_format: TextureFormat,
+        constants: &[(&str, f64)],
+        enable_ffe: bool,
+    ) -> Self {
+        let view_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("stream view"),
+            entries: &[
+                texture_entry(0, true, TextureViewDimension::D2),
+                sampler_entry(1),
+                uniform_entry(2),
+                texture_entry(3, true, TextureViewDimension::D2),
+                texture_entry(4, true, TextureViewDimension::D2),
+            ],
+        });
+
+        let depth_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("stream depth"),
+            entries: &[
+                uniform_entry(0),
+                // Depth16Unorm can be bound as unfilterable float
+                texture_entry(1, false, TextureViewDimension::D2Array),
+            ],
+        });
+
+        let main_module = shader_module(device, "stream", stream_shader_source());
+        let compilation_options = PipelineCompilationOptions {
+            constants,
+            zero_initialize_workgroup_memory: false,
+        };
+
+        let main = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("stream"),
+            // Note: Layout cannot be inferred because of a bug with push constants
+            layout: Some(&device.create_pipeline_layout(&PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[Some(&view_layout), Some(&depth_layout)],
+                immediate_size: IMMEDIATE_SIZE,
+            })),
+            vertex: VertexState {
+                module: &main_module,
+                entry_point: None,
+                compilation_options: compilation_options.clone(),
+                buffers: &[],
+            },
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(FragmentState {
+                module: &main_module,
+                entry_point: None,
+                compilation_options,
+                targets: &[Some(ColorTargetState {
+                    format: target_format,
+                    blend: None,
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let probe_local_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("light probe local"),
+            entries: &[
+                texture_entry(0, true, TextureViewDimension::D2),
+                sampler_entry(1),
+                uniform_entry(2),
+            ],
+        });
+        let probe_local_module = shader_module(
+            device,
+            "light probe local",
+            light_probe_local_shader_source(),
+        );
+        let probe_constants = [
+            ("ENABLE_FFE", enable_ffe.into()),
+            ("PROBE_SIZE", f64::from(LIGHT_PROBE_SIZE)),
+        ];
+        let probe_compilation_options = PipelineCompilationOptions {
+            constants: &probe_constants,
+            zero_initialize_workgroup_memory: false,
+        };
+        // Temporal smoothing: new * k + old * (1 - k), k is the blend constant
+        let smoothing_blend = BlendComponent {
+            src_factor: BlendFactor::Constant,
+            dst_factor: BlendFactor::OneMinusConstant,
+            operation: BlendOperation::Add,
+        };
+        let probe_local = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("light probe local"),
+            layout: Some(&device.create_pipeline_layout(&PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[Some(&probe_local_layout)],
+                immediate_size: PROBE_IMMEDIATE_SIZE,
+            })),
+            vertex: VertexState {
+                module: &probe_local_module,
+                entry_point: None,
+                compilation_options: probe_compilation_options.clone(),
+                buffers: &[],
+            },
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(FragmentState {
+                module: &probe_local_module,
+                entry_point: None,
+                compilation_options: probe_compilation_options,
+                targets: &[Some(ColorTargetState {
+                    format: LIGHT_PROBE_FORMAT,
+                    blend: Some(BlendState {
+                        color: smoothing_blend,
+                        alpha: smoothing_blend,
+                    }),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let probe_global_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("light probe global"),
+            entries: &[texture_entry(0, true, TextureViewDimension::D2)],
+        });
+        let probe_global_module = shader_module(
+            device,
+            "light probe global",
+            light_probe_global_shader_source(),
+        );
+        let probe_global = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("light probe global"),
+            layout: Some(&device.create_pipeline_layout(&PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[Some(&probe_global_layout)],
+                immediate_size: 0,
+            })),
+            vertex: VertexState {
+                module: &probe_global_module,
+                entry_point: None,
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(FragmentState {
+                module: &probe_global_module,
+                entry_point: None,
+                compilation_options: Default::default(),
+                targets: &[Some(ColorTargetState {
+                    format: LIGHT_PROBE_FORMAT,
+                    blend: None,
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        Self {
+            view_layout,
+            depth_layout,
+            main,
+            probe_local_layout,
+            probe_local,
+            probe_global_layout,
+            probe_global,
+        }
+    }
+}
+
+pub(crate) fn create_light_probe_texture(device: &Device, size: u32) -> Texture {
+    device.create_texture(&TextureDescriptor {
+        label: Some("light probe"),
+        size: Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: LIGHT_PROBE_FORMAT,
+        usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    })
+}
+
+/// Placeholder bound when no environment depth is available
+pub(crate) fn create_dummy_depth_texture(device: &Device) -> Texture {
+    device.create_texture(&TextureDescriptor {
+        label: Some("dummy depth"),
+        size: Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 2,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::R32Float,
+        usage: TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    })
+}
+
+pub(crate) fn depth_array_view(texture: &Texture) -> TextureView {
+    texture.create_view(&TextureViewDescriptor {
+        dimension: Some(TextureViewDimension::D2Array),
+        ..Default::default()
+    })
+}
+
+pub(crate) fn create_depth_bind_group(
+    device: &Device,
+    pipelines: &StreamPipelines,
+    uniforms: &Buffer,
+    depth_view: &TextureView,
+) -> BindGroup {
+    device.create_bind_group(&BindGroupDescriptor {
+        label: Some("stream depth"),
+        layout: &pipelines.depth_layout,
+        entries: &[
+            BindGroupEntry {
+                binding: 0,
+                resource: uniforms.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: BindingResource::TextureView(depth_view),
+            },
+        ],
+    })
+}
+
+pub(crate) fn create_depth_uniform_buffer(device: &Device) -> Buffer {
+    device.create_buffer(&BufferDescriptor {
+        label: Some("stream depth uniforms"),
+        size: DEPTH_UNIFORMS_SIZE as u64,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+pub(crate) fn floats_to_bytes(values: &[f32]) -> Vec<u8> {
+    values.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
 
 pub struct StreamViewParams {
     pub swapchain_index: u32,
@@ -43,20 +387,32 @@ pub struct StreamViewParams {
     pub output_view_params: ViewParams,
 }
 
-#[derive(Debug)]
+struct LightProbe {
+    local_view: TextureView,
+    global_view: TextureView,
+    local_bind_group: BindGroup,
+    global_bind_group: BindGroup,
+}
+
 struct ViewObjects {
     bind_group: BindGroup,
     render_target: Vec<TextureView>,
+    light_probe: LightProbe,
 }
 
 pub struct StreamRenderer {
     context: Rc<GraphicsContext>,
     staging_renderer: StagingRenderer,
-    pipeline: RenderPipeline,
+    pipelines: StreamPipelines,
     views_objects: [ViewObjects; 2],
     foveated_encoding: Option<AlvrFoveatedEncodingParams>,
     foveation_buffer: Buffer,
     last_foveation_center_shifts: Cell<Option<[Vec2; 2]>>,
+    depth_uniform_buffer: Buffer,
+    dummy_depth_bind_group: BindGroup,
+    // One per environment depth swapchain image
+    depth_bind_groups: Vec<BindGroup>,
+    light_probe_initialized: Cell<bool>,
 }
 
 impl StreamRenderer {
@@ -77,40 +433,6 @@ impl StreamRenderer {
         let device = &context.device;
 
         let target_format = super::gl_format_to_wgpu(target_format);
-
-        let bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-            label: None,
-            entries: &[
-                BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Texture {
-                        sample_type: TextureSampleType::Float { filterable: true },
-                        view_dimension: TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
-                    count: None,
-                },
-                BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Buffer {
-                        ty: BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-
-        let shader_module = device.create_shader_module(include_wgsl!("../resources/stream.wgsl"));
 
         let mut constants = vec![];
 
@@ -165,45 +487,12 @@ impl StreamRenderer {
             ]);
         };
 
-        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: None,
-            // Note: Layout cannot be inferred because of a bug with push constants
-            layout: Some(&device.create_pipeline_layout(&PipelineLayoutDescriptor {
-                label: None,
-                bind_group_layouts: &[Some(&bind_group_layout)],
-                immediate_size: IMMEDIATE_SIZE,
-            })),
-            vertex: VertexState {
-                module: &shader_module,
-                entry_point: None,
-                compilation_options: PipelineCompilationOptions {
-                    constants: &constants,
-                    zero_initialize_workgroup_memory: false,
-                },
-                buffers: &[],
-            },
-            primitive: PrimitiveState {
-                topology: PrimitiveTopology::TriangleStrip,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: Default::default(),
-            fragment: Some(FragmentState {
-                module: &shader_module,
-                entry_point: None,
-                compilation_options: PipelineCompilationOptions {
-                    constants: &constants,
-                    zero_initialize_workgroup_memory: false,
-                },
-                targets: &[Some(ColorTargetState {
-                    format: target_format,
-                    blend: None,
-                    write_mask: ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        let pipelines = StreamPipelines::new(
+            device,
+            target_format,
+            &constants,
+            foveated_encoding.is_some(),
+        );
 
         let sampler = device.create_sampler(&SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
@@ -215,27 +504,24 @@ impl StreamRenderer {
         let mut staging_textures_gl = vec![];
         for target_swapchain in &swapchain_textures {
             let staging_texture = super::create_texture(device, staging_resolution, target_format);
+            let staging_view = staging_texture.create_view(&TextureViewDescriptor::default());
 
-            let bind_group = device.create_bind_group(&BindGroupDescriptor {
-                label: None,
-                layout: &bind_group_layout,
-                entries: &[
-                    BindGroupEntry {
-                        binding: 0,
-                        resource: BindingResource::TextureView(
-                            &staging_texture.create_view(&TextureViewDescriptor::default()),
-                        ),
-                    },
-                    BindGroupEntry {
-                        binding: 1,
-                        resource: BindingResource::Sampler(&sampler),
-                    },
-                    BindGroupEntry {
-                        binding: 2,
-                        resource: foveation_buffer.as_entire_binding(),
-                    },
-                ],
-            });
+            let light_probe = create_light_probe(
+                device,
+                &pipelines,
+                &staging_view,
+                &sampler,
+                &foveation_buffer,
+            );
+
+            let bind_group = create_view_bind_group(
+                device,
+                &pipelines,
+                &staging_view,
+                &sampler,
+                &foveation_buffer,
+                &light_probe,
+            );
 
             let render_target = super::create_gl_swapchain(
                 device,
@@ -247,6 +533,7 @@ impl StreamRenderer {
             view_objects.push(ViewObjects {
                 bind_group,
                 render_target,
+                light_probe,
             });
 
             #[cfg(not(any(target_os = "macos", target_os = "ios")))]
@@ -270,15 +557,58 @@ impl StreamRenderer {
             fix_limited_range,
         );
 
+        let depth_uniform_buffer = create_depth_uniform_buffer(device);
+        let dummy_depth_texture = create_dummy_depth_texture(device);
+        let dummy_depth_bind_group = create_depth_bind_group(
+            device,
+            &pipelines,
+            &depth_uniform_buffer,
+            &depth_array_view(&dummy_depth_texture),
+        );
+
         Self {
             context,
             staging_renderer,
-            pipeline,
-            views_objects: view_objects.try_into().unwrap(),
+            pipelines,
+            views_objects: view_objects.try_into().unwrap_or_else(|_| unreachable!()),
             foveated_encoding,
             foveation_buffer,
             last_foveation_center_shifts: Cell::new(None),
+            depth_uniform_buffer,
+            dummy_depth_bind_group,
+            depth_bind_groups: vec![],
+            light_probe_initialized: Cell::new(false),
         }
+    }
+
+    /// Register the images of the environment depth swapchain (GL texture arrays with one layer
+    /// per eye, GL_DEPTH_COMPONENT16).
+    pub fn set_depth_swapchain(&mut self, gl_textures: &[u32], resolution: UVec2) {
+        self.context.make_current();
+
+        self.depth_bind_groups = gl_textures
+            .iter()
+            .map(|&gl_texture| {
+                self.context.prepare_external_depth_texture(gl_texture);
+
+                let texture = super::create_depth_array_from_gles(
+                    &self.context.device,
+                    gl_texture,
+                    resolution,
+                    2,
+                );
+                create_depth_bind_group(
+                    &self.context.device,
+                    &self.pipelines,
+                    &self.depth_uniform_buffer,
+                    &depth_array_view(&texture),
+                )
+            })
+            .collect();
+    }
+
+    pub fn clear_depth_swapchain(&mut self) {
+        self.depth_bind_groups.clear();
     }
 
     /// Runtime foveation centers must already be encoder-aligned. `None` uses the negotiated centers.
@@ -291,9 +621,12 @@ impl StreamRenderer {
         view_params: [StreamViewParams; 2],
         passthrough: Option<&PassthroughMode>,
         foveation_center_shifts: Option<[Vec2; 2]>,
+        depth: Option<&DepthRenderInput>,
     ) {
+        let new_frame = !hardware_buffer.is_null();
+
         // if hardware_buffer is available copy stream to staging texture
-        if !hardware_buffer.is_null() {
+        if new_frame {
             self.staging_renderer.render(hardware_buffer);
         }
 
@@ -312,10 +645,73 @@ impl StreamRenderer {
                 .set(foveation_center_shifts);
         }
 
+        let depth_config = match passthrough {
+            Some(PassthroughMode::Depth(config)) => Some(config),
+            _ => None,
+        };
+
+        let mut depth_bind_group = &self.dummy_depth_bind_group;
+        let mut lighting_response = None;
+        if let Some(config) = depth_config {
+            let input = depth.copied().unwrap_or(DepthRenderInput {
+                frame: None,
+                eye_positions: [Vec3::ZERO; 2],
+            });
+
+            // Fall back to "no depth" if the swapchain image is unknown
+            let input = DepthRenderInput {
+                frame: input
+                    .frame
+                    .filter(|f| (f.swapchain_index as usize) < self.depth_bind_groups.len()),
+                ..input
+            };
+            if let Some(frame) = &input.frame {
+                depth_bind_group = &self.depth_bind_groups[frame.swapchain_index as usize];
+            }
+
+            lighting_response = config.lighting.as_option().map(|l| l.response_speed);
+
+            let uniforms = depth_mask::depth_uniforms(
+                config,
+                &[
+                    view_params[0].input_view_params,
+                    view_params[1].input_view_params,
+                ],
+                &input,
+                lighting_response.is_some(),
+            );
+            self.context.queue.write_buffer(
+                &self.depth_uniform_buffer,
+                0,
+                &floats_to_bytes(&uniforms),
+            );
+        }
+
         let mut encoder = self
             .context
             .device
             .create_command_encoder(&Default::default());
+
+        if let Some(response_speed) = lighting_response
+            && new_frame
+        {
+            // The first update replaces the (zero initialized) content
+            let smoothing = if self.light_probe_initialized.replace(true) {
+                response_speed.clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+
+            for (view_idx, objects) in self.views_objects.iter().enumerate() {
+                encode_light_probe_update(
+                    &mut encoder,
+                    &self.pipelines,
+                    &objects.light_probe,
+                    view_idx as u32,
+                    smoothing,
+                );
+            }
+        }
 
         for (view_idx, view_params) in view_params.iter().enumerate() {
             let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
@@ -333,55 +729,207 @@ impl StreamRenderer {
                 ..Default::default()
             });
 
-            let input_fov = view_params.input_view_params.fov;
+            let transform = reprojection_transform(view_params);
+            let transform_bytes = floats_to_bytes(&transform.to_cols_array());
 
-            let tanl = f32::tan(input_fov.left);
-            let tanr = f32::tan(input_fov.right);
-            let tanu = f32::tan(input_fov.up);
-            let tand = f32::tan(input_fov.down);
-
-            let width = tanr - tanl;
-            let height = tanu - tand;
-            let quad_depth = 1000.0;
-
-            let output_mat4 = Mat4::from_translation(view_params.output_view_params.pose.position)
-                * Mat4::from_quat(view_params.output_view_params.pose.orientation);
-            let input_mat4 = Mat4::from_translation(view_params.input_view_params.pose.position)
-                * Mat4::from_quat(view_params.input_view_params.pose.orientation);
-
-            // The image is at z = -1.0, so we use tangents for the size
-            let model_mat =
-                Mat4::from_translation(Vec3 {
-                    x: 0.0,
-                    y: 0.0,
-                    z: -quad_depth * 0.5,
-                }) * Mat4::from_scale(Vec3::new(quad_depth, quad_depth, quad_depth * 0.5))
-                    * Mat4::from_translation(Vec3::new(
-                        width / 2.0 + tanl,
-                        height / 2.0 + tand,
-                        -1.0,
-                    ))
-                    * Mat4::from_scale(Vec3::new(width, height, 1.));
-            let view_mat = output_mat4.inverse() * input_mat4;
-            let proj_mat = super::projection_from_fov(view_params.output_view_params.fov);
-
-            let transform = proj_mat * view_mat * model_mat;
-
-            let transform_bytes = transform
-                .to_cols_array()
-                .iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect::<Vec<u8>>();
-
-            render_pass.set_pipeline(&self.pipeline);
+            render_pass.set_pipeline(&self.pipelines.main);
             render_pass.set_immediates(TRANSFORM_CONST_OFFSET, &transform_bytes);
             render_pass.set_immediates(VIEW_INDEX_CONST_OFFSET, &(view_idx as u32).to_le_bytes());
             render_pass.set_bind_group(0, &self.views_objects[view_idx].bind_group, &[]);
+            render_pass.set_bind_group(1, depth_bind_group, &[]);
             set_passthrough_immediates(&mut render_pass, passthrough);
             render_pass.draw(0..4, 0..1);
         }
 
         self.context.queue.submit(iter::once(encoder.finish()));
+    }
+}
+
+fn create_light_probe(
+    device: &Device,
+    pipelines: &StreamPipelines,
+    stream_view: &TextureView,
+    sampler: &Sampler,
+    foveation_buffer: &Buffer,
+) -> LightProbe {
+    let local_view = create_light_probe_texture(device, LIGHT_PROBE_SIZE)
+        .create_view(&TextureViewDescriptor::default());
+    let global_view =
+        create_light_probe_texture(device, 1).create_view(&TextureViewDescriptor::default());
+
+    let local_bind_group = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("light probe local"),
+        layout: &pipelines.probe_local_layout,
+        entries: &[
+            BindGroupEntry {
+                binding: 0,
+                resource: BindingResource::TextureView(stream_view),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: BindingResource::Sampler(sampler),
+            },
+            BindGroupEntry {
+                binding: 2,
+                resource: foveation_buffer.as_entire_binding(),
+            },
+        ],
+    });
+
+    let global_bind_group = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("light probe global"),
+        layout: &pipelines.probe_global_layout,
+        entries: &[BindGroupEntry {
+            binding: 0,
+            resource: BindingResource::TextureView(&local_view),
+        }],
+    });
+
+    LightProbe {
+        local_view,
+        global_view,
+        local_bind_group,
+        global_bind_group,
+    }
+}
+
+fn create_view_bind_group(
+    device: &Device,
+    pipelines: &StreamPipelines,
+    stream_view: &TextureView,
+    sampler: &Sampler,
+    foveation_buffer: &Buffer,
+    light_probe: &LightProbe,
+) -> BindGroup {
+    device.create_bind_group(&BindGroupDescriptor {
+        label: Some("stream view"),
+        layout: &pipelines.view_layout,
+        entries: &[
+            BindGroupEntry {
+                binding: 0,
+                resource: BindingResource::TextureView(stream_view),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: BindingResource::Sampler(sampler),
+            },
+            BindGroupEntry {
+                binding: 2,
+                resource: foveation_buffer.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 3,
+                resource: BindingResource::TextureView(&light_probe.local_view),
+            },
+            BindGroupEntry {
+                binding: 4,
+                resource: BindingResource::TextureView(&light_probe.global_view),
+            },
+        ],
+    })
+}
+
+fn encode_light_probe_update(
+    encoder: &mut wgpu::CommandEncoder,
+    pipelines: &StreamPipelines,
+    light_probe: &LightProbe,
+    view_idx: u32,
+    smoothing: f32,
+) {
+    {
+        let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+            label: Some("light probe local"),
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view: &light_probe.local_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: LoadOp::Load,
+                    store: StoreOp::Store,
+                },
+            })],
+            ..Default::default()
+        });
+        let k = f64::from(smoothing);
+        pass.set_pipeline(&pipelines.probe_local);
+        pass.set_bind_group(0, &light_probe.local_bind_group, &[]);
+        pass.set_immediates(0, &view_idx.to_le_bytes());
+        pass.set_blend_constant(Color {
+            r: k,
+            g: k,
+            b: k,
+            a: k,
+        });
+        pass.draw(0..3, 0..1);
+    }
+
+    let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+        label: Some("light probe global"),
+        color_attachments: &[Some(RenderPassColorAttachment {
+            view: &light_probe.global_view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: LoadOp::Clear(Color::BLACK),
+                store: StoreOp::Store,
+            },
+        })],
+        ..Default::default()
+    });
+    pass.set_pipeline(&pipelines.probe_global);
+    pass.set_bind_group(0, &light_probe.global_bind_group, &[]);
+    pass.draw(0..3, 0..1);
+}
+
+fn reprojection_transform(view_params: &StreamViewParams) -> Mat4 {
+    let input_fov = view_params.input_view_params.fov;
+
+    let tanl = f32::tan(input_fov.left);
+    let tanr = f32::tan(input_fov.right);
+    let tanu = f32::tan(input_fov.up);
+    let tand = f32::tan(input_fov.down);
+
+    let width = tanr - tanl;
+    let height = tanu - tand;
+    let quad_depth = 1000.0;
+
+    let output_mat4 = Mat4::from_translation(view_params.output_view_params.pose.position)
+        * Mat4::from_quat(view_params.output_view_params.pose.orientation);
+    let input_mat4 = Mat4::from_translation(view_params.input_view_params.pose.position)
+        * Mat4::from_quat(view_params.input_view_params.pose.orientation);
+
+    // The image is at z = -1.0, so we use tangents for the size
+    let model_mat = Mat4::from_translation(Vec3 {
+        x: 0.0,
+        y: 0.0,
+        z: -quad_depth * 0.5,
+    }) * Mat4::from_scale(Vec3::new(quad_depth, quad_depth, quad_depth * 0.5))
+        * Mat4::from_translation(Vec3::new(width / 2.0 + tanl, height / 2.0 + tand, -1.0))
+        * Mat4::from_scale(Vec3::new(width, height, 1.));
+    let view_mat = output_mat4.inverse() * input_mat4;
+    let proj_mat = super::projection_from_fov(view_params.output_view_params.fov);
+
+    proj_mat * view_mat * model_mat
+}
+
+/// Whether the projection layer must be submitted with premultiplied alpha for this mode
+pub fn passthrough_requires_premultiplied_alpha(mode: &PassthroughMode) -> bool {
+    matches!(
+        mode,
+        PassthroughMode::Blend {
+            premultiplied_alpha: true,
+            ..
+        } | PassthroughMode::RgbChromaKey(_)
+            | PassthroughMode::HsvChromaKey(_)
+            | PassthroughMode::Depth(_)
+    )
+}
+
+/// Returns the depth passthrough configuration if that mode is active
+pub fn depth_passthrough_config(mode: Option<&PassthroughMode>) -> Option<&DepthPassthroughConfig> {
+    match mode {
+        Some(PassthroughMode::Depth(config)) => Some(config),
+        _ => None,
     }
 }
 
@@ -411,6 +959,10 @@ fn set_passthrough_immediates(render_pass: &mut RenderPass, config: Option<&Pass
         Some(PassthroughMode::Blend { threshold, .. }) => {
             set_u32(render_pass, PASSTHROUGH_MODE_OFFSET, 0);
             set_float(render_pass, ALPHA_CONST_OFFSET, 1. - threshold);
+        }
+        Some(PassthroughMode::Depth(_)) => {
+            set_u32(render_pass, PASSTHROUGH_MODE_OFFSET, PASSTHROUGH_MODE_DEPTH);
+            set_float(render_pass, ALPHA_CONST_OFFSET, 1.);
         }
         Some(PassthroughMode::RgbChromaKey(config)) => {
             set_u32(render_pass, PASSTHROUGH_MODE_OFFSET, 1);

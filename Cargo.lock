@@ -344,6 +344,7 @@ dependencies = [
  "glow",
  "glyph_brush_layout",
  "khronos-egl",
+ "naga",
  "pollster 1.0.1",
  "wgpu",
 ]

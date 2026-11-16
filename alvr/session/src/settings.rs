@@ -611,6 +611,132 @@ pub struct HsvChromaKeyConfig {
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct CockpitVolumeConfig {
+    #[schema(strings(
+        help = "Center of the cockpit box in the headset stage space (origin at the guardian center, on the floor, Y up)"
+    ))]
+    #[schema(flag = "real-time")]
+    #[schema(gui(slider(min = -3.0, max = 3.0, step = 0.01)), suffix = "m")]
+    pub center_x: f32,
+
+    #[schema(flag = "real-time")]
+    #[schema(gui(slider(min = 0.0, max = 2.5, step = 0.01)), suffix = "m")]
+    pub center_y: f32,
+
+    #[schema(flag = "real-time")]
+    #[schema(gui(slider(min = -3.0, max = 3.0, step = 0.01)), suffix = "m")]
+    pub center_z: f32,
+
+    #[schema(strings(help = "Rotation of the box around the vertical axis"))]
+    #[schema(flag = "real-time")]
+    #[schema(gui(slider(min = -180.0, max = 180.0, step = 1.0)), suffix = "°")]
+    pub yaw_deg: f32,
+
+    #[schema(flag = "real-time")]
+    #[schema(gui(slider(min = 0.1, max = 3.0, step = 0.01)), suffix = "m")]
+    pub width: f32,
+
+    #[schema(flag = "real-time")]
+    #[schema(gui(slider(min = 0.1, max = 3.0, step = 0.01)), suffix = "m")]
+    pub height: f32,
+
+    #[schema(flag = "real-time")]
+    #[schema(gui(slider(min = 0.1, max = 3.0, step = 0.01)), suffix = "m")]
+    pub depth: f32,
+}
+
+#[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[schema(gui = "button_group")]
+pub enum DepthMaskRegion {
+    #[schema(strings(
+        help = "Show every real surface closer than this distance from your eyes. Needs no calibration."
+    ))]
+    Distance {
+        #[schema(flag = "real-time")]
+        #[schema(gui(slider(min = 0.2, max = 3.0, step = 0.01)), suffix = "m")]
+        max_distance: f32,
+    },
+    #[schema(strings(
+        display_name = "Cockpit volume",
+        help = "Show only real surfaces inside a box (your rig, wheel, body and hands)"
+    ))]
+    Volume(#[schema(flag = "real-time")] CockpitVolumeConfig),
+}
+
+#[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct PassthroughLightingConfig {
+    #[schema(strings(
+        help = "Passthrough brightness when the game is as bright as the reference luminance. Values below 1 leave headroom for brightening."
+    ))]
+    #[schema(flag = "real-time")]
+    #[schema(gui(slider(min = 0.2, max = 1.0, step = 0.01)))]
+    pub base_brightness: f32,
+
+    #[schema(strings(
+        help = "How strongly the game lighting affects the passthrough. 0 disables."
+    ))]
+    #[schema(flag = "real-time")]
+    #[schema(gui(slider(min = 0.0, max = 1.5, step = 0.01)))]
+    pub strength: f32,
+
+    #[schema(strings(help = "Linear game luminance considered 'normal' lighting"))]
+    #[schema(flag = "real-time")]
+    #[schema(gui(slider(min = 0.01, max = 1.0, step = 0.01)))]
+    pub reference_luminance: f32,
+
+    #[schema(strings(help = "The passthrough never gets darker than this (e.g. in tunnels)"))]
+    #[schema(flag = "real-time")]
+    #[schema(gui(slider(min = 0.0, max = 1.0, step = 0.01)))]
+    pub min_brightness: f32,
+
+    #[schema(strings(
+        help = "0: one brightness for the whole view. 1: per-region brightness taken from the game image behind your body (shadows, window frames)."
+    ))]
+    #[schema(flag = "real-time")]
+    #[schema(gui(slider(min = 0.0, max = 1.0, step = 0.01)))]
+    pub locality: f32,
+
+    #[schema(strings(help = "Per-frame smoothing factor. Higher reacts faster."))]
+    #[schema(flag = "real-time")]
+    #[schema(gui(slider(min = 0.01, max = 1.0, step = 0.01)))]
+    pub response_speed: f32,
+}
+
+#[derive(SettingsSchema, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[schema(gui = "button_group")]
+pub enum DepthPassthroughDebugView {
+    Off,
+    #[schema(strings(display_name = "Tint mask"))]
+    TintMask,
+    #[schema(strings(display_name = "Show depth"))]
+    ShowDepth,
+}
+
+#[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct DepthPassthroughConfig {
+    #[schema(flag = "real-time")]
+    pub region: DepthMaskRegion,
+
+    #[schema(strings(help = "Width of the soft transition at the edge of the region"))]
+    #[schema(flag = "real-time")]
+    #[schema(gui(slider(min = 0.0, max = 0.2, step = 0.005)), suffix = "m")]
+    pub edge_feathering: f32,
+
+    #[schema(strings(
+        help = "Match the real body/rig brightness to the game lighting (tunnels, night, shadows)"
+    ))]
+    #[schema(flag = "real-time")]
+    pub lighting: Switch<PassthroughLightingConfig>,
+
+    #[schema(flag = "real-time")]
+    pub debug_view: DepthPassthroughDebugView,
+
+    #[schema(strings(help = "Troubleshooting: use if the mask appears vertically mirrored"))]
+    #[schema(flag = "real-time")]
+    pub flip_depth_y: bool,
+}
+
+#[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[schema(gui = "button_group")]
 pub enum PassthroughMode {
     Blend {
@@ -631,6 +757,12 @@ This is a similar effect to AR glasses."
 
     #[schema(strings(display_name = "HSV Chroma Key"))]
     HsvChromaKey(#[schema(flag = "real-time")] HsvChromaKeyConfig),
+
+    #[schema(strings(
+        display_name = "Depth (Quest 3)",
+        help = "Show real-world surfaces close to you (hands, wheel, rig) using the headset depth sensor"
+    ))]
+    Depth(#[schema(flag = "real-time")] DepthPassthroughConfig),
 }
 
 #[repr(u8)]
@@ -1696,6 +1828,37 @@ pub fn session_settings_default() -> SettingsDefault {
                         value_start_min: 0.1,
                         value_end_min: 1.0,
                         value_end_max: 1.1,
+                    },
+                    Depth: DepthPassthroughConfigDefault {
+                        region: DepthMaskRegionDefault {
+                            variant: DepthMaskRegionDefaultVariant::Distance,
+                            Distance: DepthMaskRegionDistanceDefault { max_distance: 0.9 },
+                            Volume: CockpitVolumeConfigDefault {
+                                center_x: 0.0,
+                                center_y: 0.8,
+                                center_z: 0.0,
+                                yaw_deg: 0.0,
+                                width: 0.9,
+                                height: 1.4,
+                                depth: 1.4,
+                            },
+                        },
+                        edge_feathering: 0.03,
+                        lighting: SwitchDefault {
+                            enabled: false,
+                            content: PassthroughLightingConfigDefault {
+                                base_brightness: 0.8,
+                                strength: 0.6,
+                                reference_luminance: 0.15,
+                                min_brightness: 0.15,
+                                locality: 0.0,
+                                response_speed: 0.2,
+                            },
+                        },
+                        debug_view: DepthPassthroughDebugViewDefault {
+                            variant: DepthPassthroughDebugViewDefaultVariant::Off,
+                        },
+                        flip_depth_y: false,
                     },
                 },
             },

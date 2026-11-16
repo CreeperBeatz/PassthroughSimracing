@@ -1,4 +1,5 @@
 use crate::{
+    extra_extensions::EnvironmentDepthMETA,
     graphics::{self, ProjectionLayerAlphaConfig, ProjectionLayerBuilder},
     interaction::{self, InteractionContext, InteractionSourcesConfig},
 };
@@ -12,9 +13,10 @@ use alvr_common::{
     anyhow::Result,
     error,
     glam::{UVec2, Vec2},
+    info,
     parking_lot::RwLock,
 };
-use alvr_graphics::{GraphicsContext, StreamRenderer, StreamViewParams};
+use alvr_graphics::{DepthRenderInput, GraphicsContext, StreamRenderer, StreamViewParams};
 use alvr_packets::{ClientStreamConfig, RealTimeConfig, TrackingData};
 use alvr_session::{
     ClientsideFoveationConfig, ClientsideFoveationMode, ClientsidePostProcessingConfig, CodecType,
@@ -95,6 +97,9 @@ pub struct StreamContext {
     renderer: StreamRenderer,
     decoder: Option<(VideoDecoderConfig, VideoDecoderSource)>,
     use_custom_reprojection: bool,
+    // Created on demand when the depth passthrough mode is selected
+    environment_depth: Option<EnvironmentDepthMETA>,
+    environment_depth_failed: bool,
 }
 
 impl StreamContext {
@@ -241,6 +246,8 @@ impl StreamContext {
             target_view_resolution,
             renderer,
             decoder: None,
+            environment_depth: None,
+            environment_depth_failed: false,
         };
 
         this.update_reference_space();
@@ -334,6 +341,63 @@ impl StreamContext {
     pub fn update_real_time_config(&mut self, config: &RealTimeConfig) {
         self.config.passthrough = config.passthrough.clone();
         self.config.clientside_post_processing = config.clientside_post_processing.clone();
+    }
+
+    // Start or stop the environment depth provider depending on the passthrough mode, and get the
+    // depth image for this frame
+    fn update_environment_depth(
+        &mut self,
+        display_time: xr::Time,
+        current_headset_views: &[xr::View],
+    ) -> Option<DepthRenderInput> {
+        if alvr_graphics::depth_passthrough_config(self.config.passthrough.as_ref()).is_none() {
+            if self.environment_depth.take().is_some() {
+                self.renderer.clear_depth_swapchain();
+                info!("Environment depth stopped");
+            }
+            // Retry next time the mode is selected (e.g. after granting the permission)
+            self.environment_depth_failed = false;
+
+            return None;
+        }
+
+        if self.environment_depth.is_none() && !self.environment_depth_failed {
+            match EnvironmentDepthMETA::new(&self.xr_session) {
+                Ok(depth) => {
+                    info!(
+                        "Environment depth started: {} images, {}x{}",
+                        depth.images().len(),
+                        depth.resolution().x,
+                        depth.resolution().y
+                    );
+                    self.renderer
+                        .set_depth_swapchain(depth.images(), depth.resolution());
+                    self.environment_depth = Some(depth);
+                }
+                Err(e) => {
+                    error!(
+                        "Depth passthrough unavailable (requires Quest 3/3S and the spatial data permission): {e}"
+                    );
+                    self.environment_depth_failed = true;
+                }
+            }
+        }
+
+        let frame = self.environment_depth.as_ref().and_then(|depth| {
+            depth
+                .acquire(&self.stage_reference_space, display_time)
+                .inspect_err(|e| error!("Acquire environment depth: {e}"))
+                .ok()
+                .flatten()
+        });
+
+        Some(DepthRenderInput {
+            frame,
+            eye_positions: [
+                crate::from_xr_vec3(current_headset_views[0].pose.position),
+                crate::from_xr_vec3(current_headset_views[1].pose.position),
+            ],
+        })
     }
 
     pub fn render(
@@ -430,6 +494,8 @@ impl StreamContext {
             openxr_display_time = vsync_time;
         }
 
+        let depth_input = self.update_environment_depth(xr_vsync_time, &current_headset_views);
+
         self.renderer.render(
             buffer_ptr,
             [
@@ -448,6 +514,7 @@ impl StreamContext {
             frame_metadata
                 .foveation_center_shifts
                 .map(|centers| centers.map(Vec2::from_array)),
+            depth_input.as_ref(),
         );
 
         self.swapchains[0].release_image().unwrap();
@@ -503,14 +570,7 @@ impl StreamContext {
                 .passthrough
                 .clone()
                 .map(|mode| ProjectionLayerAlphaConfig {
-                    premultiplied: matches!(
-                        mode,
-                        PassthroughMode::Blend {
-                            premultiplied_alpha: true,
-                            ..
-                        } | PassthroughMode::RgbChromaKey(_)
-                            | PassthroughMode::HsvChromaKey(_)
-                    ),
+                    premultiplied: alvr_graphics::passthrough_requires_premultiplied_alpha(&mode),
                 }),
             clientside_post_processing,
         );
