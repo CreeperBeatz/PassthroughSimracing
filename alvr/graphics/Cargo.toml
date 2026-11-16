@@ -16,4 +16,4 @@ pollster = "1.0.1"
 wgpu = "29.0.4"
 
 [dev-dependencies]
-naga = { version = "29", features = ["wgsl-in", "glsl-out"] }
+naga = { version = "30", features = ["wgsl-in", "glsl-out"] }
