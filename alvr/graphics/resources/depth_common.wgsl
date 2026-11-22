@@ -38,4 +38,7 @@ struct DepthUniforms {
     hand_bounds: array<vec4f, 2>,
     // Start and end of each capsule, xyz: position, w: radius
     hand_points: array<vec4f, 2u * 2u * HAND_SEGMENTS>,
+    // Motion of each arm since the depth image was captured: xyz: wrist position, xyz: direction from
+    // the wrist to the elbow, xyz: displacement
+    arms: array<vec4f, 6>,
 }

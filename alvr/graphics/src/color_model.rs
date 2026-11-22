@@ -300,7 +300,7 @@ impl ColorModel {
                 return 0.0;
             }
 
-            reliability * smoothstep(0.7, 0.95, skin_count as f32 / point_count as f32)
+            reliability * smoothstep(0.5, 0.8, skin_count as f32 / point_count as f32)
         })
     }
 

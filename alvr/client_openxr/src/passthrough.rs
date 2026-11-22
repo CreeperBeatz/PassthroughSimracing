@@ -132,7 +132,7 @@ impl ColorKeyParams {
             zones: HandZones {
                 core: -millimeters("debug.alvr.key_inset", 4),
                 falloff: millimeters("debug.alvr.key_falloff", 4),
-                rim: millimeters("debug.alvr.key_rim", 6),
+                rim: millimeters("debug.alvr.key_rim", 2),
                 solid,
             },
             // Milliseconds

@@ -4,7 +4,8 @@
 
 use crate::{
     depth_mask::{
-        self, ColorKeyInput, DepthFrame, DepthRenderInput, HAND_SEGMENTS, HandShape, HandZones,
+        self, ArmMotion, ColorKeyInput, DepthFrame, DepthRenderInput, HAND_SEGMENTS, HandShape,
+        HandZones,
     },
     stream::{self, FOVEATION_UNIFORM_SIZE, LIGHT_PROBE_SIZE, StreamPipelines, floats_to_bytes},
 };
@@ -319,6 +320,31 @@ fn render_with_key(
     depth_available: bool,
     color_key: Option<ColorKeyInput>,
 ) -> Output {
+    render_full(
+        device,
+        queue,
+        config,
+        scene,
+        eye_position,
+        depth_camera_position,
+        depth_available,
+        color_key,
+        [None; 2],
+    )
+}
+
+#[expect(clippy::too_many_arguments)]
+fn render_full(
+    device: &Device,
+    queue: &Queue,
+    config: &DepthPassthroughConfig,
+    scene: &Scene,
+    eye_position: Vec3,
+    depth_camera_position: Vec3,
+    depth_available: bool,
+    color_key: Option<ColorKeyInput>,
+    arms: [Option<ArmMotion>; 2],
+) -> Output {
     let target_format = TextureFormat::Rgba8Unorm;
     let constants = [
         ("ENABLE_SRGB_CORRECTION", 0.0),
@@ -479,6 +505,7 @@ fn render_with_key(
         }),
         eye_positions: [eye_position; 2],
         color_key,
+        arms,
     };
     let lighting_enabled = config.lighting.as_option().is_some();
     let uniforms =
@@ -826,6 +853,45 @@ fn hand_shape_ends_at_the_fingertips() {
             assert!(points.contains(joint), "joint {i}");
         }
     }
+}
+
+#[test]
+fn late_arms_are_moved() {
+    let (device, queue) = gpu_or_skip!();
+    let config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
+
+    // An arm at 0.5 m: in the depth map it covers u 0.40..0.50, v (from the bottom) 0.2..0.8. Since
+    // then it moved 10 cm to the right, 0.1 in view uv.
+    let scene = Scene::new(3.0, [0.4, 0.2, 0.5, 0.8], 0.5);
+    let render_arm = |displacement: Vec3| {
+        render_full(
+            &device,
+            &queue,
+            &config,
+            &scene,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            true,
+            None,
+            [
+                None,
+                Some(ArmMotion {
+                    wrist: Vec3::new(0.05, 0.05, -0.5),
+                    direction: Vec3::NEG_Y,
+                    displacement,
+                }),
+            ],
+        )
+    };
+
+    let still = render_arm(Vec3::ZERO);
+    assert_eq!(still.alpha(0.45, 0.48), 0.0);
+    assert_eq!(still.alpha(0.55, 0.48), 1.0);
+
+    // Near the wrist: moved
+    let moved = render_arm(Vec3::new(0.1, 0.0, 0.0));
+    assert!(moved.alpha(0.55, 0.48) < 0.1, "{}", moved.alpha(0.55, 0.48));
+    assert!(moved.alpha(0.43, 0.48) > 0.9, "{}", moved.alpha(0.43, 0.48));
 }
 
 #[test]

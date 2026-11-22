@@ -181,6 +181,16 @@ pub struct ColorKeyInput {
     pub hands: [Option<(HandShape, HandZones)>; 2],
 }
 
+/// Motion of an arm since the depth image was captured
+#[derive(Clone, Copy)]
+pub struct ArmMotion {
+    /// Now
+    pub wrist: Vec3,
+    /// From the wrist to the elbow
+    pub direction: Vec3,
+    pub displacement: Vec3,
+}
+
 /// Per-frame depth inputs for the stream renderer
 #[derive(Clone, Copy)]
 pub struct DepthRenderInput {
@@ -190,11 +200,14 @@ pub struct DepthRenderInput {
     pub eye_positions: [Vec3; 2],
     /// Set if the passthrough is color keyed around the hands
     pub color_key: Option<ColorKeyInput>,
+    pub arms: [Option<ArmMotion>; 2],
 }
 
 const EYE_FLOAT_COUNT: usize = 16 + 4 + 16 + 16 + 4;
-pub const DEPTH_UNIFORMS_FLOAT_COUNT: usize =
-    2 * EYE_FLOAT_COUNT + 16 + 4 * 5 + 4 * (2 + 2 * HAND_SEGMENTS / 4 + 2 + 2 * 2 * HAND_SEGMENTS);
+pub const DEPTH_UNIFORMS_FLOAT_COUNT: usize = 2 * EYE_FLOAT_COUNT
+    + 16
+    + 4 * 5
+    + 4 * (2 + 2 * HAND_SEGMENTS / 4 + 2 + 2 * 2 * HAND_SEGMENTS + 6);
 pub const DEPTH_UNIFORMS_SIZE: usize = DEPTH_UNIFORMS_FLOAT_COUNT * size_of::<f32>();
 
 fn pose_to_mat4(pose: Pose) -> Mat4 {
@@ -341,6 +354,14 @@ pub fn depth_uniforms(
             data.extend(point.to_array());
         }
     }
+    for arm in &input.arms {
+        let [wrist, direction, displacement] = arm.map_or([Vec3::ZERO; 3], |arm| {
+            [arm.wrist, arm.direction, arm.displacement]
+        });
+        for v in [wrist, direction, displacement] {
+            data.extend(v.extend(0.0).to_array());
+        }
+    }
 
     data.try_into().unwrap()
 }
@@ -390,7 +411,7 @@ mod tests {
         assert_eq!(DEPTH_UNIFORMS_SIZE % 16, 0);
         assert_eq!(
             DEPTH_UNIFORMS_SIZE,
-            592 + 16 * (2 + 2 * HAND_SEGMENTS / 4 + 2 + 2 * 2 * HAND_SEGMENTS)
+            592 + 16 * (2 + 2 * HAND_SEGMENTS / 4 + 2 + 2 * 2 * HAND_SEGMENTS + 6)
         );
     }
 
@@ -463,6 +484,7 @@ mod tests {
             frame: None,
             eye_positions: [Vec3::ZERO; 2],
             color_key: None,
+            arms: [None; 2],
         };
         let data = depth_uniforms(&cfg, &[view(), view()], &input, false);
 
@@ -501,6 +523,7 @@ mod tests {
             frame: None,
             eye_positions: [Vec3::ZERO; 2],
             color_key: None,
+            arms: [None; 2],
         };
         let base = 2 * EYE_FLOAT_COUNT + 16 + 4 * 3;
 

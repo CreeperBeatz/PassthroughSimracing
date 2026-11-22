@@ -143,12 +143,13 @@ impl EnvironmentDepthMETA {
         &self.images
     }
 
-    /// Returns `Ok(None)` while the runtime has not produced a depth image yet
+    /// Returns `Ok(None)` while the runtime has not produced a depth image yet. The time is when the image
+    /// was captured, if the runtime provides it
     pub fn acquire(
         &self,
         space: &xr::Space,
         display_time: xr::Time,
-    ) -> xr::Result<Option<DepthFrame>> {
+    ) -> xr::Result<Option<(DepthFrame, Option<xr::Time>)>> {
         let info = sys::EnvironmentDepthImageAcquireInfoMETA {
             ty: sys::EnvironmentDepthImageAcquireInfoMETA::TYPE,
             next: ptr::null(),
@@ -158,6 +159,9 @@ impl EnvironmentDepthMETA {
 
         let mut image: sys::EnvironmentDepthImageMETA = unsafe { mem::zeroed() };
         image.ty = sys::EnvironmentDepthImageMETA::TYPE;
+        let mut timestamp: sys::EnvironmentDepthImageTimestampMETA = unsafe { mem::zeroed() };
+        timestamp.ty = sys::EnvironmentDepthImageTimestampMETA::TYPE;
+        image.next = (&raw mut timestamp).cast_const().cast();
         for view in &mut image.views {
             view.ty = sys::EnvironmentDepthImageViewMETA::TYPE;
         }
@@ -170,7 +174,7 @@ impl EnvironmentDepthMETA {
         }
         super::xr_res(result)?;
 
-        Ok(Some(DepthFrame {
+        let frame = DepthFrame {
             swapchain_index: image.swapchain_index,
             near: image.near_z,
             far: image.far_z,
@@ -178,7 +182,14 @@ impl EnvironmentDepthMETA {
                 pose: crate::from_xr_pose(view.pose),
                 fov: crate::from_xr_fov(view.fov),
             }),
-        }))
+        };
+        // The runtime writes through the pointer in `next`
+        let capture_time = unsafe { ptr::read_volatile(&raw const timestamp.capture_time) };
+
+        Ok(Some((
+            frame,
+            (capture_time.as_nanos() > 0).then_some(capture_time),
+        )))
     }
 }
 

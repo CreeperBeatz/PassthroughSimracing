@@ -813,6 +813,7 @@ impl StreamRenderer {
                 frame: None,
                 eye_positions: [Vec3::ZERO; 2],
                 color_key: None,
+                arms: [None; 2],
             });
 
             // Fall back to "no depth" if the swapchain image is unknown

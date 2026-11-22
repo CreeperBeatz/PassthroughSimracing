@@ -15,13 +15,13 @@ use alvr_common::{
     HAND_LEFT_ID, HAND_RIGHT_ID, HEAD_ID, Pose, RelaxedAtomic, ViewParams,
     anyhow::Result,
     error,
-    glam::{UVec2, Vec2, Vec3},
+    glam::{Quat, UVec2, Vec2, Vec3},
     info,
     parking_lot::RwLock,
 };
 use alvr_graphics::{
-    ColorKeyInput, DepthRenderInput, GraphicsContext, HAND_SEGMENTS, HandShape, SEGMENT_JOINTS,
-    StreamRenderer, StreamViewParams,
+    ArmMotion, ColorKeyInput, DepthRenderInput, GraphicsContext, HAND_SEGMENTS, HandShape,
+    SEGMENT_JOINTS, StreamRenderer, StreamViewParams,
 };
 use alvr_packets::{ClientStreamConfig, RealTimeConfig, TrackingData};
 use alvr_session::{
@@ -315,6 +315,57 @@ impl StreamContext {
         None
     }
 
+    // How the arms moved since the depth image was captured
+    fn arm_motions(
+        &self,
+        display_time: xr::Time,
+        capture_time: xr::Time,
+        views: &[xr::View],
+    ) -> [Option<ArmMotion>; 2] {
+        // Bigger displacements are tracking errors
+        const MAX_DISPLACEMENT: f32 = 0.25;
+        // Rough position of the elbows, relative to the head
+        const ELBOW_OFFSET: Vec3 = Vec3::new(0.2, -0.5, 0.05);
+
+        let delay = self
+            .color_key
+            .map_or(0, |params| params.passthrough_delay_ms * 1_000_000);
+        let now = xr::Time::from_nanos(display_time.as_nanos() - delay);
+        let int_ctx = self.interaction_context.read();
+
+        let head_position = (crate::from_xr_vec3(views[0].pose.position)
+            + crate::from_xr_vec3(views[1].pose.position))
+            / 2.0;
+        let forward = crate::from_xr_quat(views[0].pose.orientation) * Vec3::NEG_Z;
+        let yaw = Quat::from_rotation_y(f32::atan2(-forward.x, -forward.z));
+
+        [0, 1].map(|i| {
+            let tracker = int_ctx.hands_interaction[i].skeleton_tracker.as_ref()?;
+            let wrist = |time| {
+                let joints = self
+                    .stage_reference_space
+                    .locate_hand_joints(tracker, time)
+                    .ok()
+                    .flatten()?;
+
+                Some(crate::from_xr_vec3(
+                    joints[xr::HandJointEXT::WRIST].pose.position,
+                ))
+            };
+            let wrist_now = wrist(now)?;
+            let displacement = wrist_now - wrist(capture_time)?;
+
+            let side = if i == 0 { -1.0 } else { 1.0 };
+            let elbow = head_position + yaw * (ELBOW_OFFSET * Vec3::new(side, 1.0, 1.0));
+
+            Some(ArmMotion {
+                wrist: wrist_now,
+                direction: (elbow - wrist_now).normalize_or(Vec3::NEG_Y),
+                displacement: displacement.clamp_length_max(MAX_DISPLACEMENT),
+            })
+        })
+    }
+
     // The hands, at the moment shown by the passthrough image
     fn color_key_input(&self, display_time: xr::Time) -> Option<ColorKeyInput> {
         let params = self.color_key?;
@@ -540,6 +591,7 @@ impl StreamContext {
                         frame: None,
                         eye_positions: [Vec3::ZERO; 2],
                         color_key: self.color_key_input(display_time),
+                        arms: [None; 2],
                     });
                 }
                 Err(e) => {
@@ -559,6 +611,11 @@ impl StreamContext {
                 .flatten()
         });
 
+        let (frame, capture_time) = frame.unzip();
+        let arms = capture_time.flatten().map_or([None; 2], |time| {
+            self.arm_motions(display_time, time, current_headset_views)
+        });
+
         Some(DepthRenderInput {
             frame,
             eye_positions: [
@@ -566,6 +623,7 @@ impl StreamContext {
                 crate::from_xr_vec3(current_headset_views[1].pose.position),
             ],
             color_key: self.color_key_input(display_time),
+            arms,
         })
     }
 
