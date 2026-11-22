@@ -129,6 +129,17 @@ name = "com.oculus.permission.HAND_TRACKING"
 name = "com.oculus.permission.WIFI_LOCK"
 [[package.metadata.android.uses_permission]]
 name = "com.oculus.permission.USE_SCENE"
+# Only requested by the camera probe experiment
+[[package.metadata.android.uses_permission]]
+name = "android.permission.CAMERA"
+[[package.metadata.android.uses_permission]]
+name = "horizonos.permission.HEADSET_CAMERA"
+[[package.metadata.android.uses_feature]]
+name = "android.hardware.camera"
+required = false
+[[package.metadata.android.uses_feature]]
+name = "android.hardware.camera2.any"
+required = false
 [[package.metadata.android.application.meta_data]]
 name = "com.oculus.intent.category.VR"
 value = "vr_only"

@@ -1,4 +1,6 @@
 mod c_api;
+#[cfg(target_os = "android")]
+mod camera_probe;
 mod extra_extensions;
 mod graphics;
 mod interaction;
@@ -282,6 +284,9 @@ pub fn entry_point() {
 
     let graphics_context = Rc::new(GraphicsContext::new_gl());
 
+    #[cfg(target_os = "android")]
+    camera_probe::spawn();
+
     let mut last_lobby_message = String::new();
 
     'session_loop: loop {
@@ -371,6 +376,12 @@ pub fn entry_point() {
                     && matches!(platform, Platform::Quest3 | Platform::Quest3S)
                 {
                     permissions.push("com.oculus.permission.USE_SCENE");
+                }
+
+                #[cfg(target_os = "android")]
+                if camera_probe::enabled() {
+                    permissions.push("android.permission.CAMERA");
+                    permissions.push("horizonos.permission.HEADSET_CAMERA");
                 }
 
                 permissions

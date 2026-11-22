@@ -183,7 +183,7 @@ fn load_color_key(version: u32) -> Option<ColorKey> {
 
 /// Integer Android system property. `debug.*` properties can be set with adb.
 #[allow(unused_variables)]
-fn debug_property(name: &str) -> Option<i64> {
+pub fn debug_property(name: &str) -> Option<i64> {
     #[cfg(target_os = "android")]
     {
         let name = std::ffi::CString::new(name).unwrap();
