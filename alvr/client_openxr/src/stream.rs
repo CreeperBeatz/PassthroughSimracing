@@ -351,7 +351,12 @@ impl StreamContext {
             let zones = params
                 .zones
                 .for_confidence(tracked_count as f32 / joints.len() as f32)
-                .for_speed(speed, params.core_error_s, params.rim_error_s);
+                .for_speed(
+                    speed,
+                    params.core_error_s,
+                    params.rim_error_s,
+                    params.max_rim_growth_m,
+                );
 
             Some((shape, zones))
         });

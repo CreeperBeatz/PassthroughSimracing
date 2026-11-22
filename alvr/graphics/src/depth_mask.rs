@@ -132,7 +132,6 @@ pub struct HandZones {
 impl HandZones {
     const MAX_CORE_SHRINK: f32 = 0.04;
     const UNTRACKED_CORE_SHRINK: f32 = 0.04;
-    const MAX_RIM_GROWTH: f32 = 0.12;
 
     /// Hand tracking is late and predicted, so the faster the hand, the less certain its position:
     /// the solid core shrinks and the keyed rim grows.
@@ -147,10 +146,10 @@ impl HandZones {
 
     /// The errors are the assumed timing errors of the hand pose, in seconds. The rim must contain the
     /// hand even in the worst case, or the hand is cut off.
-    pub fn for_speed(self, speed: f32, core_error: f32, rim_error: f32) -> Self {
+    pub fn for_speed(self, speed: f32, core_error: f32, rim_error: f32, max_growth: f32) -> Self {
         Self {
             core: self.core - (speed * core_error).clamp(0.0, Self::MAX_CORE_SHRINK),
-            rim: self.rim + (speed * rim_error).clamp(0.0, Self::MAX_RIM_GROWTH),
+            rim: self.rim + (speed * rim_error).clamp(0.0, max_growth),
             ..self
         }
     }

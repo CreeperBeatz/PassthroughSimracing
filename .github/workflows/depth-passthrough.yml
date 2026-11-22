@@ -61,6 +61,10 @@ jobs:
       - name: Build client
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          # Optimize the debug build: release builds need a signing key
+          CARGO_PROFILE_DEV_OPT_LEVEL: "3"
+          CARGO_PROFILE_DEV_DEBUG_ASSERTIONS: "false"
+          CARGO_PROFILE_DEV_OVERFLOW_CHECKS: "false"
         working-directory: ./alvr/client_openxr
         run: cargo xtask build-client
 

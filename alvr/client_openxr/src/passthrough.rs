@@ -88,6 +88,7 @@ impl PassthroughLayer<'_> {
 /// - `setprop debug.alvr.key_falloff <mm>`: how gradually the solid inside fades out
 /// - `setprop debug.alvr.key_error <ms>`: assumed timing error, the solid core shrinks with the speed
 /// - `setprop debug.alvr.key_rim_error <ms>`: worst timing error, the rim grows with the speed
+/// - `setprop debug.alvr.key_rim_max <mm>`: limit of that growth
 /// - `setprop debug.alvr.auto_key 1` before starting the app: learn the colors with the camera
 /// - `setprop debug.alvr.key_scale <percent>`: thickness of the hands
 /// - `setprop debug.alvr.key_delay <ms>`: how late (may be negative) the passthrough image is, to locate the hands at
@@ -105,6 +106,7 @@ pub struct ColorKeyParams {
     /// How wrong the timing of the hand pose may be: for the solid core, and in the worst case
     pub core_error_s: f32,
     pub rim_error_s: f32,
+    pub max_rim_growth_m: f32,
     pub radius_scale: f32,
     /// Negative: predict ahead
     pub passthrough_delay_ms: i64,
@@ -124,13 +126,14 @@ impl ColorKeyParams {
             },
             // Milliseconds
             core_error_s: millimeters("debug.alvr.key_error", 10),
-            rim_error_s: millimeters("debug.alvr.key_rim_error", 45),
+            rim_error_s: millimeters("debug.alvr.key_rim_error", 22),
+            max_rim_growth_m: millimeters("debug.alvr.key_rim_max", 50),
             radius_scale: debug_property("debug.alvr.key_scale")
                 .unwrap_or(100)
                 .clamp(0, 300) as f32
                 / 100.0,
             passthrough_delay_ms: debug_property("debug.alvr.key_delay")
-                .unwrap_or(20)
+                .unwrap_or(0)
                 .clamp(-100, 200),
         }
     }
