@@ -134,6 +134,8 @@ impl PassthroughLayer<'_> {
 /// - `setprop debug.alvr.key_wrist_scale <percent>`: its radius, of the radius of the wrist joint
 /// - `setprop debug.alvr.key_wrist_conf <percent>`: how sure the camera must be of its direction for the
 ///   solid fill
+/// - `setprop debug.alvr.key_wrist_follow <percent>`: below this score the camera doesn't see the forearm,
+///   the bridge goes back to the default direction. 0: always the best candidate
 pub struct ColorKey {
     version: u32,
     lut: Vec<u8>,
@@ -187,6 +189,8 @@ pub struct WristParams {
     pub radius_scale: f32,
     /// Solid only if the camera is at least this sure of the direction (0..1)
     pub min_confidence: f32,
+    /// Below this score of the best direction (0..1) the default direction is used
+    pub follow: f32,
 }
 
 impl WristParams {
@@ -201,6 +205,7 @@ impl WristParams {
                 .clamp(0, 300) as f32
                 / 100.0,
             min_confidence: percent("debug.alvr.key_wrist_conf", 60),
+            follow: percent("debug.alvr.key_wrist_follow", 30),
         })
     }
 }

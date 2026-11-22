@@ -320,7 +320,7 @@ fn learn_loop(context: &Context) {
                         );
                         let reliability =
                             alvr_graphics::verification_reliability(background_kept[i]);
-                        let is_fresh = bridges[i].update(axes, &scores, reliability);
+                        let is_fresh = bridges[i].update(axes, &scores, reliability, wrist.follow);
                         if is_fresh {
                             bridge_angles[i] = bridges[i].angles(axes);
                         }

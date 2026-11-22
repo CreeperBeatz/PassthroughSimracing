@@ -569,7 +569,7 @@ pub struct BridgeChoice {
     /// Smoothed, in the local space of the wrist joint. None: the default direction
     pub direction: Option<Vec3>,
     /// How sure the camera is about it (0..1): the score of the chosen candidate, 0 where the
-    /// background looks like the hand
+    /// background looks like the hand or while the smoothed direction is still far from the candidate
     pub confidence: f32,
 }
 
@@ -580,21 +580,33 @@ impl BridgeChoice {
     const SMOOTHING: f32 = 0.3;
 
     /// `scores` of the candidates of `axes`, see `ColorModel::bridge_scores`. `reliability`: see
-    /// `verification_reliability`. Returns false if there was nothing to choose from (no fresh data).
+    /// `verification_reliability`. `follow`: below this score (times the reliability) the camera doesn't
+    /// really see the forearm, the direction goes back to the default. Returns false if there was nothing
+    /// to choose from (no fresh data).
     pub fn update(
         &mut self,
         axes: &WristAxes,
         scores: &[Option<f32>; BRIDGE_CANDIDATES],
         reliability: f32,
+        follow: f32,
     ) -> bool {
         let Some(index) = choose_bridge(scores, self.index) else {
             return false;
         };
-        let target = axes.candidate(index);
+        let score = scores[index].unwrap_or(0.0) * reliability.clamp(0.0, 1.0);
+        // Not sure: not towards what only looks most like skin (a sleeve, a skin colored background)
+        let (target, score) = if score >= follow {
+            (axes.candidate(index), score)
+        } else {
+            (axes.default, 0.0)
+        };
         let current = self.direction.unwrap_or(axes.default);
+        let direction = current.lerp(target, Self::SMOOTHING).normalize_or(target);
         self.index = Some(index);
-        self.direction = Some(current.lerp(target, Self::SMOOTHING).normalize_or(target));
-        self.confidence = scores[index].unwrap_or(0.0) * reliability.clamp(0.0, 1.0);
+        self.direction = Some(direction);
+        // The camera only checked the target: no confidence until the smoothed direction is near it
+        let off = direction.angle_between(target).to_degrees();
+        self.confidence = score * (1.0 - smoothstep(5.0, 15.0, off));
 
         true
     }
@@ -720,6 +732,8 @@ mod tests {
     const SKIN: [u8; 3] = [150, 110, 85];
     const WHITE_WALL: [u8; 3] = [105, 92, 80];
     const GREEN_WALL: [u8; 3] = [62, 56, 10];
+    // The default of debug.alvr.key_wrist_follow
+    const FOLLOW: f32 = 0.3;
 
     fn noisy(color: [u8; 3], count: usize) -> Vec<[u8; 3]> {
         // Deterministic noise of +-6
@@ -1243,7 +1257,7 @@ mod tests {
                 );
                 let mut choice = BridgeChoice::default();
                 for _ in 0..15 {
-                    assert!(choice.update(&axes, &scores, 1.0));
+                    assert!(choice.update(&axes, &scores, 1.0, FOLLOW));
                 }
 
                 // Within one step of the real bend
@@ -1265,7 +1279,7 @@ mod tests {
 
                 // The background looks like the hand: no confidence
                 let mut unsure = choice;
-                unsure.update(&axes, &scores, verification_reliability(0.8));
+                unsure.update(&axes, &scores, verification_reliability(0.8), FOLLOW);
                 assert_eq!(unsure.confidence, 0.0);
             }
         }
@@ -1282,12 +1296,12 @@ mod tests {
 
         // Nothing learned yet
         assert_eq!(scores(&model, &camera), [None; BRIDGE_CANDIDATES]);
-        assert!(!BridgeChoice::default().update(&axes, &scores(&model, &camera), 1.0));
+        assert!(!BridgeChoice::default().update(&axes, &scores(&model, &camera), 1.0, FOLLOW));
 
         model.add_samples(&samples(SKIN, WHITE_WALL), 0.1);
         model.update_lut();
         let mut choice = BridgeChoice::default();
-        assert!(choice.update(&axes, &scores(&model, &camera), 1.0));
+        assert!(choice.update(&axes, &scores(&model, &camera), 1.0, FOLLOW));
         assert!(choice.confidence < 0.2, "{}", choice.confidence);
         // With equal scores the default
         assert_eq!(choice.index.map(bridge_candidate_angles), Some((0.0, 0.0)));
@@ -1306,21 +1320,32 @@ mod tests {
         let mut scores = [Some(0.2); BRIDGE_CANDIDATES];
         scores[10] = Some(0.8);
         let mut choice = BridgeChoice::default();
-        choice.update(&axes, &scores, 1.0);
+        choice.update(&axes, &scores, 1.0, FOLLOW);
         assert_eq!(choice.index, Some(10));
 
         // Slightly better elsewhere: kept
         scores[16] = Some(0.85);
-        choice.update(&axes, &scores, 1.0);
+        choice.update(&axes, &scores, 1.0, FOLLOW);
         assert_eq!(choice.index, Some(10));
         assert_eq!(choice.confidence, 0.8);
         assert_eq!(choose_bridge(&scores, None), Some(16));
 
-        // Better by more than the hysteresis: changed
+        // Better by more than the hysteresis: changed. The smoothed direction is still 40 degrees off,
+        // nobody checked it: not sure until it gets there
         scores[16] = Some(0.95);
-        choice.update(&axes, &scores, 1.0);
+        choice.update(&axes, &scores, 1.0, FOLLOW);
         assert_eq!(choice.index, Some(16));
-        assert_eq!(choice.confidence, 0.95);
+        assert_eq!(choice.confidence, 0.0);
+        let mut updates = 1;
+        while choice.confidence < 0.95 - 1e-6 {
+            let last = choice.confidence;
+            choice.update(&axes, &scores, 1.0, FOLLOW);
+            assert!(choice.confidence >= last);
+            updates += 1;
+            assert!(updates < 15, "{}", choice.confidence);
+        }
+        assert!(choice.direction.unwrap().angle_between(axes.candidate(16)) < 5f32.to_radians());
+        assert!(updates >= 4, "{updates}");
 
         // The current one can't be seen: the best one
         scores[16] = None;
@@ -1330,14 +1355,55 @@ mod tests {
         let target = axes.candidate(16);
         let mut choice = BridgeChoice::default();
         scores[16] = Some(1.0);
-        choice.update(&axes, &scores, 1.0);
+        choice.update(&axes, &scores, 1.0, FOLLOW);
         let first = choice.direction.unwrap();
         assert!(first.angle_between(axes.default) > 0.05);
         assert!(first.angle_between(target) > 0.3);
         for _ in 0..20 {
-            choice.update(&axes, &scores, 1.0);
+            choice.update(&axes, &scores, 1.0, FOLLOW);
         }
         assert!(choice.direction.unwrap().angle_between(target) < 0.01);
+    }
+
+    #[test]
+    fn unsure_bridge_goes_back_to_the_default() {
+        let (_, _, _, axes) = bridge_scene(Vec3::Y, Vec3::NEG_Z);
+        let bent = 16;
+        let mut sure = [Some(0.1); BRIDGE_CANDIDATES];
+        sure[bent] = Some(1.0);
+        let mut choice = BridgeChoice::default();
+        for _ in 0..20 {
+            choice.update(&axes, &sure, 1.0, FOLLOW);
+        }
+        assert!(
+            choice
+                .direction
+                .unwrap()
+                .angle_between(axes.candidate(bent))
+                < 0.01
+        );
+
+        // The background looks like skin: the same scores tell nothing, back to the default
+        for _ in 0..20 {
+            choice.update(&axes, &sure, verification_reliability(0.8), FOLLOW);
+            assert_eq!(choice.confidence, 0.0);
+        }
+        assert!(choice.direction.unwrap().angle_between(axes.default) < 0.01);
+
+        // A sleeve: only noise is kept, the best of it is not followed
+        let mut noise = [Some(0.05); BRIDGE_CANDIDATES];
+        noise[bent] = Some(0.25);
+        let mut choice = BridgeChoice::default();
+        for _ in 0..5 {
+            choice.update(&axes, &noise, 1.0, FOLLOW);
+        }
+        assert_eq!(choice.index, Some(bent));
+        assert!(choice.direction.unwrap().angle_between(axes.default) < 1e-4);
+        assert_eq!(choice.confidence, 0.0);
+
+        // Follow 0: always the best one, as before
+        choice.update(&axes, &noise, 1.0, 0.0);
+        assert!(choice.direction.unwrap().angle_between(axes.default) > 0.05);
     }
 
     #[test]

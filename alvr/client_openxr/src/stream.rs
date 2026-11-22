@@ -679,10 +679,22 @@ impl StreamContext {
                     .normalize_or_zero(),
                 };
 
-                // Never solid below the confidence limit, else like the verified segments
-                let speed =
-                    crate::from_xr_vec3(velocities[xr::HandJointEXT::WRIST].linear_velocity)
-                        .length();
+                // Never solid below the confidence limit, else like the verified segments. The
+                // direction turns with the wrist joint, which also turns when only the hand bends
+                // (the forearm stays): the speed of its end counts too, until the camera follows.
+                // A turn about the forearm doesn't move it.
+                let wrist_velocity = velocities[xr::HandJointEXT::WRIST];
+                let mut speed = crate::from_xr_vec3(wrist_velocity.linear_velocity).length();
+                if wrist_velocity
+                    .velocity_flags
+                    .contains(xr::SpaceVelocityFlags::ANGULAR_VALID)
+                {
+                    let turn = crate::from_xr_vec3(wrist_velocity.angular_velocity)
+                        .cross(direction)
+                        .length()
+                        * wrist.length_m;
+                    speed = speed.max(turn);
+                }
                 let target = if joint
                     .location_flags
                     .contains(xr::SpaceLocationFlags::POSITION_TRACKED)

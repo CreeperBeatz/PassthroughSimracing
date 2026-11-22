@@ -1170,6 +1170,17 @@ fn hand_zone_sweeps_along_the_motion() {
     // The solid inside stays where it was
     assert!(moving.alpha(0.5, 0.75) < 0.01);
 
+    // A long sweep (key_sweep_bias 100) reaches beyond the bounding sphere moved half of it: the test
+    // of the distance to the hand covers all of it
+    let far = render_zones(swept(0.08, 0.0));
+    assert!(
+        (far.alpha(0.72, 0.75) - 0.5).abs() < 0.01,
+        "{}",
+        far.alpha(0.72, 0.75)
+    );
+    assert_eq!(far.alpha(0.75, 0.75), 1.0);
+    assert_eq!(far.alpha(0.34, 0.75), 1.0);
+
     // No sweep, or an empty one: exactly as before. A tiny one: the same within a level
     let empty = render_zones(swept(0.0, 0.0));
     let tiny = render_zones(swept(1e-6, 1e-6));

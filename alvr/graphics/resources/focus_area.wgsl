@@ -164,8 +164,16 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         let across = motion.xyz - dir * dot(motion.xyz, dir);
         let across_length2 = dot(across, across);
         let across_info = vec4f(across, select(0.0, 1.0 / across_length2, across_length2 > 1e-8));
-        let is_near_hand =
-            center_distance < bounds.w + max(zones.x, 0.0) + max(sweep.x, sweep.y) + SOFTNESS;
+        // A moving hand: the bounding sphere moved along the motion only, not grown in all directions
+        var is_near_hand = center_distance < bounds.w + max(zones.x, 0.0) + SOFTNESS;
+        if sweeps {
+            is_near_hand = ray_capsule_distance(
+                origin,
+                dir,
+                vec4f(bounds.xyz - motion.xyz * sweep.x, bounds.w),
+                vec4f(bounds.xyz + motion.xyz * sweep.y, bounds.w),
+            ) < max(zones.x, 0.0) + SOFTNESS;
+        }
 
         var distance = OUTSIDE;
         // Skip the hand if it is far away

@@ -75,7 +75,9 @@ test against 16 moved copies on random rays); a tapered capsule moving along its
 thicker end by up to the difference of its radii (1.7 mm measured with 3 mm tapers). Per pixel near a
 moving hand: per capsule 2 dot products, 1 division and about 12 other operations more, plus the old
 test for solid capsules; no texture samples. The zone, the scissor rect and the layer crop are larger
-along the motion. GPU time not measured. The `key:` line of `ALVR_CAM` logs `rim` and `sweep`
+along the motion. A moving hand is skipped by a test of the bounding sphere moved along the motion (one
+capsule test per hand and pixel), not a sphere grown by the sweep in all directions. GPU time not
+measured. The `key:` line of `ALVR_CAM` logs `rim` and `sweep`
 (ahead / behind, mm) of each hand.
 
 **Bridge from the wrist to the forearm** (`key_wrist_len`, **not tested**). Between the hand zone (it ends
@@ -87,11 +89,16 @@ its direction: at each update the learning thread tries 21 directions in the spa
 times -25 / 0 / 25 degrees towards the thumb). Each gets the share of points along it (1 cm apart from 3
 cm to the length: 6 for 80 mm, at most 24) whose camera color the key keeps; points hidden by the hand
 don't count. A new direction must be better by 0.1 (equal scores: the middle of the equal ones, then the
-least bent), the direction moves 30% towards it per update. Confidence: its score, 0 where the background
-around the hand looks like skin (like the verification). Without fresh data for 1 s: the default
-direction, confidence 0. The render thread turns the direction with the wrist at display time, so the
-bridge doesn't lag behind the hand. It is keyed like the hand (rim, sweep, leak narrowing) and solid only
-with confidence >= `key_wrist_conf`, faded with the speed like the verified segments. With that confidence
+least bent), the direction moves 30% towards it per update. Below a score of `key_wrist_follow` (0
+where the background around the hand looks like skin, like the verification) it moves back to the
+default instead: a sleeve or a skin colored floor is not followed. Confidence: that score, faded out
+while the smoothed direction is more than 5-15 degrees from the chosen one (the camera only checked that
+one). Without fresh data for 1 s: the default direction, confidence 0. The render thread turns the
+direction with the wrist at display time, so the bridge doesn't lag behind the hand. It is keyed like the
+hand (rim, sweep, leak narrowing) and solid only with confidence >= `key_wrist_conf`, faded with the speed
+like the verified segments. The speed is the larger of the wrist's and the speed of the bridge's end from
+the turn of the wrist joint: that joint also turns when only the hand bends, then the bridge swings with
+the hand until the camera follows (about 0.3 s); a turn about the forearm doesn't count. With that confidence
 the background ring and the forearm exclusions of the leak map also use it instead of the default. A bend
 towards or away from the camera can't be seen; any of those candidates covers the forearm in the image
 (unit test). Risk: a confident wrong direction over skin-colored wood keeps that wood out of the
@@ -247,6 +254,7 @@ Measured in the SteamVR home, 72 Hz, with color key on unless noted:
 | `key_lut_dump` | 0 | New value: write the learned LUT to `/sdcard/Android/data/alvr.client.dev/files/alvr_learned_key_<time>.lut` |
 | `key_wrist_len` | 80 mm | Keyed bridge from the wrist towards the forearm, 0: off (as before), up to 300. The direction and the solid fill need `auto_key`, without it: opposite to the fingers, never solid. Not tested |
 | `key_wrist_scale` / `key_wrist_conf` | 100 / 60 % | Its radius (of the wrist joint radius), how sure the camera must be of its direction for the solid fill |
+| `key_wrist_follow` | 30 % | Below this score of the best direction (share of points the key keeps, 0 over skin-like backgrounds) the bridge goes back to the default direction. 0: always the best one. Not tested |
 
 The LUT file must exist even with `auto_key`: 32x32x32 RGBA bytes, indexed `[b][g][r]`. It is used until
 enough colors are learned.
