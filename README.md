@@ -65,16 +65,17 @@ leaves headroom so that bright game scenes can still make the passthrough bright
 
 ## Status
 
-> **Early development. Not yet tested on a headset.**
+> **Early development. Runs on a Quest 3, with SteamVR home and BeamNG.drive.** What works, what doesn't
+> and why: [docs/KNOWLEDGE_BASE.md](docs/KNOWLEDGE_BASE.md).
 
 | Feature | State |
 | --- | --- |
-| Depth passthrough mode (distance / cockpit box) | Implemented, shader-tested on desktop GPU |
-| Game-driven lighting (global + local) | Implemented, shader-tested on desktop GPU |
-| Debug views (depth visualization, mask tint) | Implemented |
-| First on-device test | **Next** |
+| Depth passthrough mode (distance) | Works on the headset |
+| Cockpit box, game-driven lighting | Implemented, not tested on the headset |
+| Hands: color key on the live passthrough, learned automatically | Experimental (adb), works over simple backgrounds |
+| Forearms: same, with body tracking | Experimental, GPU cost too high |
+| Wheel and shifter near the hands (playzone map) | Experimental, not tested on the headset |
 | Rig calibration (markers on the rig or controller touch points, spatial anchors) | Planned |
-| Tracked hand mesh merged into the mask (sharper fingers) | Planned |
 | Static rig geometry in the mask (stable wheel edges) | Planned |
 | Per-region colour tint from the game (passthrough colour LUT) | Idea |
 | Motion rig support | Idea |
