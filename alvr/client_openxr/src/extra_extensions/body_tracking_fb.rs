@@ -127,51 +127,6 @@ impl BodyTrackerFB {
     }
 }
 
-impl BodyTrackerFB {
-    /// Vector from the wrist to the elbow
-    pub fn forearm(
-        &self,
-        time: xr::Time,
-        reference_space: &xr::Space,
-        is_right: bool,
-    ) -> Option<alvr_common::glam::Vec3> {
-        const MIN_LENGTH: f32 = 0.15;
-        const MAX_LENGTH: f32 = 0.4;
-
-        let joints = self
-            .locate_body_joints(
-                time,
-                reference_space,
-                xr::BodyJointFB::COUNT.into_raw() as usize,
-            )
-            .ok()
-            .flatten()?;
-        let (elbow, wrist) = if is_right {
-            (
-                xr::BodyJointFB::RIGHT_ARM_LOWER,
-                xr::BodyJointFB::RIGHT_HAND_WRIST,
-            )
-        } else {
-            (
-                xr::BodyJointFB::LEFT_ARM_LOWER,
-                xr::BodyJointFB::LEFT_HAND_WRIST,
-            )
-        };
-        let position = |joint: xr::BodyJointFB| {
-            let joint = &joints[joint.into_raw() as usize];
-            joint
-                .location_flags
-                .contains(xr::SpaceLocationFlags::POSITION_VALID)
-                .then(|| crate::from_xr_vec3(joint.pose.position))
-        };
-        let forearm = position(elbow)? - position(wrist)?;
-
-        (MIN_LENGTH..MAX_LENGTH)
-            .contains(&forearm.length())
-            .then_some(forearm)
-    }
-}
-
 impl Drop for BodyTrackerFB {
     fn drop(&mut self) {
         unsafe {

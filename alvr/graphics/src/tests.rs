@@ -4,7 +4,7 @@
 
 use crate::{
     depth_mask::{
-        self, ArmRemoval, ColorKeyInput, DepthFrame, DepthRenderInput, HAND_SEGMENTS, HandShape,
+        self, ArmMotion, ColorKeyInput, DepthFrame, DepthRenderInput, HAND_SEGMENTS, HandShape,
         HandZones,
     },
     stream::{self, FOVEATION_UNIFORM_SIZE, LIGHT_PROBE_SIZE, StreamPipelines, floats_to_bytes},
@@ -349,7 +349,7 @@ fn render_full(
     depth_camera_position: Vec3,
     depth_available: bool,
     color_key: Option<ColorKeyInput>,
-    arms: [Option<ArmRemoval>; 2],
+    arms: [Option<ArmMotion>; 2],
     playzone: Option<&Scene>,
 ) -> Output {
     let target_format = TextureFormat::Rgba8Unorm;
@@ -768,7 +768,6 @@ fn color_key_packs_mask_and_hand_area() {
                         core: -0.01,
                         falloff: 0.01,
                         rim: 0.04,
-                        arm_rim: 0.0,
                         solid: [1.0; HAND_SEGMENTS],
                     },
                 )),
@@ -811,7 +810,6 @@ fn hand_core_fades_out_gradually() {
         core: -0.03,
         falloff: 0.06,
         rim: 0.06,
-        arm_rim: 0.0,
         solid: [1.0; HAND_SEGMENTS],
     };
     let render_zones = |zones| {
@@ -897,7 +895,6 @@ fn negative_rim_ends_inside_the_capsule() {
                             core: -0.01,
                             falloff: 0.01,
                             rim,
-                            arm_rim: 0.0,
                             solid: [0.0; HAND_SEGMENTS],
                         },
                     )),
@@ -922,7 +919,6 @@ fn hand_zones_follow_the_speed() {
         core: -0.004,
         falloff: 0.008,
         rim: 0.01,
-        arm_rim: 0.0,
         solid: [1.0; HAND_SEGMENTS],
     };
 
@@ -944,48 +940,36 @@ fn hand_zones_shrink_over_leaks() {
         core: -0.004,
         falloff: 0.004,
         rim: 0.0,
-        arm_rim: 0.008,
         solid: [1.0; HAND_SEGMENTS],
     };
     zones.solid[3] = 0.5;
 
     // No leak: the same
-    let same = zones.for_leak(0.0, 0.003, 0.0);
+    let same = zones.for_leak(0.0, 0.003);
     assert_eq!(same.rim.to_bits(), zones.rim.to_bits());
-    assert_eq!(same.arm_rim.to_bits(), zones.arm_rim.to_bits());
     assert_eq!(same.core.to_bits(), zones.core.to_bits());
 
     // A moving hand over a full leak: the rim ends inside the hand, the core stays
     let moving = zones.for_speed(1.0, 0.01, 0.04, 0.016);
-    let leaky = moving.for_leak(1.0, 0.003, 0.0);
+    let leaky = moving.for_leak(1.0, 0.003);
     assert!((leaky.rim - -0.003).abs() < 1e-6, "{}", leaky.rim);
     assert_eq!(leaky.core, moving.core);
     assert_eq!(leaky.falloff, moving.falloff);
     assert_eq!(leaky.solid, moving.solid);
-    // The forearm rim goes down to 1 mm
-    assert!((leaky.arm_rim - 0.001).abs() < 1e-6, "{}", leaky.arm_rim);
 
-    // Half: in between, the forearm keeps a share
-    let half = moving.for_leak(0.5, 0.003, 0.5);
+    // Half: in between
+    let half = moving.for_leak(0.5, 0.003);
     assert!(
         (half.rim - (0.5 * 0.016 - 0.5 * 0.003)).abs() < 1e-6,
         "{}",
         half.rim
     );
-    assert!((half.arm_rim - 0.006).abs() < 1e-6, "{}", half.arm_rim);
-
-    // A forearm that is not tracked stays so
-    let no_arm = HandZones {
-        arm_rim: 0.0,
-        ..zones
-    };
-    assert_eq!(no_arm.for_leak(1.0, 0.003, 0.0).arm_rim, 0.0);
 }
 
 #[test]
 fn hand_shape_ends_at_the_fingertips() {
     let joints: [Vec4; 26] = std::array::from_fn(|i| Vec4::new(i as f32 * 0.03, 0.0, -0.4, 0.01));
-    let shape = HandShape::from_joints(&joints, None);
+    let shape = HandShape::from_joints(&joints);
     let points = shape.segments.as_flattened();
 
     for (i, joint) in joints.iter().enumerate() {
@@ -1001,13 +985,14 @@ fn hand_shape_ends_at_the_fingertips() {
 }
 
 #[test]
-fn tracked_arms_are_removed_from_the_depth() {
+fn late_arms_are_moved() {
     let (device, queue) = gpu_or_skip!();
     let config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
 
-    // A vertical arm at 0.5 m, and the rest of the scene
-    let scene = Scene::new(3.0, [0.45, 0.1, 0.55, 0.9], 0.5);
-    let render_arm = |trust| {
+    // An arm at 0.5 m: in the depth map it covers u 0.40..0.50, v (from the bottom) 0.2..0.8. Since
+    // then it moved 10 cm to the right, 0.1 in view uv.
+    let scene = Scene::new(3.0, [0.4, 0.2, 0.5, 0.8], 0.5);
+    let render_arm = |arm: Option<ArmMotion>| {
         render_full(
             &device,
             &queue,
@@ -1017,42 +1002,39 @@ fn tracked_arms_are_removed_from_the_depth() {
             Vec3::ZERO,
             true,
             None,
-            [
-                None,
-                Some(ArmRemoval {
-                    wrist: Vec3::new(0.0, 0.35, -0.5),
-                    elbow: Vec3::new(0.0, -0.35, -0.5),
-                    trust,
-                }),
-            ],
+            [None, arm],
             None,
         )
     };
+    let motion = |displacement| ArmMotion {
+        wrist: Vec3::new(0.05, 0.05, -0.5),
+        direction: Vec3::NEG_Y,
+        displacement,
+    };
 
-    let untrusted = render_arm([0.0; 4]);
-    assert_eq!(untrusted.alpha(0.5, 0.3), 0.0);
-    assert_eq!(untrusted.alpha(0.5, 0.7), 0.0);
+    let still = render_arm(Some(motion(Vec3::ZERO)));
+    assert_eq!(still.alpha(0.45, 0.48), 0.0);
+    assert_eq!(still.alpha(0.55, 0.48), 1.0);
 
-    let trusted = render_arm([1.0; 4]);
-    assert_eq!(trusted.alpha(0.5, 0.3), 1.0);
-    assert_eq!(trusted.alpha(0.5, 0.7), 1.0);
+    // Near the wrist: moved
+    let moved = render_arm(Some(motion(Vec3::new(0.1, 0.0, 0.0))));
+    assert!(moved.alpha(0.55, 0.48) < 0.1, "{}", moved.alpha(0.55, 0.48));
+    assert!(moved.alpha(0.43, 0.48) > 0.9, "{}", moved.alpha(0.43, 0.48));
 
-    // Only near the wrist
-    let partly = render_arm([1.0, 1.0, 0.0, 0.0]);
-    assert_eq!(partly.alpha(0.5, 0.3), 1.0);
-    assert_eq!(partly.alpha(0.5, 0.75), 0.0);
+    // Switched off (debug.alvr.arm_shift 0): plain depth, the same as a still arm
+    let plain = render_arm(None);
+    assert_eq!(plain.alpha(0.45, 0.48), 0.0);
+    assert_eq!(plain.alpha(0.55, 0.48), 1.0);
 }
 
 #[test]
 fn hands_rect_contains_the_hands() {
     let joints = std::array::from_fn(|i| Vec4::new(0.05 + i as f32 * 0.004, 0.1, -0.5, 0.01));
-    let elbow = Vec3::new(0.3, -0.1, -0.3);
-    let shape = HandShape::from_joints(&joints, Some(elbow));
+    let shape = HandShape::from_joints(&joints);
     let zones = HandZones {
         core: 0.0,
         falloff: 0.004,
         rim: 0.01,
-        arm_rim: 0.02,
         solid: [1.0; HAND_SEGMENTS],
     };
     let key = ColorKeyInput {
@@ -1091,11 +1073,10 @@ fn hands_rect_ignores_hands_out_of_view() {
             core: 0.0,
             falloff: 0.004,
             rim: 0.0,
-            arm_rim: 0.0,
             solid: [0.0; HAND_SEGMENTS],
         };
         let key = ColorKeyInput {
-            hands: [Some((HandShape::from_joints(&joints, None), zones)), None],
+            hands: [Some((HandShape::from_joints(&joints), zones)), None],
             leak: [0.0; 2],
         };
         depth_mask::hands_view_rect(&view(Vec3::ZERO), Vec3::ZERO, &key)
@@ -1202,10 +1183,7 @@ fn playzone_fills_objects_removed_near_the_hand() {
         Vec4::new(-0.02, 0.0, -0.55, 0.02),
         Vec4::new(0.02, 0.0, -0.55, 0.02),
     ];
-    let mut segments = [segment; HAND_SEGMENTS];
-    for arm in &mut segments[HAND_SEGMENTS - depth_mask::ARM_SEGMENTS..] {
-        *arm = [Vec4::new(0.0, 0.0, 5.0, 0.01); 2];
-    }
+    let segments = [segment; HAND_SEGMENTS];
     let key = ColorKeyInput {
         hands: [
             Some((
@@ -1214,7 +1192,6 @@ fn playzone_fills_objects_removed_near_the_hand() {
                     core: 0.0,
                     falloff: 0.004,
                     rim: 0.0,
-                    arm_rim: 0.0,
                     solid: [0.0; HAND_SEGMENTS],
                 },
             )),
@@ -1490,7 +1467,6 @@ fn tint_debug_view_marks_the_narrowed_rim() {
                             core: -0.01,
                             falloff: 0.01,
                             rim: 0.04,
-                            arm_rim: 0.0,
                             solid: [0.0; HAND_SEGMENTS],
                         },
                     )),

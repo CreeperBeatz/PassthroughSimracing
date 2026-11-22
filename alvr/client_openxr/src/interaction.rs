@@ -186,18 +186,6 @@ pub struct InteractionContext {
 }
 
 impl InteractionContext {
-    /// For the forearms. None if body tracking is not available
-    #[cfg_attr(not(target_os = "android"), expect(dead_code))]
-    pub fn create_body_tracker(&self) -> Option<BodyTrackerFB> {
-        BodyTrackerFB::new(
-            &self.xr_session,
-            self.xr_system,
-            xr::BodyJointSetFB::DEFAULT,
-            true,
-        )
-        .ok()
-    }
-
     pub fn new(
         xr_session: xr::Session<xr::OpenGlEs>,
         extra_extensions: Vec<String>,

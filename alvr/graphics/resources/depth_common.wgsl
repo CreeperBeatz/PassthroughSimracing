@@ -2,9 +2,8 @@
 // including shader must declare:
 //   var<uniform> depth_u: DepthUniforms;
 
-// Capsules per hand. The last ones are the forearm
-const HAND_SEGMENTS: u32 = 32u;
-const ARM_SEGMENTS: u32 = 4u;
+// Capsules per hand
+const HAND_SEGMENTS: u32 = 28u;
 
 // All positions/poses are in the stage reference space
 struct DepthEye {
@@ -38,7 +37,7 @@ struct DepthUniforms {
     lighting2: vec4f,
     // Confidence zones of each hand, as distances from its surface (negative inside).
     // x: end of the color keyed rim, y: start of the falloff (solid passthrough before it),
-    // z: width of the falloff, w: end of the color keyed rim of the forearm
+    // z: width of the falloff
     hand_zones: array<vec4f, 2>,
     // How solid the core of each capsule is (0..1), 4 capsules per vector, left hand first
     hand_solid: array<vec4f, 2u * HAND_SEGMENTS / 4u>,
@@ -46,8 +45,8 @@ struct DepthUniforms {
     hand_bounds: array<vec4f, 2>,
     // Start and end of each capsule, xyz: position, w: radius
     hand_points: array<vec4f, 2u * 2u * HAND_SEGMENTS>,
-    // Forearms at the time when the depth image was captured: xyz: wrist, xyz: elbow, and how much of the
-    // depth of each quarter (from the wrist) is replaced by the tracked arm (0..1)
+    // Motion of each arm since the depth image was captured: xyz: wrist position, xyz: direction from
+    // the wrist to the elbow, xyz: displacement (0: plain depth)
     arms: array<vec4f, 6>,
     playzone_eyes: array<PlayzoneEye, 2>,
     // x: available (0/1), y, z: debug view, how much the rim of each hand is narrowed (0..1)

@@ -84,7 +84,6 @@ impl PassthroughLayer<'_> {
 /// - push a LUT (see `COLOR_KEY_SIZE`) to one of `COLOR_KEY_PATHS`
 /// - `setprop debug.alvr.color_key <n>`: 0 disables the key, another value (re)loads the LUT
 /// - `setprop debug.alvr.key_rim <mm>`: width of the color keyed rim around the hands
-/// - `setprop debug.alvr.key_arm_rim <mm>`: same for the forearms
 /// - `setprop debug.alvr.key_inset <mm>`: how much the solid inside of the hands is shrunk
 /// - `setprop debug.alvr.key_falloff <mm>`: how gradually the solid inside fades out
 /// - `setprop debug.alvr.key_error <ms>`: assumed timing error, the solid core shrinks with the speed
@@ -105,14 +104,14 @@ impl PassthroughLayer<'_> {
 /// - `setprop debug.alvr.key_crop 0`: don't crop the lower game layer to the hands, 2: crop with the y origin
 ///   at the top of the image
 /// - `setprop debug.alvr.key_hands 0`: no hands in the GPU passes (to measure them)
-/// - `setprop debug.alvr.arm_removal 0`: don't remove the late forearms from the depth map
+/// - `setprop debug.alvr.arm_shift 0`: plain depth for the arms, not shifted by the motion of the wrist (also
+///   without the key, see `StreamContext`)
 /// - `setprop debug.alvr.playzone -1`: forget the remembered playzone
 /// - `setprop debug.alvr.key_leak <percent>`: narrow the rim where the background around a hand looks like
 ///   the hand (needs `auto_key`), 0: off, 100: on
 /// - `setprop debug.alvr.key_leak_lo <percent>` / `key_leak_hi`: share of the background around the hand
 ///   that is kept by the key, from where the rim is narrowed to where it is narrowest
 /// - `setprop debug.alvr.key_leak_inset <mm>`: the narrowest rim, inside of the hand
-/// - `setprop debug.alvr.key_leak_arm <percent>`: share of the forearm rim that stays (at least 1 mm)
 /// - `setprop debug.alvr.key_leak_force <percent>`: narrow the rim of both hands this much, without the camera
 /// - `setprop debug.alvr.key_leak_view 1`: with the "Tint mask" debug view the narrowed rim is red
 pub struct ColorKey {
@@ -136,17 +135,15 @@ pub struct ColorKeyParams {
     pub layers: i64,
     /// 0: the lower game layer is not cropped, 1: cropped, 2: cropped, y origin at the top
     pub crop: i64,
-    /// Whether the GPU passes get the hands, and remove the forearms from the depth map
+    /// Whether the GPU passes get the hands
     pub hands: bool,
-    pub arm_removal: bool,
     /// Narrower rim over backgrounds that look like the hand: gain (0..1), the shares of the background
-    /// that is kept where it starts and where it is complete, the narrowest rim (inside of the hand), the
-    /// share of the forearm rim that stays, a fixed amount (0..1), and whether it is shown
+    /// that is kept where it starts and where it is complete, the narrowest rim (inside of the hand), a
+    /// fixed amount (0..1), and whether it is shown
     pub leak_gain: f32,
     pub leak_lo: f32,
     pub leak_hi: f32,
     pub leak_inset_m: f32,
-    pub leak_arm_keep: f32,
     pub leak_force: f32,
     pub leak_view: bool,
 }
@@ -173,7 +170,6 @@ impl ColorKeyParams {
                 core: -millimeters("debug.alvr.key_inset", 4),
                 falloff: millimeters("debug.alvr.key_falloff", 4),
                 rim: millimeters("debug.alvr.key_rim", 0),
-                arm_rim: millimeters("debug.alvr.key_arm_rim", 8),
                 solid,
             },
             // Milliseconds
@@ -190,12 +186,10 @@ impl ColorKeyParams {
             layers: debug_property("debug.alvr.key_layers").unwrap_or(4),
             crop: debug_property("debug.alvr.key_crop").unwrap_or(1),
             hands: debug_property("debug.alvr.key_hands").unwrap_or(1) != 0,
-            arm_removal: debug_property("debug.alvr.arm_removal").unwrap_or(1) != 0,
             leak_gain: percent("debug.alvr.key_leak", 0),
             leak_lo: percent("debug.alvr.key_leak_lo", 5),
             leak_hi: percent("debug.alvr.key_leak_hi", 20),
             leak_inset_m: millimeters("debug.alvr.key_leak_inset", 3),
-            leak_arm_keep: percent("debug.alvr.key_leak_arm", 0),
             leak_force: percent("debug.alvr.key_leak_force", 0),
             leak_view: debug_property("debug.alvr.key_leak_view").unwrap_or(0) != 0,
         }

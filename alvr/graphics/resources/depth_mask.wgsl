@@ -111,9 +111,11 @@ fn current_mask(uv: vec2f) -> vec4f {
 
     // The depth camera is close to (but not exactly at) the eye. Project a guess point along the
     // ray into the depth map, read the real surface there, and refine the guess distance.
-    var t = 0.7;
+    var t = initial_distance(origin, dir);
     for (var i = 0u; i < 2u; i++) {
-        let guess = project_to_depth(origin + dir * t, view_idx);
+        let point = origin + dir * t;
+        let displacement = arm_displacement(point);
+        let guess = project_to_depth(point - displacement, view_idx);
         if !guess.valid {
             return vec4f(0.0);
         }
@@ -121,17 +123,15 @@ fn current_mask(uv: vec2f) -> vec4f {
         if depth >= MAX_DEPTH {
             return vec4f(0.0);
         }
-        let hit = lookup_to_world(guess, linearize_depth(depth), view_idx);
+        let hit = lookup_to_world(guess, linearize_depth(depth), view_idx) + displacement;
         t = max(dot(hit - origin, dir), 0.05);
     }
 
-    let lookup = project_to_depth(origin + dir * t, view_idx);
+    let displacement = arm_displacement(origin + dir * t);
+    let lookup = project_to_depth(origin + dir * t - displacement, view_idx);
     if !lookup.valid {
         return vec4f(0.0);
     }
-
-    // Most rays don't pass near an arm
-    let near_arms = vec2<bool>(is_near_arm(origin, dir, 0u), is_near_arm(origin, dir, 1u));
 
     // Classify the 3x3 neighborhood and blend the results (not the depths) with quadratic B-spline
     // weights. This hides the depth texel grid, without inventing surfaces between hand and wall.
@@ -147,17 +147,8 @@ fn current_mask(uv: vec2f) -> vec4f {
         for (var x = 0; x < 3; x++) {
             let depth = load_depth(vec2i(center) + vec2i(x - 1, y - 1), view_idx);
             if depth < MAX_DEPTH {
-                let hit = lookup_to_world(lookup, linearize_depth(depth), view_idx);
-                var inside = region_mask(hit, view_idx);
-                if inside > 0.0 {
-                    if near_arms.x {
-                        inside *= 1.0 - arm_removal(hit, 0u);
-                    }
-                    if near_arms.y {
-                        inside *= 1.0 - arm_removal(hit, 1u);
-                    }
-                }
-                coverage += weights[x].x * weights[y].y * inside;
+                let hit = lookup_to_world(lookup, linearize_depth(depth), view_idx) + displacement;
+                coverage += weights[x].x * weights[y].y * region_mask(hit, view_idx);
             }
         }
     }
@@ -166,7 +157,7 @@ fn current_mask(uv: vec2f) -> vec4f {
     var has_depth = 0.0;
     let center_depth = load_depth(vec2i(center), view_idx);
     if center_depth < MAX_DEPTH {
-        let hit = lookup_to_world(lookup, linearize_depth(center_depth), view_idx);
+        let hit = lookup_to_world(lookup, linearize_depth(center_depth), view_idx) + displacement;
         proximity = clamp(1.0 - length(hit - origin) / 3.0, 0.0, 1.0);
         has_depth = 1.0;
     }
@@ -177,40 +168,65 @@ fn current_mask(uv: vec2f) -> vec4f {
 // Depth values from here on mean "no data"
 const MAX_DEPTH: f32 = 0.9999;
 
-// The depth map is late, so it shows the forearms where they were. Returns 1 if this point of the depth
-// map belongs to a forearm that is tracked: the tracked one is shown instead.
-fn arm_removal(point: vec3f, hand: u32) -> f32 {
-    let wrist = depth_u.arms[hand * 3u].xyz;
-    let axis = depth_u.arms[hand * 3u + 1u].xyz - wrist;
-    let trust = depth_u.arms[hand * 3u + 2u];
+// Where to start the search of the real surface along the ray. At the arm if the ray passes near it, so
+// that its motion is taken into account.
+fn initial_distance(origin: vec3f, dir: vec3f) -> f32 {
+    var t = 0.7;
+    var nearest = ARM_RADIUS;
+    for (var hand = 0u; hand < 2u; hand++) {
+        let displacement = depth_u.arms[hand * 3u + 2u].xyz;
+        if dot(displacement, displacement) < 1e-6 {
+            continue;
+        }
+        let axis = depth_u.arms[hand * 3u + 1u].xyz * ARM_LENGTH;
+        // Middle between the old and the current position
+        let start = depth_u.arms[hand * 3u].xyz - 0.5 * displacement;
 
-    let s = clamp(dot(point - wrist, axis) / max(dot(axis, axis), 1e-4), 0.0, 1.0);
-    let aside = length(point - wrist - axis * s);
-    // Interpolate between the centers of the quarters
-    let position = clamp(s * 4.0 - 0.5, 0.0, 3.0);
-    let blend = clamp(vec4f(position) - vec4f(0.0, 1.0, 2.0, 3.0), vec4f(-1.0), vec4f(1.0));
-    let amount = dot(trust, 1.0 - abs(blend));
-
-    let radius = mix(0.055, 0.07, s);
-    return amount * (1.0 - smoothstep(radius, radius + 0.02, aside));
+        // Closest point between the ray and the arm
+        let w = origin - start;
+        let b = dot(dir, axis);
+        let c = dot(axis, axis);
+        let denominator = c - b * b;
+        var s = 0.0;
+        if denominator > 1e-9 {
+            s = clamp((dot(axis, w) - b * dot(dir, w)) / denominator, 0.0, 1.0);
+        }
+        let point = start + axis * s;
+        let arm_t = max(dot(point - origin, dir), 0.05);
+        let distance = length(origin + dir * arm_t - point) - 0.5 * length(displacement);
+        if distance < nearest {
+            nearest = distance;
+            t = arm_t;
+        }
+    }
+    return t;
 }
 
-// Whether the ray passes a forearm that is tracked, with a margin for its motion and the parallax
-fn is_near_arm(origin: vec3f, dir: vec3f, hand: u32) -> bool {
-    let trust = depth_u.arms[hand * 3u + 2u];
-    let start = depth_u.arms[hand * 3u].xyz;
-    let axis = depth_u.arms[hand * 3u + 1u].xyz - start;
-    let c = dot(axis, axis);
-    if c < 1e-4 || all(trust <= vec4f(0.0)) {
-        return false;
-    }
+const ARM_LENGTH: f32 = 0.45;
+const ARM_RADIUS: f32 = 0.14;
 
-    let w = origin - start;
-    let b = dot(dir, axis);
-    let s = clamp((dot(axis, w) - b * dot(dir, w)) / max(c - b * b, 1e-6), 0.0, 1.0);
-    let point = start + axis * s;
-    let t = max(dot(point - origin, dir), 0.0);
-    return length(origin + dir * t - point) < 0.13;
+// The depth map is late: how much the real surface at this point has moved since it was captured. The
+// arm moves with the wrist, less towards the elbow. Zero without arm motions (plain depth).
+fn arm_displacement(point: vec3f) -> vec3f {
+    var result = vec3f(0.0);
+    for (var hand = 0u; hand < 2u; hand++) {
+        let displacement = depth_u.arms[hand * 3u + 2u].xyz;
+        let from_wrist = point - depth_u.arms[hand * 3u].xyz;
+        let direction = depth_u.arms[hand * 3u + 1u].xyz;
+        let along = dot(from_wrist, direction);
+
+        // Distance from the axis of the arm, anywhere between its old and its current position
+        let offset = from_wrist - direction * along;
+        let motion = displacement - direction * dot(displacement, direction);
+        let s = clamp(-dot(offset, motion) / max(dot(motion, motion), 1e-6), 0.0, 1.0);
+        let aside = length(offset + motion * s);
+
+        let weight = (1.0 - smoothstep(0.0, ARM_LENGTH, along))
+            * smoothstep(-0.2, -0.1, along)
+            * (1.0 - smoothstep(0.6 * ARM_RADIUS, ARM_RADIUS, aside));
+        result += displacement * weight;
+    }
+    return result;
 }
 
 struct DepthLookup {

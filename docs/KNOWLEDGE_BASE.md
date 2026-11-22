@@ -17,15 +17,17 @@ Words used here:
 | Hands | Live color key on the passthrough, in a small zone around the tracked hand, with automatically learned colors | Over simple backgrounds "basically solved" (observed) |
 | Holes in a still hand | Solid fill of the hand segments that the camera confirms | Better, some noise left |
 | Hands over complex backgrounds | Same, stricter colors, small zone | Leaks much lower, not gone |
-| Forearms | Same as the hands, elbow from body tracking | Smooth edge on screenshots, GPU cost too high, see below |
+| Forearms | Depth map only, shifted by the motion of the wrist (`arm_shift`) | Coarse edge, lags or jitters. The body tracking forearm was removed: not accurate enough |
 | Held objects (wheel, shifter) | Remember the depth map without hands | Not tested on the headset |
 | GPU budget | - | **Main open problem**: 58-73 fps with the last tested build |
 
 ## How it works now
 
 1. **Depth mask.** For each pixel find the real surface with `XR_META_environment_depth` and decide if
-   it belongs to the region (distance or box). Computed at low resolution, upscaled.
-2. **Hand zones.** Capsules from the hand tracking joints, plus the forearm. They say *where to look*.
+   it belongs to the region (distance or box). Computed at low resolution, upscaled. The arms come only
+   from here: around each arm the depth is shifted by the motion of the wrist since the depth image was
+   captured (`arm_shift`).
+2. **Hand zones.** Capsules from the hand tracking joints, no forearm. They say *where to look*.
 3. **Color key.** The compositor applies a RGBA color table (LUT) to a second passthrough layer. It works
    on the image that is displayed, so its edge can't lag.
 4. **Layers**, from the bottom: passthrough, game with holes (mask, solid fill), keyed passthrough, game
@@ -39,10 +41,9 @@ Words used here:
 **Narrower rim over leaky backgrounds** (`key_leak`, **not tested**). The learning thread measures for
 each hand which share of the colors 2-7 cm around it the key keeps. Where that share is high the
 background looks like the hand and would show in the rim, so the rim of that hand shrinks, down to 3 mm
-inside the hand, and the forearm rim down to 1 mm. It narrows within about 0.2 s and widens slowly. With
-`key_leak` on, each hand is also verified against its own background instead of both together. At rest
-the rim is already 0, so only the soft edge goes; the gain is for moving hands and the forearm. Leaks
-inside the hand capsules stay.
+inside the hand. It narrows within about 0.2 s and widens slowly. With `key_leak` on, each hand is also
+verified against its own background instead of both together. At rest the rim is already 0, so only the
+soft edge goes; the gain is for moving hands. Leaks inside the hand capsules stay.
 
 ## What works
 
@@ -58,7 +59,8 @@ inside the hand capsules stay.
   (CLOCK_MONOTONIC, which is the OpenXR time). Colors match the screenshots within 1-8 levels (median)
   and 5-9 levels (mean error, coarse matching). Cost: +0.3 ms GPU (measured).
 - **Learning colors live.** Skin from the palm (and fingers of a still hand), background from a ring of
-  2-7 cm, plus the whole scene without hands and arms. A lamp that is switched on is learned in less
+  2-7 cm (without the side of the forearm: opposite to the fingers, from the hand joints), plus the whole
+  scene without hands and arms. A lamp that is switched on is learned in less
   than 0.5 s (observed).
 - **Remembering** backgrounds (60 s), scene (20 s) and skin in other places (45 s). Switching between
   simple backgrounds is not noticeable any more (observed).
@@ -90,7 +92,14 @@ inside the hand capsules stay.
   time is already predicted; 0 ms is the current setting.
 - **Filtering the camera image directly** (noise, connectivity). Estimated 60-75 ms late, so it would
   cut moving hands. It is fine for colors, and for checks of slow hands.
-- **Shifting the late depth of the arm by the motion of the wrist.** Jitters, and the edge stays coarse.
+- **Shifting the late depth of the arm by the motion of the wrist.** Jitters, and the edge stays coarse
+  (observed). It is on again by default since the body tracking forearm was removed; `arm_shift 0` turns
+  it off to compare with plain depth (not tested).
+- **The forearm from Meta's body tracking** (`XR_FB_body_tracking`, elbow of the body API). The forearm
+  zone took its direction from the estimated elbow. With the arm stretched out or the wrist bent down the
+  estimate was off, the zone lay beside the real forearm and the color key showed the room there, e.g. a
+  large patch of skin-colored parquet (observed on the headset). It also cost GPU time (11654b86, see
+  below). Removed: the forearm is depth only again.
 - **A wide zone for fast hands.** 12 cm around a fast hand near the face showed most of the room.
 - **Skin-colored backgrounds** (wood, cardboard): a key that only sees color can't separate them.
 - **`performance_level` GPU = SustainedHigh**, changed while streaming: the clock stayed at 456 MHz.
@@ -110,7 +119,8 @@ Measured in the SteamVR home, 72 Hz, with color key on unless noted:
 
 - The last build ran at 456 MHz and 48-50 degrees, so heat may be part of it.
 - Suspects: the forearm test for all 9 depth samples of every pixel, and the bigger area of the hand pass.
-  The next commit reduces both and uses 1/5 resolution. **Not tested.**
+  The next commit reduced both and used 1/5 resolution. Since then the body tracking forearm (capsules, arm
+  removal) has been removed, so its cost is gone. **Not measured.**
 - 3609efde, no hands in view (measured): 4 layers were submitted; key off took TW from 4.69 to about
   2.0 ms and load from about 85% to 62%, App time barely changed. Boost or SustainedHigh requested
   while streaming: level stayed 2, 456 MHz.
@@ -119,10 +129,8 @@ Measured in the SteamVR home, 72 Hz, with color key on unless noted:
   3% of the view; outside it the upper layer is opaque or both are transparent, so only soft mask edges
   can differ. Without the extra layers the game layer uses the upper alpha (2a - 1), the same as the
   four layers away from the hands. The focus pass is skipped without hands. Switches below
-  (`key_layers`, `key_crop`, `key_hands`, `arm_removal`) to measure each part; the performance level
+  (`key_layers`, `key_crop`, `key_hands`, `arm_shift`) to measure each part; the performance level
   is also requested at stream start, results and the layers in use are logged with `ALVR_CAM`.
-- Arm removal stays on all 9 depth samples: once per pixel, the 3x3 blend would be kept or dropped
-  as a whole at the edge of the arm in the depth map, so that edge would snap to the depth texels.
 - CI builds the APK in the dev profile. Without `CARGO_PROFILE_DEV_OPT_LEVEL=3` one color update took
   312 ms instead of about 15 ms, and wgpu validation was on.
 
@@ -153,7 +161,6 @@ Measured in the SteamVR home, 72 Hz, with color key on unless noted:
 | `color_key` | 0 | 0 off, another value (re)loads `/data/local/tmp/alvr_color_key.lut` |
 | `auto_key` | 0 | 1 before starting the app: learn the colors, asks for the camera permission |
 | `key_rim` / `key_rim_error` / `key_rim_max` | 0 mm / 45 ms / 16 mm | Zone at rest, growth with the speed, limit |
-| `key_arm_rim` | 8 mm | Zone of the forearm |
 | `key_inset` / `key_falloff` | 4 mm / 4 mm | Where the solid fill starts and how it fades out |
 | `key_error` | 10 ms | How much the fill shrinks with the speed |
 | `key_solid` | 6 | Segments that are always solid: 0 none, 6 wrist, 9 palm, 28 hand |
@@ -162,11 +169,11 @@ Measured in the SteamVR home, 72 Hz, with color key on unless noted:
 | `playzone` / `playzone_auto` | 0 / 1 | New value: remember now, -1 forgets it (not tested). Automatic after 1.5 s without hands |
 | `key_layers` | 4 | 4: extra layers only with hands in view, 2: never, 5: always, 30 / 31: always three (no upper game layer / no keyed passthrough). Not tested |
 | `key_crop` | 1 | Lower game layer only around the hands. 0: full, 2: y origin at the top (if 1 is upside down). Not tested |
-| `key_hands` / `arm_removal` | 1 / 1 | 0: no hands in the GPU passes / no forearm removal in the depth mask. Not tested |
+| `key_hands` | 1 | 0: no hands in the GPU passes. Not tested |
+| `arm_shift` | 1 | 1: the depth around each arm is shifted by the motion of the wrist, 0: plain depth. Also without the key. Not tested |
 | `key_leak` | 0 % | Narrower rim where the background around a hand looks like it, 0: off, 100: on. Needs `auto_key`. Not tested |
 | `key_leak_lo` / `key_leak_hi` | 5 / 20 % | Share of the colors around the hand that the key keeps: where the narrowing starts / is complete |
 | `key_leak_inset` | 3 mm | Rim at full narrowing, inside the hand. 0: down to the soft edge only |
-| `key_leak_arm` | 0 % | Share of the forearm rim that stays at full narrowing (at least 1 mm) |
 | `key_leak_force` | 0 % | Narrow both hands this much, without the camera |
 | `key_leak_view` | 0 | 1: with the "Tint mask" debug view the narrowed rim is red |
 
@@ -178,7 +185,7 @@ enough colors are learned.
 1. GPU budget (see above). The four layers are most likely a big part of it.
 2. Still hand with spread fingers: background is visible between them.
 3. Complex and skin-colored backgrounds.
-4. Seam at the elbow, forearm accuracy, sleeves and watches.
+4. Forearms: depth only, coarse and late (shifted: jitters, plain: lags). Sleeves and watches.
 5. Playzone map: verify with a wheel or a shifter. Turned spokes and levers are filled where they were.
 6. Cockpit volume instead of a distance, with calibration. Lighting match was never tested on the headset.
 7. A real drive with a wheel. Hands on a wheel were only approximated with a bottle and a monitor.

@@ -18,10 +18,7 @@ pub struct DepthFrame {
     pub depth_views: [ViewParams; 2],
 }
 
-/// The last segments are the forearm
-pub const HAND_SEGMENTS: usize = 32;
-pub const ARM_SEGMENTS: usize = 4;
-const JOINT_SEGMENTS: usize = HAND_SEGMENTS - ARM_SEGMENTS;
+pub const HAND_SEGMENTS: usize = 28;
 /// The first segments of a hand: around the wrist, and the whole palm
 pub const WRIST_SEGMENTS: usize = 6;
 pub const PALM_SEGMENTS: usize = 9;
@@ -59,11 +56,6 @@ pub const SEGMENT_JOINTS: [(usize, usize); HAND_SEGMENTS] = [
     (22, 23),
     (23, 24),
     (24, 25),
-    // Forearm
-    (1, 1),
-    (1, 1),
-    (1, 1),
-    (1, 1),
 ];
 
 /// Start and end of the tapered capsules a hand is made of. xyz: position, w: radius
@@ -96,11 +88,7 @@ pub fn ray_capsule_distance(origin: Vec3, direction: Vec3, start: Vec4, end: Vec
 
 impl HandShape {
     /// `joints`: position and radius of the OpenXR hand joints
-    pub fn from_joints(joints: &[Vec4; 26], elbow: Option<Vec3>) -> Self {
-        const WRIST: usize = 1;
-        const ARM_START_RADIUS: f32 = 0.027;
-        const ARM_END_RADIUS: f32 = 0.042;
-
+    pub fn from_joints(joints: &[Vec4; 26]) -> Self {
         const TIPS: [usize; 5] = [5, 10, 15, 20, 25];
 
         // The tip joint is at the end of the finger: pull it back, so that the round end of the
@@ -116,29 +104,13 @@ impl HandShape {
         for (segment, (start, end)) in segments.iter_mut().zip(SEGMENT_JOINTS) {
             *segment = [joints[start], joints[end]];
         }
-        if let Some(elbow) = elbow {
-            let start = joints[WRIST].truncate().extend(ARM_START_RADIUS);
-            let end = elbow.extend(ARM_END_RADIUS);
-            for (i, segment) in segments[JOINT_SEGMENTS..].iter_mut().enumerate() {
-                *segment = [i, i + 1].map(|n| start.lerp(end, n as f32 / ARM_SEGMENTS as f32));
-            }
-        }
 
         Self { segments }
     }
 
-    /// Distance between a ray and the surface of the hand (without the forearm), negative inside. Same as
-    /// in focus_area.wgsl
+    /// Distance between a ray and the surface of the hand, negative inside. Same as in focus_area.wgsl
     pub fn ray_distance(&self, origin: Vec3, direction: Vec3) -> f32 {
-        self.segments_ray_distance(JOINT_SEGMENTS, origin, direction)
-    }
-
-    /// Distances between a ray and the surface of the quarters of the forearm, from the wrist
-    pub fn arm_ray_distances(&self, origin: Vec3, direction: Vec3) -> [f32; ARM_SEGMENTS] {
-        std::array::from_fn(|i| {
-            let [start, end] = self.segments[JOINT_SEGMENTS + i];
-            ray_capsule_distance(origin, direction, start, end)
-        })
+        self.segments_ray_distance(HAND_SEGMENTS, origin, direction)
     }
 
     /// Same, for the palm only. It moves less and is tracked better than the fingers
@@ -153,9 +125,9 @@ impl HandShape {
             .fold(f32::MAX, f32::min)
     }
 
-    /// Bounding sphere of the hand without the forearm. xyz: position, w: radius
+    /// Bounding sphere. xyz: position, w: radius
     pub fn bounds(&self) -> Vec4 {
-        let points = self.segments[..JOINT_SEGMENTS].as_flattened();
+        let points = self.segments.as_flattened();
         let center = points.iter().map(|p| p.truncate()).sum::<Vec3>() / points.len() as f32;
         let radius = points
             .iter()
@@ -173,8 +145,6 @@ pub struct HandZones {
     pub core: f32,
     pub falloff: f32,
     pub rim: f32,
-    /// Rim of the forearm, 0 if it's not tracked
-    pub arm_rim: f32,
     /// How solid the core of each segment is (0..1): only where the tracking is known to be right
     pub solid: [f32; HAND_SEGMENTS],
 }
@@ -205,22 +175,14 @@ impl HandZones {
     }
 
     /// Where the background around the hand looks like the hand, the color key shows it: `leak` (0..1)
-    /// narrows the rim down to `inset` inside the hand, and the forearm rim to the share `arm_keep`.
-    pub fn for_leak(self, leak: f32, inset: f32, arm_keep: f32) -> Self {
-        // Smallest rim of a tracked forearm, 0 would mean that it's not tracked
-        const MIN_ARM_RIM: f32 = 0.001;
-
+    /// narrows the rim down to `inset` inside the hand.
+    pub fn for_leak(self, leak: f32, inset: f32) -> Self {
         if leak <= 0.0 {
             return self;
         }
         let leak = leak.min(1.0);
         Self {
             rim: self.rim * (1.0 - leak) - inset * leak,
-            arm_rim: if self.arm_rim > 0.0 {
-                f32::max(self.arm_rim * (1.0 - leak * (1.0 - arm_keep)), MIN_ARM_RIM)
-            } else {
-                0.0
-            },
             ..self
         }
     }
@@ -234,13 +196,14 @@ pub struct ColorKeyInput {
     pub leak: [f32; 2],
 }
 
-/// A forearm when the depth image was captured
+/// Motion of an arm since the depth image was captured
 #[derive(Clone, Copy)]
-pub struct ArmRemoval {
+pub struct ArmMotion {
+    /// Now
     pub wrist: Vec3,
-    pub elbow: Vec3,
-    /// For each quarter: how much of the depth map is replaced by the tracked forearm (0..1)
-    pub trust: [f32; ARM_SEGMENTS],
+    /// From the wrist to the elbow
+    pub direction: Vec3,
+    pub displacement: Vec3,
 }
 
 /// Per-frame depth inputs for the stream renderer
@@ -252,7 +215,8 @@ pub struct DepthRenderInput {
     pub eye_positions: [Vec3; 2],
     /// Set if the passthrough is color keyed around the hands
     pub color_key: Option<ColorKeyInput>,
-    pub arms: [Option<ArmRemoval>; 2],
+    /// The depth map of the arms is shifted by their motion. None: plain depth
+    pub arms: [Option<ArmMotion>; 2],
     /// Remember the current depth image as the playzone. There must be no hands in it
     pub capture_playzone: bool,
 }
@@ -389,7 +353,7 @@ pub fn depth_uniforms(
     data.extend([f32::from(u8::from(input.color_key.is_some())), 0.0]);
     for hand in &hands {
         data.extend(hand.map_or([0.0; 4], |(_, zones)| {
-            [zones.rim, zones.core, zones.falloff, zones.arm_rim]
+            [zones.rim, zones.core, zones.falloff, 0.0]
         }));
     }
     for hand in &hands {
@@ -410,15 +374,11 @@ pub fn depth_uniforms(
         }
     }
     for arm in &input.arms {
-        let [wrist, elbow, trust] = arm.map_or([Vec4::ZERO; 3], |arm| {
-            [
-                arm.wrist.extend(0.0),
-                arm.elbow.extend(0.0),
-                Vec4::from_array(arm.trust),
-            ]
+        let [wrist, direction, displacement] = arm.map_or([Vec3::ZERO; 3], |arm| {
+            [arm.wrist, arm.direction, arm.displacement]
         });
-        for v in [wrist, elbow, trust] {
-            data.extend(v.to_array());
+        for v in [wrist, direction, displacement] {
+            data.extend(v.extend(0.0).to_array());
         }
     }
 
@@ -475,13 +435,9 @@ pub fn hands_view_rect(
         .iter()
         .flatten()
         .flat_map(|(shape, zones)| {
-            let count = if zones.arm_rim > 0.0 {
-                HAND_SEGMENTS
-            } else {
-                JOINT_SEGMENTS
-            };
-            let rim = f32::max(zones.rim, zones.arm_rim).max(0.0) + MARGIN;
-            shape.segments[..count]
+            let rim = zones.rim.max(0.0) + MARGIN;
+            shape
+                .segments
                 .as_flattened()
                 .iter()
                 .map(move |point| (point.truncate(), point.w + rim))
@@ -624,6 +580,8 @@ mod tests {
             DEPTH_UNIFORMS_SIZE,
             592 + 16 * (2 + 2 * HAND_SEGMENTS / 4 + 2 + 2 * 2 * HAND_SEGMENTS + 6 + 2 * 9 + 1)
         );
+        // 28 capsules per hand, no forearm
+        assert_eq!(DEPTH_UNIFORMS_SIZE, 3072);
     }
 
     #[test]

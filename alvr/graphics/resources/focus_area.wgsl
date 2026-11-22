@@ -77,31 +77,16 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         let t = max(dot(to_center, dir), 0.0);
         let center_distance = length(to_center - dir * t);
         let is_near_hand = center_distance < bounds.w + max(zones.x, 0.0) + SOFTNESS;
-        // Around the whole forearm
-        let arm_base = (hand * HAND_SEGMENTS + HAND_SEGMENTS - ARM_SEGMENTS) * 2u;
-        let has_arm = zones.w > 0.0
-            && ray_capsule_distance(
-                origin,
-                dir,
-                depth_u.hand_points[arm_base],
-                depth_u.hand_points[arm_base + ARM_SEGMENTS * 2u - 1u],
-            ) < zones.w + SOFTNESS;
 
         var distance = OUTSIDE;
-        var arm_distance = OUTSIDE;
-        // Skip what is far away: the hand, or the forearm if it's not tracked
-        let first = select(HAND_SEGMENTS - ARM_SEGMENTS, 0u, is_near_hand);
-        let last = select(HAND_SEGMENTS - ARM_SEGMENTS, HAND_SEGMENTS, has_arm);
-        for (var i = first; i < last; i++) {
+        // Skip the hand if it is far away
+        let last = select(0u, HAND_SEGMENTS, is_near_hand);
+        for (var i = 0u; i < last; i++) {
             let base = (hand * HAND_SEGMENTS + i) * 2u;
             let start = depth_u.hand_points[base];
             let end = depth_u.hand_points[base + 1u];
             let segment_distance = ray_capsule_distance(origin, dir, start, end);
-            if i < HAND_SEGMENTS - ARM_SEGMENTS {
-                distance = min(distance, segment_distance);
-            } else {
-                arm_distance = min(arm_distance, segment_distance);
-            }
+            distance = min(distance, segment_distance);
 
             let segment = hand * HAND_SEGMENTS + i;
             let solid = depth_u.hand_solid[segment / 4u][segment % 4u];
@@ -122,11 +107,7 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         // hand, with the soft edge only.
         let rim_end = zones.x + SOFTNESS;
         let rim_start = min(0.5 * rim_end, rim_end - 0.5 * SOFTNESS);
-        var hand_outer = 1.0 - smoothstep(rim_start, rim_end, distance);
-        if zones.w > 0.0 {
-            let arm_rim = zones.w + SOFTNESS;
-            hand_outer = max(hand_outer, 1.0 - smoothstep(0.5 * arm_rim, arm_rim, arm_distance));
-        }
+        let hand_outer = 1.0 - smoothstep(rim_start, rim_end, distance);
         outer = max(outer, hand_outer);
         tint = max(tint, depth_u.playzone[1u + hand] * hand_outer);
     }

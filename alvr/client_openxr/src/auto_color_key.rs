@@ -3,7 +3,6 @@
 
 use crate::{
     camera::{self, CameraFrame, PassthroughCamera},
-    extra_extensions::BodyTrackerFB,
     interaction::InteractionContext,
     passthrough::debug_property,
 };
@@ -13,7 +12,7 @@ use alvr_common::{
     parking_lot::{Mutex, RwLock},
 };
 use alvr_graphics::{
-    ARM_SEGMENTS, CameraView, ColorModel, HAND_SEGMENTS, HandColorSamples, HandShape, SampledHand,
+    CameraView, ColorModel, HAND_SEGMENTS, HandColorSamples, HandShape, SampledHand,
 };
 use openxr as xr;
 use std::{
@@ -27,9 +26,6 @@ const UPDATE_INTERVAL: Duration = Duration::from_millis(60);
 const LUT_UPDATE_INTERVAL: Duration = Duration::from_millis(180);
 // Verified hands are not used if they are older
 const MAX_VERIFICATION_AGE: Duration = Duration::from_millis(300);
-const MAX_ARM_TRUST_AGE: Duration = Duration::from_secs(1);
-// How long a forearm is trusted if it can't be checked, e.g. because it moves
-const ARM_TRUST_HOLD: Duration = Duration::from_secs(3);
 // Smaller changes of the LUT are not worth an update of the passthrough layer
 const MIN_LUT_CHANGE: u8 = 10;
 const RETRY_INTERVAL: Duration = Duration::from_secs(3);
@@ -46,13 +42,11 @@ pub fn enabled() -> bool {
 }
 
 pub type HandWeights = [[f32; HAND_SEGMENTS]; 2];
-pub type ArmTrust = [[f32; ARM_SEGMENTS]; 2];
 
 #[derive(Clone, Copy)]
 struct Verified {
     time: Instant,
     weights: HandWeights,
-    arm_trust: ArmTrust,
     leak: [f32; 2],
 }
 
@@ -60,7 +54,6 @@ struct Context {
     stage_space: Arc<xr::Space>,
     view_space: Arc<xr::Space>,
     interaction_context: Arc<RwLock<InteractionContext>>,
-    body_tracker: Option<Arc<BodyTrackerFB>>,
     running: Arc<RelaxedAtomic>,
     lut: Arc<Mutex<Option<Vec<u8>>>>,
     verified: Arc<Mutex<Option<Verified>>>,
@@ -78,7 +71,6 @@ impl AutoColorKey {
         stage_space: Arc<xr::Space>,
         view_space: Arc<xr::Space>,
         interaction_context: Arc<RwLock<InteractionContext>>,
-        body_tracker: Option<Arc<BodyTrackerFB>>,
     ) -> Self {
         let running = Arc::new(RelaxedAtomic::new(true));
         let lut = Arc::new(Mutex::new(None));
@@ -87,7 +79,6 @@ impl AutoColorKey {
             stage_space,
             view_space,
             interaction_context,
-            body_tracker,
             running: Arc::clone(&running),
             lut: Arc::clone(&lut),
             verified: Arc::clone(&verified),
@@ -106,14 +97,6 @@ impl AutoColorKey {
         match &*self.verified.lock() {
             Some(verified) if verified.time.elapsed() < MAX_VERIFICATION_AGE => verified.weights,
             _ => [[0.0; HAND_SEGMENTS]; 2],
-        }
-    }
-
-    /// Which parts of the forearms are tracked well. This doesn't depend on their motion
-    pub fn arm_trust(&self) -> ArmTrust {
-        match &*self.verified.lock() {
-            Some(verified) if verified.time.elapsed() < MAX_ARM_TRUST_AGE => verified.arm_trust,
-            _ => [[0.0; ARM_SEGMENTS]; 2],
         }
     }
 
@@ -151,8 +134,6 @@ fn sleep_while_running(context: &Context, duration: Duration) {
 fn learn_loop(context: &Context) {
     let mut model = ColorModel::default();
     let mut weights: HandWeights = [[0.0; HAND_SEGMENTS]; 2];
-    let mut arm_trust: ArmTrust = [[0.0; ARM_SEGMENTS]; 2];
-    let mut last_arm_check = [Instant::now(); 2];
     let mut leak = [0.0; 2];
     let mut last_leak = [Instant::now(); 2];
     let mut last_lut = vec![];
@@ -184,7 +165,7 @@ fn learn_loop(context: &Context) {
             let elapsed = last_update.elapsed().as_secs_f32();
             last_update = Instant::now();
 
-            let Some((samples, view, hands)) = sample(context, &camera, &frame, &arm_trust) else {
+            let Some((samples, view, hands)) = sample(context, &camera, &frame) else {
                 continue;
             };
             model.unknown_keep = percent("debug.alvr.key_unknown", 10);
@@ -236,25 +217,8 @@ fn learn_loop(context: &Context) {
                         |x, y| frame.rgb(x, y),
                     )
                 });
-                // Slow, to avoid switching between the tracked forearm and the one of the depth map
-                if hand.as_ref().is_some_and(|hand| hand.arm_trust.is_some()) {
-                    last_arm_check[i] = Instant::now();
-                    for (trust, target) in arm_trust[i]
-                        .iter_mut()
-                        .zip(&targets[HAND_SEGMENTS - ARM_SEGMENTS..])
-                    {
-                        *trust += (f32::max(*target, 0.0) - *trust) * 0.2;
-                    }
-                } else if last_arm_check[i].elapsed() > ARM_TRUST_HOLD {
-                    for trust in &mut arm_trust[i] {
-                        *trust *= 0.8;
-                    }
-                }
-
                 // Lose trust immediately, gain it slowly
                 for (weight, target) in weights.iter_mut().zip(targets) {
-                    // Outside of the image
-                    let target = f32::max(target, 0.0);
                     *weight = if target < *weight {
                         target
                     } else {
@@ -265,7 +229,6 @@ fn learn_loop(context: &Context) {
             *context.verified.lock() = Some(Verified {
                 time: Instant::now(),
                 weights,
-                arm_trust,
                 leak,
             });
 
@@ -273,7 +236,7 @@ fn learn_loop(context: &Context) {
                 last_log = Instant::now();
                 camera::log(&format!(
                     "auto key: skin {} kept {:.2} mean {:?}, background {} kept {:.2} mean {:?}, \
-                     verified {:.2} {:.2}, arms {:.1?} {:.1?}, leak {:.2} {:.2}, scene {} kept {:.2}, \
+                     verified {:.2} {:.2}, leak {:.2} {:.2}, scene {} kept {:.2}, \
                      update {:.1} ms",
                     samples.skin.len(),
                     model.kept_fraction(&samples.skin),
@@ -283,8 +246,6 @@ fn learn_loop(context: &Context) {
                     mean(&samples.background),
                     weights[0].iter().sum::<f32>() / HAND_SEGMENTS as f32,
                     weights[1].iter().sum::<f32>() / HAND_SEGMENTS as f32,
-                    arm_trust[0],
-                    arm_trust[1],
                     leak[0],
                     leak[1],
                     samples.scene.len(),
@@ -321,7 +282,6 @@ fn sample(
     context: &Context,
     camera: &PassthroughCamera,
     frame: &CameraFrame,
-    arm_trust: &ArmTrust,
 ) -> Option<(HandColorSamples, CameraView, [Option<SampledHand>; 2])> {
     // The OpenXR time of the Quest runtime is CLOCK_MONOTONIC, like the timestamps of the camera
     let time = xr::Time::from_nanos(frame.timestamp_ns);
@@ -373,22 +333,16 @@ fn sample(
 
         let position = |joint: xr::HandJointEXT| crate::from_xr_vec3(joints[joint].pose.position);
         let wrist = position(xr::HandJointEXT::WRIST);
-        let forearm = context
-            .body_tracker
-            .as_ref()
-            .and_then(|tracker| tracker.forearm(time, &context.stage_space, i == 1));
 
         Some(SampledHand {
             shape: HandShape::from_joints(
                 &joints.map(|joint| crate::from_xr_vec3(joint.pose.position).extend(joint.radius)),
-                forearm.map(|forearm| wrist + forearm),
             ),
             wrist,
-            arm_direction: forearm
-                .unwrap_or_else(|| wrist - position(xr::HandJointEXT::MIDDLE_METACARPAL))
+            // Opposite to the fingers: the skin of the forearm is not background
+            arm_direction: (wrist - position(xr::HandJointEXT::MIDDLE_METACARPAL))
                 .normalize_or_zero(),
             is_still: speed < STILL_HAND_SPEED,
-            arm_trust: forearm.map(|_| arm_trust[i]),
         })
     });
     drop(interaction_context);
