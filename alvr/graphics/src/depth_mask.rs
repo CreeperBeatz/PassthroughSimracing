@@ -25,6 +25,8 @@ pub struct DepthRenderInput {
     pub frame: Option<DepthFrame>,
     /// Eye positions at display time
     pub eye_positions: [Vec3; 2],
+    /// Set if the passthrough layer is color keyed: how much to grow the mask, in view uv
+    pub color_key_growth: Option<f32>,
 }
 
 const EYE_FLOAT_COUNT: usize = 16 + 4 + 16 + 16 + 4;
@@ -147,10 +149,14 @@ pub fn depth_uniforms(
             lighting.strength,
             lighting.reference_luminance,
         ]);
-        data.extend([lighting.min_brightness, lighting.locality, 0.0, 0.0]);
+        data.extend([lighting.min_brightness, lighting.locality]);
     } else {
-        data.extend([0.0; 8]);
+        data.extend([0.0; 6]);
     }
+    data.extend([
+        f32::from(u8::from(input.color_key_growth.is_some())),
+        input.color_key_growth.unwrap_or(0.0),
+    ]);
 
     data.try_into().unwrap()
 }
@@ -269,6 +275,7 @@ mod tests {
         let input = DepthRenderInput {
             frame: None,
             eye_positions: [Vec3::ZERO; 2],
+            color_key_growth: None,
         };
         let data = depth_uniforms(&cfg, &[view(), view()], &input, false);
 
@@ -306,6 +313,7 @@ mod tests {
         let input = DepthRenderInput {
             frame: None,
             eye_positions: [Vec3::ZERO; 2],
+            color_key_growth: None,
         };
         let base = 2 * EYE_FLOAT_COUNT + 16 + 4 * 3;
 

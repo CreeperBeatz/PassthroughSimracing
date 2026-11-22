@@ -50,11 +50,14 @@ pub const LIGHT_PROBE_FORMAT: TextureFormat = TextureFormat::Rgba16Float;
 /// The depth passthrough mask is computed at 1 / DEPTH_MASK_DOWNSCALE of the view resolution. This
 /// still has more texels than the environment depth map (320x320 on Quest 3).
 const DEPTH_MASK_DOWNSCALE: u32 = 4;
+/// The focus area is coarse, so that growing it is cheap
+const FOCUS_AREA_DOWNSCALE: u32 = 16;
 const DEPTH_MASK_FORMAT: TextureFormat = TextureFormat::Rgba8Unorm;
 
 const FOVEATION_COMMON_WGSL: &str = include_str!("../resources/foveation_common.wgsl");
 const DEPTH_COMMON_WGSL: &str = include_str!("../resources/depth_common.wgsl");
 const DEPTH_MASK_WGSL: &str = include_str!("../resources/depth_mask.wgsl");
+const FOCUS_AREA_WGSL: &str = include_str!("../resources/focus_area.wgsl");
 const STREAM_WGSL: &str = include_str!("../resources/stream.wgsl");
 const LIGHT_PROBE_LOCAL_WGSL: &str = include_str!("../resources/light_probe_local.wgsl");
 const LIGHT_PROBE_GLOBAL_WGSL: &str = include_str!("../resources/light_probe_global.wgsl");
@@ -67,6 +70,10 @@ pub(crate) fn stream_shader_source() -> String {
 
 pub(crate) fn depth_mask_shader_source() -> String {
     format!("{DEPTH_MASK_WGSL}\n{DEPTH_COMMON_WGSL}")
+}
+
+pub(crate) fn focus_area_shader_source() -> String {
+    format!("{FOCUS_AREA_WGSL}\n{DEPTH_COMMON_WGSL}")
 }
 
 pub(crate) fn light_probe_local_shader_source() -> String {
@@ -126,13 +133,17 @@ fn uniform_entry(binding: u32) -> BindGroupLayoutEntry {
 /// Pipelines and layouts of the stream renderer. Separated from `StreamRenderer` so they can be
 /// built on any wgpu backend (tests run them on the desktop GPU).
 pub(crate) struct StreamPipelines {
-    /// stream texture, sampler, foveation uniforms, local light probe, global light probe, depth mask
+    /// stream texture, sampler, foveation uniforms, local light probe, global light probe, depth mask,
+    /// focus area
     pub view_layout: BindGroupLayout,
     /// depth uniforms, depth texture array
     pub depth_layout: BindGroupLayout,
     pub main: RenderPipeline,
     /// Uses `depth_layout`
     pub depth_mask: RenderPipeline,
+    /// depth uniforms, depth mask, sampler
+    pub focus_area_layout: BindGroupLayout,
+    pub focus_area: RenderPipeline,
     /// stream texture, sampler, foveation uniforms
     pub probe_local_layout: BindGroupLayout,
     pub probe_local: RenderPipeline,
@@ -157,6 +168,7 @@ impl StreamPipelines {
                 texture_entry(3, true, TextureViewDimension::D2),
                 texture_entry(4, true, TextureViewDimension::D2),
                 texture_entry(5, true, TextureViewDimension::D2),
+                texture_entry(6, true, TextureViewDimension::D2),
             ],
         });
 
@@ -228,6 +240,45 @@ impl StreamPipelines {
             multisample: Default::default(),
             fragment: Some(FragmentState {
                 module: &depth_mask_module,
+                entry_point: None,
+                compilation_options: Default::default(),
+                targets: &[Some(ColorTargetState {
+                    format: DEPTH_MASK_FORMAT,
+                    blend: None,
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let focus_area_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("focus area"),
+            entries: &[
+                uniform_entry(0),
+                texture_entry(1, true, TextureViewDimension::D2),
+                sampler_entry(2),
+            ],
+        });
+        let focus_area_module = shader_module(device, "focus area", focus_area_shader_source());
+        let focus_area = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("focus area"),
+            layout: Some(&device.create_pipeline_layout(&PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[Some(&focus_area_layout)],
+                immediate_size: 0,
+            })),
+            vertex: VertexState {
+                module: &focus_area_module,
+                entry_point: None,
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(FragmentState {
+                module: &focus_area_module,
                 entry_point: None,
                 compilation_options: Default::default(),
                 targets: &[Some(ColorTargetState {
@@ -344,6 +395,8 @@ impl StreamPipelines {
             depth_layout,
             main,
             depth_mask,
+            focus_area_layout,
+            focus_area,
             probe_local_layout,
             probe_local,
             probe_global_layout,
@@ -370,10 +423,18 @@ pub(crate) fn create_light_probe_texture(device: &Device, size: u32) -> Texture 
 }
 
 pub(crate) fn create_depth_mask_texture(device: &Device, view_resolution: UVec2) -> Texture {
-    let size = (view_resolution / DEPTH_MASK_DOWNSCALE).max(UVec2::ONE);
+    create_mask_texture(device, "depth mask", view_resolution / DEPTH_MASK_DOWNSCALE)
+}
+
+pub(crate) fn create_focus_area_texture(device: &Device, view_resolution: UVec2) -> Texture {
+    create_mask_texture(device, "focus area", view_resolution / FOCUS_AREA_DOWNSCALE)
+}
+
+fn create_mask_texture(device: &Device, label: &str, size: UVec2) -> Texture {
+    let size = size.max(UVec2::ONE);
 
     device.create_texture(&TextureDescriptor {
-        label: Some("depth mask"),
+        label: Some(label),
         size: Extent3d {
             width: size.x,
             height: size.y,
@@ -435,6 +496,33 @@ pub(crate) fn create_depth_bind_group(
     })
 }
 
+pub(crate) fn create_focus_area_bind_group(
+    device: &Device,
+    pipelines: &StreamPipelines,
+    uniforms: &Buffer,
+    depth_mask: &TextureView,
+    sampler: &Sampler,
+) -> BindGroup {
+    device.create_bind_group(&BindGroupDescriptor {
+        label: Some("focus area"),
+        layout: &pipelines.focus_area_layout,
+        entries: &[
+            BindGroupEntry {
+                binding: 0,
+                resource: uniforms.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: BindingResource::TextureView(depth_mask),
+            },
+            BindGroupEntry {
+                binding: 2,
+                resource: BindingResource::Sampler(sampler),
+            },
+        ],
+    })
+}
+
 pub(crate) fn create_depth_uniform_buffer(device: &Device) -> Buffer {
     device.create_buffer(&BufferDescriptor {
         label: Some("stream depth uniforms"),
@@ -466,6 +554,8 @@ struct ViewObjects {
     render_target: Vec<TextureView>,
     light_probe: LightProbe,
     depth_mask: TextureView,
+    focus_area: TextureView,
+    focus_area_bind_group: BindGroup,
 }
 
 pub struct StreamRenderer {
@@ -568,6 +658,8 @@ impl StreamRenderer {
             ..Default::default()
         });
 
+        let depth_uniform_buffer = create_depth_uniform_buffer(device);
+
         let mut view_objects = vec![];
         let mut staging_textures_gl = vec![];
         for target_swapchain in &swapchain_textures {
@@ -584,6 +676,15 @@ impl StreamRenderer {
 
             let depth_mask = create_depth_mask_texture(device, target_view_resolution)
                 .create_view(&TextureViewDescriptor::default());
+            let focus_area = create_focus_area_texture(device, target_view_resolution)
+                .create_view(&TextureViewDescriptor::default());
+            let focus_area_bind_group = create_focus_area_bind_group(
+                device,
+                &pipelines,
+                &depth_uniform_buffer,
+                &depth_mask,
+                &sampler,
+            );
 
             let bind_group = create_view_bind_group(
                 device,
@@ -593,6 +694,7 @@ impl StreamRenderer {
                 &foveation_buffer,
                 &light_probe,
                 &depth_mask,
+                &focus_area,
             );
 
             let render_target = super::create_gl_swapchain(
@@ -607,6 +709,8 @@ impl StreamRenderer {
                 render_target,
                 light_probe,
                 depth_mask,
+                focus_area,
+                focus_area_bind_group,
             });
 
             #[cfg(not(any(target_os = "macos", target_os = "ios")))]
@@ -630,7 +734,6 @@ impl StreamRenderer {
             fix_limited_range,
         );
 
-        let depth_uniform_buffer = create_depth_uniform_buffer(device);
         let dummy_depth_texture = create_dummy_depth_texture(device);
         let dummy_depth_bind_group = create_depth_bind_group(
             device,
@@ -724,11 +827,13 @@ impl StreamRenderer {
         };
 
         let mut depth_bind_group = &self.dummy_depth_bind_group;
+        let use_color_key = depth.is_some_and(|d| d.color_key_growth.is_some());
         let mut lighting_response = None;
         if let Some(config) = depth_config {
             let input = depth.copied().unwrap_or(DepthRenderInput {
                 frame: None,
                 eye_positions: [Vec3::ZERO; 2],
+                color_key_growth: None,
             });
 
             // Fall back to "no depth" if the swapchain image is unknown
@@ -795,6 +900,14 @@ impl StreamRenderer {
                     depth_bind_group,
                     view_idx as u32,
                 );
+                if use_color_key {
+                    encode_focus_area(
+                        &mut encoder,
+                        &self.pipelines,
+                        &objects.focus_area,
+                        &objects.focus_area_bind_group,
+                    );
+                }
             }
         }
 
@@ -886,6 +999,7 @@ fn create_view_bind_group(
     foveation_buffer: &Buffer,
     light_probe: &LightProbe,
     depth_mask: &TextureView,
+    focus_area: &TextureView,
 ) -> BindGroup {
     device.create_bind_group(&BindGroupDescriptor {
         label: Some("stream view"),
@@ -915,6 +1029,10 @@ fn create_view_bind_group(
                 binding: 5,
                 resource: BindingResource::TextureView(depth_mask),
             },
+            BindGroupEntry {
+                binding: 6,
+                resource: BindingResource::TextureView(focus_area),
+            },
         ],
     })
 }
@@ -942,6 +1060,30 @@ pub(crate) fn encode_depth_mask(
     pass.set_pipeline(&pipelines.depth_mask);
     pass.set_bind_group(0, depth_bind_group, &[]);
     pass.set_immediates(0, &view_idx.to_le_bytes());
+    pass.draw(0..3, 0..1);
+}
+
+pub(crate) fn encode_focus_area(
+    encoder: &mut wgpu::CommandEncoder,
+    pipelines: &StreamPipelines,
+    target: &TextureView,
+    bind_group: &BindGroup,
+) {
+    let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+        label: Some("focus area"),
+        color_attachments: &[Some(RenderPassColorAttachment {
+            view: target,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: LoadOp::Clear(Color::TRANSPARENT),
+                store: StoreOp::Store,
+            },
+        })],
+        ..Default::default()
+    });
+    pass.set_pipeline(&pipelines.focus_area);
+    pass.set_bind_group(0, bind_group, &[]);
     pass.draw(0..3, 0..1);
 }
 

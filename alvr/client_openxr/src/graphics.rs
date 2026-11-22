@@ -96,9 +96,21 @@ impl<'a> ProjectionLayerBuilder<'a> {
     }
 
     pub fn build(&self) -> xr::CompositionLayerProjection<'_, xr::OpenGlEs> {
+        self.build_with_alpha(self.alpha.as_ref())
+    }
+
+    /// Same image, ignoring the alpha channel
+    pub fn build_opaque(&self) -> xr::CompositionLayerProjection<'_, xr::OpenGlEs> {
+        self.build_with_alpha(None)
+    }
+
+    fn build_with_alpha(
+        &self,
+        alpha: Option<&ProjectionLayerAlphaConfig>,
+    ) -> xr::CompositionLayerProjection<'_, xr::OpenGlEs> {
         let mut flags = xr::CompositionLayerFlags::EMPTY;
 
-        if let Some(alpha) = &self.alpha {
+        if let Some(alpha) = alpha {
             flags |= xr::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA;
 
             if !alpha.premultiplied {

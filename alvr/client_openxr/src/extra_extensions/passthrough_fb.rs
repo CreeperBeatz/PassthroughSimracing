@@ -5,58 +5,9 @@ use openxr::{
 };
 use std::ptr;
 
-/// Experiment: does the compositor use the alpha channel of passthrough color LUTs? If so, the
-/// passthrough can be color keyed without any added latency. Selected at runtime with
-/// `adb shell setprop debug.alvr.lut_test <n>`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum LutTest {
-    Off,
-    /// 1: passthrough below the game, bright colors get alpha 0 and keep their RGB
-    Underlay,
-    /// 2: like `Underlay` but with the passthrough above the game
-    Overlay,
-    /// 3: control, bright colors are inverted and opaque: shows if the LUT is applied at all
-    Control,
-    /// 4: like `Overlay` but RGB is also 0 (premultiplied alpha)
-    OverlayPremultiplied,
-}
-
-impl LutTest {
-    pub fn from_index(index: u32) -> Self {
-        match index {
-            1 => Self::Underlay,
-            2 => Self::Overlay,
-            3 => Self::Control,
-            4 => Self::OverlayPremultiplied,
-            _ => Self::Off,
-        }
-    }
-
-    pub fn passthrough_on_top(self) -> bool {
-        matches!(self, Self::Overlay | Self::OverlayPremultiplied)
-    }
-
-    fn lut_data(self, resolution: u32) -> Vec<u8> {
-        let mut data = Vec::with_capacity((resolution * resolution * resolution * 4) as usize);
-        let value = |i: u32| (i * 255 / (resolution - 1)) as u8;
-        for b in 0..resolution {
-            for g in 0..resolution {
-                for r in 0..resolution {
-                    let rgb = [value(r), value(g), value(b)];
-                    let bright = rgb.iter().map(|c| u32::from(*c)).sum::<u32>() > 3 * 110;
-                    let texel = match self {
-                        Self::Underlay | Self::Overlay if bright => [rgb[0], rgb[1], rgb[2], 0],
-                        Self::OverlayPremultiplied if bright => [0, 0, 0, 0],
-                        Self::Control if bright => [255 - rgb[0], 255 - rgb[1], 255 - rgb[2], 255],
-                        _ => [rgb[0], rgb[1], rgb[2], 255],
-                    };
-                    data.extend(texel);
-                }
-            }
-        }
-        data
-    }
-}
+/// Size of the color key LUT: RGBA, indexed by the passthrough color as `[b][g][r]`
+pub const COLOR_KEY_RESOLUTION: u32 = 32;
+pub const COLOR_KEY_SIZE: usize = (COLOR_KEY_RESOLUTION.pow(3) * 4) as usize;
 
 pub struct PassthroughFB {
     handle: sys::PassthroughFB,
@@ -128,21 +79,23 @@ impl PassthroughFB {
         })
     }
 
-    pub fn set_lut_test(&mut self, test: LutTest) -> xr::Result<()> {
-        const RESOLUTION: u32 = 32;
-
+    /// Color key the passthrough with the alpha channel of a LUT (`COLOR_KEY_SIZE` bytes). This is
+    /// done by the compositor on the image it displays, so the key doesn't lag behind it.
+    pub fn set_color_key(&mut self, data: Option<&[u8]>) -> xr::Result<()> {
         let lut_fns = self
             .lut_fns
             .ok_or(sys::Result::ERROR_EXTENSION_NOT_PRESENT)?;
 
         let mut new_lut = sys::PassthroughColorLutMETA::NULL;
-        if test != LutTest::Off {
-            let data = test.lut_data(RESOLUTION);
+        if let Some(data) = data {
+            if data.len() != COLOR_KEY_SIZE {
+                return Err(sys::Result::ERROR_VALIDATION_FAILURE);
+            }
             let info = sys::PassthroughColorLutCreateInfoMETA {
                 ty: sys::PassthroughColorLutCreateInfoMETA::TYPE,
                 next: ptr::null(),
                 channels: sys::PassthroughColorLutChannelsMETA::RGBA,
-                resolution: RESOLUTION,
+                resolution: COLOR_KEY_RESOLUTION,
                 data: sys::PassthroughColorLutDataMETA {
                     buffer_size: data.len() as u32,
                     buffer: data.as_ptr(),
@@ -165,10 +118,10 @@ impl PassthroughFB {
         };
         let style = sys::PassthroughStyleFB {
             ty: sys::PassthroughStyleFB::TYPE,
-            next: if test == LutTest::Off {
-                ptr::null()
-            } else {
+            next: if data.is_some() {
                 (&raw const color_map).cast()
+            } else {
+                ptr::null()
             },
             texture_opacity_factor: 1.0,
             edge_color: sys::Color4f::default(),

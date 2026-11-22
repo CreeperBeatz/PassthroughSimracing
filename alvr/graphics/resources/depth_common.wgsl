@@ -23,6 +23,6 @@ struct DepthUniforms {
     depth: vec4f,
     // x: lighting enabled (0/1), y: base brightness, z: strength, w: reference luminance
     lighting: vec4f,
-    // x: min brightness, y: locality
+    // x: min brightness, y: locality, z: color key enabled (0/1), w: focus area growth (view uv)
     lighting2: vec4f,
 }

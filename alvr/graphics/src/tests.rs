@@ -121,6 +121,11 @@ fn depth_mask_shader_translates_to_gles() {
 }
 
 #[test]
+fn focus_area_shader_translates_to_gles() {
+    translate_to_gles("focus area", &stream::focus_area_shader_source(), &[]);
+}
+
+#[test]
 fn light_probe_shaders_translate_to_gles() {
     translate_to_gles(
         "light probe local",
@@ -279,7 +284,6 @@ fn write_texture_2d(
     );
 }
 
-/// Run the stream (and light probe) pipelines for the left eye and read back the result
 fn render(
     device: &Device,
     queue: &Queue,
@@ -288,6 +292,30 @@ fn render(
     eye_position: Vec3,
     depth_camera_position: Vec3,
     depth_available: bool,
+) -> Output {
+    render_with_key(
+        device,
+        queue,
+        config,
+        scene,
+        eye_position,
+        depth_camera_position,
+        depth_available,
+        None,
+    )
+}
+
+/// Run the stream (and light probe) pipelines for the left eye and read back the result
+#[expect(clippy::too_many_arguments)]
+fn render_with_key(
+    device: &Device,
+    queue: &Queue,
+    config: &DepthPassthroughConfig,
+    scene: &Scene,
+    eye_position: Vec3,
+    depth_camera_position: Vec3,
+    depth_available: bool,
+    color_key_growth: Option<f32>,
 ) -> Output {
     let target_format = TextureFormat::Rgba8Unorm;
     let constants = [
@@ -342,6 +370,9 @@ fn render(
     let depth_mask_view = stream::create_depth_mask_texture(device, UVec2::splat(TARGET_SIZE * 4))
         .create_view(&TextureViewDescriptor::default());
 
+    let focus_area_view = stream::create_focus_area_texture(device, UVec2::splat(TARGET_SIZE * 16))
+        .create_view(&TextureViewDescriptor::default());
+
     let view_bind_group = device.create_bind_group(&BindGroupDescriptor {
         label: None,
         layout: &pipelines.view_layout,
@@ -369,6 +400,10 @@ fn render(
             BindGroupEntry {
                 binding: 5,
                 resource: BindingResource::TextureView(&depth_mask_view),
+            },
+            BindGroupEntry {
+                binding: 6,
+                resource: BindingResource::TextureView(&focus_area_view),
             },
         ],
     });
@@ -441,6 +476,7 @@ fn render(
             depth_views: [view(depth_camera_position); 2],
         }),
         eye_positions: [eye_position; 2],
+        color_key_growth,
     };
     let lighting_enabled = config.lighting.as_option().is_some();
     let uniforms =
@@ -512,6 +548,16 @@ fn render(
         &depth_bind_group,
         0,
     );
+    if color_key_growth.is_some() {
+        let bind_group = stream::create_focus_area_bind_group(
+            device,
+            &pipelines,
+            &uniform_buffer,
+            &depth_mask_view,
+            &sampler,
+        );
+        stream::encode_focus_area(&mut encoder, &pipelines, &focus_area_view, &bind_group);
+    }
 
     {
         let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
@@ -621,6 +667,38 @@ fn distance_mode_shows_near_objects_only() {
     assert!((i32::from(background[0]) - i32::from(STREAM_GRAY)).abs() <= 2);
     // Left of the hand: background
     assert_eq!(out.alpha(0.1, 0.25), 1.0);
+}
+
+#[test]
+fn color_key_focus_area_is_grown_mask() {
+    let (device, queue) = gpu_or_skip!();
+    let config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
+
+    let out = render_with_key(
+        &device,
+        &queue,
+        &config,
+        &hand_scene(),
+        Vec3::ZERO,
+        Vec3::ZERO,
+        true,
+        Some(0.1),
+    );
+
+    // The hand covers u 0.3..0.7, v 0.1..0.45
+    assert_eq!(out.alpha(0.5, 0.25), 0.0);
+    // Inside the grown border
+    assert!(out.alpha(0.23, 0.25) < 0.05);
+    assert!(out.alpha(0.77, 0.25) < 0.05);
+    assert!(out.alpha(0.5, 0.52) < 0.05);
+    // Outside
+    assert_eq!(out.alpha(0.1, 0.25), 1.0);
+    assert_eq!(out.alpha(0.5, 0.75), 1.0);
+    // Alpha is not premultiplied: the bottom layer shows this image without blending
+    for (u, v) in [(0.5, 0.25), (0.23, 0.25), (0.1, 0.25)] {
+        let gray = i32::from(out.at(u, v)[0]);
+        assert!((gray - i32::from(STREAM_GRAY)).abs() <= 2, "{gray}");
+    }
 }
 
 #[test]

@@ -101,6 +101,8 @@ pub struct StreamContext {
     // Created on demand when the depth passthrough mode is selected
     environment_depth: Option<EnvironmentDepthMETA>,
     environment_depth_failed: bool,
+    // Set if the passthrough layer is color keyed
+    color_key_growth: Option<f32>,
 }
 
 impl StreamContext {
@@ -250,11 +252,20 @@ impl StreamContext {
             decoder: None,
             environment_depth: None,
             environment_depth_failed: false,
+            color_key_growth: None,
         };
 
         this.update_reference_space();
 
         this
+    }
+
+    pub fn uses_depth_passthrough(&self) -> bool {
+        alvr_graphics::depth_passthrough_config(self.config.passthrough.as_ref()).is_some()
+    }
+
+    pub fn set_color_key_growth(&mut self, growth: Option<f32>) {
+        self.color_key_growth = growth;
     }
 
     pub fn uses_passthrough(&self) -> bool {
@@ -386,6 +397,7 @@ impl StreamContext {
                     return Some(DepthRenderInput {
                         frame: None,
                         eye_positions: [Vec3::ZERO; 2],
+                        color_key_growth: self.color_key_growth,
                     });
                 }
                 Err(e) => {
@@ -411,6 +423,7 @@ impl StreamContext {
                 crate::from_xr_vec3(current_headset_views[0].pose.position),
                 crate::from_xr_vec3(current_headset_views[1].pose.position),
             ],
+            color_key_growth: self.color_key_growth,
         })
     }
 
@@ -584,7 +597,8 @@ impl StreamContext {
                 .passthrough
                 .clone()
                 .map(|mode| ProjectionLayerAlphaConfig {
-                    premultiplied: alvr_graphics::passthrough_requires_premultiplied_alpha(&mode),
+                    premultiplied: self.color_key_growth.is_none()
+                        && alvr_graphics::passthrough_requires_premultiplied_alpha(&mode),
                 }),
             clientside_post_processing,
         );
