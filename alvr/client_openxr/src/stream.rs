@@ -1,5 +1,7 @@
 #[cfg(target_os = "android")]
 use crate::auto_color_key::AutoColorKey;
+#[cfg(target_os = "android")]
+use crate::extra_extensions::BodyTrackerFB;
 use crate::{
     extra_extensions::EnvironmentDepthMETA,
     graphics::{self, ProjectionLayerAlphaConfig, ProjectionLayerBuilder},
@@ -15,12 +17,12 @@ use alvr_common::{
     HAND_LEFT_ID, HAND_RIGHT_ID, HEAD_ID, Pose, RelaxedAtomic, ViewParams,
     anyhow::Result,
     error,
-    glam::{Quat, UVec2, Vec2, Vec3},
+    glam::{UVec2, Vec2, Vec3},
     info,
     parking_lot::RwLock,
 };
 use alvr_graphics::{
-    ArmMotion, ColorKeyInput, DepthRenderInput, GraphicsContext, HAND_SEGMENTS, HandShape,
+    ArmRemoval, ColorKeyInput, DepthRenderInput, GraphicsContext, HAND_SEGMENTS, HandShape,
     SEGMENT_JOINTS, StreamRenderer, StreamViewParams,
 };
 use alvr_packets::{ClientStreamConfig, RealTimeConfig, TrackingData};
@@ -44,6 +46,8 @@ const DECODER_MAX_TIMEOUT_MULTIPLIER: f32 = 0.8;
 // The solid fill of the hands fades out between these speeds (m/s)
 const MIN_FILL_SPEED: f32 = 0.08;
 const MAX_FILL_SPEED: f32 = 0.25;
+
+const DEFAULT_DEPTH_AGE: Duration = Duration::from_millis(60);
 
 pub struct ParsedStreamConfig {
     pub view_resolution: UVec2,
@@ -117,6 +121,10 @@ pub struct StreamContext {
     // Learns the colors of the key, if enabled
     #[cfg(target_os = "android")]
     auto_color_key: Option<AutoColorKey>,
+    // For the forearms, with the automatic colors
+    #[cfg(target_os = "android")]
+    body_tracker: Option<Arc<BodyTrackerFB>>,
+    has_tracked_hands: Cell<bool>,
     // Smoothed, meters per second
     hand_speeds: [Cell<f32>; 2],
     hand_solid: [Cell<[f32; HAND_SEGMENTS]>; 2],
@@ -272,6 +280,9 @@ impl StreamContext {
             color_key: None,
             #[cfg(target_os = "android")]
             auto_color_key: None,
+            #[cfg(target_os = "android")]
+            body_tracker: None,
+            has_tracked_hands: Cell::new(false),
             hand_speeds: [const { Cell::new(0.0) }; 2],
             hand_solid: [const { Cell::new([0.0; HAND_SEGMENTS]) }; 2],
         };
@@ -298,13 +309,25 @@ impl StreamContext {
         #[cfg(target_os = "android")]
         if self.color_key.is_none() {
             self.auto_color_key = None;
+            self.body_tracker = None;
         } else if self.auto_color_key.is_none() && crate::auto_color_key::enabled() {
+            self.body_tracker = self
+                .interaction_context
+                .read()
+                .create_body_tracker()
+                .map(Arc::new);
             self.auto_color_key = Some(AutoColorKey::new(
                 Arc::clone(&self.stage_reference_space),
                 Arc::clone(&self.view_reference_space),
                 Arc::clone(&self.interaction_context),
+                self.body_tracker.clone(),
             ));
         }
+    }
+
+    /// The layers of the color key are only needed if there are hands
+    pub fn has_tracked_hands(&self) -> bool {
+        self.has_tracked_hands.get()
     }
 
     /// New colors for the key, learned from the camera
@@ -315,55 +338,38 @@ impl StreamContext {
         None
     }
 
-    // How the arms moved since the depth image was captured
-    fn arm_motions(
-        &self,
-        display_time: xr::Time,
-        capture_time: xr::Time,
-        views: &[xr::View],
-    ) -> [Option<ArmMotion>; 2] {
-        // Bigger displacements are tracking errors
-        const MAX_DISPLACEMENT: f32 = 0.25;
-        // Rough position of the elbows, relative to the head
-        const ELBOW_OFFSET: Vec3 = Vec3::new(0.2, -0.5, 0.05);
+    // The forearms in the depth image
+    #[cfg_attr(not(target_os = "android"), expect(unused))]
+    fn arm_removals(&self, capture_time: xr::Time) -> [Option<ArmRemoval>; 2] {
+        #[cfg(target_os = "android")]
+        {
+            let (Some(tracker), Some(key)) = (&self.body_tracker, &self.auto_color_key) else {
+                return [None; 2];
+            };
+            let trust = key.arm_trust();
+            let int_ctx = self.interaction_context.read();
 
-        let delay = self
-            .color_key
-            .map_or(0, |params| params.passthrough_delay_ms * 1_000_000);
-        let now = xr::Time::from_nanos(display_time.as_nanos() - delay);
-        let int_ctx = self.interaction_context.read();
-
-        let head_position = (crate::from_xr_vec3(views[0].pose.position)
-            + crate::from_xr_vec3(views[1].pose.position))
-            / 2.0;
-        let forward = crate::from_xr_quat(views[0].pose.orientation) * Vec3::NEG_Z;
-        let yaw = Quat::from_rotation_y(f32::atan2(-forward.x, -forward.z));
-
-        [0, 1].map(|i| {
-            let tracker = int_ctx.hands_interaction[i].skeleton_tracker.as_ref()?;
-            let wrist = |time| {
+            [0, 1].map(|i| {
                 let joints = self
                     .stage_reference_space
-                    .locate_hand_joints(tracker, time)
+                    .locate_hand_joints(
+                        int_ctx.hands_interaction[i].skeleton_tracker.as_ref()?,
+                        capture_time,
+                    )
                     .ok()
                     .flatten()?;
+                let wrist = crate::from_xr_vec3(joints[xr::HandJointEXT::WRIST].pose.position);
+                let forearm = tracker.forearm(capture_time, &self.stage_reference_space, i == 1)?;
 
-                Some(crate::from_xr_vec3(
-                    joints[xr::HandJointEXT::WRIST].pose.position,
-                ))
-            };
-            let wrist_now = wrist(now)?;
-            let displacement = wrist_now - wrist(capture_time)?;
-
-            let side = if i == 0 { -1.0 } else { 1.0 };
-            let elbow = head_position + yaw * (ELBOW_OFFSET * Vec3::new(side, 1.0, 1.0));
-
-            Some(ArmMotion {
-                wrist: wrist_now,
-                direction: (elbow - wrist_now).normalize_or(Vec3::NEG_Y),
-                displacement: displacement.clamp_length_max(MAX_DISPLACEMENT),
+                Some(ArmRemoval {
+                    wrist,
+                    elbow: wrist + forearm,
+                    trust: trust[i],
+                })
             })
-        })
+        }
+        #[cfg(not(target_os = "android"))]
+        [None; 2]
     }
 
     // The hands, at the moment shown by the passthrough image
@@ -389,9 +395,22 @@ impl StreamContext {
                 .ok()
                 .flatten()?;
 
-            let shape = HandShape::from_joints(&joints.map(|joint| {
-                crate::from_xr_vec3(joint.pose.position).extend(joint.radius * params.radius_scale)
-            }));
+            #[cfg(target_os = "android")]
+            let forearm = self
+                .body_tracker
+                .as_ref()
+                .and_then(|tracker| tracker.forearm(time, &self.stage_reference_space, i == 1));
+            #[cfg(not(target_os = "android"))]
+            let forearm = None::<Vec3>;
+            let wrist = crate::from_xr_vec3(joints[xr::HandJointEXT::WRIST].pose.position);
+
+            let shape = HandShape::from_joints(
+                &joints.map(|joint| {
+                    crate::from_xr_vec3(joint.pose.position)
+                        .extend(joint.radius * params.radius_scale)
+                }),
+                forearm.map(|forearm| wrist + forearm),
+            );
 
             // Some joints may have no valid velocity
             let speed = velocities
@@ -441,6 +460,9 @@ impl StreamContext {
             self.hand_solid[i].set(solid);
 
             let mut zones = params.zones;
+            if forearm.is_none() {
+                zones.arm_rim = 0.0;
+            }
             for (zone, solid) in zones.solid.iter_mut().zip(solid) {
                 // Some segments may always be solid
                 *zone = f32::max(*zone, solid);
@@ -457,6 +479,9 @@ impl StreamContext {
 
             Some((shape, zones))
         });
+
+        self.has_tracked_hands
+            .set(hands.iter().any(Option::is_some));
 
         Some(ColorKeyInput { hands })
     }
@@ -612,9 +637,11 @@ impl StreamContext {
         });
 
         let (frame, capture_time) = frame.unzip();
-        let arms = capture_time.flatten().map_or([None; 2], |time| {
-            self.arm_motions(display_time, time, current_headset_views)
+        // Typical age of the depth image, if it's not known
+        let capture_time = capture_time.flatten().unwrap_or_else(|| {
+            xr::Time::from_nanos(display_time.as_nanos() - DEFAULT_DEPTH_AGE.as_nanos() as i64)
         });
+        let arms = self.arm_removals(capture_time);
 
         Some(DepthRenderInput {
             frame,
@@ -813,6 +840,7 @@ impl Drop for StreamContext {
         #[cfg(target_os = "android")]
         {
             self.auto_color_key = None;
+            self.body_tracker = None;
         }
 
         self.input_thread_running.set(false);

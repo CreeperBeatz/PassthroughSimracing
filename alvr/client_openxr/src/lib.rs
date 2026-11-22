@@ -651,6 +651,11 @@ pub fn entry_point() {
             }
 
             // todo: allow rendering lobby and stream layers at the same time and add cross fade
+            let use_color_key_layers = use_color_key
+                && stream_context
+                    .as_ref()
+                    .is_some_and(|stream| stream.has_tracked_hands());
+
             let (layer, display_time) = if let Some(stream) = &mut stream_context {
                 stream.render(frame_interval, vsync_time)
             } else {
@@ -658,25 +663,25 @@ pub fn entry_point() {
             };
 
             let key_layers;
-            let layers: &[&xr::CompositionLayerBase<_>] = if let Some(passthrough_layer) =
-                &passthrough_layer
-            {
-                if use_color_key && let Some(color_key_layer) = passthrough_layer.color_key_layer()
-                {
-                    // See the color key in stream.wgsl
-                    key_layers = layer.build_color_key();
-                    &[
-                        passthrough_layer,
-                        &key_layers[0],
-                        color_key_layer,
-                        &key_layers[1],
-                    ]
+            let layers: &[&xr::CompositionLayerBase<_>] =
+                if let Some(passthrough_layer) = &passthrough_layer {
+                    if use_color_key_layers
+                        && let Some(color_key_layer) = passthrough_layer.color_key_layer()
+                    {
+                        // See the color key in stream.wgsl
+                        key_layers = layer.build_color_key();
+                        &[
+                            passthrough_layer,
+                            &key_layers[0],
+                            color_key_layer,
+                            &key_layers[1],
+                        ]
+                    } else {
+                        &[passthrough_layer, &layer.build()]
+                    }
                 } else {
-                    &[passthrough_layer, &layer.build()]
-                }
-            } else {
-                &[&layer.build()]
-            };
+                    &[&layer.build()]
+                };
 
             graphics_context.make_current();
             let res = xr_frame_stream.end(

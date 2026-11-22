@@ -4,14 +4,14 @@
 
 use crate::{
     depth_mask::{
-        self, ArmMotion, ColorKeyInput, DepthFrame, DepthRenderInput, HAND_SEGMENTS, HandShape,
+        self, ArmRemoval, ColorKeyInput, DepthFrame, DepthRenderInput, HAND_SEGMENTS, HandShape,
         HandZones,
     },
     stream::{self, FOVEATION_UNIFORM_SIZE, LIGHT_PROBE_SIZE, StreamPipelines, floats_to_bytes},
 };
 use alvr_common::{
     Fov, Pose, ViewParams,
-    glam::{Mat4, UVec2, Vec3, Vec4},
+    glam::{Mat4, UVec2, Vec2, Vec3, Vec4},
 };
 use alvr_session::{
     CockpitVolumeConfig, DepthMaskRegion, DepthPassthroughConfig, DepthPassthroughDebugView,
@@ -343,7 +343,7 @@ fn render_full(
     depth_camera_position: Vec3,
     depth_available: bool,
     color_key: Option<ColorKeyInput>,
-    arms: [Option<ArmMotion>; 2],
+    arms: [Option<ArmRemoval>; 2],
 ) -> Output {
     let target_format = TextureFormat::Rgba8Unorm;
     let constants = [
@@ -577,9 +577,18 @@ fn render_full(
         &depth_bind_group,
         0,
     );
-    if color_key.is_some() {
+    if let Some(key) = color_key {
         let bind_group = stream::create_focus_area_bind_group(device, &pipelines, &uniform_buffer);
-        stream::encode_focus_area(&mut encoder, &pipelines, &focus_area_view, &bind_group, 0);
+        let rect = depth_mask::hands_view_rect(&view(eye_position), eye_position, &key);
+        stream::encode_focus_area(
+            &mut encoder,
+            &pipelines,
+            &focus_area_view,
+            &bind_group,
+            0,
+            stream::focus_area_resolution(UVec2::splat(TARGET_SIZE * 4)),
+            rect,
+        );
     }
 
     {
@@ -721,6 +730,7 @@ fn color_key_packs_mask_and_hand_area() {
                         core: -0.01,
                         falloff: 0.01,
                         rim: 0.04,
+                        arm_rim: 0.0,
                         solid: [1.0; HAND_SEGMENTS],
                     },
                 )),
@@ -762,6 +772,7 @@ fn hand_core_fades_out_gradually() {
         core: -0.03,
         falloff: 0.06,
         rim: 0.06,
+        arm_rim: 0.0,
         solid: [1.0; HAND_SEGMENTS],
     };
     let render_zones = |zones| {
@@ -802,7 +813,7 @@ fn hand_core_fades_out_gradually() {
 
     // A half solid segment, all segments of the test hand are the same
     let mut solid = [0.0; HAND_SEGMENTS];
-    solid[HAND_SEGMENTS - 1] = 0.5;
+    solid[0] = 0.5;
     let half = render_zones(HandZones { solid, ..zones });
     assert!((half.alpha(0.5, 0.75) - 0.25).abs() < 0.03);
 
@@ -822,6 +833,7 @@ fn hand_zones_follow_the_speed() {
         core: -0.004,
         falloff: 0.008,
         rim: 0.01,
+        arm_rim: 0.0,
         solid: [1.0; HAND_SEGMENTS],
     };
 
@@ -840,7 +852,7 @@ fn hand_zones_follow_the_speed() {
 #[test]
 fn hand_shape_ends_at_the_fingertips() {
     let joints: [Vec4; 26] = std::array::from_fn(|i| Vec4::new(i as f32 * 0.03, 0.0, -0.4, 0.01));
-    let shape = HandShape::from_joints(&joints);
+    let shape = HandShape::from_joints(&joints, None);
     let points = shape.segments.as_flattened();
 
     for (i, joint) in joints.iter().enumerate() {
@@ -856,14 +868,13 @@ fn hand_shape_ends_at_the_fingertips() {
 }
 
 #[test]
-fn late_arms_are_moved() {
+fn tracked_arms_are_removed_from_the_depth() {
     let (device, queue) = gpu_or_skip!();
     let config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
 
-    // An arm at 0.5 m: in the depth map it covers u 0.40..0.50, v (from the bottom) 0.2..0.8. Since
-    // then it moved 10 cm to the right, 0.1 in view uv.
-    let scene = Scene::new(3.0, [0.4, 0.2, 0.5, 0.8], 0.5);
-    let render_arm = |displacement: Vec3| {
+    // A vertical arm at 0.5 m, and the rest of the scene
+    let scene = Scene::new(3.0, [0.45, 0.1, 0.55, 0.9], 0.5);
+    let render_arm = |trust| {
         render_full(
             &device,
             &queue,
@@ -875,23 +886,63 @@ fn late_arms_are_moved() {
             None,
             [
                 None,
-                Some(ArmMotion {
-                    wrist: Vec3::new(0.05, 0.05, -0.5),
-                    direction: Vec3::NEG_Y,
-                    displacement,
+                Some(ArmRemoval {
+                    wrist: Vec3::new(0.0, 0.35, -0.5),
+                    elbow: Vec3::new(0.0, -0.35, -0.5),
+                    trust,
                 }),
             ],
         )
     };
 
-    let still = render_arm(Vec3::ZERO);
-    assert_eq!(still.alpha(0.45, 0.48), 0.0);
-    assert_eq!(still.alpha(0.55, 0.48), 1.0);
+    let untrusted = render_arm([0.0; 4]);
+    assert_eq!(untrusted.alpha(0.5, 0.3), 0.0);
+    assert_eq!(untrusted.alpha(0.5, 0.7), 0.0);
 
-    // Near the wrist: moved
-    let moved = render_arm(Vec3::new(0.1, 0.0, 0.0));
-    assert!(moved.alpha(0.55, 0.48) < 0.1, "{}", moved.alpha(0.55, 0.48));
-    assert!(moved.alpha(0.43, 0.48) > 0.9, "{}", moved.alpha(0.43, 0.48));
+    let trusted = render_arm([1.0; 4]);
+    assert_eq!(trusted.alpha(0.5, 0.3), 1.0);
+    assert_eq!(trusted.alpha(0.5, 0.7), 1.0);
+
+    // Only near the wrist
+    let partly = render_arm([1.0, 1.0, 0.0, 0.0]);
+    assert_eq!(partly.alpha(0.5, 0.3), 1.0);
+    assert_eq!(partly.alpha(0.5, 0.75), 0.0);
+}
+
+#[test]
+fn hands_rect_contains_the_hands() {
+    let joints = std::array::from_fn(|i| Vec4::new(0.05 + i as f32 * 0.004, 0.1, -0.5, 0.01));
+    let elbow = Vec3::new(0.3, -0.1, -0.3);
+    let shape = HandShape::from_joints(&joints, Some(elbow));
+    let zones = HandZones {
+        core: 0.0,
+        falloff: 0.004,
+        rim: 0.01,
+        arm_rim: 0.02,
+        solid: [1.0; HAND_SEGMENTS],
+    };
+    let key = ColorKeyInput {
+        hands: [None, Some((shape, zones))],
+    };
+    let (min, max) = depth_mask::hands_view_rect(&view(Vec3::ZERO), Vec3::ZERO, &key).unwrap();
+
+    // Tangents of the view are +-1
+    for point in shape.segments.as_flattened() {
+        let uv = Vec2::new(
+            0.5 + 0.5 * point.x / -point.z,
+            0.5 - 0.5 * point.y / -point.z,
+        )
+        .clamp(Vec2::ZERO, Vec2::ONE);
+        assert!(
+            uv.cmpge(min).all() && uv.cmple(max).all(),
+            "{uv} {min} {max}"
+        );
+    }
+    assert!(min.x > 0.1, "{min}");
+
+    // Behind the viewer or not tracked
+    let none = ColorKeyInput { hands: [None; 2] };
+    assert!(depth_mask::hands_view_rect(&view(Vec3::ZERO), Vec3::ZERO, &none).is_none());
 }
 
 #[test]

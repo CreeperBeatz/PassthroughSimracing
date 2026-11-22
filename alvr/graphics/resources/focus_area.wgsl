@@ -70,17 +70,24 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         }
         let to_center = bounds.xyz - origin;
         let t = max(dot(to_center, dir), 0.0);
-        if length(to_center - dir * t) > bounds.w + zones.x + SOFTNESS {
-            continue;
-        }
+        let is_near_hand = length(to_center - dir * t) < bounds.w + max(zones.x, 0.0) + SOFTNESS;
+        let has_arm = zones.w > 0.0;
 
         var distance = OUTSIDE;
-        for (var i = 0u; i < HAND_SEGMENTS; i++) {
+        var arm_distance = OUTSIDE;
+        // Skip what is far away: the hand, or the forearm if it's not tracked
+        let first = select(HAND_SEGMENTS - ARM_SEGMENTS, 0u, is_near_hand);
+        let last = select(HAND_SEGMENTS - ARM_SEGMENTS, HAND_SEGMENTS, has_arm);
+        for (var i = first; i < last; i++) {
             let base = (hand * HAND_SEGMENTS + i) * 2u;
             let start = depth_u.hand_points[base];
             let end = depth_u.hand_points[base + 1u];
             let segment_distance = ray_capsule_distance(origin, dir, start, end);
-            distance = min(distance, segment_distance);
+            if i < HAND_SEGMENTS - ARM_SEGMENTS {
+                distance = min(distance, segment_distance);
+            } else {
+                arm_distance = min(arm_distance, segment_distance);
+            }
 
             let segment = hand * HAND_SEGMENTS + i;
             let solid = depth_u.hand_solid[segment / 4u][segment % 4u];
@@ -94,6 +101,10 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         // color key are weaker. Full strength up to half of the rim.
         let outer_distance = max(zones.x, 0.0) + SOFTNESS;
         outer = max(outer, 1.0 - smoothstep(0.5 * outer_distance, outer_distance, distance));
+        if zones.w > 0.0 {
+            let arm_rim = zones.w + SOFTNESS;
+            outer = max(outer, 1.0 - smoothstep(0.5 * arm_rim, arm_rim, arm_distance));
+        }
     }
 
     return vec4f(outer, inner, 0.0, 1.0);

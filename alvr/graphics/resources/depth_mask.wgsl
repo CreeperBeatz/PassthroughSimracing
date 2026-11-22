@@ -52,11 +52,9 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
 
     // The depth camera is close to (but not exactly at) the eye. Project a guess point along the
     // ray into the depth map, read the real surface there, and refine the guess distance.
-    var t = initial_distance(origin, dir);
+    var t = 0.7;
     for (var i = 0u; i < 2u; i++) {
-        let point = origin + dir * t;
-        let displacement = arm_displacement(point);
-        let guess = project_to_depth(point - displacement, view_idx);
+        let guess = project_to_depth(origin + dir * t, view_idx);
         if !guess.valid {
             return vec4f(0.0);
         }
@@ -64,12 +62,11 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         if depth >= MAX_DEPTH {
             return vec4f(0.0);
         }
-        let hit = lookup_to_world(guess, linearize_depth(depth), view_idx) + displacement;
+        let hit = lookup_to_world(guess, linearize_depth(depth), view_idx);
         t = max(dot(hit - origin, dir), 0.05);
     }
 
-    let displacement = arm_displacement(origin + dir * t);
-    let lookup = project_to_depth(origin + dir * t - displacement, view_idx);
+    let lookup = project_to_depth(origin + dir * t, view_idx);
     if !lookup.valid {
         return vec4f(0.0);
     }
@@ -88,8 +85,8 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         for (var x = 0; x < 3; x++) {
             let depth = load_depth(vec2i(center) + vec2i(x - 1, y - 1), view_idx);
             if depth < MAX_DEPTH {
-                let hit = lookup_to_world(lookup, linearize_depth(depth), view_idx) + displacement;
-                coverage += weights[x].x * weights[y].y * region_mask(hit, view_idx);
+                let hit = lookup_to_world(lookup, linearize_depth(depth), view_idx);
+                coverage += weights[x].x * weights[y].y * region_mask(hit, view_idx) * (1.0 - arm_removal(hit));
             }
         }
     }
@@ -98,7 +95,7 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     var has_depth = 0.0;
     let center_depth = load_depth(vec2i(center), view_idx);
     if center_depth < MAX_DEPTH {
-        let hit = lookup_to_world(lookup, linearize_depth(center_depth), view_idx) + displacement;
+        let hit = lookup_to_world(lookup, linearize_depth(center_depth), view_idx);
         proximity = clamp(1.0 - length(hit - origin) / 3.0, 0.0, 1.0);
         has_depth = 1.0;
     }
@@ -109,63 +106,29 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
 // Depth values from here on mean "no data"
 const MAX_DEPTH: f32 = 0.9999;
 
-// Where to start the search of the real surface along the ray. At the arm if the ray passes near it, so
-// that its motion is taken into account.
-fn initial_distance(origin: vec3f, dir: vec3f) -> f32 {
-    var t = 0.7;
-    var nearest = ARM_RADIUS;
+// The depth map is late, so it shows the forearms where they were. Returns 1 if this point of the depth
+// map belongs to a forearm that is tracked: the tracked one is shown instead.
+fn arm_removal(point: vec3f) -> f32 {
+    var result = 0.0;
     for (var hand = 0u; hand < 2u; hand++) {
-        let displacement = depth_u.arms[hand * 3u + 2u].xyz;
-        if dot(displacement, displacement) < 1e-6 {
+        let wrist = depth_u.arms[hand * 3u].xyz;
+        let axis = depth_u.arms[hand * 3u + 1u].xyz - wrist;
+        let trust = depth_u.arms[hand * 3u + 2u];
+        let length_squared = dot(axis, axis);
+        if length_squared < 1e-4 || all(trust <= vec4f(0.0)) {
             continue;
         }
-        let axis = depth_u.arms[hand * 3u + 1u].xyz * ARM_LENGTH;
-        // Middle between the old and the current position
-        let start = depth_u.arms[hand * 3u].xyz - 0.5 * displacement;
 
-        // Closest point between the ray and the arm
-        let w = origin - start;
-        let b = dot(dir, axis);
-        let c = dot(axis, axis);
-        let denominator = c - b * b;
-        var s = 0.0;
-        if denominator > 1e-9 {
-            s = clamp((dot(axis, w) - b * dot(dir, w)) / denominator, 0.0, 1.0);
-        }
-        let point = start + axis * s;
-        let arm_t = max(dot(point - origin, dir), 0.05);
-        let distance = length(origin + dir * arm_t - point) - 0.5 * length(displacement);
-        if distance < nearest {
-            nearest = distance;
-            t = arm_t;
-        }
-    }
-    return t;
-}
+        let s = clamp(dot(point - wrist, axis) / length_squared, 0.0, 1.0);
+        let aside = length(point - wrist - axis * s);
+        // Interpolate between the centers of the quarters
+        let position = clamp(s * 4.0 - 0.5, 0.0, 3.0);
+        let quarter = u32(floor(position));
+        let next_quarter = min(quarter + 1u, 3u);
+        let amount = mix(trust[quarter], trust[next_quarter], fract(position));
 
-const ARM_LENGTH: f32 = 0.45;
-const ARM_RADIUS: f32 = 0.14;
-
-// The depth map is late: how much the real surface at this point has moved since it was captured. The
-// arm moves with the wrist, less towards the elbow.
-fn arm_displacement(point: vec3f) -> vec3f {
-    var result = vec3f(0.0);
-    for (var hand = 0u; hand < 2u; hand++) {
-        let displacement = depth_u.arms[hand * 3u + 2u].xyz;
-        let from_wrist = point - depth_u.arms[hand * 3u].xyz;
-        let direction = depth_u.arms[hand * 3u + 1u].xyz;
-        let along = dot(from_wrist, direction);
-
-        // Distance from the axis of the arm, anywhere between its old and its current position
-        let offset = from_wrist - direction * along;
-        let motion = displacement - direction * dot(displacement, direction);
-        let s = clamp(-dot(offset, motion) / max(dot(motion, motion), 1e-6), 0.0, 1.0);
-        let aside = length(offset + motion * s);
-
-        let weight = (1.0 - smoothstep(0.0, ARM_LENGTH, along))
-            * smoothstep(-0.2, -0.1, along)
-            * (1.0 - smoothstep(0.6 * ARM_RADIUS, ARM_RADIUS, aside));
-        result += displacement * weight;
+        let radius = mix(0.055, 0.07, s);
+        result = max(result, amount * (1.0 - smoothstep(radius, radius + 0.02, aside)));
     }
     return result;
 }

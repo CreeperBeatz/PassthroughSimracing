@@ -426,6 +426,10 @@ pub(crate) fn create_focus_area_texture(device: &Device, view_resolution: UVec2)
     create_mask_texture(device, "focus area", view_resolution / FOCUS_AREA_DOWNSCALE)
 }
 
+pub(crate) fn focus_area_resolution(view_resolution: UVec2) -> UVec2 {
+    (view_resolution / FOCUS_AREA_DOWNSCALE).max(UVec2::ONE)
+}
+
 fn create_mask_texture(device: &Device, label: &str, size: UVec2) -> Texture {
     let size = size.max(UVec2::ONE);
 
@@ -555,6 +559,7 @@ pub struct StreamRenderer {
     // One per environment depth swapchain image
     depth_bind_groups: Vec<BindGroup>,
     light_probe_initialized: Cell<bool>,
+    focus_area_resolution: UVec2,
 }
 
 impl StreamRenderer {
@@ -733,6 +738,7 @@ impl StreamRenderer {
             dummy_depth_bind_group,
             depth_bind_groups: vec![],
             light_probe_initialized: Cell::new(false),
+            focus_area_resolution: focus_area_resolution(target_view_resolution),
         }
     }
 
@@ -806,7 +812,16 @@ impl StreamRenderer {
         };
 
         let mut depth_bind_group = &self.dummy_depth_bind_group;
-        let use_color_key = depth.is_some_and(|d| d.color_key.is_some());
+        // Only the part of the view with the hands is rendered
+        let hand_rects = depth.and_then(|d| d.color_key).map(|key| {
+            [0, 1].map(|i| {
+                depth_mask::hands_view_rect(
+                    &view_params[i].input_view_params,
+                    depth.map_or(Vec3::ZERO, |d| d.eye_positions[i]),
+                    &key,
+                )
+            })
+        });
         let mut lighting_response = None;
         if let Some(config) = depth_config {
             let input = depth.copied().unwrap_or(DepthRenderInput {
@@ -880,13 +895,15 @@ impl StreamRenderer {
                     depth_bind_group,
                     view_idx as u32,
                 );
-                if use_color_key {
+                if let Some(rects) = &hand_rects {
                     encode_focus_area(
                         &mut encoder,
                         &self.pipelines,
                         &objects.focus_area,
                         &objects.focus_area_bind_group,
                         view_idx as u32,
+                        self.focus_area_resolution,
+                        rects[view_idx],
                     );
                 }
             }
@@ -1050,6 +1067,8 @@ pub(crate) fn encode_focus_area(
     target: &TextureView,
     bind_group: &BindGroup,
     view_idx: u32,
+    resolution: UVec2,
+    rect: Option<(Vec2, Vec2)>,
 ) {
     let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
         label: Some("focus area"),
@@ -1064,6 +1083,19 @@ pub(crate) fn encode_focus_area(
         })],
         ..Default::default()
     });
+    // Without hands the target is only cleared
+    let Some((min, max)) = rect else {
+        return;
+    };
+    let min = (min * resolution.as_vec2()).floor().as_uvec2();
+    let max = (max * resolution.as_vec2())
+        .ceil()
+        .as_uvec2()
+        .min(resolution);
+    if !min.cmplt(max).all() {
+        return;
+    }
+    pass.set_scissor_rect(min.x, min.y, max.x - min.x, max.y - min.y);
     pass.set_pipeline(&pipelines.focus_area);
     pass.set_bind_group(0, bind_group, &[]);
     pass.set_immediates(0, &view_idx.to_le_bytes());

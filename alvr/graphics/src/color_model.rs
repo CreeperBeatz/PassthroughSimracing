@@ -2,7 +2,7 @@
 //! tracked hands look like, and what is behind them. Only the colors are learned from the (late)
 //! camera images. The key itself is applied by the compositor to the image it displays.
 
-use crate::{HAND_SEGMENTS, HandShape, ray_capsule_distance};
+use crate::{ARM_SEGMENTS, HAND_SEGMENTS, HandShape, ray_capsule_distance};
 use alvr_common::glam::{Quat, Vec2, Vec3};
 
 pub const COLOR_LUT_RESOLUTION: usize = 32;
@@ -248,7 +248,8 @@ impl ColorModel {
         Some(lut)
     }
 
-    /// Check the tracked hand against the image. Returns for each segment if it is really there (0..1).
+    /// Check the tracked hand against the image. Returns for each segment if it is really there (0..1), or
+    /// -1 if it's outside of the image.
     /// `background_kept`: fraction of the colors around the hand that look like the hand. If that is
     /// high, nothing can be said.
     pub fn verify_hand(
@@ -297,7 +298,7 @@ impl ColorModel {
                 }
             }
             if point_count < MIN_POINTS {
-                return 0.0;
+                return -1.0;
             }
 
             reliability * smoothstep(0.5, 0.8, skin_count as f32 / point_count as f32)
@@ -360,6 +361,9 @@ pub struct SampledHand {
     pub arm_direction: Vec3,
     /// The fingers are only tracked well enough if the hand doesn't move
     pub is_still: bool,
+    /// Which quarters of the forearm are known to be in the right place (0..1). None if the elbow is not
+    /// tracked
+    pub arm_trust: Option<[f32; ARM_SEGMENTS]>,
 }
 
 #[derive(Default)]
@@ -381,6 +385,9 @@ pub fn sample_hand_colors(
     // Distances from the surface of the hand, with a margin for tracking and timing errors
     const SKIN_MAX: f32 = -0.005;
     const FINGER_MAX: f32 = -0.004;
+    const ARM_MAX: f32 = -0.012;
+    // The start of the forearm is always right, because of the hand tracking
+    const SAFE_ARM_SEGMENTS: usize = 2;
     const BACKGROUND_MIN: f32 = 0.02;
     const BACKGROUND_MAX: f32 = 0.07;
     const STEP: usize = 2;
@@ -432,7 +439,17 @@ pub fn sample_hand_colors(
 
                 let is_skin = hand.shape.palm_ray_distance(camera.position, ray) < SKIN_MAX
                     || (hand.is_still && distance < FINGER_MAX);
-                if is_skin {
+                let is_arm = hand.arm_trust.is_some_and(|trust| {
+                    hand.shape
+                        .arm_ray_distances(camera.position, ray)
+                        .iter()
+                        .zip(trust)
+                        .enumerate()
+                        .any(|(i, (distance, trust))| {
+                            *distance < ARM_MAX && (i < SAFE_ARM_SEGMENTS || trust > 0.5)
+                        })
+                });
+                if is_skin || is_arm {
                     samples.skin.push(color(x, y));
                 } else if (BACKGROUND_MIN..BACKGROUND_MAX).contains(&distance) {
                     // The arm is not background
@@ -714,6 +731,7 @@ mod tests {
             wrist: Vec3::new(0.05, 0.0, 0.5),
             arm_direction: Vec3::X,
             is_still: false,
+            arm_trust: None,
         };
         let camera = CameraView {
             position: Vec3::ZERO,
@@ -768,6 +786,7 @@ mod tests {
             wrist: Vec3::new(0.05, 0.0, 0.5),
             arm_direction: Vec3::X,
             is_still: true,
+            arm_trust: None,
         };
         let camera = CameraView {
             position: Vec3::ZERO,
@@ -805,7 +824,10 @@ mod tests {
             center: Vec2::new(1000.0, 120.0),
             ..camera
         };
-        assert_eq!(model.verify_hand(&far, 320, 240, &hand, 0.0, color)[0], 0.0);
+        assert_eq!(
+            model.verify_hand(&far, 320, 240, &hand, 0.0, color)[0],
+            -1.0
+        );
     }
 
     #[test]

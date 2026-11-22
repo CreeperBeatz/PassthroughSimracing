@@ -84,6 +84,7 @@ impl PassthroughLayer<'_> {
 /// - push a LUT (see `COLOR_KEY_SIZE`) to one of `COLOR_KEY_PATHS`
 /// - `setprop debug.alvr.color_key <n>`: 0 disables the key, another value (re)loads the LUT
 /// - `setprop debug.alvr.key_rim <mm>`: width of the color keyed rim around the hands
+/// - `setprop debug.alvr.key_arm_rim <mm>`: same for the forearms
 /// - `setprop debug.alvr.key_inset <mm>`: how much the solid inside of the hands is shrunk
 /// - `setprop debug.alvr.key_falloff <mm>`: how gradually the solid inside fades out
 /// - `setprop debug.alvr.key_error <ms>`: assumed timing error, the solid core shrinks with the speed
@@ -132,13 +133,14 @@ impl ColorKeyParams {
             zones: HandZones {
                 core: -millimeters("debug.alvr.key_inset", 4),
                 falloff: millimeters("debug.alvr.key_falloff", 4),
-                rim: millimeters("debug.alvr.key_rim", 2),
+                rim: millimeters("debug.alvr.key_rim", 0),
+                arm_rim: millimeters("debug.alvr.key_arm_rim", 15),
                 solid,
             },
             // Milliseconds
             core_error_s: millimeters("debug.alvr.key_error", 10),
-            rim_error_s: millimeters("debug.alvr.key_rim_error", 22),
-            max_rim_growth_m: millimeters("debug.alvr.key_rim_max", 10),
+            rim_error_s: millimeters("debug.alvr.key_rim_error", 45),
+            max_rim_growth_m: millimeters("debug.alvr.key_rim_max", 16),
             radius_scale: debug_property("debug.alvr.key_scale")
                 .unwrap_or(100)
                 .clamp(0, 300) as f32
