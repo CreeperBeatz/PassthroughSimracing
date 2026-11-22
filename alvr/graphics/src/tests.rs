@@ -5,7 +5,7 @@
 use crate::{
     depth_mask::{
         self, ArmMotion, ColorKeyInput, DepthFrame, DepthRenderInput, HAND_SEGMENTS, HandShape,
-        HandSweep, HandZones, SweepParams,
+        HandSweep, HandZones, SweepParams, WristBridge,
     },
     stream::{self, FOVEATION_UNIFORM_SIZE, LIGHT_PROBE_SIZE, StreamPipelines, floats_to_bytes},
 };
@@ -777,6 +777,7 @@ fn color_key_packs_mask_and_hand_area() {
                 )),
             ],
             leak: [0.0; 2],
+            bridges: [None; 2],
         }),
     );
 
@@ -805,6 +806,7 @@ fn color_key_upper_layer_alone_matches_both() {
     let no_hands = ColorKeyInput {
         hands: [None; 2],
         leak: [0.0; 2],
+        bridges: [None; 2],
     };
     let render_rects = |rects| {
         render_full(
@@ -882,6 +884,7 @@ fn hand_core_fades_out_gradually() {
             Some(ColorKeyInput {
                 hands: [Some((shape, zones)), None],
                 leak: [0.0; 2],
+                bridges: [None; 2],
             }),
         )
     };
@@ -959,6 +962,7 @@ fn negative_rim_ends_inside_the_capsule() {
                     )),
                 ],
                 leak: [0.0; 2],
+                bridges: [None; 2],
             }),
         )
     };
@@ -1129,6 +1133,7 @@ fn hand_zone_sweeps_along_the_motion() {
             Some(ColorKeyInput {
                 hands: [None, Some((shape, zones))],
                 leak: [0.0; 2],
+                bridges: [None; 2],
             }),
         )
     };
@@ -1177,6 +1182,153 @@ fn hand_zone_sweeps_along_the_motion() {
             }
         }
     }
+}
+
+#[test]
+fn wrist_bridge_extends_the_hand_zone() {
+    let (device, queue) = gpu_or_skip!();
+    let config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
+
+    // A short bar as the hand, 0.5 m away at v = 0.75, the fingers to the left. The wrist is at its
+    // right end (u = 0.45), the forearm goes to the right: 1 cm is 0.01 in view uv.
+    let wrist = Vec3::new(-0.05, -0.25, -0.5);
+    let segment = [Vec4::new(-0.15, -0.25, -0.5, 0.02), wrist.extend(0.02)];
+    let shape = HandShape {
+        segments: [segment; HAND_SEGMENTS],
+    };
+    let zones = HandZones {
+        core: -0.01,
+        falloff: 0.005,
+        rim: 0.0,
+        solid: [0.0; HAND_SEGMENTS],
+        sweep: HandSweep::NONE,
+    };
+    let render_bridge = |zones, bridge| {
+        render_with_key(
+            &device,
+            &queue,
+            &config,
+            &hand_scene(),
+            Vec3::ZERO,
+            Vec3::ZERO,
+            true,
+            Some(ColorKeyInput {
+                hands: [None, Some((shape, zones))],
+                leak: [0.0; 2],
+                bridges: [None, bridge],
+            }),
+        )
+    };
+    let bridge = |length, solid| WristBridge::new(wrist, Vec3::X, length, 0.025, solid);
+
+    // 4 cm behind the wrist: game without the bridge, keyed with it
+    let without = render_bridge(zones, None);
+    let with = render_bridge(zones, bridge(0.08, 0.0));
+    assert_eq!(without.alpha(0.49, 0.75), 1.0);
+    assert!(
+        (with.alpha(0.49, 0.75) - 0.5).abs() < 0.01,
+        "{}",
+        with.alpha(0.49, 0.75)
+    );
+    // Past its end and beside it: game
+    assert_eq!(with.alpha(0.58, 0.75), 1.0);
+    assert_eq!(with.alpha(0.49, 0.81), 1.0);
+    // The hand is the same
+    assert_eq!(with.at(0.4, 0.75), without.at(0.4, 0.75));
+
+    // Long, far out of the bounding sphere of the hand: 20 cm behind the wrist
+    let long = render_bridge(zones, bridge(0.25, 0.0));
+    assert!((long.alpha(0.65, 0.75) - 0.5).abs() < 0.01);
+    assert_eq!(with.alpha(0.65, 0.75), 1.0);
+
+    // Off (debug.alvr.key_wrist_len 0): no bridge, the output is the same as without one. A bridge of
+    // a hand that is not there does nothing either.
+    assert_eq!(bridge(0.0, 1.0), None);
+    let lone = render_with_key(
+        &device,
+        &queue,
+        &config,
+        &hand_scene(),
+        Vec3::ZERO,
+        Vec3::ZERO,
+        true,
+        Some(ColorKeyInput {
+            hands: [None, Some((shape, zones))],
+            leak: [0.0; 2],
+            bridges: [bridge(0.08, 1.0), None],
+        }),
+    );
+    for v in (0..64).map(|i| (i as f32 + 0.5) / 64.0) {
+        for u in (0..64).map(|i| (i as f32 + 0.5) / 64.0) {
+            assert_eq!(lone.at(u, v), without.at(u, v), "{u} {v}");
+        }
+    }
+
+    // Solid only if the camera is sure enough of the direction
+    let unsure = render_bridge(
+        zones,
+        bridge(0.08, WristBridge::solid_target(0.5, 0.6, 1.0)),
+    );
+    let sure = render_bridge(
+        zones,
+        bridge(0.08, WristBridge::solid_target(0.7, 0.6, 1.0)),
+    );
+    let moving = render_bridge(
+        zones,
+        bridge(0.08, WristBridge::solid_target(0.7, 0.6, 0.0)),
+    );
+    assert!((unsure.alpha(0.49, 0.75) - 0.5).abs() < 0.01);
+    assert!(sure.alpha(0.49, 0.75) < 0.01, "{}", sure.alpha(0.49, 0.75));
+    assert!((moving.alpha(0.49, 0.75) - 0.5).abs() < 0.01);
+    // The solid core ends inside, the edge is keyed like for the hand
+    assert!((sure.alpha(0.49, 0.77) - 0.5).abs() < 0.01);
+
+    // Moving down in the image: the rim of the bridge is swept like the hand
+    let swept = HandZones {
+        sweep: HandSweep {
+            direction: Vec3::NEG_Y,
+            forward: 0.04,
+            backward: 0.0,
+        },
+        ..zones
+    };
+    assert_eq!(with.alpha(0.49, 0.80), 1.0);
+    let moving = render_bridge(swept, bridge(0.08, 0.0));
+    assert!((moving.alpha(0.49, 0.80) - 0.5).abs() < 0.01);
+    // Over a leak it narrows like the hand
+    let narrow = render_bridge(zones.for_leak(1.0, 0.012), bridge(0.08, 0.0));
+    assert!((narrow.alpha(0.49, 0.75) - 0.5).abs() < 0.01);
+    assert_eq!(narrow.alpha(0.49, 0.77), 1.0);
+    assert!((with.alpha(0.49, 0.77) - 0.5).abs() < 0.01);
+}
+
+#[test]
+fn hands_rect_contains_the_bridge() {
+    let joints = std::array::from_fn(|i| Vec4::new(0.05 + i as f32 * 0.004, 0.1, -0.5, 0.01));
+    let shape = HandShape::from_joints(&joints);
+    let zones = HandZones {
+        core: 0.0,
+        falloff: 0.004,
+        rim: 0.01,
+        solid: [0.0; HAND_SEGMENTS],
+        sweep: HandSweep::NONE,
+    };
+    let rect = |bridge| {
+        let key = ColorKeyInput {
+            hands: [None, Some((shape, zones))],
+            leak: [0.0; 2],
+            bridges: [None, bridge],
+        };
+        depth_mask::hands_view_rect(&view(Vec3::ZERO), Vec3::ZERO, &key).unwrap()
+    };
+
+    // 25 cm to the left from the wrist: to x = -0.2 m, u = 0.3
+    let wrist = joints[0].truncate();
+    let (min, max) = rect(WristBridge::new(wrist, Vec3::NEG_X, 0.25, 0.02, 0.0));
+    let (hand_min, hand_max) = rect(None);
+    assert!(min.x < 0.3 - 0.02, "{min}");
+    assert!(hand_min.x > 0.4, "{hand_min}");
+    assert_eq!(max, hand_max);
 }
 
 #[test]
@@ -1254,6 +1406,7 @@ fn late_arms_are_moved() {
         Some(ColorKeyInput {
             hands: [None; 2],
             leak: [0.0; 2],
+            bridges: [None; 2],
         }),
         [None, Some(motion(Vec3::new(0.1, 0.0, 0.0)))],
         None,
@@ -1277,6 +1430,7 @@ fn hands_rect_contains_the_hands() {
     let key = ColorKeyInput {
         hands: [None, Some((shape, zones))],
         leak: [0.0; 2],
+        bridges: [None; 2],
     };
     let (min, max) = depth_mask::hands_view_rect(&view(Vec3::ZERO), Vec3::ZERO, &key).unwrap();
 
@@ -1303,6 +1457,7 @@ fn hands_rect_contains_the_hands() {
     let swept = ColorKeyInput {
         hands: [None, Some((shape, HandZones { sweep, ..zones }))],
         leak: [0.0; 2],
+        bridges: [None; 2],
     };
     let (swept_min, swept_max) =
         depth_mask::hands_view_rect(&view(Vec3::ZERO), Vec3::ZERO, &swept).unwrap();
@@ -1328,6 +1483,7 @@ fn hands_rect_contains_the_hands() {
     let none = ColorKeyInput {
         hands: [None; 2],
         leak: [0.0; 2],
+        bridges: [None; 2],
     };
     assert!(depth_mask::hands_view_rect(&view(Vec3::ZERO), Vec3::ZERO, &none).is_none());
 }
@@ -1346,6 +1502,7 @@ fn hands_rect_ignores_hands_out_of_view() {
         let key = ColorKeyInput {
             hands: [Some((HandShape::from_joints(&joints), zones)), None],
             leak: [0.0; 2],
+            bridges: [None; 2],
         };
         depth_mask::hands_view_rect(&view(Vec3::ZERO), Vec3::ZERO, &key)
     };
@@ -1488,6 +1645,7 @@ fn playzone_fills_objects_removed_near_the_hand() {
             None,
         ],
         leak: [0.0; 2],
+        bridges: [None; 2],
     };
     let render_playzone = |playzone| {
         render_full(
@@ -1764,6 +1922,7 @@ fn tint_debug_view_marks_the_narrowed_rim() {
                     )),
                 ],
                 leak,
+                bridges: [None; 2],
             }),
         )
     };

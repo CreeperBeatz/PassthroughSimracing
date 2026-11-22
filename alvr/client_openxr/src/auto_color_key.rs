@@ -4,7 +4,7 @@
 use crate::{
     camera::{self, CameraCalibration, CameraFrame, PassthroughCamera},
     interaction::InteractionContext,
-    passthrough::debug_property,
+    passthrough::{WristParams, debug_property},
 };
 use alvr_common::{
     RelaxedAtomic,
@@ -12,8 +12,8 @@ use alvr_common::{
     parking_lot::{Mutex, RwLock},
 };
 use alvr_graphics::{
-    CameraView, ColorModel, HAND_SEGMENTS, HandColorSamples, HandShape, LeakMap, LeakSnapshot,
-    SampledHand,
+    BridgeChoice, CameraView, ColorModel, HAND_SEGMENTS, HandColorSamples, HandShape, LeakMap,
+    LeakSnapshot, SampledHand, WristAxes,
 };
 use openxr as xr;
 use std::{
@@ -38,6 +38,8 @@ const MAX_HAND_SPEED: f32 = 0.5;
 const STILL_HAND_SPEED: f32 = 0.12;
 // How long the leak of a hand is kept when it's not seen, and when it is not used any more
 const LEAK_HOLD: Duration = Duration::from_secs(1);
+// The direction of the bridge from the wrist is forgotten if the camera didn't see it for this long
+const BRIDGE_HOLD: Duration = Duration::from_secs(1);
 // The leak map sees every 8th pixel in x and y (1200 of 320 x 240), see `leak_sample_offset`
 const LEAK_MAP_STEP: u32 = 8;
 // Grid of the camera view for `debug.alvr.key_leak_dump`
@@ -56,6 +58,7 @@ struct Verified {
     time: Instant,
     weights: HandWeights,
     leak: [f32; 2],
+    bridges: [BridgeChoice; 2],
 }
 
 /// The leak map for the render thread
@@ -138,6 +141,15 @@ impl AutoColorKey {
         }
     }
 
+    /// Direction of the bridge from each wrist to the forearm, in the space of the wrist joint, and how
+    /// sure the camera is about it. The default direction with confidence 0 if it is off or not known.
+    pub fn wrist_bridges(&self) -> [BridgeChoice; 2] {
+        match &*self.verified.lock() {
+            Some(verified) if verified.time.elapsed() < BRIDGE_HOLD => verified.bridges,
+            _ => [BridgeChoice::default(); 2],
+        }
+    }
+
     /// New colors, if there are any
     pub fn take_lut(&self) -> Option<Vec<u8>> {
         self.lut.lock().take()
@@ -186,6 +198,10 @@ fn learn_loop(context: &Context) {
     let mut last_leak = [Instant::now(); 2];
     let mut last_lut = vec![];
     let mut leak_learner = LeakLearner::new();
+    let mut bridges = [BridgeChoice::default(); 2];
+    let mut last_bridges = [Instant::now(); 2];
+    // Flexion and deviation of each bridge, for the log
+    let mut bridge_angles = [(0.0, 0.0); 2];
 
     while context.running.value() {
         let camera = match PassthroughCamera::open() {
@@ -214,7 +230,16 @@ fn learn_loop(context: &Context) {
             let elapsed = last_update.elapsed().as_secs_f32();
             last_update = Instant::now();
 
-            let Some((samples, view, hands, exclusions)) = sample(context, &camera, &frame) else {
+            // Once the camera is sure where the forearm is, it is not background
+            let wrist = WristParams::load();
+            let arm_directions = bridges.map(|bridge| {
+                bridge.direction.filter(|_| {
+                    wrist.is_some_and(|wrist| bridge.confidence >= wrist.min_confidence)
+                })
+            });
+            let Some((samples, view, hands, wrists, exclusions)) =
+                sample(context, &camera, &frame, arm_directions)
+            else {
                 continue;
             };
             model.unknown_keep = percent("debug.alvr.key_unknown", 10);
@@ -249,13 +274,16 @@ fn learn_loop(context: &Context) {
             }
             // With the narrower rim each hand is verified against its own background
             let use_hand_kept = debug_property("debug.alvr.key_leak").unwrap_or(0) > 0;
-
-            for (i, (weights, hand)) in weights.iter_mut().zip(&hands).enumerate() {
-                let background_kept = if use_hand_kept {
+            let background_kept = [0, 1].map(|i| {
+                if use_hand_kept {
                     hand_kept[i].unwrap_or(background_kept)
                 } else {
                     background_kept
-                };
+                }
+            });
+
+            for (i, (weights, hand)) in weights.iter_mut().zip(&hands).enumerate() {
+                let background_kept = background_kept[i];
                 let targets = hand.as_ref().map_or([0.0; HAND_SEGMENTS], |hand| {
                     model.verify_hand(
                         &view,
@@ -275,10 +303,45 @@ fn learn_loop(context: &Context) {
                     };
                 }
             }
+
+            // Which way from the wrist the camera sees the forearm
+            for i in 0..2 {
+                let is_fresh = match (wrist, &hands[i], &wrists[i]) {
+                    (Some(wrist), Some(hand), Some((orientation, axes))) => {
+                        let scores = model.bridge_scores(
+                            &view,
+                            camera.calibration.width,
+                            camera.calibration.height,
+                            hand,
+                            *orientation,
+                            axes,
+                            wrist.length_m,
+                            |x, y| frame.rgb(x, y),
+                        );
+                        let reliability =
+                            alvr_graphics::verification_reliability(background_kept[i]);
+                        let is_fresh = bridges[i].update(axes, &scores, reliability);
+                        if is_fresh {
+                            bridge_angles[i] = bridges[i].angles(axes);
+                        }
+                        is_fresh
+                    }
+                    _ => false,
+                };
+                if is_fresh {
+                    last_bridges[i] = Instant::now();
+                } else if wrist.is_none() || last_bridges[i].elapsed() > BRIDGE_HOLD {
+                    // The default direction, not sure
+                    bridges[i] = BridgeChoice::default();
+                    bridge_angles[i] = (0.0, 0.0);
+                }
+            }
+
             *context.verified.lock() = Some(Verified {
                 time: Instant::now(),
                 weights,
                 leak,
+                bridges,
             });
 
             if last_log.elapsed() > LOG_INTERVAL {
@@ -295,10 +358,22 @@ fn learn_loop(context: &Context) {
                 } else {
                     String::new()
                 };
+                // Flexion / deviation in degrees and the confidence of each bridge
+                let wrist_log = if wrist.is_some() {
+                    let [left, right] = [0, 1].map(|i| {
+                        format!(
+                            "{:.0}/{:.0} deg {:.2}",
+                            bridge_angles[i].0, bridge_angles[i].1, bridges[i].confidence
+                        )
+                    });
+                    format!(", wrist {left}, {right}")
+                } else {
+                    String::new()
+                };
                 camera::log(&format!(
                     "auto key: skin {} kept {:.2} mean {:?}, background {} kept {:.2} mean {:?}, \
                      verified {:.2} {:.2}, leak {:.2} {:.2}, scene {} kept {:.2}, \
-                     update {:.1} ms{leak_map}",
+                     update {:.1} ms{wrist_log}{leak_map}",
                     samples.skin.len(),
                     model.kept_fraction(&samples.skin),
                     mean(&samples.skin),
@@ -555,15 +630,24 @@ fn mean(colors: &[[u8; 3]]) -> [u32; 3] {
     [0, 1, 2].map(|c| colors.iter().map(|color| u32::from(color[c])).sum::<u32>() / count)
 }
 
-// Colors, camera, hands, and spheres around every located hand for the leak map
+// Colors, camera, hands, the orientation and the axes of their wrists, and spheres around every located
+// hand for the leak map
 type Sampled = (
     HandColorSamples,
     CameraView,
     [Option<SampledHand>; 2],
+    [Option<(Quat, WristAxes)>; 2],
     Vec<Vec4>,
 );
 
-fn sample(context: &Context, camera: &PassthroughCamera, frame: &CameraFrame) -> Option<Sampled> {
+// `arm_directions`: of the forearms where the camera is sure, in the space of the wrist joint. None: the
+// default, opposite to the fingers
+fn sample(
+    context: &Context,
+    camera: &PassthroughCamera,
+    frame: &CameraFrame,
+    arm_directions: [Option<Vec3>; 2],
+) -> Option<Sampled> {
     // The OpenXR time of the Quest runtime is CLOCK_MONOTONIC, like the timestamps of the camera
     let time = xr::Time::from_nanos(frame.timestamp_ns);
 
@@ -590,6 +674,7 @@ fn sample(context: &Context, camera: &PassthroughCamera, frame: &CameraFrame) ->
 
     let interaction_context = context.interaction_context.read();
     let mut exclusions = Vec::with_capacity(2 * (1 + alvr_graphics::ARM_EXCLUSION_SPHERES));
+    let mut wrists = [None; 2];
     let hands = [0, 1].map(|i| {
         let tracker = interaction_context.hands_interaction[i]
             .skeleton_tracker
@@ -624,8 +709,19 @@ fn sample(context: &Context, camera: &PassthroughCamera, frame: &CameraFrame) ->
         let position = |joint: xr::HandJointEXT| crate::from_xr_vec3(joints[joint].pose.position);
         let wrist = position(xr::HandJointEXT::WRIST);
         // Opposite to the fingers: the skin of the forearm is not background
-        let arm_direction =
+        let default_direction =
             (wrist - position(xr::HandJointEXT::MIDDLE_METACARPAL)).normalize_or_zero();
+        let wrist_joint = joints[xr::HandJointEXT::WRIST];
+        let wrist_orientation = wrist_joint
+            .location_flags
+            .contains(xr::SpaceLocationFlags::ORIENTATION_VALID)
+            .then(|| crate::from_xr_quat(wrist_joint.pose.orientation).normalize());
+        // Or where the camera saw it
+        let arm_direction = wrist_orientation
+            .zip(arm_directions[i])
+            .map_or(default_direction, |(orientation, local)| {
+                orientation * local
+            });
 
         exclusions.push(alvr_graphics::hand_exclusion(shape.bounds(), valid_speed));
         exclusions.extend(alvr_graphics::arm_exclusions(
@@ -636,6 +732,16 @@ fn sample(context: &Context, camera: &PassthroughCamera, frame: &CameraFrame) ->
         if !all_tracked || speed > MAX_HAND_SPEED {
             return None;
         }
+
+        // The joint spaces have +y out of the back of the hand
+        wrists[i] = wrist_orientation.and_then(|orientation| {
+            let to_local = orientation.inverse();
+            let thumb = position(xr::HandJointEXT::INDEX_PROXIMAL)
+                - position(xr::HandJointEXT::LITTLE_PROXIMAL);
+            let axes = WristAxes::new(to_local * default_direction, Vec3::NEG_Y, to_local * thumb)?;
+
+            Some((orientation, axes))
+        });
 
         Some(SampledHand {
             shape,
@@ -654,5 +760,5 @@ fn sample(context: &Context, camera: &PassthroughCamera, frame: &CameraFrame) ->
         |x, y| frame.rgb(x, y),
     );
 
-    Some((samples, view, hands, exclusions))
+    Some((samples, view, hands, wrists, exclusions))
 }

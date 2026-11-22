@@ -3,7 +3,8 @@
 //
 // Renders the confidence zones of the tracked hands, made of tapered capsules. Hands move faster than
 // the depth map can follow, everything else is handled by the depth mask. Hand tracking is only an
-// estimate, so the solid inside fades out gradually into the color keyed rim.
+// estimate, so the solid inside fades out gradually into the color keyed rim. Each hand may have one
+// more capsule, the bridge from the wrist towards the forearm (hand_bridge).
 //
 // Output: r: the hand with its rim (the rim is color keyed), g: solid passthrough, b: near the hand, where
 // the runtime may remove objects from the depth map, a: debug view, how much the rim is narrowed
@@ -104,6 +105,40 @@ fn ray_swept_capsule_distance(
     return length(origin + dir * t - point) - mix(start.w, end.w, s);
 }
 
+// Zones of one capsule of a hand: x: distance for the rim (moved along the motion if `sweeps`), y: how
+// solid it is at this pixel (0..1)
+fn capsule_zones(
+    origin: vec3f,
+    dir: vec3f,
+    start: vec4f,
+    end: vec4f,
+    solid: f32,
+    zones: vec4f,
+    sweeps: bool,
+    motion: vec3f,
+    across: vec4f,
+    sweep: vec2f,
+) -> vec2f {
+    var distance = 0.0;
+    var segment_distance = 0.0;
+    if sweeps {
+        distance = ray_swept_capsule_distance(origin, dir, start, end, motion, across, sweep);
+        if solid > 0.0 {
+            segment_distance = ray_capsule_distance(origin, dir, start, end);
+        }
+    } else {
+        segment_distance = ray_capsule_distance(origin, dir, start, end);
+        distance = segment_distance;
+    }
+
+    var inner = 0.0;
+    if solid > 0.0 {
+        let fade = smoothstep(zones.y, zones.y + max(zones.z, 0.0005), segment_distance);
+        inner = solid * (1.0 - fade);
+    }
+    return vec2f(distance, inner);
+}
+
 @fragment
 fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     let origin = depth_u.eyes[imm.view_idx].eye_position.xyz;
@@ -142,23 +177,46 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
             let segment = hand * HAND_SEGMENTS + i;
             let solid = depth_u.hand_solid[segment / 4u][segment % 4u];
 
-            var segment_distance = 0.0;
-            if sweeps {
-                distance = min(
-                    distance,
-                    ray_swept_capsule_distance(origin, dir, start, end, motion.xyz, across_info, sweep),
-                );
-                if solid > 0.0 {
-                    segment_distance = ray_capsule_distance(origin, dir, start, end);
-                }
-            } else {
-                segment_distance = ray_capsule_distance(origin, dir, start, end);
-                distance = min(distance, segment_distance);
-            }
+            let capsule = capsule_zones(
+                origin,
+                dir,
+                start,
+                end,
+                solid,
+                zones,
+                sweeps,
+                motion.xyz,
+                across_info,
+                sweep,
+            );
+            distance = min(distance, capsule.x);
+            inner = max(inner, capsule.y);
+        }
 
-            if solid > 0.0 {
-                let fade = smoothstep(zones.y, zones.y + max(zones.z, 0.0005), segment_distance);
-                inner = max(inner, solid * (1.0 - fade));
+        // The bridge from the wrist to the forearm: one more capsule of the hand, with its own test of
+        // the distance because it may reach far out of the bounding sphere
+        let bridge_start = depth_u.hand_bridge[hand * 2u];
+        if bridge_start.w > 0.0 {
+            let bridge_end = depth_u.hand_bridge[hand * 2u + 1u];
+            let to_middle = 0.5 * (bridge_start.xyz + bridge_end.xyz) - origin;
+            let middle_t = max(dot(to_middle, dir), 0.0);
+            let reach = 0.5 * length(bridge_end.xyz - bridge_start.xyz) + bridge_start.w;
+            if length(to_middle - dir * middle_t)
+                < reach + max(zones.x, 0.0) + max(sweep.x, sweep.y) + SOFTNESS {
+                let capsule = capsule_zones(
+                    origin,
+                    dir,
+                    bridge_start,
+                    vec4f(bridge_end.xyz, bridge_start.w),
+                    bridge_end.w,
+                    zones,
+                    sweeps,
+                    motion.xyz,
+                    across_info,
+                    sweep,
+                );
+                distance = min(distance, capsule.x);
+                inner = max(inner, capsule.y);
             }
         }
 

@@ -20,8 +20,8 @@ use alvr_common::{
     parking_lot::RwLock,
 };
 use alvr_graphics::{
-    ArmMotion, ColorKeyInput, DepthRenderInput, GraphicsContext, HAND_SEGMENTS, HandShape,
-    HandZones, LeakGains, SEGMENT_JOINTS, StreamRenderer, StreamViewParams,
+    ArmMotion, BridgeChoice, ColorKeyInput, DepthRenderInput, GraphicsContext, HAND_SEGMENTS,
+    HandShape, HandZones, LeakGains, SEGMENT_JOINTS, StreamRenderer, StreamViewParams, WristBridge,
 };
 use alvr_packets::{ClientStreamConfig, RealTimeConfig, TrackingData};
 use alvr_session::{
@@ -164,6 +164,8 @@ pub struct StreamContext {
     // Smoothed, meters per second, stage space
     hand_velocities: [Cell<Vec3>; 2],
     hand_solid: [Cell<[f32; HAND_SEGMENTS]>; 2],
+    // How solid the bridge from each wrist to the forearm is (0..1), smoothed
+    bridge_solid: [Cell<f32>; 2],
     // How much the rim of each hand is narrowed over backgrounds that look like it (0..1), smoothed
     hand_leak: [Cell<f32>; 2],
     // Log of the leak map: last time, and the lookup time since then
@@ -331,6 +333,7 @@ impl StreamContext {
             last_playzone_request: 0,
             hand_velocities: [const { Cell::new(Vec3::ZERO) }; 2],
             hand_solid: [const { Cell::new([0.0; HAND_SEGMENTS]) }; 2],
+            bridge_solid: [const { Cell::new(0.0) }; 2],
             hand_leak: [const { Cell::new(0.0) }; 2],
             last_leak_log: Cell::new(Instant::now()),
             leak_lookup_time: Cell::new((Duration::ZERO, 0)),
@@ -487,6 +490,15 @@ impl StreamContext {
             .map_or([[0.0; HAND_SEGMENTS]; 2], |key| key.verified_hands());
         #[cfg(not(target_os = "android"))]
         let verified = [[0.0; HAND_SEGMENTS]; 2];
+        // Direction of the forearm from each wrist, seen by the camera
+        #[cfg(target_os = "android")]
+        let learned_bridges = self
+            .auto_color_key
+            .as_ref()
+            .filter(|_| params.wrist.is_some())
+            .map_or([BridgeChoice::default(); 2], |key| key.wrist_bridges());
+        #[cfg(not(target_os = "android"))]
+        let learned_bridges = [BridgeChoice::default(); 2];
 
         let uses_leak = params.leak_gain > 0.0 || params.leak_force > 0.0 || params.leak_map > 0.0;
         #[cfg(target_os = "android")]
@@ -524,6 +536,11 @@ impl StreamContext {
         };
         let mut lookup_time = Duration::ZERO;
         let mut leak_log: [LeakLog; 2] = [None; 2];
+        let mut bridges = [None; 2];
+        // The solid fill fades out with the speed
+        let stillness = |speed: f32| {
+            1.0 - ((speed - MIN_FILL_SPEED) / (MAX_FILL_SPEED - MIN_FILL_SPEED)).clamp(0.0, 1.0)
+        };
 
         let hands = [0, 1].map(|i| {
             let tracker = int_ctx.hands_interaction[i].skeleton_tracker.as_ref()?;
@@ -583,11 +600,8 @@ impl StreamContext {
                     .map(|joint| crate::from_xr_vec3(velocities[joint].linear_velocity).length())
                     .into_iter()
                     .fold(0.0, f32::max);
-                let stillness = 1.0
-                    - ((segment_speed - MIN_FILL_SPEED) / (MAX_FILL_SPEED - MIN_FILL_SPEED))
-                        .clamp(0.0, 1.0);
                 let target = if is_tracked {
-                    verified[i][segment] * stillness
+                    verified[i][segment] * stillness(segment_speed)
                 } else {
                     0.0
                 };
@@ -642,13 +656,73 @@ impl StreamContext {
                 zones
             };
 
+            // From the wrist towards the forearm, at the display time. The camera only chose the
+            // direction in the space of the wrist joint.
+            bridges[i] = params.wrist.and_then(|wrist| {
+                let joint = joints[xr::HandJointEXT::WRIST];
+                if !joint.location_flags.contains(
+                    xr::SpaceLocationFlags::POSITION_VALID
+                        | xr::SpaceLocationFlags::ORIENTATION_VALID,
+                ) {
+                    self.bridge_solid[i].set(0.0);
+                    return None;
+                }
+                let position = crate::from_xr_vec3(joint.pose.position);
+                let learned = learned_bridges[i];
+                let direction = match learned.direction {
+                    Some(local) => crate::from_xr_quat(joint.pose.orientation) * local,
+                    // Opposite to the fingers
+                    None => (position
+                        - crate::from_xr_vec3(
+                            joints[xr::HandJointEXT::MIDDLE_METACARPAL].pose.position,
+                        ))
+                    .normalize_or_zero(),
+                };
+
+                // Never solid below the confidence limit, else like the verified segments
+                let speed =
+                    crate::from_xr_vec3(velocities[xr::HandJointEXT::WRIST].linear_velocity)
+                        .length();
+                let target = if joint
+                    .location_flags
+                    .contains(xr::SpaceLocationFlags::POSITION_TRACKED)
+                {
+                    WristBridge::solid_target(
+                        learned.confidence,
+                        wrist.min_confidence,
+                        stillness(speed),
+                    )
+                } else {
+                    0.0
+                };
+                let solid = self.bridge_solid[i].get();
+                let solid = if target > 0.0 {
+                    solid + (target - solid) * if target < solid { 0.35 } else { 0.1 }
+                } else {
+                    0.0
+                };
+                self.bridge_solid[i].set(solid);
+
+                WristBridge::new(
+                    position,
+                    direction,
+                    wrist.length_m,
+                    joint.radius * wrist.radius_scale,
+                    solid,
+                )
+            });
+
             Some((shape, zones))
         });
 
         self.tracked_hands.set(hands.map(|hand| hand.is_some()));
 
         // To measure the cost of the hands on the GPU. The playzone still knows about them.
-        let mut hands = if params.hands { hands } else { [None; 2] };
+        let (mut hands, mut bridges) = if params.hands {
+            (hands, bridges)
+        } else {
+            ([None; 2], [None; 2])
+        };
         let mut leak = if params.leak_view != 0 {
             self.hand_leak.each_ref().map(Cell::get)
         } else {
@@ -671,13 +745,18 @@ impl StreamContext {
                 Some((shape, zones))
             });
             leak[1] = 0.0;
+            bridges[1] = None;
         }
 
         if params.leak_map > 0.0 {
             self.log_leak_map(leak_log, lookup_time);
         }
 
-        Some(ColorKeyInput { hands, leak })
+        Some(ColorKeyInput {
+            hands,
+            leak,
+            bridges,
+        })
     }
 
     // Every 2 s, to tune `debug.alvr.key_leak_map_lo` / `key_leak_map_hi`

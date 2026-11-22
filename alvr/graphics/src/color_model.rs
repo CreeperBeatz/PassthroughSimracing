@@ -265,7 +265,7 @@ impl ColorModel {
         let Some(alpha) = &self.alpha else {
             return [0.0; HAND_SEGMENTS];
         };
-        let reliability = 1.0 - smoothstep(0.35, 0.65, background_kept);
+        let reliability = verification_reliability(background_kept);
 
         hand.shape.segments.map(|[start, end]| {
             let axis = (end - start).truncate();
@@ -304,6 +304,60 @@ impl ColorModel {
         })
     }
 
+    /// Score of each candidate direction of the wrist bridge (see `WristAxes`): the share of the points
+    /// along it, from a few cm behind the wrist to `length`, whose color the key keeps. The hand pose
+    /// must be from the time of the image, like for `verify_hand`. None: no LUT yet, or too few of its
+    /// points are in the image and not hidden by the hand.
+    #[expect(clippy::too_many_arguments)]
+    pub fn bridge_scores(
+        &self,
+        camera: &CameraView,
+        width: u32,
+        height: u32,
+        hand: &SampledHand,
+        wrist_orientation: Quat,
+        axes: &WristAxes,
+        length: f32,
+        color: impl Fn(u32, u32) -> [u8; 3],
+    ) -> [Option<f32>; BRIDGE_CANDIDATES] {
+        let Some(alpha) = &self.alpha else {
+            return [None; BRIDGE_CANDIDATES];
+        };
+        let distances = bridge_sample_distances(length);
+
+        std::array::from_fn(|index| {
+            let direction = wrist_orientation * axes.candidate(index);
+            let mut point_count = 0;
+            let mut skin_count = 0;
+            for distance in &distances {
+                let point = hand.wrist + direction * *distance;
+                let Some((pixel, _)) = camera.project(point) else {
+                    continue;
+                };
+                if pixel.x < 0.0
+                    || pixel.y < 0.0
+                    || pixel.x >= width as f32
+                    || pixel.y >= height as f32
+                {
+                    continue;
+                }
+                // Behind the hand (or in front of it): the pixel shows the hand
+                let ray = (point - camera.position).normalize_or_zero();
+                if hand.shape.ray_distance(camera.position, ray) < 0.0 {
+                    continue;
+                }
+                point_count += 1;
+                if alpha[texel_index(color(pixel.x as u32, pixel.y as u32))] > 0.5 {
+                    skin_count += 1;
+                }
+            }
+
+            // At least half of the points
+            (point_count >= 3 && 2 * point_count >= distances.len())
+                .then(|| skin_count as f32 / point_count as f32)
+        })
+    }
+
     /// Fraction of the colors that are kept by the current LUT, for diagnostics
     pub fn kept_fraction(&self, colors: &[[u8; 3]]) -> f32 {
         let Some(alpha) = &self.alpha else {
@@ -324,6 +378,12 @@ impl ColorModel {
 
         (self.alpha.is_some() && colors.len() >= MIN_COLORS).then(|| self.kept_fraction(colors))
     }
+}
+
+/// How much the camera can tell about the hand (0..1): nothing if most of the colors around it look like
+/// it (`background_kept`, 0..1)
+pub fn verification_reliability(background_kept: f32) -> f32 {
+    1.0 - smoothstep(0.35, 0.65, background_kept)
 }
 
 fn smoothstep(min: f32, max: f32, value: f32) -> f32 {
@@ -369,6 +429,181 @@ pub struct SampledHand {
     pub arm_direction: Vec3,
     /// The fingers are only tracked well enough if the hand doesn't move
     pub is_still: bool,
+}
+
+// Candidate directions of the wrist bridge, about the default: bent towards the palm (positive) or the
+// back of the hand, and towards the thumb (positive) or the little finger, in degrees
+pub const BRIDGE_FLEXIONS: [f32; 7] = [-60.0, -40.0, -20.0, 0.0, 20.0, 40.0, 60.0];
+pub const BRIDGE_DEVIATIONS: [f32; 3] = [-25.0, 0.0, 25.0];
+pub const BRIDGE_CANDIDATES: usize = BRIDGE_FLEXIONS.len() * BRIDGE_DEVIATIONS.len();
+// Points along the bridge: from here (or half of it if it is shorter), about this far apart
+const BRIDGE_SAMPLE_START: f32 = 0.03;
+const BRIDGE_SAMPLE_SPACING: f32 = 0.01;
+const BRIDGE_MIN_SAMPLES: usize = 4;
+const BRIDGE_MAX_SAMPLES: usize = 24;
+
+/// Flexion and deviation of a candidate, in degrees
+pub fn bridge_candidate_angles(index: usize) -> (f32, f32) {
+    (
+        BRIDGE_FLEXIONS[index / BRIDGE_DEVIATIONS.len()],
+        BRIDGE_DEVIATIONS[index % BRIDGE_DEVIATIONS.len()],
+    )
+}
+
+/// Distances from the wrist of the points that are checked along a bridge of this length: about 1 cm
+/// apart, 6 for 80 mm, more for longer bridges
+pub fn bridge_sample_distances(length: f32) -> Vec<f32> {
+    let start = BRIDGE_SAMPLE_START.min(0.5 * length);
+    let count = (((length - start) / BRIDGE_SAMPLE_SPACING).round().max(0.0) as usize + 1)
+        .clamp(BRIDGE_MIN_SAMPLES, BRIDGE_MAX_SAMPLES);
+
+    (0..count)
+        .map(|i| start + (length - start) * i as f32 / (count - 1) as f32)
+        .collect()
+}
+
+/// Axes of the hand in the local space of the wrist joint, to bend the default direction of the forearm
+#[derive(Clone, Copy, Debug)]
+pub struct WristAxes {
+    /// From the hand to the arm: opposite to the fingers (wrist minus middle finger metacarpal)
+    pub default: Vec3,
+    /// Out of the palm, across `default`
+    pub palm: Vec3,
+    /// Towards the thumb, across both
+    pub thumb: Vec3,
+}
+
+impl WristAxes {
+    /// Unit vectors from rough directions. None if they are (almost) parallel
+    pub fn new(default: Vec3, palm: Vec3, thumb: Vec3) -> Option<Self> {
+        let default = default.try_normalize()?;
+        let palm = (palm - default * palm.dot(default)).try_normalize()?;
+        let side = default.cross(palm);
+        let thumb = if side.dot(thumb) < 0.0 { -side } else { side };
+
+        Some(Self {
+            default,
+            palm,
+            thumb,
+        })
+    }
+
+    /// Unit vector, bent by `flexion` towards the palm and by `deviation` towards the thumb (degrees)
+    pub fn direction(&self, flexion: f32, deviation: f32) -> Vec3 {
+        let (flexion, deviation) = (flexion.to_radians(), deviation.to_radians());
+        let bent = self.default * flexion.cos() + self.palm * flexion.sin();
+
+        bent * deviation.cos() + self.thumb * deviation.sin()
+    }
+
+    pub fn candidate(&self, index: usize) -> Vec3 {
+        let (flexion, deviation) = bridge_candidate_angles(index);
+        self.direction(flexion, deviation)
+    }
+
+    /// Flexion and deviation of a direction, in degrees
+    pub fn angles(&self, direction: Vec3) -> (f32, f32) {
+        let direction = direction.normalize_or(self.default);
+        (
+            direction
+                .dot(self.palm)
+                .atan2(direction.dot(self.default))
+                .to_degrees(),
+            direction
+                .dot(self.thumb)
+                .clamp(-1.0, 1.0)
+                .asin()
+                .to_degrees(),
+        )
+    }
+}
+
+/// The best candidate, if there is one. The current one is kept unless another one is better by
+/// `BridgeChoice::HYSTERESIS`. Of equal scores the one in the middle of equal ones wins (the bridge is
+/// thin, so near the forearm several candidates see only skin), then the least bent one.
+pub fn choose_bridge(
+    scores: &[Option<f32>; BRIDGE_CANDIDATES],
+    current: Option<usize>,
+) -> Option<usize> {
+    let columns = BRIDGE_DEVIATIONS.len();
+    let rank = |index: usize| {
+        let (row, column) = (index / columns, index % columns);
+        let score = |row: Option<usize>, column: Option<usize>| {
+            let index = row? * columns + column?;
+            (column? < columns && index < BRIDGE_CANDIDATES)
+                .then(|| scores[index])
+                .flatten()
+        };
+        let neighbours = [
+            score(row.checked_sub(1), Some(column)),
+            score(Some(row + 1), Some(column)),
+            score(Some(row), column.checked_sub(1)),
+            score(Some(row), Some(column + 1)),
+        ]
+        .into_iter()
+        .flatten()
+        .sum::<f32>();
+        let (flexion, deviation) = bridge_candidate_angles(index);
+
+        (neighbours, -(flexion.abs() + deviation.abs()))
+    };
+    let best = (0..BRIDGE_CANDIDATES)
+        .filter_map(|index| Some((index, scores[index]?)))
+        .reduce(|best, candidate| {
+            let is_better =
+                candidate.1 > best.1 || (candidate.1 == best.1 && rank(candidate.0) > rank(best.0));
+            if is_better { candidate } else { best }
+        })?;
+
+    match current.and_then(|index| Some((index, scores[index]?))) {
+        Some((index, score)) if best.1 < score + BridgeChoice::HYSTERESIS => Some(index),
+        _ => Some(best.0),
+    }
+}
+
+/// Direction of the wrist bridge chosen by the camera, for one hand
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BridgeChoice {
+    /// The chosen candidate
+    pub index: Option<usize>,
+    /// Smoothed, in the local space of the wrist joint. None: the default direction
+    pub direction: Option<Vec3>,
+    /// How sure the camera is about it (0..1): the score of the chosen candidate, 0 where the
+    /// background looks like the hand
+    pub confidence: f32,
+}
+
+impl BridgeChoice {
+    /// How much better another candidate must be
+    pub const HYSTERESIS: f32 = 0.1;
+    /// Share of the chosen direction that is taken at each update
+    const SMOOTHING: f32 = 0.3;
+
+    /// `scores` of the candidates of `axes`, see `ColorModel::bridge_scores`. `reliability`: see
+    /// `verification_reliability`. Returns false if there was nothing to choose from (no fresh data).
+    pub fn update(
+        &mut self,
+        axes: &WristAxes,
+        scores: &[Option<f32>; BRIDGE_CANDIDATES],
+        reliability: f32,
+    ) -> bool {
+        let Some(index) = choose_bridge(scores, self.index) else {
+            return false;
+        };
+        let target = axes.candidate(index);
+        let current = self.direction.unwrap_or(axes.default);
+        self.index = Some(index);
+        self.direction = Some(current.lerp(target, Self::SMOOTHING).normalize_or(target));
+        self.confidence = scores[index].unwrap_or(0.0) * reliability.clamp(0.0, 1.0);
+
+        true
+    }
+
+    /// Flexion and deviation of the smoothed direction (degrees), for the log
+    pub fn angles(&self, axes: &WristAxes) -> (f32, f32) {
+        self.direction
+            .map_or((0.0, 0.0), |direction| axes.angles(direction))
+    }
 }
 
 #[derive(Default)]
@@ -890,6 +1125,219 @@ mod tests {
             ..camera
         };
         assert_eq!(model.verify_hand(&far, 320, 240, &hand, 0.0, color)[0], 0.0);
+    }
+
+    // A hand 0.5 m in front of the camera, the fingers to the left. In the wrist space (turned in some
+    // way) the default direction of the forearm is to the right, the palm and the thumb face these
+    // directions (camera space, +y is down in the image).
+    fn bridge_scene(palm: Vec3, thumb: Vec3) -> (CameraView, SampledHand, Quat, WristAxes) {
+        let camera = CameraView {
+            position: Vec3::ZERO,
+            orientation: Quat::IDENTITY,
+            focal_length: Vec2::splat(217.0),
+            center: Vec2::new(160.0, 120.0),
+        };
+        let wrist = Vec3::new(0.0, 0.0, 0.5);
+        let segment = [wrist.extend(0.02), Vec3::new(-0.08, 0.0, 0.5).extend(0.02)];
+        let hand = SampledHand {
+            shape: HandShape {
+                segments: [segment; HAND_SEGMENTS],
+            },
+            wrist,
+            arm_direction: Vec3::X,
+            is_still: true,
+        };
+        let orientation = Quat::from_euler(alvr_common::glam::EulerRot::YXZ, 0.7, -0.4, 1.1);
+        let to_local = orientation.inverse();
+        let axes = WristAxes::new(to_local * Vec3::X, to_local * palm, to_local * thumb).unwrap();
+
+        (camera, hand, orientation, axes)
+    }
+
+    // Skin where the ray passes the hand or a forearm in `direction` (world space, 2.5 cm radius)
+    fn forearm_image(
+        camera: CameraView,
+        hand: SampledHand,
+        direction: Option<Vec3>,
+    ) -> impl Fn(u32, u32) -> [u8; 3] {
+        move |x, y| {
+            let ray = camera.ray(Vec2::new(x as f32 + 0.5, y as f32 + 0.5));
+            let on_arm = direction.is_some_and(|direction| {
+                let end = hand.wrist + direction * 0.3;
+                ray_capsule_distance(
+                    camera.position,
+                    ray,
+                    hand.wrist.extend(0.025),
+                    end.extend(0.025),
+                ) < 0.0
+            });
+            if on_arm || hand.shape.ray_distance(camera.position, ray) < 0.0 {
+                SKIN
+            } else {
+                WHITE_WALL
+            }
+        }
+    }
+
+    #[test]
+    fn bridge_candidates_bend_the_default() {
+        let (_, _, orientation, axes) = bridge_scene(Vec3::Y, Vec3::NEG_Z);
+        assert_eq!(BRIDGE_CANDIDATES, 21);
+        let candidates = (0..BRIDGE_CANDIDATES)
+            .map(|index| orientation * axes.candidate(index))
+            .collect::<Vec<_>>();
+        // The default, 40 degrees towards the palm (down in the image), 25 towards the thumb
+        assert!((candidates[10] - Vec3::X).length() < 1e-5);
+        let (sin, cos) = 40_f32.to_radians().sin_cos();
+        assert!((candidates[16] - Vec3::new(cos, sin, 0.0)).length() < 1e-5);
+        assert!(candidates[11].z < -0.4);
+        for (index, candidate) in candidates.iter().enumerate() {
+            assert!((candidate.length() - 1.0).abs() < 1e-5);
+            let (flexion, deviation) = axes.angles(orientation.inverse() * *candidate);
+            assert_eq!(
+                (flexion.round(), deviation.round()),
+                bridge_candidate_angles(index)
+            );
+        }
+
+        // About 1 cm apart from 3 cm on, 6 points for 80 mm
+        let distances = bridge_sample_distances(0.08);
+        assert_eq!(distances.len(), 6);
+        assert!((distances[0] - 0.03).abs() < 1e-6 && (distances[5] - 0.08).abs() < 1e-6);
+        assert_eq!(bridge_sample_distances(0.25).len(), 23);
+        assert_eq!(bridge_sample_distances(0.02).len(), 4);
+    }
+
+    #[test]
+    fn bridge_follows_a_bent_forearm() {
+        let mut model = ColorModel::default();
+        model.add_samples(&samples(SKIN, WHITE_WALL), 0.1);
+        model.update_lut();
+
+        // The palm faces down, then the camera. A bend towards the camera can't be seen (any of them
+        // covers the forearm in the image), the other one must be found
+        let down = (Vec3::Y, Vec3::NEG_Z);
+        let front = (Vec3::NEG_Z, Vec3::Y);
+        let cases = [
+            (down, (40.0, 0.0)),
+            (down, (-60.0, 0.0)),
+            (down, (0.0, 0.0)),
+            (down, (-20.0, 25.0)),
+            (front, (0.0, 25.0)),
+            (front, (20.0, -25.0)),
+        ];
+        for ((palm, thumb), (flexion, deviation)) in cases {
+            let (camera, hand, orientation, axes) = bridge_scene(palm, thumb);
+            for length in [0.08, 0.25] {
+                let direction = orientation * axes.direction(flexion, deviation);
+                let image = forearm_image(camera, hand, Some(direction));
+                let scores = model.bridge_scores(
+                    &camera,
+                    320,
+                    240,
+                    &hand,
+                    orientation,
+                    &axes,
+                    length,
+                    &image,
+                );
+                let mut choice = BridgeChoice::default();
+                for _ in 0..15 {
+                    assert!(choice.update(&axes, &scores, 1.0));
+                }
+
+                // Within one step of the real bend
+                let (chosen_flexion, chosen_deviation) =
+                    bridge_candidate_angles(choice.index.unwrap());
+                let (smooth_flexion, smooth_deviation) = choice.angles(&axes);
+                let label = format!(
+                    "{flexion} {deviation} {length}: chose {chosen_flexion} {chosen_deviation}, \
+                     smoothed {smooth_flexion} {smooth_deviation}, {scores:.2?}"
+                );
+                if palm == down.0 {
+                    assert!((chosen_flexion - flexion).abs() <= 20.0, "{label}");
+                    assert!((smooth_flexion - flexion).abs() <= 21.0, "{label}");
+                } else {
+                    assert!((chosen_deviation - deviation).abs() <= 25.0, "{label}");
+                    assert!((smooth_deviation - deviation).abs() <= 26.0, "{label}");
+                }
+                assert!(choice.confidence > 0.9, "{label}: {}", choice.confidence);
+
+                // The background looks like the hand: no confidence
+                let mut unsure = choice;
+                unsure.update(&axes, &scores, verification_reliability(0.8));
+                assert_eq!(unsure.confidence, 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn bridge_without_a_visible_forearm_is_unsure() {
+        let (camera, hand, orientation, axes) = bridge_scene(Vec3::Y, Vec3::NEG_Z);
+        let mut model = ColorModel::default();
+        let image = forearm_image(camera, hand, None);
+        let scores = |model: &ColorModel, camera: &CameraView| {
+            model.bridge_scores(camera, 320, 240, &hand, orientation, &axes, 0.08, &image)
+        };
+
+        // Nothing learned yet
+        assert_eq!(scores(&model, &camera), [None; BRIDGE_CANDIDATES]);
+        assert!(!BridgeChoice::default().update(&axes, &scores(&model, &camera), 1.0));
+
+        model.add_samples(&samples(SKIN, WHITE_WALL), 0.1);
+        model.update_lut();
+        let mut choice = BridgeChoice::default();
+        assert!(choice.update(&axes, &scores(&model, &camera), 1.0));
+        assert!(choice.confidence < 0.2, "{}", choice.confidence);
+        // With equal scores the default
+        assert_eq!(choice.index.map(bridge_candidate_angles), Some((0.0, 0.0)));
+
+        // Out of the image
+        let far = CameraView {
+            center: Vec2::new(1000.0, 120.0),
+            ..camera
+        };
+        assert_eq!(scores(&model, &far), [None; BRIDGE_CANDIDATES]);
+    }
+
+    #[test]
+    fn bridge_choice_has_hysteresis() {
+        let (_, _, _, axes) = bridge_scene(Vec3::Y, Vec3::NEG_Z);
+        let mut scores = [Some(0.2); BRIDGE_CANDIDATES];
+        scores[10] = Some(0.8);
+        let mut choice = BridgeChoice::default();
+        choice.update(&axes, &scores, 1.0);
+        assert_eq!(choice.index, Some(10));
+
+        // Slightly better elsewhere: kept
+        scores[16] = Some(0.85);
+        choice.update(&axes, &scores, 1.0);
+        assert_eq!(choice.index, Some(10));
+        assert_eq!(choice.confidence, 0.8);
+        assert_eq!(choose_bridge(&scores, None), Some(16));
+
+        // Better by more than the hysteresis: changed
+        scores[16] = Some(0.95);
+        choice.update(&axes, &scores, 1.0);
+        assert_eq!(choice.index, Some(16));
+        assert_eq!(choice.confidence, 0.95);
+
+        // The current one can't be seen: the best one
+        scores[16] = None;
+        assert_eq!(choose_bridge(&scores, Some(16)), Some(10));
+
+        // The direction moves there step by step
+        let target = axes.candidate(16);
+        let mut choice = BridgeChoice::default();
+        scores[16] = Some(1.0);
+        choice.update(&axes, &scores, 1.0);
+        let first = choice.direction.unwrap();
+        assert!(first.angle_between(axes.default) > 0.05);
+        assert!(first.angle_between(target) > 0.3);
+        for _ in 0..20 {
+            choice.update(&axes, &scores, 1.0);
+        }
+        assert!(choice.direction.unwrap().angle_between(target) < 0.01);
     }
 
     #[test]

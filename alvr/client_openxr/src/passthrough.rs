@@ -129,6 +129,11 @@ impl PassthroughLayer<'_> {
 ///   a value other than 0 also learns the map
 /// - `setprop debug.alvr.key_leak_probe <cm>`: distance of the spheres of `key_leak_view 2`
 /// - `setprop debug.alvr.key_lut_dump <n>`: another value writes the learned LUT to the files folder of the app
+/// - `setprop debug.alvr.key_wrist_len <mm>`: length of the key zone from the wrist towards the forearm, its
+///   direction is chosen with the camera (`auto_key`), 0: off
+/// - `setprop debug.alvr.key_wrist_scale <percent>`: its radius, of the radius of the wrist joint
+/// - `setprop debug.alvr.key_wrist_conf <percent>`: how sure the camera must be of its direction for the
+///   solid fill
 pub struct ColorKey {
     version: u32,
     lut: Vec<u8>,
@@ -169,6 +174,35 @@ pub struct ColorKeyParams {
     pub leak_map_lo: f32,
     pub leak_map_hi: f32,
     pub leak_probe_m: f32,
+    /// Key zone from the wrist towards the forearm. None: off
+    pub wrist: Option<WristParams>,
+}
+
+/// Key zone from the wrist towards the forearm, its direction chosen by the camera
+/// (`debug.alvr.key_wrist_*`)
+#[derive(Clone, Copy)]
+pub struct WristParams {
+    pub length_m: f32,
+    /// Of the radius of the wrist joint
+    pub radius_scale: f32,
+    /// Solid only if the camera is at least this sure of the direction (0..1)
+    pub min_confidence: f32,
+}
+
+impl WristParams {
+    /// None if it is off
+    pub fn load() -> Option<Self> {
+        let length_m = millimeters("debug.alvr.key_wrist_len", 80);
+
+        (length_m > 0.0).then(|| Self {
+            length_m,
+            radius_scale: debug_property("debug.alvr.key_wrist_scale")
+                .unwrap_or(100)
+                .clamp(0, 300) as f32
+                / 100.0,
+            min_confidence: percent("debug.alvr.key_wrist_conf", 60),
+        })
+    }
 }
 
 fn millimeters(property: &str, default: i64) -> f32 {
@@ -233,6 +267,7 @@ impl ColorKeyParams {
                 .unwrap_or(60)
                 .clamp(10, 500) as f32
                 / 100.0,
+            wrist: WristParams::load(),
         }
     }
 

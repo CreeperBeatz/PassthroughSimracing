@@ -17,7 +17,7 @@ Words used here:
 | Hands | Live color key on the passthrough, in a small zone around the tracked hand, with automatically learned colors | Over simple backgrounds "basically solved" (observed) |
 | Holes in a still hand | Solid fill of the hand segments that the camera confirms | Better, some noise left |
 | Hands over complex backgrounds | Same, stricter colors, small zone | Leaks much lower, not gone |
-| Forearms | Depth map only, shifted by the motion of the wrist (`arm_shift`) | Coarse edge, lags or jitters. The body tracking forearm was removed: not accurate enough |
+| Forearms | Depth map only, shifted by the motion of the wrist (`arm_shift`), plus a keyed bridge from the wrist whose direction the camera chooses | Coarse edge, lags or jitters. The body tracking forearm was removed: not accurate enough. Bridge not tested |
 | Held objects (wheel, shifter) | Remember the depth map without hands | Not tested on the headset |
 | GPU budget | - | **Main open problem**: 58-73 fps with the last tested build |
 
@@ -27,7 +27,8 @@ Words used here:
    it belongs to the region (distance or box). Computed at low resolution, upscaled. The arms come only
    from here: around each arm the depth is shifted by the motion of the wrist since the depth image was
    captured (`arm_shift`).
-2. **Hand zones.** Capsules from the hand tracking joints, no forearm. They say *where to look*.
+2. **Hand zones.** Capsules from the hand tracking joints, no forearm, plus a short bridge from the wrist
+   (see below). They say *where to look*.
 3. **Color key.** The compositor applies a RGBA color table (LUT) to a second passthrough layer. It works
    on the image that is displayed, so its edge can't lag.
 4. **Layers**, from the bottom: passthrough, game with holes (mask, solid fill), keyed passthrough, game
@@ -76,6 +77,32 @@ moving hand: per capsule 2 dot products, 1 division and about 12 other operation
 test for solid capsules; no texture samples. The zone, the scissor rect and the layer crop are larger
 along the motion. GPU time not measured. The `key:` line of `ALVR_CAM` logs `rim` and `sweep`
 (ahead / behind, mm) of each hand.
+
+**Bridge from the wrist to the forearm** (`key_wrist_len`, **not tested**). Between the hand zone (it ends
+at the wrist joint) and the forearm of the depth mask a wedge showed the game (observed): the runtime
+removes the hand and a bit of the wrist from the depth map. Now each hand has one more capsule from the
+wrist joint, `key_wrist_len` long, radius: the wrist joint radius x `key_wrist_scale`. The camera chooses
+its direction: at each update the learning thread tries 21 directions in the space of the wrist joint
+(the default, opposite to the middle metacarpal, bent -60..60 degrees towards the palm in 20 degree steps,
+times -25 / 0 / 25 degrees towards the thumb). Each gets the share of points along it (1 cm apart from 3
+cm to the length: 6 for 80 mm, at most 24) whose camera color the key keeps; points hidden by the hand
+don't count. A new direction must be better by 0.1 (equal scores: the middle of the equal ones, then the
+least bent), the direction moves 30% towards it per update. Confidence: its score, 0 where the background
+around the hand looks like skin (like the verification). Without fresh data for 1 s: the default
+direction, confidence 0. The render thread turns the direction with the wrist at display time, so the
+bridge doesn't lag behind the hand. It is keyed like the hand (rim, sweep, leak narrowing) and solid only
+with confidence >= `key_wrist_conf`, faded with the speed like the verified segments. With that confidence
+the background ring and the forearm exclusions of the leak map also use it instead of the default. A bend
+towards or away from the camera can't be seen; any of those candidates covers the forearm in the image
+(unit test). Risk: a confident wrong direction over skin-colored wood keeps that wood out of the
+background. The depth mask is unchanged: the playzone around the hands stays the bounding sphere (the
+runtime removes the hand, not the forearm), and the arm shift still starts 3 cm behind the wrist; both are
+combined with the bridge by max. So a long bridge adds keyed skin ahead of a moving forearm, but the late
+depth behind it still shows the room. Per pixel of the focus pass, per hand: a check of the radius, a
+bounding test of the bridge (about 15 operations, 2 square roots), near it one capsule test like one of
+the 28 (two for a moving bridge with solid fill); no texture samples. `key_wrist_len 0`: the output is the
+same as before (GPU test). The `auto key` line of `ALVR_CAM` logs `wrist` flexion / deviation (degrees)
+and the confidence of each hand.
 
 ## What works
 
@@ -218,6 +245,8 @@ Measured in the SteamVR home, 72 Hz, with color key on unless noted:
 | `key_leak_dump` | 0 | New value: log the leak map of the camera view, 40x30 (`#` leaks, `.` doesn't, `?` unknown, `H` hand). Not 0: the map is learned |
 | `key_leak_probe` | 60 cm | Distance of the spheres of `key_leak_view 2` from the anchor of the map |
 | `key_lut_dump` | 0 | New value: write the learned LUT to `/sdcard/Android/data/alvr.client.dev/files/alvr_learned_key_<time>.lut` |
+| `key_wrist_len` | 80 mm | Keyed bridge from the wrist towards the forearm, 0: off (as before), up to 300. The direction and the solid fill need `auto_key`, without it: opposite to the fingers, never solid. Not tested |
+| `key_wrist_scale` / `key_wrist_conf` | 100 / 60 % | Its radius (of the wrist joint radius), how sure the camera must be of its direction for the solid fill |
 
 The LUT file must exist even with `auto_key`: 32x32x32 RGBA bytes, indexed `[b][g][r]`. It is used until
 enough colors are learned.
@@ -239,7 +268,9 @@ enough colors are learned.
 1. GPU budget (see above). The four layers are most likely a big part of it.
 2. Still hand with spread fingers: background is visible between them.
 3. Complex and skin-colored backgrounds.
-4. Forearms: depth only, coarse and late (shifted: jitters, plain: lags). Sleeves and watches.
+4. Forearms: depth only, coarse and late (shifted: jitters, plain: lags). Sleeves and watches. The wrist
+   bridge (not tested) should close the gap at the wrist; whether a long one (up to 250 mm) can replace
+   the edge of the depth is open, the late depth behind a moving forearm still shows the room.
 5. Playzone map: verify with a wheel or a shifter. Turned spokes and levers are filled where they were.
 6. Cockpit volume instead of a distance, with calibration. Lighting match was never tested on the headset.
 7. A real drive with a wheel. Hands on a wheel were only approximated with a bottle and a monitor.

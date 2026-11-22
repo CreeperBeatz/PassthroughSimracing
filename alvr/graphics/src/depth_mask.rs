@@ -310,12 +310,54 @@ impl HandZones {
     }
 }
 
+/// One more capsule of a hand, from the wrist joint towards the forearm (`debug.alvr.key_wrist_*`).
+/// The hand capsules end at the wrist joint and the runtime removes the hand and a bit of the wrist from
+/// the depth map, so without it there is a gap. Its direction is chosen with the camera.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WristBridge {
+    /// The wrist joint
+    pub start: Vec3,
+    pub end: Vec3,
+    pub radius: f32,
+    /// How solid its core is (0..1)
+    pub solid: f32,
+}
+
+impl WristBridge {
+    /// `direction`: unit vector from the wrist to the forearm. None if the length or the radius is 0 (off)
+    pub fn new(wrist: Vec3, direction: Vec3, length: f32, radius: f32, solid: f32) -> Option<Self> {
+        (length > 0.0 && radius > 0.0).then(|| Self {
+            start: wrist,
+            end: wrist + direction * length,
+            radius,
+            solid: solid.clamp(0.0, 1.0),
+        })
+    }
+
+    /// Solid only if the camera is sure enough of the direction (`confidence` at least `limit`), then
+    /// faded with the speed like the verified segments (`stillness`, 0..1)
+    pub fn solid_target(confidence: f32, limit: f32, stillness: f32) -> f32 {
+        if confidence >= limit && confidence > 0.0 {
+            stillness.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// Start and end, xyz: position, w: radius
+    pub fn capsule(&self) -> [Vec4; 2] {
+        [self.start.extend(self.radius), self.end.extend(self.radius)]
+    }
+}
+
 /// The hands are passthrough, the color key decides where the hand tracking is not certain
 #[derive(Clone, Copy)]
 pub struct ColorKeyInput {
     pub hands: [Option<(HandShape, HandZones)>; 2],
     /// Debug view: how much the rim of each hand is narrowed (0..1), shown in red with the tint
     pub leak: [f32; 2],
+    /// Of each hand, only used with the hand. None: off
+    pub bridges: [Option<WristBridge>; 2],
 }
 
 /// Motion of an arm since the depth image was captured
@@ -350,7 +392,7 @@ const EYE_FLOAT_COUNT: usize = 16 + 4 + 16 + 16 + 4;
 pub const DEPTH_UNIFORMS_FLOAT_COUNT: usize = 2 * EYE_FLOAT_COUNT
     + 16
     + 4 * 5
-    + 4 * (2 + 2 * HAND_SEGMENTS / 4 + 2 + 2 * 2 * HAND_SEGMENTS + 6 + 2 * 9 + 1 + 2 + 2);
+    + 4 * (2 + 2 * HAND_SEGMENTS / 4 + 2 + 2 * 2 * HAND_SEGMENTS + 6 + 2 * 9 + 1 + 2 + 2 + 2 * 2);
 pub const DEPTH_UNIFORMS_SIZE: usize = DEPTH_UNIFORMS_FLOAT_COUNT * size_of::<f32>();
 
 fn pose_to_mat4(pose: Pose) -> Mat4 {
@@ -536,6 +578,20 @@ pub fn depth_uniforms(
             zones.sweep.direction.extend(zones.sweep.forward).to_array()
         }));
     }
+    // Radius 0: no bridge
+    let bridges = input.color_key.map_or([None; 2], |key| key.bridges);
+    for (hand, bridge) in hands.iter().zip(bridges) {
+        let [start, end] = bridge
+            .filter(|_| hand.is_some())
+            .map_or([Vec4::ZERO; 2], |bridge| {
+                [
+                    bridge.start.extend(bridge.radius),
+                    bridge.end.extend(bridge.solid),
+                ]
+            });
+        data.extend(start.to_array());
+        data.extend(end.to_array());
+    }
 
     data.try_into().unwrap()
 }
@@ -569,16 +625,20 @@ pub fn hands_view_rect(
     color_key
         .hands
         .iter()
-        .flatten()
-        .flat_map(|(shape, zones)| {
+        .zip(color_key.bridges)
+        .filter_map(|(hand, bridge)| Some((hand.as_ref()?, bridge)))
+        .flat_map(|((shape, zones), bridge)| {
             let rim = zones.rim.max(0.0) + MARGIN;
             // Both ends of the sweep: the moved capsules lie in between
             let shifts = [0.0, zones.sweep.forward, -zones.sweep.backward]
                 .map(|shift| zones.sweep.direction * shift);
+            // The bridge is one more capsule of the hand
+            let bridge = bridge.map(|bridge| bridge.capsule());
             shape
                 .segments
-                .as_flattened()
                 .iter()
+                .chain(&bridge)
+                .flatten()
                 .flat_map(move |point| {
                     shifts.map(|shift| (point.truncate() + shift, point.w + rim))
                 })
@@ -848,9 +908,11 @@ mod tests {
             DEPTH_UNIFORMS_SIZE,
             592 + 16
                 * (2 + 2 * HAND_SEGMENTS / 4 + 2 + 2 * 2 * HAND_SEGMENTS + 6 + 2 * 9 + 1 + 2 + 2)
+                // The bridges
+                + 16 * 4
         );
-        // 28 capsules per hand, no forearm
-        assert_eq!(DEPTH_UNIFORMS_SIZE, 3136);
+        // 28 capsules per hand, and the bridges from the wrists
+        assert_eq!(DEPTH_UNIFORMS_SIZE, 3200);
     }
 
     #[test]
