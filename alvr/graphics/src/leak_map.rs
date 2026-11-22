@@ -7,7 +7,7 @@
 //! Layout: octahedral map of the directions, 96 x 96 cells of about 2.1 degrees, the lower hemisphere
 //! (desk, lap, hands) in the inner diamond without seams.
 
-use crate::COLOR_LUT_RESOLUTION;
+use crate::{COLOR_LUT_RESOLUTION, HAND_SEGMENTS, HandShape};
 use alvr_common::glam::{Vec2, Vec3, Vec4};
 use std::collections::VecDeque;
 
@@ -161,7 +161,8 @@ fn neighbor(x: usize, y: usize, dx: isize, dy: isize) -> usize {
     (y.clamp(0, n - 1) * n + x.clamp(0, n - 1)) as usize
 }
 
-fn ray_hits_sphere(origin: Vec3, direction: Vec3, sphere: Vec4) -> bool {
+/// Whether a ray (unit `direction`) from `origin` hits a sphere (xyz: position, w: radius)
+pub fn ray_hits_sphere(origin: Vec3, direction: Vec3, sphere: Vec4) -> bool {
     let to_center = sphere.truncate() - origin;
     let radius_squared = sphere.w * sphere.w;
     let distance_squared = to_center.length_squared();
@@ -549,6 +550,11 @@ impl LeakSnapshot {
     /// of `lookup` over the `eyes` (stage space, meters), then the mean of the 7 highest points. None if
     /// fewer than half of the cells looked at are known. No allocation.
     pub fn hand_leak(&self, eyes: &[Vec3], points: &[Vec3]) -> Option<f32> {
+        self.hand_leak_known(eyes, points).0
+    }
+
+    /// Same as `hand_leak`, plus the share of the cells looked at that are known (0..1), for the log
+    pub fn hand_leak_known(&self, eyes: &[Vec3], points: &[Vec3]) -> (Option<f32>, f32) {
         // Sorted, highest first
         let mut top = [f32::NEG_INFINITY; LEAK_TOP_SEGMENTS];
         let mut known = 0;
@@ -568,15 +574,20 @@ impl LeakSnapshot {
                 }
             }
         }
+        let known_share = if total > 0 {
+            known as f32 / total as f32
+        } else {
+            0.0
+        };
         if total == 0 || known * 2 < total {
-            return None;
+            return (None, known_share);
         }
 
         let (sum, count) = top
             .iter()
             .filter(|value| value.is_finite())
             .fold((0.0, 0), |(sum, count), value| (sum + value, count + 1));
-        (count > 0).then(|| sum / count as f32)
+        ((count > 0).then(|| sum / count as f32), known_share)
     }
 
     /// Unit directions from the anchor of up to `count` clusters of leaking cells, leakiest first, at
@@ -645,6 +656,73 @@ impl LeakSnapshot {
 
         text
     }
+}
+
+/// 0 below `lo`, 1 above `hi`, smooth in between (smoothstep)
+pub fn leak_amount(value: f32, lo: f32, hi: f32) -> f32 {
+    let x = ((value - lo) / (hi - lo).max(0.001)).clamp(0.0, 1.0);
+    x * x * (3.0 - 2.0 * x)
+}
+
+/// How a hand's leak (0..1, how much its rim is narrowed) is found
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LeakGains {
+    /// Fixed amount, without the camera
+    pub force: f32,
+    /// The ring around the hand: gain, and the share kept by the key where it starts / is complete
+    pub ring_gain: f32,
+    pub ring_lo: f32,
+    pub ring_hi: f32,
+    /// The leak map: weight, and the leak of the looked-up cells where it starts / is complete
+    pub map_weight: f32,
+    pub map_lo: f32,
+    pub map_hi: f32,
+}
+
+impl LeakGains {
+    /// Target leak of a hand from the ring value and the map value (None: not known), whichever is
+    /// highest. With `map_weight` 0 the map is ignored.
+    pub fn target(&self, ring: f32, map: Option<f32>) -> f32 {
+        let ring = self.ring_gain * leak_amount(ring, self.ring_lo, self.ring_hi);
+        let map = match map {
+            Some(map) if self.map_weight > 0.0 => {
+                self.map_weight * leak_amount(map, self.map_lo, self.map_hi)
+            }
+            _ => 0.0,
+        };
+
+        f32::max(self.force, ring).max(map)
+    }
+}
+
+/// Pixel offset of the leak map samples in update `index`: every `step`th pixel in x and y, with an
+/// offset that visits every pixel once in `step` x `step` updates
+pub fn leak_sample_offset(index: u32, step: u32) -> (u32, u32) {
+    let step = step.max(1);
+    let k = index % (step * step);
+    let x = k % step;
+
+    (x, (k / step + 3 * x) % step)
+}
+
+/// Debug view of the map: a "hand" of spheres (`radius`, meters) at `distance` from the anchor in the
+/// `directions` of the leakiest clusters, so the color key shows what is there. Missing spheres repeat
+/// the first one. None without directions.
+pub fn leak_probes(
+    anchor: Vec3,
+    directions: &[Vec3],
+    distance: f32,
+    radius: f32,
+) -> Option<HandShape> {
+    let first = *directions.first()?;
+    let mut segments = [[Vec4::ZERO; 2]; HAND_SEGMENTS];
+    for (i, segment) in segments.iter_mut().enumerate() {
+        let direction = directions.get(i).copied().unwrap_or(first);
+        let center = anchor + direction.normalize_or_zero() * distance;
+        *segment = [center.extend(radius); 2];
+    }
+
+    Some(HandShape { segments })
 }
 
 #[cfg(test)]
@@ -1168,5 +1246,124 @@ mod tests {
             "leak map: observe {observe:?} (1200 samples, 2 hands), snapshot {snapshot_time:?}, \
              lookups per frame {frame:?} (2 hands x 2 eyes x 28 points), checksum {total}"
         );
+    }
+
+    #[test]
+    fn leak_amount_thresholds() {
+        assert_eq!(leak_amount(0.02, 0.03, 0.15), 0.0);
+        assert_eq!(leak_amount(0.03, 0.03, 0.15), 0.0);
+        assert!((leak_amount(0.09, 0.03, 0.15) - 0.5).abs() < 1e-6);
+        assert_eq!(leak_amount(0.15, 0.03, 0.15), 1.0);
+        assert_eq!(leak_amount(0.5, 0.03, 0.15), 1.0);
+        // Equal thresholds: a step, not a division by zero
+        assert_eq!(leak_amount(0.1, 0.1, 0.1), 0.0);
+        assert_eq!(leak_amount(0.2, 0.1, 0.1), 1.0);
+    }
+
+    #[test]
+    fn map_and_ring_combine_by_maximum() {
+        let ring_only = LeakGains {
+            force: 0.0,
+            ring_gain: 1.0,
+            ring_lo: 0.05,
+            ring_hi: 0.2,
+            map_weight: 0.0,
+            map_lo: 0.03,
+            map_hi: 0.15,
+        };
+        // Without the map weight the map value doesn't matter: the same as the ring alone
+        for ring in [0.0, 0.1, 0.125, 0.3] {
+            let expected = f32::max(0.0, leak_amount(ring, 0.05, 0.2));
+            assert_eq!(ring_only.target(ring, Some(1.0)), expected);
+            assert_eq!(ring_only.target(ring, None), expected);
+        }
+
+        let with_map = LeakGains {
+            map_weight: 0.6,
+            ..ring_only
+        };
+        // The map acts alone when the ring sees nothing
+        assert!((with_map.target(0.0, Some(0.2)) - 0.6).abs() < 1e-6);
+        assert!((with_map.target(0.0, Some(0.09)) - 0.3).abs() < 1e-6);
+        assert_eq!(with_map.target(0.0, Some(0.01)), 0.0);
+        // Unknown map: the ring alone
+        assert_eq!(with_map.target(0.0, None), 0.0);
+        assert_eq!(with_map.target(0.3, None), 1.0);
+        // The higher one wins, and the fixed amount is a floor
+        assert_eq!(with_map.target(0.3, Some(0.2)), 1.0);
+        let forced = LeakGains {
+            force: 0.8,
+            ..with_map
+        };
+        assert_eq!(forced.target(0.0, Some(0.2)), 0.8);
+    }
+
+    #[test]
+    fn sample_offsets_visit_every_pixel() {
+        let mut seen = std::collections::HashSet::new();
+        for index in 0..64 {
+            let (x, y) = leak_sample_offset(index, 8);
+            assert!(x < 8 && y < 8);
+            seen.insert((x, y));
+        }
+        assert_eq!(seen.len(), 64);
+        assert_eq!(leak_sample_offset(64, 8), leak_sample_offset(0, 8));
+        assert_eq!(leak_sample_offset(5, 0), (0, 0));
+    }
+
+    #[test]
+    fn probes_sit_on_the_leaking_patch() {
+        // Wood straight ahead and 40 degrees down, plain everywhere else
+        let wood = rotation(0.0, 40.0) * Vec3::NEG_Z;
+        let color = move |_: Vec3, ray: Vec3| {
+            if ray.angle_between(wood) < 6f32.to_radians() {
+                WOOD
+            } else {
+                PLAIN
+            }
+        };
+        let anchor = Vec3::new(0.1, 1.2, -0.3);
+        let scene = Scene {
+            position: anchor,
+            rotation: rotation(0.0, 30.0),
+            color: &color,
+            exclusions: &[],
+        };
+        let mut map = LeakMap::new();
+        map.set_alpha(&alpha_table(&[WOOD]));
+        run(&mut map, &scene, 0, steps(2.0));
+        let snapshot = map.snapshot().unwrap();
+
+        let directions = snapshot.top_clusters(HAND_SEGMENTS);
+        assert!(!directions.is_empty() && directions.len() < HAND_SEGMENTS);
+        let probes = leak_probes(snapshot.anchor, &directions, 0.6, 0.0125).unwrap();
+        for [start, end] in probes.segments {
+            // Spheres, 60 cm from the anchor, towards the wood
+            assert_eq!(start, end);
+            assert!((start.w - 0.0125).abs() < 1e-6);
+            let offset = start.truncate() - anchor;
+            assert!((offset.length() - 0.6).abs() < 1e-4);
+            assert!(offset.angle_between(wood) < 9f32.to_radians());
+        }
+        // The missing ones repeat the leakiest
+        assert_eq!(probes.segments[HAND_SEGMENTS - 1], probes.segments[0]);
+        assert!(leak_probes(anchor, &[], 0.6, 0.0125).is_none());
+    }
+
+    #[test]
+    fn hand_leak_reports_the_known_share() {
+        let eye = Vec3::ZERO;
+        let points = (0..28)
+            .map(|i| Vec3::new(-0.1 + i as f32 * 0.007, -0.3, 0.35))
+            .collect::<Vec<_>>();
+        let unknown = LeakSnapshot::unknown(eye);
+        assert_eq!(unknown.hand_leak_known(&[eye], &points), (None, 0.0));
+
+        let mut known = LeakSnapshot::unknown(eye);
+        known.cells.fill(LEAK_FULL);
+        let (leak, share) = known.hand_leak_known(&[eye], &points);
+        assert_eq!(leak, Some(1.0));
+        assert_eq!(share, 1.0);
+        assert_eq!(known.hand_leak(&[eye], &points), leak);
     }
 }

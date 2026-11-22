@@ -45,6 +45,20 @@ inside the hand. It narrows within about 0.2 s and widens slowly. With `key_leak
 verified against its own background instead of both together. At rest the rim is already 0, so only the
 soft edge goes; the gain is for moving hands. Leaks inside the hand capsules stay.
 
+**Leak map** (`key_leak_map`, **not tested**). On the headset the ring above barely reacted (logged
+`leak` 0.00-0.13 over a skin-colored wooden floor that visibly leaked), while a narrow zone everywhere
+(`key_rim_max 0`) was clearly better over clutter, with slight clipping of the hand (observed). So the
+map can narrow the rim alone: L = max(ring L, weight x map L). The learning thread turns 1200 camera
+pixels per update into directions around the head (an octahedral map of about 2 degrees per cell,
+anchored where the head was, `graphics/src/leak_map.rs`). Pixels behind a located hand (bounding sphere
++ 3 cm + 80 ms of its motion) are skipped, and a color is only stored if no hand came near it for 1 s.
+The cells keep colors, so each new LUT re-evaluates the whole map. At render time each hand looks up the
+cells behind its 28 segments from both eyes; the mean of the 7 leakiest gives the map value, which goes
+through `key_leak_map_lo` / `key_leak_map_hi` like the ring. Fewer than half of the cells known: the
+ring alone. The map is forgotten when the head moves more than 5 cm for 1 s, when most colors change
+(light), after `key_leak_memory`, and when the reference space changes. A hand that is in view but not
+tracked is learned as room. Unknown: whether the camera registration is good enough for 2 degree cells.
+
 ## What works
 
 - **Color keying in the compositor.** An RGBA `XR_META_passthrough_color_lut` makes the passthrough
@@ -175,10 +189,29 @@ Measured in the SteamVR home, 72 Hz, with color key on unless noted:
 | `key_leak_lo` / `key_leak_hi` | 5 / 20 % | Share of the colors around the hand that the key keeps: where the narrowing starts / is complete |
 | `key_leak_inset` | 3 mm | Rim at full narrowing, inside the hand. 0: down to the soft edge only |
 | `key_leak_force` | 0 % | Narrow both hands this much, without the camera |
-| `key_leak_view` | 0 | 1: with the "Tint mask" debug view the narrowed rim is red |
+| `key_leak_view` | 0 | 1: with the "Tint mask" debug view the narrowed rim is red. 2: also the right hand is replaced by 28 spheres at the leakiest places of the leak map (learns the map). Not tested |
+| `key_leak_map` | 0 % | Weight of the leak map, 0: off and not learned. Needs `auto_key`. Not tested |
+| `key_leak_map_lo` / `key_leak_map_hi` | 3 / 15 % | Leak of the map cells behind the hand: where the narrowing starts / is complete |
+| `key_leak_memory` | 120 s | How long the leak map remembers a direction |
+| `key_leak_clear` | 0 | New value: forget the leak map |
+| `key_leak_dump` | 0 | New value: log the leak map of the camera view, 40x30 (`#` leaks, `.` doesn't, `?` unknown, `H` hand). Not 0: the map is learned |
+| `key_leak_probe` | 60 cm | Distance of the spheres of `key_leak_view 2` from the anchor of the map |
+| `key_lut_dump` | 0 | New value: write the learned LUT to `/sdcard/Android/data/alvr.client.dev/files/alvr_learned_key_<time>.lut` |
 
 The LUT file must exist even with `auto_key`: 32x32x32 RGBA bytes, indexed `[b][g][r]`. It is used until
 enough colors are learned.
+
+**Testing the leak map on the headset** (`adb logcat -s ALVR_CAM`, `auto_key 1`, debug view "Tint mask"):
+- [ ] `key_leak_map 0`: same look and same App / TW times as before; no `leak map` lines in the log.
+- [ ] Hands in the lap, `key_leak_map 100`, wait 5 s, then `key_leak_dump 1`, `2`, ...: `#` where wood
+      and cardboard are, `.` on plain surfaces, `H` where the hands are. Switch a lamp and dump again.
+- [ ] `key_leak_view 2`, right eye closed: the spheres sit on wood and cardboard. Turn the head 30 degrees
+      and back: they stay on the objects. Lean 10 cm for 2 s: `anchor moves` goes up in the log.
+- [ ] The left hand over a plain surface, then over wood: the `leak map:` line shows `map` above
+      `key_leak_map_hi` and `L` near 1 over wood, below `key_leak_map_lo` over plain. Tune them from there.
+- [ ] Fast arrival onto wood with `key_leak_map` 0 against 100: the rim is narrow from the start with 100.
+- [ ] The `leak map ... ms` part of the `auto key` line and the `lookup ... us` of the render thread.
+- [ ] `key_lut_dump 1`, then `adb pull` the file for offline tests.
 
 ## Open problems, in order
 

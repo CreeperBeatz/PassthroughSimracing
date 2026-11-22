@@ -21,7 +21,7 @@ use alvr_common::{
 };
 use alvr_graphics::{
     ArmMotion, ColorKeyInput, DepthRenderInput, GraphicsContext, HAND_SEGMENTS, HandShape,
-    SEGMENT_JOINTS, StreamRenderer, StreamViewParams,
+    LeakGains, SEGMENT_JOINTS, StreamRenderer, StreamViewParams,
 };
 use alvr_packets::{ClientStreamConfig, RealTimeConfig, TrackingData};
 use alvr_session::{
@@ -56,6 +56,14 @@ const PLAYZONE_INTERVAL: Duration = Duration::from_millis(500);
 const KEY_LAYERS_HOLD: Duration = Duration::from_millis(300);
 // Of the view, around the hands, so that the edge of the cropped layer is not on a hand
 const KEY_CROP_MARGIN: f32 = 0.03;
+
+// Per hand for the log: ring, map, known share of the map, leak, rim
+type LeakLog = Option<(f32, Option<f32>, f32, f32, f32)>;
+
+// Spheres of `debug.alvr.key_leak_view 2`, meters
+const LEAK_PROBE_RADIUS: f32 = 0.0125;
+// The leak map values are logged this often while it is used
+const LEAK_LOG_INTERVAL: Duration = Duration::from_secs(2);
 
 /// What the color key needs in this frame
 #[derive(Clone, Copy, Default)]
@@ -156,6 +164,9 @@ pub struct StreamContext {
     hand_solid: [Cell<[f32; HAND_SEGMENTS]>; 2],
     // How much the rim of each hand is narrowed over backgrounds that look like it (0..1), smoothed
     hand_leak: [Cell<f32>; 2],
+    // Log of the leak map: last time, and the lookup time since then
+    last_leak_log: Cell<Instant>,
+    leak_lookup_time: Cell<(Duration, u32)>,
 }
 
 impl StreamContext {
@@ -319,6 +330,8 @@ impl StreamContext {
             hand_speeds: [const { Cell::new(0.0) }; 2],
             hand_solid: [const { Cell::new([0.0; HAND_SEGMENTS]) }; 2],
             hand_leak: [const { Cell::new(0.0) }; 2],
+            last_leak_log: Cell::new(Instant::now()),
+            leak_lookup_time: Cell::new((Duration::ZERO, 0)),
         };
 
         this.update_reference_space();
@@ -448,8 +461,13 @@ impl StreamContext {
         })
     }
 
-    // The hands, at the moment shown by the passthrough image
-    fn color_key_input(&self, display_time: xr::Time) -> Option<ColorKeyInput> {
+    // The hands, at the moment shown by the passthrough image. `eye_positions` (stage space) are needed
+    // for the leak map.
+    fn color_key_input(
+        &self,
+        display_time: xr::Time,
+        eye_positions: Option<[Vec3; 2]>,
+    ) -> Option<ColorKeyInput> {
         let params = self.color_key?;
         let delay = params.passthrough_delay_ms * 1_000_000;
         let time = xr::Time::from_nanos(display_time.as_nanos() - delay);
@@ -463,7 +481,7 @@ impl StreamContext {
         #[cfg(not(target_os = "android"))]
         let verified = [[0.0; HAND_SEGMENTS]; 2];
 
-        let uses_leak = params.leak_gain > 0.0 || params.leak_force > 0.0;
+        let uses_leak = params.leak_gain > 0.0 || params.leak_force > 0.0 || params.leak_map > 0.0;
         #[cfg(target_os = "android")]
         let ring_leak = self
             .auto_color_key
@@ -472,6 +490,33 @@ impl StreamContext {
             .map_or([0.0; 2], |key| key.ring_leak());
         #[cfg(not(target_os = "android"))]
         let ring_leak = [0.0; 2];
+
+        // Where the room leaks through the key, learned only while it is used
+        let shows_probes = params.leak_view == 2;
+        #[cfg(target_os = "android")]
+        let leak_map_state = self
+            .auto_color_key
+            .as_ref()
+            .filter(|_| params.leak_map > 0.0 || shows_probes)
+            .and_then(|key| key.leak_map());
+        #[cfg(target_os = "android")]
+        let leak_map = leak_map_state
+            .as_deref()
+            .map(|state| (&state.snapshot, state.probes.as_slice()));
+        #[cfg(not(target_os = "android"))]
+        let leak_map: Option<(&alvr_graphics::LeakSnapshot, &[Vec3])> = None;
+        let map_eyes = eye_positions.filter(|_| params.leak_map > 0.0);
+        let gains = LeakGains {
+            force: params.leak_force,
+            ring_gain: params.leak_gain,
+            ring_lo: params.leak_lo,
+            ring_hi: params.leak_hi,
+            map_weight: params.leak_map,
+            map_lo: params.leak_map_lo,
+            map_hi: params.leak_map_hi,
+        };
+        let mut lookup_time = Duration::ZERO;
+        let mut leak_log: [LeakLog; 2] = [None; 2];
 
         let hands = [0, 1].map(|i| {
             let tracker = int_ctx.hands_interaction[i].skeleton_tracker.as_ref()?;
@@ -549,19 +594,29 @@ impl StreamContext {
 
             // Where the background around the hand looks like it, the rim would show it
             let zones = if uses_leak {
-                let x = ((ring_leak[i] - params.leak_lo)
-                    / (params.leak_hi - params.leak_lo).max(0.001))
-                .clamp(0.0, 1.0);
-                let target = f32::max(
-                    params.leak_force,
-                    params.leak_gain * x * x * (3.0 - 2.0 * x),
-                );
+                // The map: the cells behind the segments, seen from both eyes
+                let (map_leak, known) = match (leak_map, map_eyes) {
+                    (Some((snapshot, _)), Some(eyes)) => {
+                        let lookup_start = Instant::now();
+                        let points = shape
+                            .segments
+                            .map(|[start, end]| ((start + end) * 0.5).truncate());
+                        let result = snapshot.hand_leak_known(&eyes, &points);
+                        lookup_time += lookup_start.elapsed();
+                        result
+                    }
+                    _ => (None, 0.0),
+                };
+                let target = gains.target(ring_leak[i], map_leak);
                 let leak = self.hand_leak[i].get();
                 // Narrow quickly, widen slowly
                 let leak = leak + (target - leak) * if target > leak { 0.2 } else { 0.05 };
                 self.hand_leak[i].set(leak);
 
-                zones.for_leak(leak, params.leak_inset_m)
+                let zones = zones.for_leak(leak, params.leak_inset_m);
+                leak_log[i] = Some((ring_leak[i], map_leak, known, leak, zones.rim));
+
+                zones
             } else {
                 self.hand_leak[i].set(0.0);
                 zones
@@ -573,14 +628,69 @@ impl StreamContext {
         self.tracked_hands.set(hands.map(|hand| hand.is_some()));
 
         // To measure the cost of the hands on the GPU. The playzone still knows about them.
-        let hands = if params.hands { hands } else { [None; 2] };
-        let leak = if params.leak_view {
+        let mut hands = if params.hands { hands } else { [None; 2] };
+        let mut leak = if params.leak_view != 0 {
             self.hand_leak.each_ref().map(Cell::get)
         } else {
             [0.0; 2]
         };
 
+        // Debug view of the map: the right hand is replaced by spheres where the room leaks. They are
+        // in the hand zones, so they also keep the layers of the key.
+        if shows_probes {
+            hands[1] = leak_map.and_then(|(snapshot, probes)| {
+                let shape = alvr_graphics::leak_probes(
+                    snapshot.anchor,
+                    probes,
+                    params.leak_probe_m,
+                    LEAK_PROBE_RADIUS,
+                )?;
+                let mut zones = params.zones;
+                zones.solid = [0.0; HAND_SEGMENTS];
+
+                Some((shape, zones))
+            });
+            leak[1] = 0.0;
+        }
+
+        if params.leak_map > 0.0 {
+            self.log_leak_map(leak_log, lookup_time);
+        }
+
         Some(ColorKeyInput { hands, leak })
+    }
+
+    // Every 2 s, to tune `debug.alvr.key_leak_map_lo` / `key_leak_map_hi`
+    #[allow(unused_variables)]
+    fn log_leak_map(&self, hands: [LeakLog; 2], lookup_time: Duration) {
+        let (total, count) = self.leak_lookup_time.get();
+        let (total, count) = (total + lookup_time, count + 1);
+        if self.last_leak_log.get().elapsed() < LEAK_LOG_INTERVAL {
+            self.leak_lookup_time.set((total, count));
+            return;
+        }
+        self.last_leak_log.set(Instant::now());
+        self.leak_lookup_time.set((Duration::ZERO, 0));
+
+        let text = ["left", "right"]
+            .iter()
+            .zip(hands)
+            .map(|(name, hand)| match hand {
+                Some((ring, map, known, leak, rim)) => format!(
+                    "{name} ring {ring:.2} map {} known {:.0}% L {leak:.2} rim {:.1} mm",
+                    map.map_or("-".into(), |map| format!("{map:.2}")),
+                    known * 100.0,
+                    rim * 1000.0,
+                ),
+                None => format!("{name} -"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        #[cfg(target_os = "android")]
+        crate::camera::log(&format!(
+            "leak map: {text}, lookup {:.0} us per frame",
+            total.as_secs_f32() * 1e6 / count as f32
+        ));
     }
 
     pub fn uses_passthrough(&self) -> bool {
@@ -589,6 +699,10 @@ impl StreamContext {
 
     pub fn update_reference_space(&mut self) {
         self.renderer.clear_playzone();
+        #[cfg(target_os = "android")]
+        if let Some(key) = &self.auto_color_key {
+            key.clear_leak_map();
+        }
         self.input_thread_running.set(false);
 
         self.stage_reference_space = Arc::new(interaction::get_reference_space(
@@ -713,7 +827,7 @@ impl StreamContext {
                     return Some(DepthRenderInput {
                         frame: None,
                         eye_positions: [Vec3::ZERO; 2],
-                        color_key: self.color_key_input(display_time),
+                        color_key: self.color_key_input(display_time, None),
                         arms: [None; 2],
                         capture_playzone: false,
                     });
@@ -740,15 +854,16 @@ impl StreamContext {
             self.arm_motions(display_time, time, current_headset_views)
         });
 
-        let color_key = self.color_key_input(display_time);
+        let eye_positions = [
+            crate::from_xr_vec3(current_headset_views[0].pose.position),
+            crate::from_xr_vec3(current_headset_views[1].pose.position),
+        ];
+        let color_key = self.color_key_input(display_time, Some(eye_positions));
         let capture_playzone = frame.is_some() && self.should_capture_playzone();
 
         Some(DepthRenderInput {
             frame,
-            eye_positions: [
-                crate::from_xr_vec3(current_headset_views[0].pose.position),
-                crate::from_xr_vec3(current_headset_views[1].pose.position),
-            ],
+            eye_positions,
             color_key,
             arms,
             capture_playzone,

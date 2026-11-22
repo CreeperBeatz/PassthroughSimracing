@@ -341,7 +341,8 @@ pub struct CameraView {
 }
 
 impl CameraView {
-    fn ray(&self, pixel: Vec2) -> Vec3 {
+    /// Unit direction of the ray through a pixel, world space
+    pub fn ray(&self, pixel: Vec2) -> Vec3 {
         self.orientation
             * ((pixel - self.center) / self.focal_length)
                 .extend(1.0)

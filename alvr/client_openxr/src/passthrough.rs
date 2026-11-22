@@ -113,7 +113,18 @@ impl PassthroughLayer<'_> {
 ///   that is kept by the key, from where the rim is narrowed to where it is narrowest
 /// - `setprop debug.alvr.key_leak_inset <mm>`: the narrowest rim, inside of the hand
 /// - `setprop debug.alvr.key_leak_force <percent>`: narrow the rim of both hands this much, without the camera
-/// - `setprop debug.alvr.key_leak_view 1`: with the "Tint mask" debug view the narrowed rim is red
+/// - `setprop debug.alvr.key_leak_view 1`: with the "Tint mask" debug view the narrowed rim is red. 2: the
+///   right hand is replaced by spheres where the leak map says the room leaks (and the map is learned)
+/// - `setprop debug.alvr.key_leak_map <percent>`: weight of the leak map (directions around the head where the
+///   key showed the room), 0: off, the map is not learned
+/// - `setprop debug.alvr.key_leak_map_lo <percent>` / `key_leak_map_hi`: leak of the cells behind the hand,
+///   from where the rim is narrowed to where it is narrowest
+/// - `setprop debug.alvr.key_leak_memory <s>`: how long the leak map remembers a direction
+/// - `setprop debug.alvr.key_leak_clear <n>`: another value forgets the leak map
+/// - `setprop debug.alvr.key_leak_dump <n>`: another value logs the leak map of the camera view (`ALVR_CAM`),
+///   a value other than 0 also learns the map
+/// - `setprop debug.alvr.key_leak_probe <cm>`: distance of the spheres of `key_leak_view 2`
+/// - `setprop debug.alvr.key_lut_dump <n>`: another value writes the learned LUT to the files folder of the app
 pub struct ColorKey {
     version: u32,
     lut: Vec<u8>,
@@ -139,13 +150,19 @@ pub struct ColorKeyParams {
     pub hands: bool,
     /// Narrower rim over backgrounds that look like the hand: gain (0..1), the shares of the background
     /// that is kept where it starts and where it is complete, the narrowest rim (inside of the hand), a
-    /// fixed amount (0..1), and whether it is shown
+    /// fixed amount (0..1), and how it is shown (`debug.alvr.key_leak_view`)
     pub leak_gain: f32,
     pub leak_lo: f32,
     pub leak_hi: f32,
     pub leak_inset_m: f32,
     pub leak_force: f32,
-    pub leak_view: bool,
+    pub leak_view: i64,
+    /// The leak map: weight (0..1, 0: not used), leak of the cells behind the hand where the narrowing
+    /// starts and where it is complete, and the distance of the debug spheres
+    pub leak_map: f32,
+    pub leak_map_lo: f32,
+    pub leak_map_hi: f32,
+    pub leak_probe_m: f32,
 }
 
 fn millimeters(property: &str, default: i64) -> f32 {
@@ -191,7 +208,14 @@ impl ColorKeyParams {
             leak_hi: percent("debug.alvr.key_leak_hi", 20),
             leak_inset_m: millimeters("debug.alvr.key_leak_inset", 3),
             leak_force: percent("debug.alvr.key_leak_force", 0),
-            leak_view: debug_property("debug.alvr.key_leak_view").unwrap_or(0) != 0,
+            leak_view: debug_property("debug.alvr.key_leak_view").unwrap_or(0),
+            leak_map: percent("debug.alvr.key_leak_map", 0),
+            leak_map_lo: percent("debug.alvr.key_leak_map_lo", 3),
+            leak_map_hi: percent("debug.alvr.key_leak_map_hi", 15),
+            leak_probe_m: debug_property("debug.alvr.key_leak_probe")
+                .unwrap_or(60)
+                .clamp(10, 500) as f32
+                / 100.0,
         }
     }
 }
