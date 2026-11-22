@@ -21,7 +21,7 @@ use alvr_common::{
 };
 use alvr_graphics::{
     ArmMotion, ColorKeyInput, DepthRenderInput, GraphicsContext, HAND_SEGMENTS, HandShape,
-    LeakGains, SEGMENT_JOINTS, StreamRenderer, StreamViewParams,
+    HandZones, LeakGains, SEGMENT_JOINTS, StreamRenderer, StreamViewParams,
 };
 use alvr_packets::{ClientStreamConfig, RealTimeConfig, TrackingData};
 use alvr_session::{
@@ -74,6 +74,8 @@ pub struct ColorKeyFrame {
     pub hand_rects: [Option<(Vec2, Vec2)>; 2],
     /// The hands are in view, or were a moment ago: the layers of the color key are needed
     pub hands_in_view: bool,
+    /// Applied zones of each hand, for the log
+    pub hand_zones: [Option<HandZones>; 2],
 }
 
 pub struct ParsedStreamConfig {
@@ -159,8 +161,8 @@ pub struct StreamContext {
     last_hands_seen: Instant,
     last_playzone_capture: Instant,
     last_playzone_request: i64,
-    // Smoothed, meters per second
-    hand_speeds: [Cell<f32>; 2],
+    // Smoothed, meters per second, stage space
+    hand_velocities: [Cell<Vec3>; 2],
     hand_solid: [Cell<[f32; HAND_SEGMENTS]>; 2],
     // How much the rim of each hand is narrowed over backgrounds that look like it (0..1), smoothed
     hand_leak: [Cell<f32>; 2],
@@ -327,7 +329,7 @@ impl StreamContext {
             last_hands_seen: Instant::now(),
             last_playzone_capture: Instant::now(),
             last_playzone_request: 0,
-            hand_speeds: [const { Cell::new(0.0) }; 2],
+            hand_velocities: [const { Cell::new(Vec3::ZERO) }; 2],
             hand_solid: [const { Cell::new([0.0; HAND_SEGMENTS]) }; 2],
             hand_leak: [const { Cell::new(0.0) }; 2],
             last_leak_log: Cell::new(Instant::now()),
@@ -535,18 +537,30 @@ impl StreamContext {
                 crate::from_xr_vec3(joint.pose.position).extend(joint.radius * params.radius_scale)
             }));
 
-            // Some joints may have no valid velocity
-            let speed = velocities
+            // The fastest joint, in the stage space like the shape. Some joints may have no valid
+            // velocity
+            let velocity = velocities
                 .iter()
                 .filter(|v| {
                     v.velocity_flags
                         .contains(xr::SpaceVelocityFlags::LINEAR_VALID)
                 })
-                .map(|v| crate::from_xr_vec3(v.linear_velocity).length())
-                .fold(0.0, f32::max);
+                .map(|v| crate::from_xr_vec3(v.linear_velocity))
+                .fold(Vec3::ZERO, |fastest, v| {
+                    if v.length_squared() > fastest.length_squared() {
+                        v
+                    } else {
+                        fastest
+                    }
+                });
             // Grow immediately, shrink slowly: velocities are noisy
-            let speed = speed.max(self.hand_speeds[i].get() * 0.9);
-            self.hand_speeds[i].set(speed);
+            let last = self.hand_velocities[i].get() * 0.9;
+            let velocity = if velocity.length_squared() >= last.length_squared() {
+                velocity
+            } else {
+                last
+            };
+            self.hand_velocities[i].set(velocity);
 
             let tracked_count = joints
                 .iter()
@@ -591,10 +605,11 @@ impl StreamContext {
             let zones = zones
                 .for_confidence(tracked_count as f32 / joints.len() as f32)
                 .for_speed(
-                    speed,
+                    velocity,
                     params.core_error_s,
                     params.rim_error_s,
                     params.max_rim_growth_m,
+                    params.sweep,
                 );
 
             // Where the background around the hand looks like it, the rim would show it
@@ -1003,6 +1018,12 @@ impl StreamContext {
             hands_in_view: self
                 .last_hand_rect_time
                 .is_some_and(|time| time.elapsed() < KEY_LAYERS_HOLD),
+            hand_zones: depth_input
+                .as_ref()
+                .and_then(|input| input.color_key)
+                .map_or([None; 2], |key| {
+                    key.hands.map(|hand| hand.map(|(_, zones)| zones))
+                }),
         };
 
         // Outside the hands the lower color key layer is covered by the upper one, or shows the same

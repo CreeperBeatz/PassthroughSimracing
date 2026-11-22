@@ -37,7 +37,7 @@ struct DepthUniforms {
     lighting2: vec4f,
     // Confidence zones of each hand, as distances from its surface (negative inside).
     // x: end of the color keyed rim, y: start of the falloff (solid passthrough before it),
-    // z: width of the falloff
+    // z: width of the falloff, w: how far the rim reaches back against the motion (see hand_sweep)
     hand_zones: array<vec4f, 2>,
     // How solid the core of each capsule is (0..1), 4 capsules per vector, left hand first
     hand_solid: array<vec4f, 2u * HAND_SEGMENTS / 4u>,
@@ -53,4 +53,7 @@ struct DepthUniforms {
     playzone: vec4f,
     // Color key: part of each view where the lower game layer is shown, xy: min, zw: max view uv
     key_lower: array<vec4f, 2>,
+    // Rim of a moving hand: the capsules moved anywhere along the motion, from hand_zones.w back to w
+    // ahead. xyz: direction of the motion (unit vector), w: how far ahead (0 with hand_zones.w: no sweep)
+    hand_sweep: array<vec4f, 2>,
 }

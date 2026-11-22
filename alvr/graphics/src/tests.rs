@@ -5,7 +5,7 @@
 use crate::{
     depth_mask::{
         self, ArmMotion, ColorKeyInput, DepthFrame, DepthRenderInput, HAND_SEGMENTS, HandShape,
-        HandZones,
+        HandSweep, HandZones, SweepParams,
     },
     stream::{self, FOVEATION_UNIFORM_SIZE, LIGHT_PROBE_SIZE, StreamPipelines, floats_to_bytes},
 };
@@ -772,6 +772,7 @@ fn color_key_packs_mask_and_hand_area() {
                         falloff: 0.01,
                         rim: 0.04,
                         solid: [1.0; HAND_SEGMENTS],
+                        sweep: HandSweep::NONE,
                     },
                 )),
             ],
@@ -867,6 +868,7 @@ fn hand_core_fades_out_gradually() {
         falloff: 0.06,
         rim: 0.06,
         solid: [1.0; HAND_SEGMENTS],
+        sweep: HandSweep::NONE,
     };
     let render_zones = |zones| {
         render_with_key(
@@ -912,7 +914,7 @@ fn hand_core_fades_out_gradually() {
     assert!((half.alpha(0.5, 0.75) - 0.25).abs() < 0.03);
 
     // A fast hand is keyed, not solid, also further away
-    let fast = render_zones(zones.for_speed(10.0, 0.02, 0.004, 0.05));
+    let fast = render_zones(zones.for_speed(Vec3::X * 10.0, 0.02, 0.004, 0.05, None));
     assert!(fast.alpha(0.5, 0.75) > out.alpha(0.5, 0.75) + 0.1);
     assert_eq!(out.alpha(0.5, 0.9), 1.0);
     // Near the end of the rim the key fades out
@@ -952,6 +954,7 @@ fn negative_rim_ends_inside_the_capsule() {
                             falloff: 0.01,
                             rim,
                             solid: [0.0; HAND_SEGMENTS],
+                            sweep: HandSweep::NONE,
                         },
                     )),
                 ],
@@ -976,17 +979,18 @@ fn hand_zones_follow_the_speed() {
         falloff: 0.008,
         rim: 0.01,
         solid: [1.0; HAND_SEGMENTS],
+        sweep: HandSweep::NONE,
     };
 
-    let still = zones.for_speed(0.0, 0.01, 0.04, 0.05);
+    let still = zones.for_speed(Vec3::ZERO, 0.01, 0.04, 0.05, None);
     assert!((still.core - zones.core).abs() < 1e-6 && (still.rim - zones.rim).abs() < 1e-6);
 
     // 1 m/s: 1 cm and 4 cm
-    let moving = zones.for_speed(1.0, 0.01, 0.04, 0.05);
+    let moving = zones.for_speed(Vec3::Y, 0.01, 0.04, 0.05, None);
     assert!((moving.core - -0.014).abs() < 1e-6 && (moving.rim - 0.05).abs() < 1e-6);
 
     // Limited
-    let fast = zones.for_speed(100.0, 0.01, 0.04, 0.05);
+    let fast = zones.for_speed(Vec3::Z * 100.0, 0.01, 0.04, 0.05, None);
     assert!((fast.core - -0.044).abs() < 1e-6 && (fast.rim - 0.06).abs() < 1e-6);
 }
 
@@ -997,6 +1001,7 @@ fn hand_zones_shrink_over_leaks() {
         falloff: 0.004,
         rim: 0.0,
         solid: [1.0; HAND_SEGMENTS],
+        sweep: HandSweep::NONE,
     };
     zones.solid[3] = 0.5;
 
@@ -1006,7 +1011,7 @@ fn hand_zones_shrink_over_leaks() {
     assert_eq!(same.core.to_bits(), zones.core.to_bits());
 
     // A moving hand over a full leak: the rim ends inside the hand, the core stays
-    let moving = zones.for_speed(1.0, 0.01, 0.04, 0.016);
+    let moving = zones.for_speed(Vec3::X, 0.01, 0.04, 0.016, None);
     let leaky = moving.for_leak(1.0, 0.003);
     assert!((leaky.rim - -0.003).abs() < 1e-6, "{}", leaky.rim);
     assert_eq!(leaky.core, moving.core);
@@ -1020,6 +1025,158 @@ fn hand_zones_shrink_over_leaks() {
         "{}",
         half.rim
     );
+}
+
+#[test]
+fn hand_zones_sweep_along_the_motion() {
+    let zones = HandZones {
+        core: -0.004,
+        falloff: 0.008,
+        rim: 0.002,
+        solid: [1.0; HAND_SEGMENTS],
+        sweep: HandSweep::NONE,
+    };
+    let params = SweepParams {
+        max: 0.04,
+        iso: 0.25,
+        bias: 0.0,
+    };
+
+    // Still: no sweep, the same as without it
+    let still = zones.for_speed(Vec3::ZERO, 0.01, 0.045, 0.016, Some(params));
+    assert_eq!(still.sweep, HandSweep::NONE);
+    assert_eq!(still.rim, zones.rim);
+
+    // Barely moving (less than 1 mm): in all directions, no sweep
+    let slow = zones.for_speed(Vec3::X * 0.02, 0.01, 0.045, 0.016, Some(params));
+    assert_eq!(slow.sweep, HandSweep::NONE);
+    assert!((slow.rim - (0.002 + 0.0009)).abs() < 1e-6, "{}", slow.rim);
+
+    // 0.4 m/s to the right: 18 mm of growth, a quarter in all directions
+    let moving = zones.for_speed(Vec3::X * 0.4, 0.01, 0.045, 0.016, Some(params));
+    assert!(
+        (moving.rim - (0.002 + 0.0045)).abs() < 1e-6,
+        "{}",
+        moving.rim
+    );
+    assert!((moving.core - -0.008).abs() < 1e-6);
+    assert!((moving.sweep.direction - Vec3::X).length() < 1e-6);
+    assert!((moving.sweep.forward - 0.018).abs() < 1e-6);
+    assert_eq!(moving.sweep.forward, moving.sweep.backward);
+
+    // Fast: the sweep and the part in all directions are limited
+    let fast = zones.for_speed(Vec3::NEG_Y * 4.0, 0.01, 0.045, 0.016, Some(params));
+    assert!((fast.rim - (0.002 + 0.016)).abs() < 1e-6, "{}", fast.rim);
+    assert!((fast.sweep.forward - 0.04).abs() < 1e-6);
+    assert!((fast.sweep.direction - Vec3::NEG_Y).length() < 1e-6);
+
+    // Bias: further ahead than behind
+    let ahead = zones.for_speed(
+        Vec3::X * 0.4,
+        0.01,
+        0.045,
+        0.016,
+        Some(SweepParams {
+            bias: 0.5,
+            ..params
+        }),
+    );
+    assert!((ahead.sweep.forward - 0.027).abs() < 1e-6);
+    assert!((ahead.sweep.backward - 0.009).abs() < 1e-6);
+
+    // Off: growth in all directions as before
+    let off = zones.for_speed(Vec3::X * 0.4, 0.01, 0.045, 0.016, None);
+    assert_eq!(off.sweep, HandSweep::NONE);
+    assert!((off.rim - 0.018).abs() < 1e-6);
+
+    // Over a leak the sweep shrinks like the rim
+    let half = moving.for_leak(0.5, 0.003);
+    assert!((half.sweep.forward - 0.009).abs() < 1e-6);
+    assert!((half.sweep.backward - 0.009).abs() < 1e-6);
+    assert_eq!(half.sweep.direction, moving.sweep.direction);
+    assert_eq!(moving.for_leak(1.0, 0.003).sweep.forward, 0.0);
+}
+
+#[test]
+fn hand_zone_sweeps_along_the_motion() {
+    let (device, queue) = gpu_or_skip!();
+    let config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
+
+    // The bar of color_key_packs_mask_and_hand_area: u 0.35..0.65, v 0.70..0.80, solid inside
+    let segment = [
+        Vec4::new(-0.1, -0.25, -0.5, 0.05),
+        Vec4::new(0.1, -0.25, -0.5, 0.05),
+    ];
+    let shape = HandShape {
+        segments: [segment; HAND_SEGMENTS],
+    };
+    let zones = HandZones {
+        core: -0.01,
+        falloff: 0.005,
+        rim: 0.0,
+        solid: [1.0; HAND_SEGMENTS],
+        sweep: HandSweep::NONE,
+    };
+    let render_zones = |zones| {
+        render_with_key(
+            &device,
+            &queue,
+            &config,
+            &hand_scene(),
+            Vec3::ZERO,
+            Vec3::ZERO,
+            true,
+            Some(ColorKeyInput {
+                hands: [None, Some((shape, zones))],
+                leak: [0.0; 2],
+            }),
+        )
+    };
+    // Moving to the right, 4 cm (0.04 in view uv) ahead, 2 cm behind
+    let swept = |forward, backward| HandZones {
+        sweep: HandSweep {
+            direction: Vec3::X,
+            forward,
+            backward,
+        },
+        ..zones
+    };
+
+    let still = render_zones(zones);
+    let moving = render_zones(swept(0.04, 0.02));
+
+    // Ahead of the bar: keyed, only when moving. The solid fill is not moved
+    assert_eq!(still.alpha(0.67, 0.75), 1.0);
+    assert!(
+        (moving.alpha(0.67, 0.75) - 0.5).abs() < 0.01,
+        "{}",
+        moving.alpha(0.67, 0.75)
+    );
+    // Behind it, less far
+    assert!(
+        (moving.alpha(0.34, 0.75) - 0.5).abs() < 0.01,
+        "{}",
+        moving.alpha(0.34, 0.75)
+    );
+    assert_eq!(moving.alpha(0.31, 0.75), 1.0);
+    // Beside the motion (below the bar): game as before
+    assert_eq!(moving.alpha(0.5, 0.83), 1.0);
+    assert_eq!(moving.alpha(0.67, 0.83), 1.0);
+    // The solid inside stays where it was
+    assert!(moving.alpha(0.5, 0.75) < 0.01);
+
+    // No sweep, or an empty one: exactly as before. A tiny one: the same within a level
+    let empty = render_zones(swept(0.0, 0.0));
+    let tiny = render_zones(swept(1e-6, 1e-6));
+    for v in (0..64).map(|i| (i as f32 + 0.5) / 64.0) {
+        for u in (0..64).map(|i| (i as f32 + 0.5) / 64.0) {
+            assert_eq!(empty.at(u, v), still.at(u, v), "{u} {v}");
+            let (a, b) = (tiny.at(u, v), still.at(u, v));
+            for c in 0..4 {
+                assert!(a[c].abs_diff(b[c]) <= 1, "{u} {v}: {a:?} {b:?}");
+            }
+        }
+    }
 }
 
 #[test]
@@ -1115,6 +1272,7 @@ fn hands_rect_contains_the_hands() {
         falloff: 0.004,
         rim: 0.01,
         solid: [1.0; HAND_SEGMENTS],
+        sweep: HandSweep::NONE,
     };
     let key = ColorKeyInput {
         hands: [None, Some((shape, zones))],
@@ -1136,6 +1294,36 @@ fn hands_rect_contains_the_hands() {
     }
     assert!(min.x > 0.1, "{min}");
 
+    // A moving hand: both ends of the sweep. Longer than the range of the playzone around the hand
+    let sweep = HandSweep {
+        direction: Vec3::Y,
+        forward: 0.2,
+        backward: 0.15,
+    };
+    let swept = ColorKeyInput {
+        hands: [None, Some((shape, HandZones { sweep, ..zones }))],
+        leak: [0.0; 2],
+    };
+    let (swept_min, swept_max) =
+        depth_mask::hands_view_rect(&view(Vec3::ZERO), Vec3::ZERO, &swept).unwrap();
+    for point in shape.segments.as_flattened() {
+        for shift in [sweep.forward, -sweep.backward] {
+            let point = point.truncate() + sweep.direction * shift;
+            let uv = Vec2::new(
+                0.5 + 0.5 * point.x / -point.z,
+                0.5 - 0.5 * point.y / -point.z,
+            );
+            assert!(
+                uv.cmpge(swept_min).all() && uv.cmple(swept_max).all(),
+                "{uv} {swept_min} {swept_max}"
+            );
+        }
+    }
+    assert!(
+        swept_min.y < min.y - 0.05 && swept_max.y > max.y + 0.05,
+        "{min} {max} {swept_min} {swept_max}"
+    );
+
     // Behind the viewer or not tracked
     let none = ColorKeyInput {
         hands: [None; 2],
@@ -1153,6 +1341,7 @@ fn hands_rect_ignores_hands_out_of_view() {
             falloff: 0.004,
             rim: 0.0,
             solid: [0.0; HAND_SEGMENTS],
+            sweep: HandSweep::NONE,
         };
         let key = ColorKeyInput {
             hands: [Some((HandShape::from_joints(&joints), zones)), None],
@@ -1293,6 +1482,7 @@ fn playzone_fills_objects_removed_near_the_hand() {
                     falloff: 0.004,
                     rim: 0.0,
                     solid: [0.0; HAND_SEGMENTS],
+                    sweep: HandSweep::NONE,
                 },
             )),
             None,
@@ -1569,6 +1759,7 @@ fn tint_debug_view_marks_the_narrowed_rim() {
                             falloff: 0.01,
                             rim: 0.04,
                             solid: [0.0; HAND_SEGMENTS],
+                            sweep: HandSweep::NONE,
                         },
                     )),
                 ],

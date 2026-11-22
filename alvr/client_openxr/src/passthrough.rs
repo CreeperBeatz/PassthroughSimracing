@@ -3,7 +3,7 @@ use alvr_common::{
     anyhow::{Result, bail},
     error,
 };
-use alvr_graphics::HandZones;
+use alvr_graphics::{HandSweep, HandZones, SweepParams};
 use alvr_system_info::Platform;
 use openxr::{self as xr};
 use std::{
@@ -89,6 +89,10 @@ impl PassthroughLayer<'_> {
 /// - `setprop debug.alvr.key_error <ms>`: assumed timing error, the solid core shrinks with the speed
 /// - `setprop debug.alvr.key_rim_error <ms>`: worst timing error, the rim grows with the speed
 /// - `setprop debug.alvr.key_rim_max <mm>`: limit of that growth
+/// - `setprop debug.alvr.key_sweep 0`: the rim grows in all directions, not along the motion of the hand
+/// - `setprop debug.alvr.key_sweep_max <mm>`: limit of the growth along the motion, ahead and behind
+/// - `setprop debug.alvr.key_sweep_iso <percent>`: share of the growth that stays in all directions
+/// - `setprop debug.alvr.key_sweep_bias <percent>`: -100..100, positive grows further ahead than behind
 /// - `setprop debug.alvr.key_unknown <percent>`: how much to keep colors that were never seen
 /// - `setprop debug.alvr.key_bias <percent>`: preference for skin if the background looks the same
 /// - `setprop debug.alvr.key_tight <percent>`: how similar to the skin a color must be
@@ -139,6 +143,8 @@ pub struct ColorKeyParams {
     pub core_error_s: f32,
     pub rim_error_s: f32,
     pub max_rim_growth_m: f32,
+    /// The rim grows along the motion of the hand. None: in all directions
+    pub sweep: Option<SweepParams>,
     pub radius_scale: f32,
     /// Negative: predict ahead
     pub passthrough_delay_ms: i64,
@@ -188,11 +194,22 @@ impl ColorKeyParams {
                 falloff: millimeters("debug.alvr.key_falloff", 4),
                 rim: millimeters("debug.alvr.key_rim", 0),
                 solid,
+                sweep: HandSweep::NONE,
             },
             // Milliseconds
             core_error_s: millimeters("debug.alvr.key_error", 10),
             rim_error_s: millimeters("debug.alvr.key_rim_error", 45),
             max_rim_growth_m: millimeters("debug.alvr.key_rim_max", 16),
+            sweep: (debug_property("debug.alvr.key_sweep").unwrap_or(1) != 0).then(|| {
+                SweepParams {
+                    max: millimeters("debug.alvr.key_sweep_max", 40),
+                    iso: percent("debug.alvr.key_sweep_iso", 25),
+                    bias: debug_property("debug.alvr.key_sweep_bias")
+                        .unwrap_or(0)
+                        .clamp(-100, 100) as f32
+                        / 100.0,
+                }
+            }),
             radius_scale: debug_property("debug.alvr.key_scale")
                 .unwrap_or(100)
                 .clamp(0, 300) as f32

@@ -58,6 +58,52 @@ fn ray_capsule_distance(origin: vec3f, dir: vec3f, start: vec4f, end: vec4f) -> 
     return length(origin + dir * t - point) - mix(start.w, end.w, s);
 }
 
+// Same, for the capsule moved anywhere from -sweep.x to +sweep.y along the unit vector `motion` (a
+// moving hand, while its pose may be off). `across`: xyz: the part of `motion` across the ray, w: 1 / its
+// squared length (0 if it is almost along the ray). Seen along the ray, the ray is a point and the moved
+// axis covers a parallelogram. Its closest point is found like the closest points of two segments, the
+// axis and the motion (Ericson, Real-Time Collision Detection, 5.1.9): exact for a capsule of constant
+// radius in front of the eye. Like above, a tapered capsule takes the radius at that point.
+fn ray_swept_capsule_distance(
+    origin: vec3f,
+    dir: vec3f,
+    start: vec4f,
+    end: vec4f,
+    motion: vec3f,
+    across: vec4f,
+    sweep: vec2f,
+) -> f32 {
+    let axis = end.xyz - start.xyz;
+    let w = origin - start.xyz;
+    let b = dot(dir, axis);
+    let d = dot(dir, w);
+    // Across the ray: axis . axis, axis . w, axis . motion, motion . w
+    let aa = dot(axis, axis) - b * b;
+    let aw = dot(axis, w) - b * d;
+    let am = dot(axis, across.xyz);
+    let mw = dot(w, across.xyz);
+
+    var inv_aa = 0.0;
+    if aa > 1e-9 {
+        inv_aa = 1.0 / aa;
+    }
+    // The point of the axis where it crosses the line of the motion (the closest point to the ray if
+    // they are parallel), then the shift for it, then the point of the axis for that shift
+    let det = aa - am * am * across.w;
+    var s = aw * inv_aa;
+    if det > 1e-7 * aa {
+        s = (aw - am * mw * across.w) / det;
+    }
+    s = clamp(s, 0.0, 1.0);
+    let shift = clamp((mw - s * am) * across.w, -sweep.x, sweep.y);
+    s = clamp((aw - shift * am) * inv_aa, 0.0, 1.0);
+
+    let point = start.xyz + axis * s + motion * shift;
+    let t = max(dot(point - origin, dir), 0.0);
+
+    return length(origin + dir * t - point) - mix(start.w, end.w, s);
+}
+
 @fragment
 fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     let origin = depth_u.eyes[imm.view_idx].eye_position.xyz;
@@ -76,7 +122,15 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         let to_center = bounds.xyz - origin;
         let t = max(dot(to_center, dir), 0.0);
         let center_distance = length(to_center - dir * t);
-        let is_near_hand = center_distance < bounds.w + max(zones.x, 0.0) + SOFTNESS;
+        // A moving hand: the rim covers the capsules moved along the motion, the solid fill doesn't
+        let motion = depth_u.hand_sweep[hand];
+        let sweep = vec2f(zones.w, motion.w);
+        let sweeps = sweep.x + sweep.y > 0.0;
+        let across = motion.xyz - dir * dot(motion.xyz, dir);
+        let across_length2 = dot(across, across);
+        let across_info = vec4f(across, select(0.0, 1.0 / across_length2, across_length2 > 1e-8));
+        let is_near_hand =
+            center_distance < bounds.w + max(zones.x, 0.0) + max(sweep.x, sweep.y) + SOFTNESS;
 
         var distance = OUTSIDE;
         // Skip the hand if it is far away
@@ -85,11 +139,23 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
             let base = (hand * HAND_SEGMENTS + i) * 2u;
             let start = depth_u.hand_points[base];
             let end = depth_u.hand_points[base + 1u];
-            let segment_distance = ray_capsule_distance(origin, dir, start, end);
-            distance = min(distance, segment_distance);
-
             let segment = hand * HAND_SEGMENTS + i;
             let solid = depth_u.hand_solid[segment / 4u][segment % 4u];
+
+            var segment_distance = 0.0;
+            if sweeps {
+                distance = min(
+                    distance,
+                    ray_swept_capsule_distance(origin, dir, start, end, motion.xyz, across_info, sweep),
+                );
+                if solid > 0.0 {
+                    segment_distance = ray_capsule_distance(origin, dir, start, end);
+                }
+            } else {
+                segment_distance = ray_capsule_distance(origin, dir, start, end);
+                distance = min(distance, segment_distance);
+            }
+
             if solid > 0.0 {
                 let fade = smoothstep(zones.y, zones.y + max(zones.z, 0.0005), segment_distance);
                 inner = max(inner, solid * (1.0 - fade));

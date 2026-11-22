@@ -61,6 +61,22 @@ ring alone. The map is forgotten when the head moves more than 5 cm for 1 s, whe
 change time are dropped). A hand that is in view but not
 tracked is learned as room. Unknown: whether the camera registration is good enough for 2 degree cells.
 
+**Growth along the motion** (`key_sweep`, **not tested**). Without growth (`key_rim_max 0`) leaks were
+clearly better, but the cutout did not follow a fast hand immediately (observed). Now the zone of a
+moving hand is the hand moved anywhere along the velocity of its fastest joint, up to speed x
+`key_rim_error` (limit `key_sweep_max`) ahead and behind; `key_sweep_bias` shifts this ahead or behind
+(0: the same, earlier tests could not tell whether the tracked pose is ahead of or behind the image).
+`key_sweep_iso` of the old growth stays in all directions (fingers, rotation). Below 1 mm the growth is
+in all directions as before. The solid fill is not moved, and over leaks the sweep narrows like the rim.
+In the shader each capsule is tested once: seen along the pixel's ray, the moved axis is a parallelogram
+whose closest point is found like the closest points of two segments. Exact for constant radius (unit
+test against 16 moved copies on random rays); a tapered capsule moving along itself can miss the
+thicker end by up to the difference of its radii (1.7 mm measured with 3 mm tapers). Per pixel near a
+moving hand: per capsule 2 dot products, 1 division and about 12 other operations more, plus the old
+test for solid capsules; no texture samples. The zone, the scissor rect and the layer crop are larger
+along the motion. GPU time not measured. The `key:` line of `ALVR_CAM` logs `rim` and `sweep`
+(ahead / behind, mm) of each hand.
+
 ## What works
 
 - **Color keying in the compositor.** An RGBA `XR_META_passthrough_color_lut` makes the passthrough
@@ -178,6 +194,8 @@ Measured in the SteamVR home, 72 Hz, with color key on unless noted:
 | `color_key` | 0 | 0 off, another value (re)loads `/data/local/tmp/alvr_color_key.lut` |
 | `auto_key` | 0 | 1 before starting the app: learn the colors, asks for the camera permission |
 | `key_rim` / `key_rim_error` / `key_rim_max` | 0 mm / 45 ms / 16 mm | Zone at rest, growth with the speed, limit |
+| `key_sweep` | 1 | 1: the zone grows along the motion of the hand, 0: in all directions as before. Not tested |
+| `key_sweep_max` / `key_sweep_iso` / `key_sweep_bias` | 40 mm / 25 % / 0 % | Limit of the growth along the motion (each side, before the bias), share of the growth that stays in all directions (limited by `key_rim_max`), -100..100: more ahead (positive) or behind |
 | `key_inset` / `key_falloff` | 4 mm / 4 mm | Where the solid fill starts and how it fades out |
 | `key_error` | 10 ms | How much the fill shrinks with the speed |
 | `key_solid` | 6 | Segments that are always solid: 0 none, 6 wrist, 9 palm, 28 hand |

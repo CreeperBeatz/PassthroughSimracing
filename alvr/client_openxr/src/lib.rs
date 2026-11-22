@@ -731,11 +731,24 @@ pub fn entry_point() {
 
             if use_color_key && last_key_log.elapsed() > Duration::from_secs(2) {
                 last_key_log = Instant::now();
+                // Rim in all directions, sweep ahead / behind the motion
+                let zones = key_frame.hand_zones.map(|zones| {
+                    zones.map_or("-".into(), |zones| {
+                        format!(
+                            "rim {:.0} sweep {:.0}/{:.0} mm",
+                            zones.rim * 1000.0,
+                            zones.sweep.forward * 1000.0,
+                            zones.sweep.backward * 1000.0
+                        )
+                    })
+                });
                 stream_log(&format!(
-                    "key: tracked hands {:?}, rects {:.2?}, layers {}",
+                    "key: tracked hands {:?}, rects {:.2?}, layers {}, zones {}, {}",
                     key_frame.tracked_hands,
                     key_frame.hand_rects,
-                    layers.len()
+                    layers.len(),
+                    zones[0],
+                    zones[1]
                 ));
             }
 

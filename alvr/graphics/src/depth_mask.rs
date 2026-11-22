@@ -86,6 +86,55 @@ pub fn ray_capsule_distance(origin: Vec3, direction: Vec3, start: Vec4, end: Vec
     (origin + direction * t).distance(point) - (start.w + (end.w - start.w) * s)
 }
 
+/// Same, for the capsule moved anywhere along the sweep. Seen along the ray, the ray is a point and the
+/// moved axis covers a parallelogram: its closest point is found like the closest points of two
+/// segments (the axis and the motion). Exact for capsules of constant radius in front of the eye; a
+/// tapered capsule takes the radius at that point. Same as in focus_area.wgsl
+pub fn ray_swept_capsule_distance(
+    origin: Vec3,
+    direction: Vec3,
+    start: Vec4,
+    end: Vec4,
+    sweep: &HandSweep,
+) -> f32 {
+    // Per hand in the shader
+    let motion = sweep.direction;
+    let across = motion - direction * motion.dot(direction);
+    let across_length2 = across.length_squared();
+    let inv_across = if across_length2 > 1e-8 {
+        1.0 / across_length2
+    } else {
+        0.0
+    };
+
+    let axis = (end - start).truncate();
+    let w = origin - start.truncate();
+    let b = direction.dot(axis);
+    let d = direction.dot(w);
+    // Across the ray: axis . axis, axis . w, axis . motion, motion . w
+    let aa = axis.dot(axis) - b * b;
+    let aw = axis.dot(w) - b * d;
+    let am = axis.dot(across);
+    let mw = w.dot(across);
+
+    let inv_aa = if aa > 1e-9 { 1.0 / aa } else { 0.0 };
+    // Where the axis crosses the line of the motion, the shift for that point, the point for the shift
+    let det = aa - am * am * inv_across;
+    let s = if det > 1e-7 * aa {
+        (aw - am * mw * inv_across) / det
+    } else {
+        aw * inv_aa
+    };
+    let s = s.clamp(0.0, 1.0);
+    let shift = ((mw - s * am) * inv_across).clamp(-sweep.backward, sweep.forward);
+    let s = ((aw - shift * am) * inv_aa).clamp(0.0, 1.0);
+
+    let point = start.truncate() + axis * s + motion * shift;
+    let t = (point - origin).dot(direction).max(0.0);
+
+    (origin + direction * t).distance(point) - (start.w + (end.w - start.w) * s)
+}
+
 impl HandShape {
     /// `joints`: position and radius of the OpenXR hand joints
     pub fn from_joints(joints: &[Vec4; 26]) -> Self {
@@ -118,6 +167,14 @@ impl HandShape {
         self.segments_ray_distance(PALM_SEGMENTS, origin, direction)
     }
 
+    /// Same, for the hand moved anywhere along the sweep
+    pub fn swept_ray_distance(&self, origin: Vec3, direction: Vec3, sweep: &HandSweep) -> f32 {
+        self.segments
+            .iter()
+            .map(|[start, end]| ray_swept_capsule_distance(origin, direction, *start, *end, sweep))
+            .fold(f32::MAX, f32::min)
+    }
+
     fn segments_ray_distance(&self, count: usize, origin: Vec3, direction: Vec3) -> f32 {
         self.segments[..count]
             .iter()
@@ -138,6 +195,36 @@ impl HandShape {
     }
 }
 
+/// The rim of a moving hand covers the hand moved anywhere from `backward` behind to `forward` ahead
+/// along `direction`, in meters
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HandSweep {
+    /// Unit vector, in the space of the hand shape
+    pub direction: Vec3,
+    pub forward: f32,
+    pub backward: f32,
+}
+
+impl HandSweep {
+    pub const NONE: Self = Self {
+        direction: Vec3::ZERO,
+        forward: 0.0,
+        backward: 0.0,
+    };
+}
+
+/// Growth of the rim along the motion of the hand instead of in all directions
+/// (`debug.alvr.key_sweep*`)
+#[derive(Clone, Copy, Debug)]
+pub struct SweepParams {
+    /// Limit of the sweep on each side, before the bias, meters
+    pub max: f32,
+    /// Share of the growth that stays in all directions (0..1), limited like the rim
+    pub iso: f32,
+    /// -1..1: positive sweeps further ahead than behind, 0: the same
+    pub bias: f32,
+}
+
 /// Confidence zones of a hand, as distances from its surface in meters (negative inside): solid
 /// passthrough up to `core`, fading out over `falloff`, and color keyed passthrough up to `rim`.
 #[derive(Clone, Copy, Debug)]
@@ -147,11 +234,14 @@ pub struct HandZones {
     pub rim: f32,
     /// How solid the core of each segment is (0..1): only where the tracking is known to be right
     pub solid: [f32; HAND_SEGMENTS],
+    /// The rim (not the solid fill) also covers the hand moved along its motion
+    pub sweep: HandSweep,
 }
 
 impl HandZones {
     const MAX_CORE_SHRINK: f32 = 0.04;
     const UNTRACKED_CORE_SHRINK: f32 = 0.04;
+    const MIN_SWEEP: f32 = 0.001;
 
     /// Hand tracking is late and predicted, so the faster the hand, the less certain its position:
     /// the solid core shrinks and the keyed rim grows.
@@ -165,11 +255,38 @@ impl HandZones {
     }
 
     /// The errors are the assumed timing errors of the hand pose, in seconds. The rim must contain the
-    /// hand even in the worst case, or the hand is cut off.
-    pub fn for_speed(self, speed: f32, core_error: f32, rim_error: f32, max_growth: f32) -> Self {
+    /// hand even in the worst case, or the hand is cut off. With `sweep` the rim grows along the
+    /// `velocity` only, except for a share in all directions (fingers and rotation).
+    pub fn for_speed(
+        self,
+        velocity: Vec3,
+        core_error: f32,
+        rim_error: f32,
+        max_growth: f32,
+        sweep: Option<SweepParams>,
+    ) -> Self {
+        let speed = velocity.length();
+        let growth = speed * rim_error;
+        let (rim_growth, sweep) = match (sweep, velocity.try_normalize()) {
+            // A hand that barely moves grows in all directions: the shader is cheaper without a sweep
+            (Some(params), Some(direction)) if growth.min(params.max) >= Self::MIN_SWEEP => {
+                let length = growth.min(params.max);
+                let bias = params.bias.clamp(-1.0, 1.0);
+                let sweep = HandSweep {
+                    direction,
+                    forward: length * (1.0 + bias),
+                    backward: length * (1.0 - bias),
+                };
+
+                (growth * params.iso, sweep)
+            }
+            _ => (growth, self.sweep),
+        };
+
         Self {
             core: self.core - (speed * core_error).clamp(0.0, Self::MAX_CORE_SHRINK),
-            rim: self.rim + (speed * rim_error).clamp(0.0, max_growth),
+            rim: self.rim + rim_growth.clamp(0.0, max_growth),
+            sweep,
             ..self
         }
     }
@@ -183,6 +300,11 @@ impl HandZones {
         let leak = leak.min(1.0);
         Self {
             rim: self.rim * (1.0 - leak) - inset * leak,
+            sweep: HandSweep {
+                forward: self.sweep.forward * (1.0 - leak),
+                backward: self.sweep.backward * (1.0 - leak),
+                ..self.sweep
+            },
             ..self
         }
     }
@@ -228,7 +350,7 @@ const EYE_FLOAT_COUNT: usize = 16 + 4 + 16 + 16 + 4;
 pub const DEPTH_UNIFORMS_FLOAT_COUNT: usize = 2 * EYE_FLOAT_COUNT
     + 16
     + 4 * 5
-    + 4 * (2 + 2 * HAND_SEGMENTS / 4 + 2 + 2 * 2 * HAND_SEGMENTS + 6 + 2 * 9 + 1 + 2);
+    + 4 * (2 + 2 * HAND_SEGMENTS / 4 + 2 + 2 * 2 * HAND_SEGMENTS + 6 + 2 * 9 + 1 + 2 + 2);
 pub const DEPTH_UNIFORMS_SIZE: usize = DEPTH_UNIFORMS_FLOAT_COUNT * size_of::<f32>();
 
 fn pose_to_mat4(pose: Pose) -> Mat4 {
@@ -356,7 +478,7 @@ pub fn depth_uniforms(
     data.extend([f32::from(u8::from(input.color_key.is_some())), 0.0]);
     for hand in &hands {
         data.extend(hand.map_or([0.0; 4], |(_, zones)| {
-            [zones.rim, zones.core, zones.falloff, 0.0]
+            [zones.rim, zones.core, zones.falloff, zones.sweep.backward]
         }));
     }
     for hand in &hands {
@@ -409,6 +531,11 @@ pub fn depth_uniforms(
     {
         data.extend([min.x, min.y, max.x, max.y]);
     }
+    for hand in &hands {
+        data.extend(hand.map_or([0.0; 4], |(_, zones)| {
+            zones.sweep.direction.extend(zones.sweep.forward).to_array()
+        }));
+    }
 
     data.try_into().unwrap()
 }
@@ -445,11 +572,16 @@ pub fn hands_view_rect(
         .flatten()
         .flat_map(|(shape, zones)| {
             let rim = zones.rim.max(0.0) + MARGIN;
+            // Both ends of the sweep: the moved capsules lie in between
+            let shifts = [0.0, zones.sweep.forward, -zones.sweep.backward]
+                .map(|shift| zones.sweep.direction * shift);
             shape
                 .segments
                 .as_flattened()
                 .iter()
-                .map(move |point| (point.truncate(), point.w + rim))
+                .flat_map(move |point| {
+                    shifts.map(|shift| (point.truncate() + shift, point.w + rim))
+                })
                 // Where the playzone is used
                 .chain([(shape.bounds().truncate(), shape.bounds().w + PLAYZONE_RANGE)])
                 .collect::<Vec<_>>()
@@ -602,16 +734,123 @@ mod tests {
         }
     }
 
+    // Deterministic random numbers (xorshift)
+    struct Random(u32);
+
+    impl Random {
+        fn range(&mut self, min: f32, max: f32) -> f32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 17;
+            self.0 ^= self.0 << 5;
+            min + (max - min) * (self.0 >> 8) as f32 / (1 << 24) as f32
+        }
+
+        fn vec3(&mut self, size: f32) -> Vec3 {
+            Vec3::new(
+                self.range(-size, size),
+                self.range(-size, size),
+                self.range(-size, size),
+            )
+        }
+    }
+
+    // The swept distance against the minimum over copies of the hand moved along the sweep, on random
+    // rays near random hands. Constant radius: exact (never above the copies, at most half their
+    // spacing below). Tapered: the radius is taken where the axis is closest, so where the motion is
+    // (almost) along a capsule the thicker end may be missed: up to the difference of its radii above.
+    #[test]
+    fn swept_distance_matches_brute_force() {
+        const COPIES: usize = 16;
+        let mut random = Random(0x1234_5678);
+
+        for taper in [0.0, 0.003] {
+            // How much the swept distance is below the copies (in their spacing) / above them (m)
+            let (mut below, mut above) = (0.0_f32, 0.0_f32);
+            for _ in 0..300 {
+                let center = Vec3::new(
+                    random.range(-0.2, 0.2),
+                    random.range(-0.2, 0.1),
+                    -random.range(0.25, 0.6),
+                );
+                let segments = std::array::from_fn(|i| {
+                    let start = center + random.vec3(0.06);
+                    // Some are spheres, like the first segment of a real hand
+                    let end = if i % 7 == 0 {
+                        start
+                    } else {
+                        start + random.vec3(0.04)
+                    };
+                    let radius = random.range(0.005, 0.012);
+                    let end_radius = radius + random.range(-taper, taper);
+                    [start.extend(radius), end.extend(end_radius)]
+                });
+                let shape = HandShape { segments };
+                let length = random.range(0.0, 0.04);
+                let bias = random.range(-1.0, 1.0);
+                let sweep = HandSweep {
+                    direction: random.vec3(1.0).normalize_or(Vec3::X),
+                    forward: length * (1.0 + bias),
+                    backward: length * (1.0 - bias),
+                };
+                let spacing = (sweep.forward + sweep.backward) / (COPIES - 1) as f32;
+
+                for _ in 0..50 {
+                    let origin = random.vec3(0.03);
+                    let direction = (center + random.vec3(0.1) - origin).normalize();
+                    let swept = shape.swept_ray_distance(origin, direction, &sweep);
+                    let copies = (0..COPIES)
+                        .map(|i| {
+                            let shift = sweep.direction * (spacing * i as f32 - sweep.backward);
+                            let segments = shape
+                                .segments
+                                .map(|ends| ends.map(|p| p + shift.extend(0.0)));
+                            HandShape { segments }.ray_distance(origin, direction)
+                        })
+                        .fold(f32::MAX, f32::min);
+
+                    // Between copies the distance can only be lower, by at most half their spacing
+                    assert!(swept >= copies - 0.5 * spacing - 1e-5, "{swept} {copies}");
+                    assert!(swept <= copies + taper + 1e-5, "{swept} {copies}");
+                    below = below.max((copies - swept) / spacing.max(1e-6));
+                    above = above.max(swept - copies);
+                }
+            }
+            eprintln!("taper {taper} m: below {below} x spacing, above {above} m");
+        }
+    }
+
+    #[test]
+    fn swept_distance_without_sweep_is_the_same() {
+        let start = Vec4::new(-0.05, 0.02, -0.4, 0.01);
+        let end = Vec4::new(0.03, -0.01, -0.45, 0.008);
+        let mut random = Random(42);
+        for _ in 0..1000 {
+            let direction = (Vec3::new(0.0, 0.0, -0.42) + random.vec3(0.1)).normalize();
+            let plain = ray_capsule_distance(Vec3::ZERO, direction, start, end);
+            for sweep in [
+                HandSweep::NONE,
+                HandSweep {
+                    direction: random.vec3(1.0).normalize(),
+                    ..HandSweep::NONE
+                },
+            ] {
+                let swept = ray_swept_capsule_distance(Vec3::ZERO, direction, start, end, &sweep);
+                assert!((swept - plain).abs() < 1e-6, "{swept} {plain}");
+            }
+        }
+    }
+
     #[test]
     fn layout_size() {
         // std140: must be a multiple of 16 bytes
         assert_eq!(DEPTH_UNIFORMS_SIZE % 16, 0);
         assert_eq!(
             DEPTH_UNIFORMS_SIZE,
-            592 + 16 * (2 + 2 * HAND_SEGMENTS / 4 + 2 + 2 * 2 * HAND_SEGMENTS + 6 + 2 * 9 + 1 + 2)
+            592 + 16
+                * (2 + 2 * HAND_SEGMENTS / 4 + 2 + 2 * 2 * HAND_SEGMENTS + 6 + 2 * 9 + 1 + 2 + 2)
         );
         // 28 capsules per hand, no forearm
-        assert_eq!(DEPTH_UNIFORMS_SIZE, 3104);
+        assert_eq!(DEPTH_UNIFORMS_SIZE, 3136);
     }
 
     #[test]
