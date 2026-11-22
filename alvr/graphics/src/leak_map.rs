@@ -43,8 +43,9 @@ const ARM_EXCLUSION_RADIUS: f32 = 0.1;
 pub const ARM_EXCLUSION_SPHERES: usize = 6;
 // The camera rays are moved to the anchor assuming the background is this far away, in meters
 const OBSERVE_DEPTH: f32 = 0.8;
-// The anchor moves if the camera is farther than this for this long
-const ANCHOR_TOLERANCE: f32 = 0.05;
+// The anchor moves if the camera is farther than this for this long. Turning the head alone moves
+// the camera by about 8 cm, and 5 cm restarted the map 20 times in 80 s on the headset.
+const ANCHOR_TOLERANCE: f32 = 0.2;
 const ANCHOR_DELAY: f32 = 1.0;
 // Light change: share of the re-observed colors that moved by more than the texel distance
 const LIGHT_CHANGE_TEXELS: usize = 2;
@@ -289,8 +290,25 @@ impl LeakMap {
         }
     }
 
+    // The cells move with the anchor as if everything was `OBSERVE_DEPTH` away, like the camera rays
     fn reanchor(&mut self, position: Vec3) {
-        self.cells.fill(EMPTY_CELL);
+        let shift = position - self.anchor.unwrap_or(position);
+        let mut moved = vec![EMPTY_CELL; LEAK_MAP_CELLS];
+        for (index, cell) in self.cells.iter().enumerate() {
+            if !cell.is_known() && cell.last_hand == f32::NEG_INFINITY {
+                continue;
+            }
+            let Some(target) = cell_index(cell_direction(index) * OBSERVE_DEPTH - shift) else {
+                continue;
+            };
+            let target = &mut moved[target];
+            let last_hand = target.last_hand.max(cell.last_hand);
+            if cell.is_known() && cell.stamp >= target.stamp {
+                *target = *cell;
+            }
+            target.last_hand = last_hand;
+        }
+        self.cells = moved;
         self.drop_pending();
         self.anchor = Some(position);
         self.away_since = None;
@@ -1133,14 +1151,18 @@ mod tests {
         assert_eq!(map.anchor_moves(), 0);
         assert_eq!(map.snapshot().unwrap().direction_leak(direction), Some(0.0));
 
-        let moved = Vec3::new(0.1, 0.0, 0.0);
+        let known_before = map.snapshot().unwrap().known_fraction();
+        assert!(known_before > 0.0);
+        let moved = Vec3::new(0.3, 0.0, 0.0);
         step = run(&mut map, &at(moved), step, step + steps(0.5));
         assert_eq!(map.anchor(), Some(Vec3::ZERO));
         assert_eq!(map.snapshot().unwrap().direction_leak(direction), Some(0.0));
         step = run(&mut map, &at(moved), step, step + steps(0.6));
         assert_eq!(map.anchor(), Some(moved));
         assert_eq!(map.anchor_moves(), 1);
-        assert_eq!(map.snapshot().unwrap().known_fraction(), 0.0);
+        // The cells moved with the anchor instead of being forgotten
+        assert!(map.snapshot().unwrap().known_fraction() > 0.5 * known_before);
+        assert_eq!(map.snapshot().unwrap().direction_leak(direction), Some(0.0));
         run(&mut map, &at(moved), step, step + steps(1.5));
         assert_eq!(map.snapshot().unwrap().direction_leak(direction), Some(0.0));
 

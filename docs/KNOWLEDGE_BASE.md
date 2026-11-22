@@ -57,7 +57,10 @@ motion) are skipped, and a color is only stored if no hand came near it for 1 s.
 The cells keep colors, so each new LUT re-evaluates the whole map. At render time each hand looks up the
 cells behind its 28 segments from both eyes; the mean of the 7 leakiest gives the map value, which goes
 through `key_leak_map_lo` / `key_leak_map_hi` like the ring. Fewer than half of the cells known: the
-ring alone. The map is forgotten when the head moves more than 5 cm for 1 s, when most colors change
+ring alone. When the head moves more than 20 cm for 1 s, the map moves with it (as if everything was
+0.8 m away). With the first limit of 5 cm and a full restart, normal head motion restarted the map 20
+times in 80 s and it never knew more than 10 % of the room (measured, ff6c6022), so it never acted.
+The map is forgotten when most colors change
 (light), after `key_leak_memory`, and when the reference space changes (camera images from before the
 change time are dropped). A hand that is in view but not
 tracked is learned as room. Unknown: whether the camera registration is good enough for 2 degree cells.
