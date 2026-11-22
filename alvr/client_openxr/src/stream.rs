@@ -85,6 +85,7 @@ impl ParsedStreamConfig {
 pub struct StreamContext {
     core_context: Arc<ClientCoreContext>,
     xr_session: xr::Session<xr::OpenGlEs>,
+    gfx_ctx: Rc<GraphicsContext>,
     interaction_context: Arc<RwLock<InteractionContext>>,
     stage_reference_space: Arc<xr::Space>,
     view_reference_space: Arc<xr::Space>,
@@ -175,7 +176,7 @@ impl StreamContext {
         ];
 
         let renderer = StreamRenderer::new(
-            gfx_ctx,
+            Rc::clone(&gfx_ctx),
             config.view_resolution,
             target_view_resolution,
             [
@@ -232,6 +233,7 @@ impl StreamContext {
             use_custom_reprojection: core_ctx.platform().is_yvr(),
             core_context: core_ctx,
             xr_session,
+            gfx_ctx,
             interaction_context: interaction_ctx,
             stage_reference_space,
             view_reference_space,
@@ -351,8 +353,10 @@ impl StreamContext {
         current_headset_views: &[xr::View],
     ) -> Option<DepthRenderInput> {
         if alvr_graphics::depth_passthrough_config(self.config.passthrough.as_ref()).is_none() {
-            if self.environment_depth.take().is_some() {
+            if let Some(depth) = self.environment_depth.take() {
                 self.renderer.clear_depth_swapchain();
+                self.gfx_ctx.make_current();
+                drop(depth);
                 info!("Environment depth stopped");
             }
             // Retry next time the mode is selected (e.g. after granting the permission)
@@ -360,6 +364,10 @@ impl StreamContext {
 
             return None;
         }
+
+        // The runtime imports the depth textures into the current GL context, and wgpu releases the
+        // context after each call. Without this the texture names are 0.
+        self.gfx_ctx.make_current();
 
         if self.environment_depth.is_none() && !self.environment_depth_failed {
             match EnvironmentDepthMETA::new(&self.xr_session) {
@@ -372,6 +380,7 @@ impl StreamContext {
                     );
                     self.renderer
                         .set_depth_swapchain(depth.images(), depth.resolution());
+                    self.gfx_ctx.make_current();
                     self.environment_depth = Some(depth);
                 }
                 Err(e) => {

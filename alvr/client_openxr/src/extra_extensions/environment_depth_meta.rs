@@ -18,6 +18,7 @@ pub struct EnvironmentDepthMETA {
 }
 
 impl EnvironmentDepthMETA {
+    /// The GL context of the session must be current
     pub fn new(session: &xr::Session<xr::OpenGlEs>) -> xr::Result<Self> {
         let ext_fns = session
             .instance()
@@ -101,6 +102,10 @@ impl EnvironmentDepthMETA {
             .take(count as usize)
             .map(|i| i.image)
             .collect();
+        if this.images.is_empty() || this.images.contains(&0) {
+            alvr_common::error!("Invalid environment depth textures: {:?}", this.images);
+            return Err(sys::Result::ERROR_RUNTIME_FAILURE);
+        }
 
         // We want the hands in the depth map: they are what we need to see. This is the default,
         // but set it explicitly. Fails harmlessly on systems without hand removal support.
