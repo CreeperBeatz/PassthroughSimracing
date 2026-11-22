@@ -52,12 +52,15 @@ pub const LIGHT_PROBE_FORMAT: TextureFormat = TextureFormat::Rgba16Float;
 const DEPTH_MASK_DOWNSCALE: u32 = 4;
 /// The outline of the hands is visible, keep it sharp
 const FOCUS_AREA_DOWNSCALE: u32 = 4;
+// Distances in meters
+const PLAYZONE_FORMAT: TextureFormat = LIGHT_PROBE_FORMAT;
 const DEPTH_MASK_FORMAT: TextureFormat = TextureFormat::Rgba8Unorm;
 
 const FOVEATION_COMMON_WGSL: &str = include_str!("../resources/foveation_common.wgsl");
 const DEPTH_COMMON_WGSL: &str = include_str!("../resources/depth_common.wgsl");
 const DEPTH_MASK_WGSL: &str = include_str!("../resources/depth_mask.wgsl");
 const FOCUS_AREA_WGSL: &str = include_str!("../resources/focus_area.wgsl");
+const PLAYZONE_COPY_WGSL: &str = include_str!("../resources/playzone_copy.wgsl");
 const STREAM_WGSL: &str = include_str!("../resources/stream.wgsl");
 const LIGHT_PROBE_LOCAL_WGSL: &str = include_str!("../resources/light_probe_local.wgsl");
 const LIGHT_PROBE_GLOBAL_WGSL: &str = include_str!("../resources/light_probe_global.wgsl");
@@ -70,6 +73,10 @@ pub(crate) fn stream_shader_source() -> String {
 
 pub(crate) fn depth_mask_shader_source() -> String {
     format!("{DEPTH_MASK_WGSL}\n{DEPTH_COMMON_WGSL}")
+}
+
+pub(crate) fn playzone_copy_shader_source() -> String {
+    format!("{PLAYZONE_COPY_WGSL}\n{DEPTH_COMMON_WGSL}")
 }
 
 pub(crate) fn focus_area_shader_source() -> String {
@@ -139,8 +146,12 @@ pub(crate) struct StreamPipelines {
     /// depth uniforms, depth texture array
     pub depth_layout: BindGroupLayout,
     pub main: RenderPipeline,
-    /// Uses `depth_layout`
+    /// Uses `depth_layout` and `playzone_layout`
     pub depth_mask: RenderPipeline,
+    /// playzone depth, focus area, sampler
+    pub playzone_layout: BindGroupLayout,
+    /// Uses `depth_layout`
+    pub playzone_copy: RenderPipeline,
     /// depth uniforms
     pub focus_area_layout: BindGroupLayout,
     pub focus_area: RenderPipeline,
@@ -221,12 +232,52 @@ impl StreamPipelines {
             cache: None,
         });
 
+        let playzone_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("playzone"),
+            entries: &[
+                texture_entry(0, false, TextureViewDimension::D2),
+                texture_entry(1, true, TextureViewDimension::D2),
+                sampler_entry(2),
+            ],
+        });
+        let playzone_copy_module =
+            shader_module(device, "playzone copy", playzone_copy_shader_source());
+        let playzone_copy = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("playzone copy"),
+            layout: Some(&device.create_pipeline_layout(&PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[Some(&depth_layout)],
+                immediate_size: VIEW_IDX_IMMEDIATE_SIZE,
+            })),
+            vertex: VertexState {
+                module: &playzone_copy_module,
+                entry_point: None,
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(FragmentState {
+                module: &playzone_copy_module,
+                entry_point: None,
+                compilation_options: Default::default(),
+                targets: &[Some(ColorTargetState {
+                    format: PLAYZONE_FORMAT,
+                    blend: None,
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
         let depth_mask_module = shader_module(device, "depth mask", depth_mask_shader_source());
         let depth_mask = device.create_render_pipeline(&RenderPipelineDescriptor {
             label: Some("depth mask"),
             layout: Some(&device.create_pipeline_layout(&PipelineLayoutDescriptor {
                 label: None,
-                bind_group_layouts: &[Some(&depth_layout)],
+                bind_group_layouts: &[Some(&depth_layout), Some(&playzone_layout)],
                 immediate_size: VIEW_IDX_IMMEDIATE_SIZE,
             })),
             vertex: VertexState {
@@ -391,6 +442,8 @@ impl StreamPipelines {
             depth_layout,
             main,
             depth_mask,
+            playzone_layout,
+            playzone_copy,
             focus_area_layout,
             focus_area,
             probe_local_layout,
@@ -446,6 +499,51 @@ fn create_mask_texture(device: &Device, label: &str, size: UVec2) -> Texture {
         format: DEPTH_MASK_FORMAT,
         usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
+    })
+}
+
+/// Depth map without hands, for one eye
+pub(crate) fn create_playzone_texture(device: &Device, depth_resolution: UVec2) -> Texture {
+    device.create_texture(&TextureDescriptor {
+        label: Some("playzone"),
+        size: Extent3d {
+            width: depth_resolution.x,
+            height: depth_resolution.y,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: PLAYZONE_FORMAT,
+        usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    })
+}
+
+pub(crate) fn create_playzone_bind_group(
+    device: &Device,
+    pipelines: &StreamPipelines,
+    playzone: &TextureView,
+    focus_area: &TextureView,
+    sampler: &Sampler,
+) -> BindGroup {
+    device.create_bind_group(&BindGroupDescriptor {
+        label: Some("playzone"),
+        layout: &pipelines.playzone_layout,
+        entries: &[
+            BindGroupEntry {
+                binding: 0,
+                resource: BindingResource::TextureView(playzone),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: BindingResource::TextureView(focus_area),
+            },
+            BindGroupEntry {
+                binding: 2,
+                resource: BindingResource::Sampler(sampler),
+            },
+        ],
     })
 }
 
@@ -560,6 +658,11 @@ pub struct StreamRenderer {
     depth_bind_groups: Vec<BindGroup>,
     light_probe_initialized: Cell<bool>,
     focus_area_resolution: UVec2,
+    sampler: Sampler,
+    playzone_textures: [TextureView; 2],
+    playzone_bind_groups: [BindGroup; 2],
+    // Depth cameras of the remembered playzone
+    playzone_views: Cell<Option<[ViewParams; 2]>>,
 }
 
 impl StreamRenderer {
@@ -726,11 +829,16 @@ impl StreamRenderer {
             &depth_array_view(&dummy_depth_texture),
         );
 
+        let views_objects: [ViewObjects; 2] =
+            view_objects.try_into().unwrap_or_else(|_| unreachable!());
+        let (playzone_textures, playzone_bind_groups) =
+            create_playzone(device, &pipelines, &views_objects, &sampler, UVec2::ONE);
+
         Self {
             context,
             staging_renderer,
             pipelines,
-            views_objects: view_objects.try_into().unwrap_or_else(|_| unreachable!()),
+            views_objects,
             foveated_encoding,
             foveation_buffer,
             last_foveation_center_shifts: Cell::new(None),
@@ -739,6 +847,10 @@ impl StreamRenderer {
             depth_bind_groups: vec![],
             light_probe_initialized: Cell::new(false),
             focus_area_resolution: focus_area_resolution(target_view_resolution),
+            sampler,
+            playzone_textures,
+            playzone_bind_groups,
+            playzone_views: Cell::new(None),
         }
     }
 
@@ -766,10 +878,25 @@ impl StreamRenderer {
                 )
             })
             .collect();
+
+        (self.playzone_textures, self.playzone_bind_groups) = create_playzone(
+            &self.context.device,
+            &self.pipelines,
+            &self.views_objects,
+            &self.sampler,
+            resolution,
+        );
+        self.clear_playzone();
     }
 
     pub fn clear_depth_swapchain(&mut self) {
         self.depth_bind_groups.clear();
+        self.clear_playzone();
+    }
+
+    /// Forget the playzone, e.g. if the reference space changed
+    pub fn clear_playzone(&self) {
+        self.playzone_views.set(None);
     }
 
     /// Runtime foveation centers must already be encoder-aligned. `None` uses the negotiated centers.
@@ -812,6 +939,7 @@ impl StreamRenderer {
         };
 
         let mut depth_bind_group = &self.dummy_depth_bind_group;
+        let mut capture_playzone = false;
         // Only the part of the view with the hands is rendered
         let hand_rects = depth.and_then(|d| d.color_key).map(|key| {
             [0, 1].map(|i| {
@@ -829,6 +957,7 @@ impl StreamRenderer {
                 eye_positions: [Vec3::ZERO; 2],
                 color_key: None,
                 arms: [None; 2],
+                capture_playzone: false,
             });
 
             // Fall back to "no depth" if the swapchain image is unknown
@@ -842,6 +971,13 @@ impl StreamRenderer {
                 depth_bind_group = &self.depth_bind_groups[frame.swapchain_index as usize];
             }
 
+            if input.capture_playzone
+                && let Some(frame) = &input.frame
+            {
+                self.playzone_views.set(Some(frame.depth_views));
+                capture_playzone = true;
+            }
+
             lighting_response = config.lighting.as_option().map(|l| l.response_speed);
 
             let uniforms = depth_mask::depth_uniforms(
@@ -851,6 +987,7 @@ impl StreamRenderer {
                     view_params[1].input_view_params,
                 ],
                 &input,
+                self.playzone_views.get().as_ref(),
                 lighting_response.is_some(),
             );
             self.context.queue.write_buffer(
@@ -888,13 +1025,16 @@ impl StreamRenderer {
 
         if depth_config.is_some() {
             for (view_idx, objects) in self.views_objects.iter().enumerate() {
-                encode_depth_mask(
-                    &mut encoder,
-                    &self.pipelines,
-                    &objects.depth_mask,
-                    depth_bind_group,
-                    view_idx as u32,
-                );
+                if capture_playzone {
+                    encode_playzone_copy(
+                        &mut encoder,
+                        &self.pipelines,
+                        &self.playzone_textures[view_idx],
+                        depth_bind_group,
+                        view_idx as u32,
+                    );
+                }
+                // The depth mask uses the focus area
                 if let Some(rects) = &hand_rects {
                     encode_focus_area(
                         &mut encoder,
@@ -906,6 +1046,14 @@ impl StreamRenderer {
                         rects[view_idx],
                     );
                 }
+                encode_depth_mask(
+                    &mut encoder,
+                    &self.pipelines,
+                    &objects.depth_mask,
+                    depth_bind_group,
+                    &self.playzone_bind_groups[view_idx],
+                    view_idx as u32,
+                );
             }
         }
 
@@ -939,6 +1087,30 @@ impl StreamRenderer {
 
         self.context.queue.submit(iter::once(encoder.finish()));
     }
+}
+
+fn create_playzone(
+    device: &Device,
+    pipelines: &StreamPipelines,
+    views_objects: &[ViewObjects; 2],
+    sampler: &Sampler,
+    depth_resolution: UVec2,
+) -> ([TextureView; 2], [BindGroup; 2]) {
+    let textures = [0, 1].map(|_| {
+        create_playzone_texture(device, depth_resolution)
+            .create_view(&TextureViewDescriptor::default())
+    });
+    let bind_groups = [0, 1].map(|i| {
+        create_playzone_bind_group(
+            device,
+            pipelines,
+            &textures[i],
+            &views_objects[i].focus_area,
+            sampler,
+        )
+    });
+
+    (textures, bind_groups)
 }
 
 fn create_light_probe(
@@ -1040,6 +1212,7 @@ pub(crate) fn encode_depth_mask(
     pipelines: &StreamPipelines,
     target: &TextureView,
     depth_bind_group: &BindGroup,
+    playzone_bind_group: &BindGroup,
     view_idx: u32,
 ) {
     let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
@@ -1056,6 +1229,33 @@ pub(crate) fn encode_depth_mask(
         ..Default::default()
     });
     pass.set_pipeline(&pipelines.depth_mask);
+    pass.set_bind_group(0, depth_bind_group, &[]);
+    pass.set_bind_group(1, playzone_bind_group, &[]);
+    pass.set_immediates(0, &view_idx.to_le_bytes());
+    pass.draw(0..3, 0..1);
+}
+
+pub(crate) fn encode_playzone_copy(
+    encoder: &mut wgpu::CommandEncoder,
+    pipelines: &StreamPipelines,
+    target: &TextureView,
+    depth_bind_group: &BindGroup,
+    view_idx: u32,
+) {
+    let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+        label: Some("playzone copy"),
+        color_attachments: &[Some(RenderPassColorAttachment {
+            view: target,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: LoadOp::Clear(Color::TRANSPARENT),
+                store: StoreOp::Store,
+            },
+        })],
+        ..Default::default()
+    });
+    pass.set_pipeline(&pipelines.playzone_copy);
     pass.set_bind_group(0, depth_bind_group, &[]);
     pass.set_immediates(0, &view_idx.to_le_bytes());
     pass.draw(0..3, 0..1);

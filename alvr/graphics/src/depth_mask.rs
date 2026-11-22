@@ -230,13 +230,15 @@ pub struct DepthRenderInput {
     /// Set if the passthrough is color keyed around the hands
     pub color_key: Option<ColorKeyInput>,
     pub arms: [Option<ArmRemoval>; 2],
+    /// Remember the current depth image as the playzone. There must be no hands in it
+    pub capture_playzone: bool,
 }
 
 const EYE_FLOAT_COUNT: usize = 16 + 4 + 16 + 16 + 4;
 pub const DEPTH_UNIFORMS_FLOAT_COUNT: usize = 2 * EYE_FLOAT_COUNT
     + 16
     + 4 * 5
-    + 4 * (2 + 2 * HAND_SEGMENTS / 4 + 2 + 2 * 2 * HAND_SEGMENTS + 6);
+    + 4 * (2 + 2 * HAND_SEGMENTS / 4 + 2 + 2 * 2 * HAND_SEGMENTS + 6 + 2 * 9 + 1);
 pub const DEPTH_UNIFORMS_SIZE: usize = DEPTH_UNIFORMS_FLOAT_COUNT * size_of::<f32>();
 
 fn pose_to_mat4(pose: Pose) -> Mat4 {
@@ -277,6 +279,7 @@ pub fn depth_uniforms(
     config: &DepthPassthroughConfig,
     stream_views: &[ViewParams; 2],
     input: &DepthRenderInput,
+    playzone: Option<&[ViewParams; 2]>,
     lighting_enabled: bool,
 ) -> [f32; DEPTH_UNIFORMS_FLOAT_COUNT] {
     let mut data = Vec::with_capacity(DEPTH_UNIFORMS_FLOAT_COUNT);
@@ -396,6 +399,19 @@ pub fn depth_uniforms(
         }
     }
 
+    for view_idx in 0..2 {
+        let (pose, tangents) = playzone.map_or((Mat4::IDENTITY, Vec4::ONE), |views| {
+            (
+                pose_to_mat4(views[view_idx].pose),
+                fov_tangents(views[view_idx].fov),
+            )
+        });
+        data.extend(pose.inverse().to_cols_array());
+        data.extend(pose.to_cols_array());
+        data.extend(tangents.to_array());
+    }
+    data.extend([f32::from(u8::from(playzone.is_some())), 0.0, 0.0, 0.0]);
+
     data.try_into().unwrap()
 }
 
@@ -406,6 +422,8 @@ pub fn hands_view_rect(
     color_key: &ColorKeyInput,
 ) -> Option<(Vec2, Vec2)> {
     const MARGIN: f32 = 0.01;
+    // See focus_area.wgsl
+    const PLAYZONE_RANGE: f32 = 0.06;
 
     let tan_min = Vec2::new(view.fov.left.tan(), view.fov.down.tan());
     let tan_max = Vec2::new(view.fov.right.tan(), view.fov.up.tan());
@@ -420,7 +438,7 @@ pub fn hands_view_rect(
             } else {
                 JOINT_SEGMENTS
             };
-            let rim = f32::max(zones.rim, zones.arm_rim).max(0.0) + MARGIN;
+            let rim = f32::max(zones.rim, zones.arm_rim).max(PLAYZONE_RANGE) + MARGIN;
             shape.segments[..count]
                 .as_flattened()
                 .iter()
@@ -498,7 +516,7 @@ mod tests {
         assert_eq!(DEPTH_UNIFORMS_SIZE % 16, 0);
         assert_eq!(
             DEPTH_UNIFORMS_SIZE,
-            592 + 16 * (2 + 2 * HAND_SEGMENTS / 4 + 2 + 2 * 2 * HAND_SEGMENTS + 6)
+            592 + 16 * (2 + 2 * HAND_SEGMENTS / 4 + 2 + 2 * 2 * HAND_SEGMENTS + 6 + 2 * 9 + 1)
         );
     }
 
@@ -572,8 +590,9 @@ mod tests {
             eye_positions: [Vec3::ZERO; 2],
             color_key: None,
             arms: [None; 2],
+            capture_playzone: false,
         };
-        let data = depth_uniforms(&cfg, &[view(), view()], &input, false);
+        let data = depth_uniforms(&cfg, &[view(), view()], &input, None, false);
 
         let base = 2 * EYE_FLOAT_COUNT;
         let world_to_volume = Mat4::from_cols_slice(&data[base..base + 16]);
@@ -611,13 +630,14 @@ mod tests {
             eye_positions: [Vec3::ZERO; 2],
             color_key: None,
             arms: [None; 2],
+            capture_playzone: false,
         };
         let base = 2 * EYE_FLOAT_COUNT + 16 + 4 * 3;
 
-        let data = depth_uniforms(&cfg, &[view(), view()], &input, true);
+        let data = depth_uniforms(&cfg, &[view(), view()], &input, None, true);
         assert_eq!(&data[base..base + 4], &[1.0, 0.8, 0.6, 0.15]);
 
-        let data = depth_uniforms(&cfg, &[view(), view()], &input, false);
+        let data = depth_uniforms(&cfg, &[view(), view()], &input, None, false);
         assert_eq!(data[base], 0.0);
     }
 }

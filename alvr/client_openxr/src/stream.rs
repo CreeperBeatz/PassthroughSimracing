@@ -49,6 +49,10 @@ const MAX_FILL_SPEED: f32 = 0.25;
 
 const DEFAULT_DEPTH_AGE: Duration = Duration::from_millis(60);
 
+// The playzone is remembered when no hands were tracked for a while
+const PLAYZONE_HANDS_TIMEOUT: Duration = Duration::from_millis(1500);
+const PLAYZONE_INTERVAL: Duration = Duration::from_millis(500);
+
 pub struct ParsedStreamConfig {
     pub view_resolution: UVec2,
     pub refresh_rate_hint: f32,
@@ -125,6 +129,9 @@ pub struct StreamContext {
     #[cfg(target_os = "android")]
     body_tracker: Option<Arc<BodyTrackerFB>>,
     has_tracked_hands: Cell<bool>,
+    last_hands_seen: Instant,
+    last_playzone_capture: Instant,
+    last_playzone_request: i64,
     // Smoothed, meters per second
     hand_speeds: [Cell<f32>; 2],
     hand_solid: [Cell<[f32; HAND_SEGMENTS]>; 2],
@@ -283,6 +290,9 @@ impl StreamContext {
             #[cfg(target_os = "android")]
             body_tracker: None,
             has_tracked_hands: Cell::new(false),
+            last_hands_seen: Instant::now(),
+            last_playzone_capture: Instant::now(),
+            last_playzone_request: 0,
             hand_speeds: [const { Cell::new(0.0) }; 2],
             hand_solid: [const { Cell::new([0.0; HAND_SEGMENTS]) }; 2],
         };
@@ -336,6 +346,30 @@ impl StreamContext {
         return self.auto_color_key.as_ref()?.take_lut();
         #[cfg(not(target_os = "android"))]
         None
+    }
+
+    // Objects that are held are partly missing in the depth image, so remember how the playzone looks
+    // without hands
+    fn should_capture_playzone(&mut self) -> bool {
+        if self.has_tracked_hands.get() {
+            self.last_hands_seen = Instant::now();
+        }
+
+        let request = crate::passthrough::debug_property("debug.alvr.playzone").unwrap_or(0);
+        let is_requested = request != self.last_playzone_request && request > 0;
+        self.last_playzone_request = request;
+
+        let is_automatic = self.color_key.is_some()
+            && self.last_hands_seen.elapsed() > PLAYZONE_HANDS_TIMEOUT
+            && self.last_playzone_capture.elapsed() > PLAYZONE_INTERVAL
+            && crate::passthrough::debug_property("debug.alvr.playzone_auto").unwrap_or(1) > 0;
+
+        let capture = is_requested || is_automatic;
+        if capture {
+            self.last_playzone_capture = Instant::now();
+        }
+
+        capture
     }
 
     // The forearms in the depth image
@@ -491,6 +525,7 @@ impl StreamContext {
     }
 
     pub fn update_reference_space(&mut self) {
+        self.renderer.clear_playzone();
         self.input_thread_running.set(false);
 
         self.stage_reference_space = Arc::new(interaction::get_reference_space(
@@ -617,6 +652,7 @@ impl StreamContext {
                         eye_positions: [Vec3::ZERO; 2],
                         color_key: self.color_key_input(display_time),
                         arms: [None; 2],
+                        capture_playzone: false,
                     });
                 }
                 Err(e) => {
@@ -643,14 +679,18 @@ impl StreamContext {
         });
         let arms = self.arm_removals(capture_time);
 
+        let color_key = self.color_key_input(display_time);
+        let capture_playzone = frame.is_some() && self.should_capture_playzone();
+
         Some(DepthRenderInput {
             frame,
             eye_positions: [
                 crate::from_xr_vec3(current_headset_views[0].pose.position),
                 crate::from_xr_vec3(current_headset_views[1].pose.position),
             ],
-            color_key: self.color_key_input(display_time),
+            color_key,
             arms,
+            capture_playzone,
         })
     }
 

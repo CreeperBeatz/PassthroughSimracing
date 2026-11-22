@@ -124,6 +124,11 @@ fn depth_mask_shader_translates_to_gles() {
 }
 
 #[test]
+fn playzone_copy_shader_translates_to_gles() {
+    translate_to_gles("playzone copy", &stream::playzone_copy_shader_source(), &[]);
+}
+
+#[test]
 fn focus_area_shader_translates_to_gles() {
     translate_to_gles("focus area", &stream::focus_area_shader_source(), &[]);
 }
@@ -330,6 +335,7 @@ fn render_with_key(
         depth_available,
         color_key,
         [None; 2],
+        None,
     )
 }
 
@@ -344,6 +350,7 @@ fn render_full(
     depth_available: bool,
     color_key: Option<ColorKeyInput>,
     arms: [Option<ArmRemoval>; 2],
+    playzone: Option<&Scene>,
 ) -> Output {
     let target_format = TextureFormat::Rgba8Unorm;
     let constants = [
@@ -463,31 +470,35 @@ fn render_full(
     });
 
     // Synthetic depth: same image in both layers
-    let depth_texture = device.create_texture(&TextureDescriptor {
-        label: None,
-        size: Extent3d {
-            width: DEPTH_SIZE,
-            height: DEPTH_SIZE,
-            depth_or_array_layers: 2,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: TextureDimension::D2,
-        format: TextureFormat::R32Float,
-        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    let depth_bytes = floats_to_bytes(&scene.depth);
-    for layer in 0..2 {
-        write_texture_2d(
-            queue,
-            &depth_texture,
-            &depth_bytes,
-            DEPTH_SIZE * 4,
-            DEPTH_SIZE,
-            layer,
-        );
-    }
+    let create_depth = |scene: &Scene| {
+        let depth_texture = device.create_texture(&TextureDescriptor {
+            label: None,
+            size: Extent3d {
+                width: DEPTH_SIZE,
+                height: DEPTH_SIZE,
+                depth_or_array_layers: 2,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::R32Float,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let depth_bytes = floats_to_bytes(&scene.depth);
+        for layer in 0..2 {
+            write_texture_2d(
+                queue,
+                &depth_texture,
+                &depth_bytes,
+                DEPTH_SIZE * 4,
+                DEPTH_SIZE,
+                layer,
+            );
+        }
+        depth_texture
+    };
+    let depth_texture = create_depth(scene);
     let uniform_buffer = stream::create_depth_uniform_buffer(device);
     let depth_bind_group = stream::create_depth_bind_group(
         device,
@@ -506,10 +517,17 @@ fn render_full(
         eye_positions: [eye_position; 2],
         color_key,
         arms,
+        capture_playzone: false,
     };
     let lighting_enabled = config.lighting.as_option().is_some();
-    let uniforms =
-        depth_mask::depth_uniforms(config, &[view(eye_position); 2], &input, lighting_enabled);
+    let playzone_views = [view(depth_camera_position); 2];
+    let uniforms = depth_mask::depth_uniforms(
+        config,
+        &[view(eye_position); 2],
+        &input,
+        playzone.map(|_| &playzone_views),
+        lighting_enabled,
+    );
     queue.write_buffer(&uniform_buffer, 0, &floats_to_bytes(&uniforms));
 
     let target = device.create_texture(&TextureDescriptor {
@@ -570,13 +588,25 @@ fn render_full(
         }
     }
 
-    stream::encode_depth_mask(
-        &mut encoder,
+    let playzone_view = stream::create_playzone_texture(device, UVec2::splat(DEPTH_SIZE))
+        .create_view(&TextureViewDescriptor::default());
+    let playzone_bind_group = stream::create_playzone_bind_group(
+        device,
         &pipelines,
-        &depth_mask_view,
-        &depth_bind_group,
-        0,
+        &playzone_view,
+        &focus_area_view,
+        &sampler,
     );
+    if let Some(playzone) = playzone {
+        let texture = create_depth(playzone);
+        let bind_group = stream::create_depth_bind_group(
+            device,
+            &pipelines,
+            &uniform_buffer,
+            &stream::depth_array_view(&texture),
+        );
+        stream::encode_playzone_copy(&mut encoder, &pipelines, &playzone_view, &bind_group, 0);
+    }
     if let Some(key) = color_key {
         let bind_group = stream::create_focus_area_bind_group(device, &pipelines, &uniform_buffer);
         let rect = depth_mask::hands_view_rect(&view(eye_position), eye_position, &key);
@@ -590,6 +620,14 @@ fn render_full(
             rect,
         );
     }
+    stream::encode_depth_mask(
+        &mut encoder,
+        &pipelines,
+        &depth_mask_view,
+        &depth_bind_group,
+        &playzone_bind_group,
+        0,
+    );
 
     {
         let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
@@ -892,6 +930,7 @@ fn tracked_arms_are_removed_from_the_depth() {
                     trust,
                 }),
             ],
+            None,
         )
     };
 
@@ -943,6 +982,66 @@ fn hands_rect_contains_the_hands() {
     // Behind the viewer or not tracked
     let none = ColorKeyInput { hands: [None; 2] };
     assert!(depth_mask::hands_view_rect(&view(Vec3::ZERO), Vec3::ZERO, &none).is_none());
+}
+
+#[test]
+fn playzone_fills_objects_removed_near_the_hand() {
+    let (device, queue) = gpu_or_skip!();
+    let config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
+
+    // A wheel: a wide bar at 0.6 m. The runtime removed all of it, because of the hand
+    let remembered = Scene::new(3.0, [0.1, 0.4, 0.9, 0.6], 0.6);
+    let current = Scene::new(3.0, [2.0, 2.0, 2.0, 2.0], 0.6);
+
+    // The hand is in the middle of the wheel
+    let segment = [
+        Vec4::new(-0.02, 0.0, -0.55, 0.02),
+        Vec4::new(0.02, 0.0, -0.55, 0.02),
+    ];
+    let mut segments = [segment; HAND_SEGMENTS];
+    for arm in &mut segments[HAND_SEGMENTS - depth_mask::ARM_SEGMENTS..] {
+        *arm = [Vec4::new(0.0, 0.0, 5.0, 0.01); 2];
+    }
+    let key = ColorKeyInput {
+        hands: [
+            Some((
+                HandShape { segments },
+                HandZones {
+                    core: 0.0,
+                    falloff: 0.004,
+                    rim: 0.0,
+                    arm_rim: 0.0,
+                    solid: [0.0; HAND_SEGMENTS],
+                },
+            )),
+            None,
+        ],
+    };
+    let render_playzone = |playzone| {
+        render_full(
+            &device,
+            &queue,
+            &config,
+            &current,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            true,
+            Some(key),
+            [None; 2],
+            playzone,
+        )
+    };
+
+    // Beside the hand, 4 cm from its surface
+    let without = render_playzone(None);
+    assert_eq!(without.alpha(0.555, 0.5), 1.0);
+
+    let with = render_playzone(Some(&remembered));
+    assert!(with.alpha(0.555, 0.5) < 0.1, "{}", with.alpha(0.555, 0.5));
+    // Above the wheel there is nothing
+    assert_eq!(with.alpha(0.5, 0.36), 1.0);
+    // Far from the hand the current depth map is right: somebody moved the wheel
+    assert_eq!(with.alpha(0.8, 0.5), 1.0);
 }
 
 #[test]

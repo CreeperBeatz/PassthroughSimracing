@@ -5,7 +5,8 @@
 // the depth map can follow, everything else is handled by the depth mask. Hand tracking is only an
 // estimate, so the solid inside fades out gradually into the color keyed rim.
 //
-// Output: r: the hand with its rim (the rim is color keyed), g: solid passthrough
+// Output: r: the hand with its rim (the rim is color keyed), g: solid passthrough, b: near the hand, where
+// the runtime may remove objects from the depth map
 
 struct Immediate {
     view_idx: u32,
@@ -33,6 +34,8 @@ fn vertex_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 const OUTSIDE: f32 = 1000.0;
 // Soft edge of the rim
 const SOFTNESS: f32 = 0.003;
+// Range of the remembered playzone around the hands. See also hands_view_rect()
+const PLAYZONE_RANGE: f32 = 0.06;
 
 // Distance between a ray and the surface of a tapered capsule, negative inside
 fn ray_capsule_distance(origin: vec3f, dir: vec3f, start: vec4f, end: vec4f) -> f32 {
@@ -62,6 +65,7 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
 
     var outer = 0.0;
     var inner = 0.0;
+    var near = 0.0;
     for (var hand = 0u; hand < 2u; hand++) {
         let bounds = depth_u.hand_bounds[hand];
         let zones = depth_u.hand_zones[hand];
@@ -70,7 +74,7 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         }
         let to_center = bounds.xyz - origin;
         let t = max(dot(to_center, dir), 0.0);
-        let is_near_hand = length(to_center - dir * t) < bounds.w + max(zones.x, 0.0) + SOFTNESS;
+        let is_near_hand = length(to_center - dir * t) < bounds.w + max(zones.x, PLAYZONE_RANGE) + SOFTNESS;
         let has_arm = zones.w > 0.0;
 
         var distance = OUTSIDE;
@@ -97,6 +101,8 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
             }
         }
 
+        near = max(near, 1.0 - smoothstep(0.7 * PLAYZONE_RANGE, PLAYZONE_RANGE, min(distance, arm_distance)));
+
         // The further from the hand, the less likely that it is there: fade out, so that leaks of the
         // color key are weaker. Full strength up to half of the rim.
         let outer_distance = max(zones.x, 0.0) + SOFTNESS;
@@ -107,5 +113,5 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         }
     }
 
-    return vec4f(outer, inner, 0.0, 1.0);
+    return vec4f(outer, inner, near, 1.0);
 }

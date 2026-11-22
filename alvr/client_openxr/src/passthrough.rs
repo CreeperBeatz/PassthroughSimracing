@@ -93,6 +93,8 @@ impl PassthroughLayer<'_> {
 /// - `setprop debug.alvr.key_unknown <percent>`: how much to keep colors that were never seen
 /// - `setprop debug.alvr.key_bias <percent>`: preference for skin if the background looks the same
 /// - `setprop debug.alvr.key_tight <percent>`: how similar to the skin a color must be
+/// - `setprop debug.alvr.playzone <n>`: another value remembers the playzone now (keep the hands away)
+/// - `setprop debug.alvr.playzone_auto 0`: don't remember the playzone when no hands are tracked
 /// - `setprop debug.alvr.auto_key 1` before starting the app: learn the colors with the camera
 /// - `setprop debug.alvr.key_solid <n>`: capsules that are always solid, 0: none, 6: wrist, 9: palm, 28: whole hand
 /// - `setprop debug.alvr.key_scale <percent>`: thickness of the hands

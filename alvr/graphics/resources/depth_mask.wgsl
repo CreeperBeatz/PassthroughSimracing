@@ -22,6 +22,10 @@ var<immediate> imm: Immediate;
 // float instead of a depth texture: naga would otherwise emit a shadow sampler, which cannot be
 // used with texelFetch in GLSL ES.
 @group(0) @binding(1) var depth_texture: texture_2d_array<f32>;
+// Remembered depth map without hands, in meters (0: no data). See playzone_copy.wgsl
+@group(1) @binding(0) var playzone_texture: texture_2d<f32>;
+@group(1) @binding(1) var focus_area: texture_2d<f32>;
+@group(1) @binding(2) var linear_sampler: sampler;
 
 struct VertexOutput {
     @builtin(position) position: vec4f,
@@ -44,6 +48,61 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     if depth_u.depth.z < 0.5 {
         return vec4f(0.0);
     }
+
+    var result = current_mask(uv);
+
+    // Near the hands, objects may be missing in the depth map
+    if depth_u.lighting2.z > 0.5 && depth_u.playzone.x > 0.5 && result.r < 1.0 {
+        let near_hand = textureSampleLevel(focus_area, linear_sampler, uv, 0.0).b;
+        if near_hand > 0.0 {
+            result.r = max(result.r, near_hand * playzone_coverage(uv));
+        }
+    }
+
+    return result;
+}
+
+// Coverage of the region in the remembered playzone
+fn playzone_coverage(uv: vec2f) -> f32 {
+    let view_idx = imm.view_idx;
+    let origin = depth_u.eyes[view_idx].eye_position.xyz;
+    let dir = normalize((depth_u.eyes[view_idx].uv_to_world_dir * vec4f(uv, 1.0, 0.0)).xyz);
+
+    var t = 0.7;
+    for (var i = 0u; i < 2u; i++) {
+        let guess = project_to_playzone(origin + dir * t, view_idx);
+        if !guess.valid {
+            return 0.0;
+        }
+        let z = load_playzone(vec2i(floor(guess.texel)));
+        if z <= 0.0 {
+            return 0.0;
+        }
+        t = max(dot(playzone_to_world(guess, z, view_idx) - origin, dir), 0.05);
+    }
+
+    let lookup = project_to_playzone(origin + dir * t, view_idx);
+    if !lookup.valid {
+        return 0.0;
+    }
+
+    // 2x2 neighborhood, blend the results
+    let corner = floor(lookup.texel - 0.5);
+    let f = lookup.texel - 0.5 - corner;
+    var coverage = 0.0;
+    for (var y = 0; y < 2; y++) {
+        for (var x = 0; x < 2; x++) {
+            let z = load_playzone(vec2i(corner) + vec2i(x, y));
+            if z > 0.0 {
+                let weight = mix(1.0 - f.x, f.x, f32(x)) * mix(1.0 - f.y, f.y, f32(y));
+                coverage += weight * region_mask(playzone_to_world(lookup, z, view_idx), view_idx);
+            }
+        }
+    }
+    return coverage;
+}
+
+fn current_mask(uv: vec2f) -> vec4f {
 
     let view_idx = imm.view_idx;
     let eye = depth_u.eyes[view_idx];
@@ -168,6 +227,40 @@ fn project_to_depth(world_point: vec3f, view_idx: u32) -> DepthLookup {
     result.texel = tex_uv * vec2f(textureDimensions(depth_texture));
     result.valid = true;
     return result;
+}
+
+fn project_to_playzone(world_point: vec3f, view_idx: u32) -> DepthLookup {
+    var result: DepthLookup;
+    result.valid = false;
+
+    let view_point = (depth_u.playzone_eyes[view_idx].world_to_view * vec4f(world_point, 1.0)).xyz;
+    if view_point.z > -0.001 {
+        return result;
+    }
+
+    let tangents = depth_u.playzone_eyes[view_idx].tangents;
+    result.tan_xy = view_point.xy / -view_point.z;
+    var tex_uv = (result.tan_xy - tangents.xz) / (tangents.yw - tangents.xz);
+    if any(tex_uv < vec2f(0.0)) || any(tex_uv > vec2f(1.0)) {
+        return result;
+    }
+    if depth_u.depth.w > 0.5 {
+        tex_uv.y = 1.0 - tex_uv.y;
+    }
+
+    result.texel = tex_uv * vec2f(textureDimensions(playzone_texture));
+    result.valid = true;
+    return result;
+}
+
+fn load_playzone(coord: vec2i) -> f32 {
+    let dims = vec2i(textureDimensions(playzone_texture));
+    return textureLoad(playzone_texture, clamp(coord, vec2i(0), dims - 1), 0).r;
+}
+
+fn playzone_to_world(lookup: DepthLookup, z: f32, view_idx: u32) -> vec3f {
+    let view_point = vec4f(lookup.tan_xy * z, -z, 1.0);
+    return (depth_u.playzone_eyes[view_idx].view_to_world * view_point).xyz;
 }
 
 // Returns the world-space point at distance `z` from the depth camera plane

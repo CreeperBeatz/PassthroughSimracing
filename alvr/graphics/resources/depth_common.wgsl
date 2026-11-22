@@ -17,6 +17,13 @@ struct DepthEye {
     // Tangents of the depth view fov: left, right, down, up
     depth_tan: vec4f,
 }
+// Depth camera of the remembered playzone
+struct PlayzoneEye {
+    world_to_view: mat4x4f,
+    view_to_world: mat4x4f,
+    // Tangents of the fov: left, right, down, up
+    tangents: vec4f,
+}
 struct DepthUniforms {
     eyes: array<DepthEye, 2>,
     world_to_volume: mat4x4f,
@@ -42,4 +49,7 @@ struct DepthUniforms {
     // Forearms at the time when the depth image was captured: xyz: wrist, xyz: elbow, and how much of the
     // depth of each quarter (from the wrist) is replaced by the tracked arm (0..1)
     arms: array<vec4f, 6>,
+    playzone_eyes: array<PlayzoneEye, 2>,
+    // x: available (0/1)
+    playzone: vec4f,
 }
