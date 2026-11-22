@@ -95,6 +95,12 @@ artifacts:
 - `alvr-streamer-windows`: the PC streamer and dashboard. Use this instead of official ALVR: the
   depth passthrough settings only exist in this build.
 
+**OpenXR games (e.g. BeamNG.drive):** SteamVR must be the active OpenXR runtime on the PC, otherwise the
+game reports that no VR headset is connected (`XR_ERROR_FORM_FACTOR_UNAVAILABLE`). This is common if the
+Meta Horizon / Quest Link software is installed. Set it once on every PC: *SteamVR Settings > OpenXR > Set
+SteamVR as OpenXR runtime*, then restart the game. The setting is system-wide. To go back, set Meta Horizon
+Link as the runtime in the Meta app. Native OpenVR (SteamVR) games don't need this.
+
 Then, in the dashboard, go to **Settings → Video → Passthrough** and select **Depth (Quest 3)**.
 Accept the *spatial data* permission prompt on the headset.
 
