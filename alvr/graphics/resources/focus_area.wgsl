@@ -75,15 +75,21 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         }
 
         var distance = OUTSIDE;
+        var solid_distance = OUTSIDE;
+        let solid_count = u32(zones.w + 0.5);
         for (var i = 0u; i < HAND_SEGMENTS; i++) {
             let base = (hand * HAND_SEGMENTS + i) * 2u;
             let start = depth_u.hand_points[base];
             let end = depth_u.hand_points[base + 1u];
-            distance = min(distance, ray_capsule_distance(origin, dir, start, end));
+            let segment_distance = ray_capsule_distance(origin, dir, start, end);
+            distance = min(distance, segment_distance);
+            if i < solid_count {
+                solid_distance = min(solid_distance, segment_distance);
+            }
         }
 
         outer = max(outer, 1.0 - smoothstep(zones.x - SOFTNESS, zones.x + SOFTNESS, distance));
-        inner = max(inner, 1.0 - smoothstep(zones.y, zones.y + max(zones.z, 0.0005), distance));
+        inner = max(inner, 1.0 - smoothstep(zones.y, zones.y + max(zones.z, 0.0005), solid_distance));
     }
 
     return vec4f(outer, inner, 0.0, 1.0);

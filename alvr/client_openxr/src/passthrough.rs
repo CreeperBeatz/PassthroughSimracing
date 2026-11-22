@@ -90,6 +90,7 @@ impl PassthroughLayer<'_> {
 /// - `setprop debug.alvr.key_rim_error <ms>`: worst timing error, the rim grows with the speed
 /// - `setprop debug.alvr.key_rim_max <mm>`: limit of that growth
 /// - `setprop debug.alvr.auto_key 1` before starting the app: learn the colors with the camera
+/// - `setprop debug.alvr.key_solid <n>`: solid capsules, 0: none, 6: wrist, 9: palm, 28: whole hand
 /// - `setprop debug.alvr.key_scale <percent>`: thickness of the hands
 /// - `setprop debug.alvr.key_delay <ms>`: how late (may be negative) the passthrough image is, to locate the hands at
 ///   the moment it shows
@@ -123,6 +124,10 @@ impl ColorKeyParams {
                 core: -millimeters("debug.alvr.key_inset", 4),
                 falloff: millimeters("debug.alvr.key_falloff", 8),
                 rim: millimeters("debug.alvr.key_rim", 6),
+                solid_segments: debug_property("debug.alvr.key_solid")
+                    .unwrap_or(alvr_graphics::WRIST_SEGMENTS as i64)
+                    .clamp(0, alvr_graphics::HAND_SEGMENTS as i64)
+                    as usize,
             },
             // Milliseconds
             core_error_s: millimeters("debug.alvr.key_error", 10),

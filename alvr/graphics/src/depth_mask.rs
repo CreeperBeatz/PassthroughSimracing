@@ -19,6 +19,9 @@ pub struct DepthFrame {
 }
 
 pub const HAND_SEGMENTS: usize = 28;
+/// The first segments of a hand: around the wrist, and the whole palm
+pub const WRIST_SEGMENTS: usize = 6;
+pub const PALM_SEGMENTS: usize = 9;
 
 /// Start and end of the tapered capsules a hand is made of. xyz: position, w: radius
 #[derive(Clone, Copy)]
@@ -83,7 +86,16 @@ impl HandShape {
 
     /// Distance between a ray and the surface of the hand, negative inside. Same as in focus_area.wgsl
     pub fn ray_distance(&self, origin: Vec3, direction: Vec3) -> f32 {
-        self.segments
+        self.segments_ray_distance(HAND_SEGMENTS, origin, direction)
+    }
+
+    /// Same, for the palm only. It moves less and is tracked better than the fingers
+    pub fn palm_ray_distance(&self, origin: Vec3, direction: Vec3) -> f32 {
+        self.segments_ray_distance(PALM_SEGMENTS, origin, direction)
+    }
+
+    fn segments_ray_distance(&self, count: usize, origin: Vec3, direction: Vec3) -> f32 {
+        self.segments[..count]
             .iter()
             .map(|[start, end]| {
                 let axis = (*end - *start).truncate();
@@ -127,6 +139,8 @@ pub struct HandZones {
     pub core: f32,
     pub falloff: f32,
     pub rim: f32,
+    /// Only the first segments have a solid core: hand tracking is too slow for the fingers
+    pub solid_segments: usize,
 }
 
 impl HandZones {
@@ -301,7 +315,12 @@ pub fn depth_uniforms(
     data.extend([f32::from(u8::from(input.color_key.is_some())), 0.0]);
     for hand in &hands {
         data.extend(hand.map_or([0.0; 4], |(_, zones)| {
-            [zones.rim, zones.core, zones.falloff, 0.0]
+            [
+                zones.rim,
+                zones.core,
+                zones.falloff,
+                zones.solid_segments as f32,
+            ]
         }));
     }
     for hand in &hands {

@@ -694,6 +694,7 @@ fn color_key_packs_mask_and_hand_area() {
                         core: -0.01,
                         falloff: 0.01,
                         rim: 0.04,
+                        solid_segments: HAND_SEGMENTS,
                     },
                 )),
             ],
@@ -734,6 +735,7 @@ fn hand_core_fades_out_gradually() {
         core: -0.03,
         falloff: 0.06,
         rim: 0.06,
+        solid_segments: HAND_SEGMENTS,
     };
     let render_zones = |zones| {
         render_with_key(
@@ -764,6 +766,13 @@ fn hand_core_fades_out_gradually() {
         assert!((-0.01..0.25).contains(&(pair[1] - pair[0])), "{alphas:?}");
     }
 
+    // Without solid segments everything is keyed
+    let keyed = render_zones(HandZones {
+        solid_segments: 0,
+        ..zones
+    });
+    assert!((keyed.alpha(0.5, 0.75) - 0.5).abs() < 0.01);
+
     // A fast hand is keyed, not solid, also further away
     let fast = render_zones(zones.for_speed(10.0, 0.02, 0.004, 0.05));
     assert!(fast.alpha(0.5, 0.75) > out.alpha(0.5, 0.75) + 0.1);
@@ -777,6 +786,7 @@ fn hand_zones_follow_the_speed() {
         core: -0.004,
         falloff: 0.008,
         rim: 0.01,
+        solid_segments: HAND_SEGMENTS,
     };
 
     let still = zones.for_speed(0.0, 0.01, 0.04, 0.05);

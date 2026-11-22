@@ -13,16 +13,18 @@ const SKIN_MEMORY: f32 = 5.0;
 const BACKGROUND_MEMORY: f32 = 3.0;
 // Width of the smoothing of the color densities, in LUT texels. The camera colors are a bit different
 // from the colors seen by the compositor (about one texel).
-const SKIN_SMOOTHING: f32 = 1.0;
+const SKIN_SMOOTHING: f32 = 1.4;
 const BACKGROUND_SMOOTHING: f32 = 1.3;
 // If skin and background look the same, keep the hand and accept the leak
-const SKIN_BIAS: f32 = 1.5;
+const SKIN_BIAS: f32 = 2.0;
 // Colors that are seen neither on the hand nor in the background are kept
 const SKIN_FLOOR: f32 = 3e-6;
 const BACKGROUND_FLOOR: f32 = 1e-7;
 const LIKELIHOOD_SOFTNESS: f32 = 0.7;
 // How much of the new LUT is used at each update, to avoid visible jumps
 const BLEND: f32 = 0.35;
+// How much of the samples may come from the wrong side, because the hand tracking is not exact
+const CONTAMINATION: f32 = 0.25;
 const MIN_SAMPLES: usize = 300;
 
 struct Density {
@@ -136,6 +138,11 @@ impl ColorModel {
         let skin = smooth(&self.skin.values, SKIN_SMOOTHING);
         let background = smooth(&self.background.values, BACKGROUND_SMOOTHING);
         let target = skin.iter().zip(&background).map(|(skin, background)| {
+            // Remove the part of each that can be explained by samples of the other one
+            let (skin, background) = (
+                (skin - background * CONTAMINATION).max(0.0),
+                (background - skin * CONTAMINATION).max(0.0),
+            );
             let score = ((background + BACKGROUND_FLOOR) / (skin * SKIN_BIAS + SKIN_FLOOR)).ln();
             let keep = 1.0 / (1.0 + (score / LIKELIHOOD_SOFTNESS).clamp(-30.0, 30.0).exp());
             // Make it steeper
@@ -235,7 +242,7 @@ pub fn sample_hand_colors(
     color: impl Fn(u32, u32) -> [u8; 3],
 ) -> HandColorSamples {
     // Distances from the surface of the hand, with a margin for tracking and timing errors
-    const SKIN_MAX: f32 = -0.004;
+    const SKIN_MAX: f32 = -0.005;
     const BACKGROUND_MIN: f32 = 0.02;
     const BACKGROUND_MAX: f32 = 0.07;
     const STEP: usize = 2;
@@ -263,7 +270,7 @@ pub fn sample_hand_colors(
                 let ray = camera.ray(Vec2::new(x as f32 + 0.5, y as f32 + 0.5));
                 let distance = hand.shape.ray_distance(camera.position, ray);
 
-                if distance < SKIN_MAX {
+                if hand.shape.palm_ray_distance(camera.position, ray) < SKIN_MAX {
                     samples.skin.push(color(x, y));
                 } else if (BACKGROUND_MIN..BACKGROUND_MAX).contains(&distance) {
                     // The arm is not background
@@ -374,6 +381,34 @@ mod tests {
         let lut = model.update_lut().unwrap();
 
         assert!(alpha(&lut, SKIN) > 200, "{}", alpha(&lut, SKIN));
+    }
+
+    #[test]
+    fn tolerates_samples_from_the_wrong_side() {
+        let mixed = |main, other| {
+            let mut colors = noisy(main, 850);
+            colors.extend(noisy(other, 150));
+            colors
+        };
+        let mut model = ColorModel::default();
+        model.add_samples(
+            &HandColorSamples {
+                skin: mixed(SKIN, GREEN_WALL),
+                background: mixed(GREEN_WALL, SKIN),
+            },
+            0.1,
+        );
+        let lut = model.update_lut().unwrap();
+
+        assert_eq!(alpha(&lut, SKIN), 255);
+        assert_eq!(alpha(&lut, GREEN_WALL), 0);
+        // Noisy pixels are still clearly on one side
+        for color in noisy(SKIN, 200) {
+            assert!(alpha(&lut, color) > 200, "{color:?}");
+        }
+        for color in noisy(GREEN_WALL, 200) {
+            assert!(alpha(&lut, color) < 55, "{color:?}");
+        }
     }
 
     #[test]
