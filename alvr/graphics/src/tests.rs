@@ -985,6 +985,110 @@ fn hands_rect_contains_the_hands() {
 }
 
 #[test]
+fn hands_rect_ignores_hands_out_of_view() {
+    let rect = |center: Vec3| {
+        let joints = [center.extend(0.01); 26];
+        let zones = HandZones {
+            core: 0.0,
+            falloff: 0.004,
+            rim: 0.0,
+            arm_rim: 0.0,
+            solid: [0.0; HAND_SEGMENTS],
+        };
+        let key = ColorKeyInput {
+            hands: [Some((HandShape::from_joints(&joints, None), zones)), None],
+        };
+        depth_mask::hands_view_rect(&view(Vec3::ZERO), Vec3::ZERO, &key)
+    };
+
+    // Behind the eye
+    assert!(rect(Vec3::new(0.0, 0.0, 0.3)).is_none());
+    // Beside the head, below the view, crossing the near plane
+    assert!(rect(Vec3::new(0.0, -0.4, 0.0)).is_none());
+    // In front of the eye, crossing the near plane: the whole view
+    assert_eq!(
+        rect(Vec3::new(0.0, 0.0, -0.05)),
+        Some((Vec2::ZERO, Vec2::ONE))
+    );
+    // In front
+    let (min, max) = rect(Vec3::new(0.1, 0.0, -0.5)).unwrap();
+    assert!(min.x > 0.5 && max.x < 1.0, "{min} {max}");
+}
+
+#[test]
+fn crop_view_matches_the_full_view() {
+    let fov = Fov {
+        left: -0.9,
+        right: 0.8,
+        up: 0.7,
+        down: -0.95,
+    };
+    let resolution = UVec2::new(2144, 2240);
+    let size = resolution.as_vec2();
+    let lerp = |a: f32, b: f32, f: f32| a.tan() * (1.0 - f) + b.tan() * f;
+    let rect = (Vec2::new(0.3, 0.1), Vec2::new(0.5, 0.4));
+    const MARGIN: f32 = 0.03;
+
+    for top_origin in [false, true] {
+        let (offset, crop_size, crop) =
+            depth_mask::crop_view(fov, resolution, rect, MARGIN, top_origin);
+        assert!((offset + crop_size).cmple(resolution).all());
+        assert!(crop_size.cmplt(resolution).all(), "{crop_size}");
+
+        // Each pixel edge of the crop looks in the same direction as in the full image
+        let from_bottom = |row: f32| if top_origin { 1.0 - row } else { row };
+        for pixel in [
+            offset,
+            offset + crop_size,
+            offset + crop_size / 2 + UVec2::new(1, 3),
+        ] {
+            let full = pixel.as_vec2() / size;
+            let local = (pixel - offset).as_vec2() / crop_size.as_vec2();
+            let full_tan = Vec2::new(
+                lerp(fov.left, fov.right, full.x),
+                lerp(fov.down, fov.up, from_bottom(full.y)),
+            );
+            let crop_tan = Vec2::new(
+                lerp(crop.left, crop.right, local.x),
+                lerp(crop.down, crop.up, from_bottom(local.y)),
+            );
+            assert!(
+                (full_tan - crop_tan).abs().max_element() < 1e-4,
+                "{top_origin} {pixel} {full_tan} {crop_tan}"
+            );
+        }
+
+        // The rect and its margin are inside (view uv: v from the top)
+        let min = rect.0 - MARGIN;
+        let max = rect.1 + MARGIN;
+        assert!(crop.left.tan() <= lerp(fov.left, fov.right, min.x) + 1e-5);
+        assert!(crop.right.tan() >= lerp(fov.left, fov.right, max.x) - 1e-5);
+        assert!(crop.up.tan() >= lerp(fov.down, fov.up, 1.0 - min.y) - 1e-5);
+        assert!(crop.down.tan() <= lerp(fov.down, fov.up, 1.0 - max.y) + 1e-5);
+    }
+
+    // The top of the view is at the last rows in OpenGL
+    let top = (Vec2::new(0.4, 0.0), Vec2::new(0.6, 0.1));
+    let (offset, crop_size, _) = depth_mask::crop_view(fov, resolution, top, 0.0, false);
+    assert_eq!(offset.y + crop_size.y, resolution.y);
+    let (offset, _, _) = depth_mask::crop_view(fov, resolution, top, 0.0, true);
+    assert_eq!(offset.y, 0);
+
+    // The whole view
+    let (offset, crop_size, full) =
+        depth_mask::crop_view(fov, resolution, (Vec2::ZERO, Vec2::ONE), MARGIN, false);
+    assert_eq!((offset, crop_size), (UVec2::ZERO, resolution));
+    for (a, b) in [
+        (full.left, fov.left),
+        (full.right, fov.right),
+        (full.up, fov.up),
+        (full.down, fov.down),
+    ] {
+        assert!((a - b).abs() < 1e-5);
+    }
+}
+
+#[test]
 fn playzone_fills_objects_removed_near_the_hand() {
     let (device, queue) = gpu_or_skip!();
     let config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });

@@ -53,6 +53,22 @@ const DEFAULT_DEPTH_AGE: Duration = Duration::from_millis(60);
 const PLAYZONE_HANDS_TIMEOUT: Duration = Duration::from_millis(1500);
 const PLAYZONE_INTERVAL: Duration = Duration::from_millis(500);
 
+// The layers of the color key stay a moment after the hands left the view, so they don't flicker
+const KEY_LAYERS_HOLD: Duration = Duration::from_millis(300);
+// Of the view, around the hands, so that the edge of the cropped layer is not on a hand
+const KEY_CROP_MARGIN: f32 = 0.03;
+
+/// What the color key needs in this frame
+#[derive(Clone, Copy, Default)]
+pub struct ColorKeyFrame {
+    /// Hands with a pose
+    pub tracked_hands: [bool; 2],
+    /// Part of each view with the hands, see `hands_view_rect`
+    pub hand_rects: [Option<(Vec2, Vec2)>; 2],
+    /// The hands are in view, or were a moment ago: the layers of the color key are needed
+    pub hands_in_view: bool,
+}
+
 pub struct ParsedStreamConfig {
     pub view_resolution: UVec2,
     pub refresh_rate_hint: f32,
@@ -128,7 +144,10 @@ pub struct StreamContext {
     // For the forearms, with the automatic colors
     #[cfg(target_os = "android")]
     body_tracker: Option<Arc<BodyTrackerFB>>,
-    has_tracked_hands: Cell<bool>,
+    tracked_hands: Cell<[bool; 2]>,
+    // Last part of each view with the hands, and when there was one
+    last_hand_rects: [Option<(Vec2, Vec2)>; 2],
+    last_hand_rect_time: Option<Instant>,
     last_hands_seen: Instant,
     last_playzone_capture: Instant,
     last_playzone_request: i64,
@@ -289,7 +308,9 @@ impl StreamContext {
             auto_color_key: None,
             #[cfg(target_os = "android")]
             body_tracker: None,
-            has_tracked_hands: Cell::new(false),
+            tracked_hands: Cell::new([false; 2]),
+            last_hand_rects: [None; 2],
+            last_hand_rect_time: None,
             last_hands_seen: Instant::now(),
             last_playzone_capture: Instant::now(),
             last_playzone_request: 0,
@@ -335,11 +356,6 @@ impl StreamContext {
         }
     }
 
-    /// The layers of the color key are only needed if there are hands
-    pub fn has_tracked_hands(&self) -> bool {
-        self.has_tracked_hands.get()
-    }
-
     /// New colors for the key, learned from the camera
     pub fn take_color_key_lut(&self) -> Option<Vec<u8>> {
         #[cfg(target_os = "android")]
@@ -351,12 +367,16 @@ impl StreamContext {
     // Objects that are held are partly missing in the depth image, so remember how the playzone looks
     // without hands
     fn should_capture_playzone(&mut self) -> bool {
-        if self.has_tracked_hands.get() {
+        if self.tracked_hands.get().contains(&true) {
             self.last_hands_seen = Instant::now();
         }
 
         let request = crate::passthrough::debug_property("debug.alvr.playzone").unwrap_or(0);
         let is_requested = request != self.last_playzone_request && request > 0;
+        // A negative value forgets the playzone
+        if request < 0 && request != self.last_playzone_request {
+            self.renderer.clear_playzone();
+        }
         self.last_playzone_request = request;
 
         let is_automatic = self.color_key.is_some()
@@ -375,6 +395,9 @@ impl StreamContext {
     // The forearms in the depth image
     #[cfg_attr(not(target_os = "android"), expect(unused))]
     fn arm_removals(&self, capture_time: xr::Time) -> [Option<ArmRemoval>; 2] {
+        if self.color_key.is_some_and(|params| !params.arm_removal) {
+            return [None; 2];
+        }
         #[cfg(target_os = "android")]
         {
             let (Some(tracker), Some(key)) = (&self.body_tracker, &self.auto_color_key) else {
@@ -514,8 +537,10 @@ impl StreamContext {
             Some((shape, zones))
         });
 
-        self.has_tracked_hands
-            .set(hands.iter().any(Option::is_some));
+        self.tracked_hands.set(hands.map(|hand| hand.is_some()));
+
+        // To measure the cost of the hands on the GPU. The playzone still knows about them.
+        let hands = if params.hands { hands } else { [None; 2] };
 
         Some(ColorKeyInput { hands })
     }
@@ -698,7 +723,7 @@ impl StreamContext {
         &mut self,
         frame_interval: Duration,
         vsync_time: Duration,
-    ) -> (ProjectionLayerBuilder<'_>, Duration) {
+    ) -> (ProjectionLayerBuilder<'_>, Duration, ColorKeyFrame) {
         let xr_vsync_time = xr::Time::from_nanos(vsync_time.as_nanos() as _);
         let frame_poll_deadline = Instant::now()
             + Duration::from_secs_f32(
@@ -790,7 +815,7 @@ impl StreamContext {
 
         let depth_input = self.update_environment_depth(xr_vsync_time, &current_headset_views);
 
-        self.renderer.render(
+        let hand_rects = self.renderer.render(
             buffer_ptr,
             [
                 StreamViewParams {
@@ -810,6 +835,23 @@ impl StreamContext {
                 .map(|centers| centers.map(Vec2::from_array)),
             depth_input.as_ref(),
         );
+
+        let hand_rects = hand_rects.unwrap_or_default();
+        if hand_rects.iter().any(Option::is_some) {
+            self.last_hand_rect_time = Some(Instant::now());
+        }
+        for (last, rect) in self.last_hand_rects.iter_mut().zip(hand_rects) {
+            if rect.is_some() {
+                *last = rect;
+            }
+        }
+        let key_frame = ColorKeyFrame {
+            tracked_hands: self.tracked_hands.get(),
+            hand_rects,
+            hands_in_view: self
+                .last_hand_rect_time
+                .is_some_and(|time| time.elapsed() < KEY_LAYERS_HOLD),
+        };
 
         self.swapchains[0].release_image().unwrap();
         self.swapchains[1].release_image().unwrap();
@@ -870,7 +912,46 @@ impl StreamContext {
             clientside_post_processing,
         );
 
-        (layer, openxr_display_time)
+        // Outside the hands the lower color key layer is covered by the upper one, or shows the same
+        // passthrough. For a view without hands the last rect is used, the content there is the same.
+        let crop = self.color_key.map_or(0, |params| params.crop);
+        let layer = if crop > 0 && !self.use_custom_reprojection {
+            let swapchains = &self.swapchains;
+            let resolution = self.target_view_resolution;
+            let last_rects = self.last_hand_rects;
+            layer.crop_lower_key_layer([0, 1].map(|i| {
+                let fov = output_view_params[i].fov;
+                let (offset, size, fov) = match last_rects[i] {
+                    Some(rect) => {
+                        alvr_graphics::crop_view(fov, resolution, rect, KEY_CROP_MARGIN, crop == 2)
+                    }
+                    None => (UVec2::ZERO, resolution, fov),
+                };
+
+                xr::CompositionLayerProjectionView::new()
+                    .pose(crate::to_xr_pose(output_view_params[i].pose))
+                    .fov(crate::to_xr_fov(fov))
+                    .sub_image(
+                        xr::SwapchainSubImage::new()
+                            .swapchain(&swapchains[i])
+                            .image_array_index(0)
+                            .image_rect(xr::Rect2Di {
+                                offset: xr::Offset2Di {
+                                    x: offset.x as _,
+                                    y: offset.y as _,
+                                },
+                                extent: xr::Extent2Di {
+                                    width: size.x as _,
+                                    height: size.y as _,
+                                },
+                            }),
+                    )
+            }))
+        } else {
+            layer
+        };
+
+        (layer, openxr_display_time, key_frame)
     }
 }
 

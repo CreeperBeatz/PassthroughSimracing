@@ -103,6 +103,18 @@ Measured in the SteamVR home, 72 Hz, with color key on unless noted:
 - The last build ran at 456 MHz and 48-50 degrees, so heat may be part of it.
 - Suspects: the forearm test for all 9 depth samples of every pixel, and the bigger area of the hand pass.
   The next commit reduces both and uses 1/5 resolution. **Not tested.**
+- 3609efde, no hands in view (measured): 4 layers were submitted; key off took TW from 4.69 to about
+  2.0 ms and load from about 85% to 62%, App time barely changed. Boost or SustainedHigh requested
+  while streaming: level stayed 2, 456 MHz.
+- The next commit (**not tested**): the two extra layers only while a hand is in view (plus 0.3 s);
+  hands behind or beside the head no longer count. The lower game layer only covers the hands plus
+  3% of the view; outside it the upper layer is opaque or both are transparent, so only soft mask edges
+  can differ. Without the extra layers the game layer uses the upper alpha (2a - 1), the same as the
+  four layers away from the hands. The focus pass is skipped without hands. Switches below
+  (`key_layers`, `key_crop`, `key_hands`, `arm_removal`) to measure each part; the performance level
+  is also requested at stream start, results and the layers in use are logged with `ALVR_CAM`.
+- Arm removal stays on all 9 depth samples: once per pixel, the 3x3 blend would be kept or dropped
+  as a whole at the edge of the arm in the depth map, so that edge would snap to the depth texels.
 - CI builds the APK in the dev profile. Without `CARGO_PROFILE_DEV_OPT_LEVEL=3` one color update took
   312 ms instead of about 15 ms, and wgpu validation was on.
 
@@ -139,7 +151,10 @@ Measured in the SteamVR home, 72 Hz, with color key on unless noted:
 | `key_solid` | 6 | Segments that are always solid: 0 none, 6 wrist, 9 palm, 28 hand |
 | `key_tight` / `key_bias` / `key_unknown` | 30 / 150 / 10 % | Strictness, preference for skin, unknown colors |
 | `key_delay` / `key_scale` | 0 ms / 100 % | Hand pose offset (negative predicts), thickness |
-| `playzone` / `playzone_auto` | 0 / 1 | New value: remember now. Automatic after 1.5 s without hands |
+| `playzone` / `playzone_auto` | 0 / 1 | New value: remember now, -1 forgets it (not tested). Automatic after 1.5 s without hands |
+| `key_layers` | 4 | 4: extra layers only with hands in view, 2: never, 5: always, 30 / 31: always three (no upper game layer / no keyed passthrough). Not tested |
+| `key_crop` | 1 | Lower game layer only around the hands. 0: full, 2: y origin at the top (if 1 is upside down). Not tested |
+| `key_hands` / `arm_removal` | 1 / 1 | 0: no hands in the GPU passes / no forearm removal in the depth mask. Not tested |
 
 The LUT file must exist even with `auto_key`: 32x32x32 RGBA bytes, indexed `[b][g][r]`. It is used until
 enough colors are learned.

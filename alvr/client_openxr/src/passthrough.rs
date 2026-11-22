@@ -100,6 +100,13 @@ impl PassthroughLayer<'_> {
 /// - `setprop debug.alvr.key_scale <percent>`: thickness of the hands
 /// - `setprop debug.alvr.key_delay <ms>`: how late (may be negative) the passthrough image is, to locate the hands at
 ///   the moment it shows
+/// - `setprop debug.alvr.key_layers <n>`: 4: the extra layers only with hands in view, 2: never, 5: always,
+///   30 / 31: always, three layers for measurements (without the upper game layer / the keyed passthrough)
+/// - `setprop debug.alvr.key_crop 0`: don't crop the lower game layer to the hands, 2: crop with the y origin
+///   at the top of the image
+/// - `setprop debug.alvr.key_hands 0`: no hands in the GPU passes (to measure them)
+/// - `setprop debug.alvr.arm_removal 0`: don't remove the late forearms from the depth map
+/// - `setprop debug.alvr.playzone -1`: forget the remembered playzone
 pub struct ColorKey {
     version: u32,
     lut: Vec<u8>,
@@ -117,6 +124,13 @@ pub struct ColorKeyParams {
     pub radius_scale: f32,
     /// Negative: predict ahead
     pub passthrough_delay_ms: i64,
+    /// Composition layers of the key, see `debug.alvr.key_layers`
+    pub layers: i64,
+    /// 0: the lower game layer is not cropped, 1: cropped, 2: cropped, y origin at the top
+    pub crop: i64,
+    /// Whether the GPU passes get the hands, and remove the forearms from the depth map
+    pub hands: bool,
+    pub arm_removal: bool,
 }
 
 fn millimeters(property: &str, default: i64) -> f32 {
@@ -150,6 +164,10 @@ impl ColorKeyParams {
             passthrough_delay_ms: debug_property("debug.alvr.key_delay")
                 .unwrap_or(0)
                 .clamp(-100, 200),
+            layers: debug_property("debug.alvr.key_layers").unwrap_or(4),
+            crop: debug_property("debug.alvr.key_crop").unwrap_or(1),
+            hands: debug_property("debug.alvr.key_hands").unwrap_or(1) != 0,
+            arm_removal: debug_property("debug.alvr.arm_removal").unwrap_or(1) != 0,
         }
     }
 }

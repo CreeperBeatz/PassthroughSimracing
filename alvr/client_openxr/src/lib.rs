@@ -29,7 +29,14 @@ use interaction::{InteractionContext, InteractionSourcesConfig};
 use lobby::Lobby;
 use openxr as xr;
 use passthrough::{ColorKeyLoader, PassthroughLayer};
-use std::{ffi::CStr, path::Path, rc::Rc, sync::Arc, thread, time::Duration};
+use std::{
+    ffi::CStr,
+    path::Path,
+    rc::Rc,
+    sync::Arc,
+    thread,
+    time::{Duration, Instant},
+};
 use stream::StreamContext;
 
 fn from_xr_vec3(v: xr::Vector3f) -> Vec3 {
@@ -113,14 +120,26 @@ fn set_performance_level(
     level: PerformanceLevel,
 ) {
     if let Some(performance_settings) = xr_instance.exts().ext_performance_settings {
-        unsafe {
+        let level = to_perf_settings_level(level);
+        let result = unsafe {
             (performance_settings.perf_settings_set_performance_level)(
                 xr_session.as_raw(),
                 domain,
-                to_perf_settings_level(level),
-            );
-        }
+                level,
+            )
+        };
+        stream_log(&format!("Perf: set {domain:?} to {level:?}: {result:?}"));
+    } else {
+        stream_log("Perf: XR_EXT_performance_settings is not available");
     }
+}
+
+// The client logger drops info while streaming
+fn stream_log(text: &str) {
+    #[cfg(target_os = "android")]
+    camera::log(text);
+    #[cfg(not(target_os = "android"))]
+    info!("{text}");
 }
 
 fn default_view() -> xr::View {
@@ -433,6 +452,7 @@ pub fn entry_point() {
         let mut event_storage = xr::EventDataBuffer::new();
         let mut headset_is_worn = true;
         let mut color_key_loader = ColorKeyLoader::new();
+        let mut last_key_log = Instant::now();
         'render_loop: loop {
             while let Some(event) = xr_instance.poll_event(&mut event_storage).unwrap() {
                 match event {
@@ -479,13 +499,13 @@ pub fn entry_point() {
                         }
                     }
                     xr::Event::PerfSettingsEXT(event) => {
-                        info!(
+                        stream_log(&format!(
                             "Perf: from {:?} to {:?}, domain: {:?}/{:?}",
                             event.from_level(),
                             event.to_level(),
                             event.domain(),
                             event.sub_domain(),
-                        );
+                        ));
                     }
                     xr::Event::InteractionProfileChanged(_)
                     | xr::Event::PassthroughStateChangedFB(_) => {
@@ -513,6 +533,22 @@ pub fn entry_point() {
                         lobby.update_hud_message(&message);
                     }
                     ClientCoreEvent::StreamingStarted(config) => {
+                        // Also sent with the real time config, but only when it changes
+                        let levels = &config.settings.headset.performance_level;
+                        for (domain, level) in [
+                            (xr::PerfSettingsDomainEXT::CPU, &levels.cpu),
+                            (xr::PerfSettingsDomainEXT::GPU, &levels.gpu),
+                        ] {
+                            if let Some(level) = level.as_option() {
+                                set_performance_level(
+                                    &xr_instance,
+                                    &xr_session,
+                                    domain,
+                                    level.clone(),
+                                );
+                            }
+                        }
+
                         let config = ParsedStreamConfig::new(&config);
 
                         let context = StreamContext::new(
@@ -650,38 +686,58 @@ pub fn entry_point() {
                 continue;
             }
 
-            // todo: allow rendering lobby and stream layers at the same time and add cross fade
-            let use_color_key_layers = use_color_key
-                && stream_context
-                    .as_ref()
-                    .is_some_and(|stream| stream.has_tracked_hands());
+            let key_params = color_key.map(|key| key.params);
 
-            let (layer, display_time) = if let Some(stream) = &mut stream_context {
+            // todo: allow rendering lobby and stream layers at the same time and add cross fade
+            let (layer, display_time, key_frame) = if let Some(stream) = &mut stream_context {
                 stream.render(frame_interval, vsync_time)
             } else {
-                (lobby.render(vsync_time), vsync_time)
+                (
+                    lobby.render(vsync_time),
+                    vsync_time,
+                    stream::ColorKeyFrame::default(),
+                )
             };
 
             let key_layers;
             let layers: &[&xr::CompositionLayerBase<_>] =
                 if let Some(passthrough_layer) = &passthrough_layer {
-                    if use_color_key_layers
+                    if use_color_key
+                        && let Some(params) = key_params
                         && let Some(color_key_layer) = passthrough_layer.color_key_layer()
                     {
                         // See the color key in stream.wgsl
                         key_layers = layer.build_color_key();
-                        &[
-                            passthrough_layer,
-                            &key_layers[0],
-                            color_key_layer,
-                            &key_layers[1],
-                        ]
+                        let [lower, upper] = &key_layers;
+                        // Without the extra layers, look like the four layers away from the hands:
+                        // there only the upper one is visible if the lower one is cropped
+                        let single = if params.crop > 0 { upper } else { lower };
+                        match params.layers {
+                            2 => &[passthrough_layer, single],
+                            5 => &[passthrough_layer, lower, color_key_layer, upper],
+                            30 => &[passthrough_layer, lower, color_key_layer],
+                            31 => &[passthrough_layer, lower, upper],
+                            _ if key_frame.hands_in_view => {
+                                &[passthrough_layer, lower, color_key_layer, upper]
+                            }
+                            _ => &[passthrough_layer, single],
+                        }
                     } else {
                         &[passthrough_layer, &layer.build()]
                     }
                 } else {
                     &[&layer.build()]
                 };
+
+            if use_color_key && last_key_log.elapsed() > Duration::from_secs(2) {
+                last_key_log = Instant::now();
+                stream_log(&format!(
+                    "key: tracked hands {:?}, rects {:.2?}, layers {}",
+                    key_frame.tracked_hands,
+                    key_frame.hand_rects,
+                    layers.len()
+                ));
+            }
 
             graphics_context.make_current();
             let res = xr_frame_stream.end(

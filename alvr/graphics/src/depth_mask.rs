@@ -3,7 +3,7 @@
 
 use alvr_common::{
     Fov, Pose, ViewParams,
-    glam::{Mat4, Quat, Vec2, Vec3, Vec4},
+    glam::{Mat4, Quat, UVec2, Vec2, Vec3, Vec4},
 };
 use alvr_session::{DepthMaskRegion, DepthPassthroughConfig, DepthPassthroughDebugView};
 
@@ -424,9 +424,22 @@ pub fn hands_view_rect(
     const MARGIN: f32 = 0.01;
     // See focus_area.wgsl
     const PLAYZONE_RANGE: f32 = 0.06;
+    const NEAR: f32 = 0.05;
 
     let tan_min = Vec2::new(view.fov.left.tan(), view.fov.down.tan());
     let tan_max = Vec2::new(view.fov.right.tan(), view.fov.up.tan());
+    // Distance of a point outside each side plane of the view (through the eye), in meters
+    let outside_sides = |local: Vec3| {
+        let depth = -local.z;
+        [
+            (tan_min.x * depth - local.x) / tan_min.x.hypot(1.0),
+            (local.x - tan_max.x * depth) / tan_max.x.hypot(1.0),
+            (tan_min.y * depth - local.y) / tan_min.y.hypot(1.0),
+            (local.y - tan_max.y * depth) / tan_max.y.hypot(1.0),
+        ]
+        .into_iter()
+        .fold(f32::MIN, f32::max)
+    };
 
     color_key
         .hands
@@ -447,12 +460,16 @@ pub fn hands_view_rect(
                 .chain([(shape.bounds().truncate(), shape.bounds().w + PLAYZONE_RANGE)])
                 .collect::<Vec<_>>()
         })
-        .map(|(position, radius)| {
+        .filter_map(|(position, radius)| {
             let local = view.pose.orientation.inverse() * (position - eye_position);
+            // Behind the near plane or beside the view: not visible
+            if -local.z + radius < NEAR || outside_sides(local) > radius {
+                return None;
+            }
             let depth = -local.z - radius;
-            if depth < 0.05 {
-                // Conservative near the eyes
-                return (Vec2::ZERO, Vec2::ONE);
+            if depth < NEAR {
+                // Conservative where it crosses the near plane
+                return Some((Vec2::ZERO, Vec2::ONE));
             }
 
             let corners = [-radius, radius].map(|r| {
@@ -465,13 +482,70 @@ pub fn hands_view_rect(
             let min = corners.iter().copied().fold(Vec2::MAX, Vec2::min);
             let max = corners.iter().copied().fold(Vec2::MIN, Vec2::max);
 
-            (
+            Some((
                 min.clamp(Vec2::ZERO, Vec2::ONE),
                 max.clamp(Vec2::ZERO, Vec2::ONE),
-            )
+            ))
         })
         .filter(|(min, max)| min.cmplt(*max).all())
         .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
+}
+
+/// Part of a view's image that contains `rect` (view uv, origin top-left) grown by `margin`: pixel
+/// offset and size, and the fov of exactly these pixels, for a projection layer with the same pose.
+/// `top_origin`: pixel row 0 is the top of the view. OpenXR on OpenGL ES uses the bottom.
+pub fn crop_view(
+    fov: Fov,
+    resolution: UVec2,
+    rect: (Vec2, Vec2),
+    margin: f32,
+    top_origin: bool,
+) -> (UVec2, UVec2, Fov) {
+    let resolution = resolution.max(UVec2::ONE);
+    let size = resolution.as_vec2();
+    let min = (rect.0 - margin).clamp(Vec2::ZERO, Vec2::ONE);
+    let max = (rect.1 + margin).clamp(Vec2::ZERO, Vec2::ONE);
+    let (row_min, row_max) = if top_origin {
+        (min.y, max.y)
+    } else {
+        (1.0 - max.y, 1.0 - min.y)
+    };
+
+    let start = (Vec2::new(min.x, row_min) * size)
+        .floor()
+        .as_uvec2()
+        .min(resolution - 1);
+    let end = (Vec2::new(max.x, row_max) * size)
+        .ceil()
+        .as_uvec2()
+        .clamp(start + 1, resolution);
+
+    // The image is linear in the tangents of the view
+    let angle_x = |column: u32| {
+        let f = column as f32 / size.x;
+        (fov.left.tan() * (1.0 - f) + fov.right.tan() * f).atan()
+    };
+    let angle_y = |row: u32| {
+        let f = row as f32 / size.y;
+        let from_bottom = if top_origin { 1.0 - f } else { f };
+        (fov.down.tan() * (1.0 - from_bottom) + fov.up.tan() * from_bottom).atan()
+    };
+    let (down, up) = if top_origin {
+        (angle_y(end.y), angle_y(start.y))
+    } else {
+        (angle_y(start.y), angle_y(end.y))
+    };
+
+    (
+        start,
+        end - start,
+        Fov {
+            left: angle_x(start.x),
+            right: angle_x(end.x),
+            up,
+            down,
+        },
+    )
 }
 
 /// Encode a positive view-space distance as a [0, 1] OpenGL depth buffer value (inverse of

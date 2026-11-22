@@ -64,6 +64,8 @@ pub struct ProjectionLayerAlphaConfig {
 pub struct ProjectionLayerBuilder<'a> {
     reference_space: &'a xr::Space,
     layers: [xr::CompositionLayerProjectionView<'a, xr::OpenGlEs>; 2],
+    // The lower color key layer may only show the part with the hands
+    lower_key_layers: Option<[xr::CompositionLayerProjectionView<'a, xr::OpenGlEs>; 2]>,
     alpha: Option<ProjectionLayerAlphaConfig>,
     composition_layer_settings: Option<xr::sys::CompositionLayerSettingsFB>,
     lower_key_alpha: xr::sys::CompositionLayerColorScaleBiasKHR,
@@ -92,6 +94,7 @@ impl<'a> ProjectionLayerBuilder<'a> {
         Self {
             reference_space,
             layers,
+            lower_key_layers: None,
             alpha,
             composition_layer_settings,
             lower_key_alpha: alpha_scale_bias(2.0, 0.0),
@@ -115,30 +118,45 @@ impl<'a> ProjectionLayerBuilder<'a> {
             .as_ref()
             .map_or(ptr::null(), |settings| ptr::from_ref(settings).cast());
 
-        self.build_with_next(flags, next)
+        self.build_with_next(flags, next, &self.layers)
+    }
+
+    /// Show the lower color key layer only in these views: same poses, smaller fov and image rect
+    pub fn crop_lower_key_layer(
+        mut self,
+        layers: [xr::CompositionLayerProjectionView<'a, xr::OpenGlEs>; 2],
+    ) -> Self {
+        self.lower_key_layers = Some(layers);
+        self
     }
 
     /// Layers below and above the color keyed passthrough. They show the same image with different
     /// alpha values, see the color key in stream.wgsl.
     pub fn build_color_key(&self) -> [xr::CompositionLayerProjection<'_, xr::OpenGlEs>; 2] {
-        [&self.lower_key_alpha, &self.upper_key_alpha].map(|scale_bias| {
+        [
+            (&self.lower_key_alpha, self.lower_key_layers.as_ref()),
+            (&self.upper_key_alpha, None),
+        ]
+        .map(|(scale_bias, layers)| {
             self.build_with_next(
                 xr::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA
                     | xr::CompositionLayerFlags::UNPREMULTIPLIED_ALPHA,
                 ptr::from_ref(scale_bias).cast(),
+                layers.unwrap_or(&self.layers),
             )
         })
     }
 
-    fn build_with_next(
-        &self,
+    fn build_with_next<'s>(
+        &'s self,
         flags: xr::CompositionLayerFlags,
         next: *const std::ffi::c_void,
-    ) -> xr::CompositionLayerProjection<'_, xr::OpenGlEs> {
+        layers: &'s [xr::CompositionLayerProjectionView<'a, xr::OpenGlEs>; 2],
+    ) -> xr::CompositionLayerProjection<'s, xr::OpenGlEs> {
         let layer = xr::CompositionLayerProjection::new()
             .layer_flags(flags)
             .space(self.reference_space)
-            .views(&self.layers);
+            .views(layers);
 
         if next.is_null() {
             layer

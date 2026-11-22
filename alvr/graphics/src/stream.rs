@@ -658,6 +658,8 @@ pub struct StreamRenderer {
     depth_bind_groups: Vec<BindGroup>,
     light_probe_initialized: Cell<bool>,
     focus_area_resolution: UVec2,
+    // The focus area of each view is empty, its pass can be skipped
+    focus_area_cleared: [Cell<bool>; 2],
     sampler: Sampler,
     playzone_textures: [TextureView; 2],
     playzone_bind_groups: [BindGroup; 2],
@@ -847,6 +849,7 @@ impl StreamRenderer {
             depth_bind_groups: vec![],
             light_probe_initialized: Cell::new(false),
             focus_area_resolution: focus_area_resolution(target_view_resolution),
+            focus_area_cleared: [const { Cell::new(false) }; 2],
             sampler,
             playzone_textures,
             playzone_bind_groups,
@@ -900,6 +903,7 @@ impl StreamRenderer {
     }
 
     /// Runtime foveation centers must already be encoder-aligned. `None` uses the negotiated centers.
+    /// Returns the part of each view with the hands, if the color key is used (see `hands_view_rect`).
     ///
     /// # Safety
     /// `hardware_buffer` must be a valid pointer to a ANativeWindowBuffer.
@@ -910,7 +914,7 @@ impl StreamRenderer {
         passthrough: Option<&PassthroughMode>,
         foveation_center_shifts: Option<[Vec2; 2]>,
         depth: Option<&DepthRenderInput>,
-    ) {
+    ) -> Option<[Option<(Vec2, Vec2)>; 2]> {
         let new_frame = !hardware_buffer.is_null();
 
         // if hardware_buffer is available copy stream to staging texture
@@ -1034,8 +1038,11 @@ impl StreamRenderer {
                         view_idx as u32,
                     );
                 }
-                // The depth mask uses the focus area
-                if let Some(rects) = &hand_rects {
+                // The depth mask uses the focus area. Without hands it only needs to be cleared once.
+                if let Some(rects) = &hand_rects
+                    && !(rects[view_idx].is_none() && self.focus_area_cleared[view_idx].get())
+                {
+                    self.focus_area_cleared[view_idx].set(rects[view_idx].is_none());
                     encode_focus_area(
                         &mut encoder,
                         &self.pipelines,
@@ -1086,6 +1093,8 @@ impl StreamRenderer {
         }
 
         self.context.queue.submit(iter::once(encoder.finish()));
+
+        hand_rects
     }
 }
 
