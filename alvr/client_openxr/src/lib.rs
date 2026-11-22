@@ -18,14 +18,21 @@ use alvr_graphics::GraphicsContext;
 use alvr_session::{BodyTrackingBDConfig, BodyTrackingSourcesConfig, PerformanceLevel};
 use alvr_system_info::Platform;
 use extra_extensions::{
-    BD_MOTION_TRACKING_EXTENSION_NAME, META_BODY_TRACKING_FIDELITY_EXTENSION_NAME,
+    BD_MOTION_TRACKING_EXTENSION_NAME, LutTest, META_BODY_TRACKING_FIDELITY_EXTENSION_NAME,
     PICO_CONFIGURATION_EXTENSION_NAME,
 };
 use interaction::{InteractionContext, InteractionSourcesConfig};
 use lobby::Lobby;
 use openxr as xr;
 use passthrough::PassthroughLayer;
-use std::{ffi::CStr, path::Path, rc::Rc, sync::Arc, thread, time::Duration};
+use std::{
+    ffi::CStr,
+    path::Path,
+    rc::Rc,
+    sync::Arc,
+    thread,
+    time::{Duration, Instant},
+};
 use stream::StreamContext;
 
 fn from_xr_vec3(v: xr::Vector3f) -> Vec3 {
@@ -227,6 +234,7 @@ pub fn entry_point() {
     selected_exts.meta_simultaneous_hands_and_controllers = true;
     selected_exts.meta_detached_controllers = true;
     selected_exts.meta_environment_depth = true;
+    selected_exts.meta_passthrough_color_lut = true;
     selected_exts.other = [
         META_BODY_TRACKING_FIDELITY_EXTENSION_NAME,
         BD_MOTION_TRACKING_EXTENSION_NAME,
@@ -420,6 +428,8 @@ pub fn entry_point() {
 
         let mut event_storage = xr::EventDataBuffer::new();
         let mut headset_is_worn = true;
+        let mut lut_test = LutTest::Off;
+        let mut last_lut_test_poll = Instant::now();
         'render_loop: loop {
             while let Some(event) = xr_instance.poll_event(&mut event_storage).unwrap() {
                 match event {
@@ -599,6 +609,14 @@ pub fn entry_point() {
             let vsync_time =
                 Duration::from_nanos(frame_state.predicted_display_time.as_nanos() as _);
 
+            if last_lut_test_poll.elapsed() > Duration::from_millis(500) {
+                last_lut_test_poll = Instant::now();
+                lut_test = LutTest::from_index(debug_property("debug.alvr.lut_test"));
+            }
+            if let Some(passthrough_layer) = &mut passthrough_layer {
+                passthrough_layer.set_lut_test(lut_test);
+            }
+
             xr_frame_stream.begin().unwrap();
 
             if !frame_state.should_render {
@@ -622,7 +640,11 @@ pub fn entry_point() {
 
             let layers: &[&xr::CompositionLayerBase<_>] =
                 if let Some(passthrough_layer) = &passthrough_layer {
-                    &[passthrough_layer, &layer.build()]
+                    if passthrough_layer.is_on_top() {
+                        &[&layer.build(), passthrough_layer]
+                    } else {
+                        &[passthrough_layer, &layer.build()]
+                    }
                 } else {
                     &[&layer.build()]
                 };
@@ -652,6 +674,23 @@ pub fn entry_point() {
     }
 
     // grapics_context is dropped here
+}
+
+/// Integer Android system property, 0 if unset. `debug.*` properties can be set with adb.
+#[allow(unused_variables)]
+fn debug_property(name: &str) -> u32 {
+    #[cfg(target_os = "android")]
+    {
+        let name = std::ffi::CString::new(name).unwrap();
+        let mut value = [0; libc::PROP_VALUE_MAX as usize];
+        let length =
+            unsafe { libc::__system_property_get(name.as_ptr(), value.as_mut_ptr().cast()) };
+        let bytes: Vec<u8> = value[..length.max(0) as usize].to_vec();
+
+        String::from_utf8_lossy(&bytes).trim().parse().unwrap_or(0)
+    }
+    #[cfg(not(target_os = "android"))]
+    0
 }
 
 #[allow(unused)]
