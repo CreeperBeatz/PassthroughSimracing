@@ -39,7 +39,7 @@ override UPSCALE_EDGE_SHARPNESS: f32 = 2.0;
 @group(0) @binding(4) var light_probe_global: texture_2d<f32>;
 // Low resolution depth passthrough mask (view-space uv). See depth_mask.wgsl
 @group(0) @binding(5) var depth_mask: texture_2d<f32>;
-// Grown depth mask, only used with the color key. See focus_area.wgsl
+// Area around the hands, only used with the color key. See focus_area.wgsl
 @group(0) @binding(6) var focus_area: texture_2d<f32>;
 
 @group(1) @binding(0) var<uniform> depth_u: DepthUniforms;
@@ -137,14 +137,22 @@ fn depth_passthrough(game_color: vec3f, uv: vec2f) -> vec4f {
     }
 
     if depth_u.lighting2.z > 0.5 {
-        // Color key. The layers are: opaque game, color keyed passthrough, and this one, which hides
-        // the passthrough outside of the focus area. Alpha is not premultiplied, because the bottom
-        // layer shows the same image.
+        // Color key. The layers are, from the bottom:
+        // 1. passthrough
+        // 2. this image, with a hole in the mask
+        // 3. color keyed passthrough
+        // 4. this image again, with a hole in the mask and in the focus area
+        // Both alpha values are packed in one channel: 0 in the mask, 0.5 in the focus area, 1
+        // elsewhere. They are unpacked by the color scale and bias of the layers (2a and 2a - 1).
+        // Alpha is not premultiplied.
         let focus = textureSampleLevel(focus_area, stream_sampler, uv, 0.0).r;
+        let lower_alpha = 1.0 - mask;
+        let upper_alpha = 1.0 - max(mask, focus);
+        var rgb = game_color;
         if debug_view == DEBUG_VIEW_TINT_MASK {
-            return vec4f(mix(game_color, vec3f(0.0, 0.8, 0.0), focus), 1.0 - 0.8 * focus);
+            rgb = mix(rgb, vec3f(0.0, 0.8, 0.0), 0.5 * focus);
         }
-        return vec4f(game_color, 1.0 - focus);
+        return vec4f(rgb, 0.5 * (lower_alpha + upper_alpha));
     }
 
     var brightness = 1.0;

@@ -221,6 +221,7 @@ pub fn entry_point() {
     {
         selected_exts.khr_android_create_instance = true;
     }
+    selected_exts.khr_composition_layer_color_scale_bias = true;
     selected_exts.khr_convert_timespec_time = true;
     selected_exts.khr_opengl_es_enable = true;
     selected_exts.meta_body_tracking_full_body = true;
@@ -603,17 +604,19 @@ pub fn entry_point() {
 
             // The color key needs the focus area, which comes from the depth passthrough
             let color_key = color_key_loader.poll().filter(|_| {
-                stream_context
-                    .as_ref()
-                    .is_some_and(|stream| stream.uses_depth_passthrough())
+                let exts = xr_session.instance().exts();
+                let supported = exts.meta_passthrough_color_lut.is_some()
+                    && exts.khr_composition_layer_color_scale_bias.is_some();
+                supported
+                    && stream_context
+                        .as_ref()
+                        .is_some_and(|stream| stream.uses_depth_passthrough())
             });
             let use_color_key = passthrough_layer
                 .as_mut()
                 .is_some_and(|layer| layer.update_color_key(color_key));
             if let Some(stream) = &mut stream_context {
-                stream.set_color_key_growth(
-                    color_key.filter(|_| use_color_key).map(|key| key.growth),
-                );
+                stream.set_color_key(color_key.filter(|_| use_color_key).map(|key| key.params));
             }
 
             xr_frame_stream.begin().unwrap();
@@ -637,17 +640,26 @@ pub fn entry_point() {
                 (lobby.render(vsync_time), vsync_time)
             };
 
-            let layers: &[&xr::CompositionLayerBase<_>] =
-                if let Some(passthrough_layer) = &passthrough_layer {
-                    if use_color_key {
-                        // Game, keyed passthrough, game with a hole in the focus area
-                        &[&layer.build_opaque(), passthrough_layer, &layer.build()]
-                    } else {
-                        &[passthrough_layer, &layer.build()]
-                    }
+            let key_layers;
+            let layers: &[&xr::CompositionLayerBase<_>] = if let Some(passthrough_layer) =
+                &passthrough_layer
+            {
+                if use_color_key && let Some(color_key_layer) = passthrough_layer.color_key_layer()
+                {
+                    // See the color key in stream.wgsl
+                    key_layers = layer.build_color_key();
+                    &[
+                        passthrough_layer,
+                        &key_layers[0],
+                        color_key_layer,
+                        &key_layers[1],
+                    ]
                 } else {
-                    &[&layer.build()]
-                };
+                    &[passthrough_layer, &layer.build()]
+                }
+            } else {
+                &[&layer.build()]
+            };
 
             graphics_context.make_current();
             let res = xr_frame_stream.end(

@@ -66,6 +66,8 @@ pub struct ProjectionLayerBuilder<'a> {
     layers: [xr::CompositionLayerProjectionView<'a, xr::OpenGlEs>; 2],
     alpha: Option<ProjectionLayerAlphaConfig>,
     composition_layer_settings: Option<xr::sys::CompositionLayerSettingsFB>,
+    lower_key_alpha: xr::sys::CompositionLayerColorScaleBiasKHR,
+    upper_key_alpha: xr::sys::CompositionLayerColorScaleBiasKHR,
 }
 
 impl<'a> ProjectionLayerBuilder<'a> {
@@ -92,25 +94,15 @@ impl<'a> ProjectionLayerBuilder<'a> {
             layers,
             alpha,
             composition_layer_settings,
+            lower_key_alpha: alpha_scale_bias(2.0, 0.0),
+            upper_key_alpha: alpha_scale_bias(2.0, -1.0),
         }
     }
 
     pub fn build(&self) -> xr::CompositionLayerProjection<'_, xr::OpenGlEs> {
-        self.build_with_alpha(self.alpha.as_ref())
-    }
-
-    /// Same image, ignoring the alpha channel
-    pub fn build_opaque(&self) -> xr::CompositionLayerProjection<'_, xr::OpenGlEs> {
-        self.build_with_alpha(None)
-    }
-
-    fn build_with_alpha(
-        &self,
-        alpha: Option<&ProjectionLayerAlphaConfig>,
-    ) -> xr::CompositionLayerProjection<'_, xr::OpenGlEs> {
         let mut flags = xr::CompositionLayerFlags::EMPTY;
 
-        if let Some(alpha) = alpha {
+        if let Some(alpha) = &self.alpha {
             flags |= xr::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA;
 
             if !alpha.premultiplied {
@@ -118,20 +110,64 @@ impl<'a> ProjectionLayerBuilder<'a> {
             }
         }
 
+        let next = self
+            .composition_layer_settings
+            .as_ref()
+            .map_or(ptr::null(), |settings| ptr::from_ref(settings).cast());
+
+        self.build_with_next(flags, next)
+    }
+
+    /// Layers below and above the color keyed passthrough. They show the same image with different
+    /// alpha values, see the color key in stream.wgsl.
+    pub fn build_color_key(&self) -> [xr::CompositionLayerProjection<'_, xr::OpenGlEs>; 2] {
+        [&self.lower_key_alpha, &self.upper_key_alpha].map(|scale_bias| {
+            self.build_with_next(
+                xr::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA
+                    | xr::CompositionLayerFlags::UNPREMULTIPLIED_ALPHA,
+                ptr::from_ref(scale_bias).cast(),
+            )
+        })
+    }
+
+    fn build_with_next(
+        &self,
+        flags: xr::CompositionLayerFlags,
+        next: *const std::ffi::c_void,
+    ) -> xr::CompositionLayerProjection<'_, xr::OpenGlEs> {
         let layer = xr::CompositionLayerProjection::new()
             .layer_flags(flags)
             .space(self.reference_space)
             .views(&self.layers);
 
-        if let Some(composition_layer_settings) = self.composition_layer_settings.as_ref() {
+        if next.is_null() {
+            layer
+        } else {
             unsafe {
                 xr::CompositionLayerProjection::from_raw(xr::sys::CompositionLayerProjection {
-                    next: ptr::from_ref(composition_layer_settings).cast(),
+                    next,
                     ..layer.into_raw()
                 })
             }
-        } else {
-            layer
         }
+    }
+}
+
+fn alpha_scale_bias(scale: f32, bias: f32) -> xr::sys::CompositionLayerColorScaleBiasKHR {
+    xr::sys::CompositionLayerColorScaleBiasKHR {
+        ty: xr::sys::CompositionLayerColorScaleBiasKHR::TYPE,
+        next: ptr::null(),
+        color_scale: xr::Color4f {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: scale,
+        },
+        color_bias: xr::Color4f {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: bias,
+        },
     }
 }

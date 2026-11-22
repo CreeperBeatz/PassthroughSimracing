@@ -15,6 +15,13 @@ pub struct PassthroughFB {
     layer: sys::CompositionLayerPassthroughFB,
     ext_fns: raw::PassthroughFB,
     lut_fns: Option<raw::PassthroughColorLutMETA>,
+    key: Option<KeyedLayer>,
+    session: sys::Session,
+}
+
+struct KeyedLayer {
+    layer_handle: sys::PassthroughLayerFB,
+    layer: sys::CompositionLayerPassthroughFB,
     lut: sys::PassthroughColorLutMETA,
 }
 
@@ -75,75 +82,115 @@ impl PassthroughFB {
             layer,
             ext_fns,
             lut_fns: session.instance().exts().meta_passthrough_color_lut,
-            lut: sys::PassthroughColorLutMETA::NULL,
+            key: None,
+            session: session.as_raw(),
         })
     }
 
-    /// Color key the passthrough with the alpha channel of a LUT (`COLOR_KEY_SIZE` bytes). This is
-    /// done by the compositor on the image it displays, so the key doesn't lag behind it.
+    /// Create, replace or remove a second passthrough layer that is color keyed with the alpha
+    /// channel of a LUT (`COLOR_KEY_SIZE` bytes). The key is applied by the compositor to the image
+    /// it displays, so it doesn't lag behind it.
     pub fn set_color_key(&mut self, data: Option<&[u8]>) -> xr::Result<()> {
         let lut_fns = self
             .lut_fns
             .ok_or(sys::Result::ERROR_EXTENSION_NOT_PRESENT)?;
 
-        let mut new_lut = sys::PassthroughColorLutMETA::NULL;
-        if let Some(data) = data {
-            if data.len() != COLOR_KEY_SIZE {
-                return Err(sys::Result::ERROR_VALIDATION_FAILURE);
-            }
-            let info = sys::PassthroughColorLutCreateInfoMETA {
-                ty: sys::PassthroughColorLutCreateInfoMETA::TYPE,
-                next: ptr::null(),
-                channels: sys::PassthroughColorLutChannelsMETA::RGBA,
-                resolution: COLOR_KEY_RESOLUTION,
-                data: sys::PassthroughColorLutDataMETA {
-                    buffer_size: data.len() as u32,
-                    buffer: data.as_ptr(),
-                },
-            };
-            unsafe {
-                super::xr_res((lut_fns.create_passthrough_color_lut)(
-                    self.handle,
-                    &info,
-                    &mut new_lut,
-                ))?;
-            }
+        self.destroy_color_key();
+
+        let Some(data) = data else {
+            return Ok(());
+        };
+        if data.len() != COLOR_KEY_SIZE {
+            return Err(sys::Result::ERROR_VALIDATION_FAILURE);
         }
+
+        let mut lut = sys::PassthroughColorLutMETA::NULL;
+        let info = sys::PassthroughColorLutCreateInfoMETA {
+            ty: sys::PassthroughColorLutCreateInfoMETA::TYPE,
+            next: ptr::null(),
+            channels: sys::PassthroughColorLutChannelsMETA::RGBA,
+            resolution: COLOR_KEY_RESOLUTION,
+            data: sys::PassthroughColorLutDataMETA {
+                buffer_size: data.len() as u32,
+                buffer: data.as_ptr(),
+            },
+        };
+        unsafe {
+            super::xr_res((lut_fns.create_passthrough_color_lut)(
+                self.handle,
+                &info,
+                &mut lut,
+            ))?;
+        }
+
+        let mut layer_handle = sys::PassthroughLayerFB::NULL;
+        let info = sys::PassthroughLayerCreateInfoFB {
+            ty: sys::PassthroughLayerCreateInfoFB::TYPE,
+            next: ptr::null(),
+            passthrough: self.handle,
+            flags: sys::PassthroughFlagsFB::IS_RUNNING_AT_CREATION,
+            purpose: sys::PassthroughLayerPurposeFB::RECONSTRUCTION,
+        };
+        let result = unsafe {
+            super::xr_res((self.ext_fns.create_passthrough_layer)(
+                self.session,
+                &info,
+                &mut layer_handle,
+            ))
+        };
+        if let Err(e) = result {
+            unsafe { (lut_fns.destroy_passthrough_color_lut)(lut) };
+            return Err(e);
+        }
+
+        // From here on, destroy_color_key() takes care of the cleanup
+        self.key = Some(KeyedLayer {
+            layer_handle,
+            layer: sys::CompositionLayerPassthroughFB {
+                layer_handle,
+                ..self.layer
+            },
+            lut,
+        });
 
         let color_map = sys::PassthroughColorMapLutMETA {
             ty: sys::PassthroughColorMapLutMETA::TYPE,
             next: ptr::null(),
-            color_lut: new_lut,
+            color_lut: lut,
             weight: 1.0,
         };
         let style = sys::PassthroughStyleFB {
             ty: sys::PassthroughStyleFB::TYPE,
-            next: if data.is_some() {
-                (&raw const color_map).cast()
-            } else {
-                ptr::null()
-            },
+            next: (&raw const color_map).cast(),
             texture_opacity_factor: 1.0,
             edge_color: sys::Color4f::default(),
         };
         let result = unsafe {
             super::xr_res((self.ext_fns.passthrough_layer_set_style)(
-                self.layer_handle,
+                layer_handle,
                 &style,
             ))
         };
-
-        // The style doesn't reference the old LUT anymore, unless setting it failed
-        let unused_lut = if result.is_ok() {
-            std::mem::replace(&mut self.lut, new_lut)
-        } else {
-            new_lut
-        };
-        if unused_lut != sys::PassthroughColorLutMETA::NULL {
-            unsafe { (lut_fns.destroy_passthrough_color_lut)(unused_lut) };
+        if result.is_err() {
+            self.destroy_color_key();
         }
 
         result
+    }
+
+    fn destroy_color_key(&mut self) {
+        if let Some(key) = self.key.take() {
+            unsafe {
+                (self.ext_fns.destroy_passthrough_layer)(key.layer_handle);
+                if let Some(lut_fns) = &self.lut_fns {
+                    (lut_fns.destroy_passthrough_color_lut)(key.lut);
+                }
+            }
+        }
+    }
+
+    pub fn color_key_layer(&self) -> Option<&sys::CompositionLayerPassthroughFB> {
+        self.key.as_ref().map(|key| &key.layer)
     }
 
     // return reference to make sure the passthrough handle is not dropped while the layer is in use
@@ -154,12 +201,9 @@ impl PassthroughFB {
 
 impl Drop for PassthroughFB {
     fn drop(&mut self) {
+        self.destroy_color_key();
+
         unsafe {
-            if let Some(lut_fns) = &self.lut_fns
-                && self.lut != sys::PassthroughColorLutMETA::NULL
-            {
-                (lut_fns.destroy_passthrough_color_lut)(self.lut);
-            }
             (self.ext_fns.destroy_passthrough_layer)(self.layer_handle);
             (self.ext_fns.destroy_passthrough)(self.handle);
         }

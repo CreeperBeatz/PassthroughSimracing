@@ -3,12 +3,12 @@
 //! - the depth passthrough shader is run on the desktop GPU against a synthetic depth scene
 
 use crate::{
-    depth_mask::{self, DepthFrame, DepthRenderInput},
+    depth_mask::{self, ColorKeyInput, DepthFrame, DepthRenderInput},
     stream::{self, FOVEATION_UNIFORM_SIZE, LIGHT_PROBE_SIZE, StreamPipelines, floats_to_bytes},
 };
 use alvr_common::{
     Fov, Pose, ViewParams,
-    glam::{Mat4, UVec2, Vec3},
+    glam::{Mat4, UVec2, Vec3, Vec4},
 };
 use alvr_session::{
     CockpitVolumeConfig, DepthMaskRegion, DepthPassthroughConfig, DepthPassthroughDebugView,
@@ -315,7 +315,7 @@ fn render_with_key(
     eye_position: Vec3,
     depth_camera_position: Vec3,
     depth_available: bool,
-    color_key_growth: Option<f32>,
+    color_key: Option<ColorKeyInput>,
 ) -> Output {
     let target_format = TextureFormat::Rgba8Unorm;
     let constants = [
@@ -476,7 +476,7 @@ fn render_with_key(
             depth_views: [view(depth_camera_position); 2],
         }),
         eye_positions: [eye_position; 2],
-        color_key_growth,
+        color_key,
     };
     let lighting_enabled = config.lighting.as_option().is_some();
     let uniforms =
@@ -548,15 +548,9 @@ fn render_with_key(
         &depth_bind_group,
         0,
     );
-    if color_key_growth.is_some() {
-        let bind_group = stream::create_focus_area_bind_group(
-            device,
-            &pipelines,
-            &uniform_buffer,
-            &depth_mask_view,
-            &sampler,
-        );
-        stream::encode_focus_area(&mut encoder, &pipelines, &focus_area_view, &bind_group);
+    if color_key.is_some() {
+        let bind_group = stream::create_focus_area_bind_group(device, &pipelines, &uniform_buffer);
+        stream::encode_focus_area(&mut encoder, &pipelines, &focus_area_view, &bind_group, 0);
     }
 
     {
@@ -670,10 +664,12 @@ fn distance_mode_shows_near_objects_only() {
 }
 
 #[test]
-fn color_key_focus_area_is_grown_mask() {
+fn color_key_packs_mask_and_hand_area() {
     let (device, queue) = gpu_or_skip!();
     let config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
 
+    // A tracked hand below the near object, 0.5 m away: view uv (0.5, 0.75)
+    let hand = Vec4::new(0.0, -0.25, -0.5, 0.05);
     let out = render_with_key(
         &device,
         &queue,
@@ -682,20 +678,17 @@ fn color_key_focus_area_is_grown_mask() {
         Vec3::ZERO,
         Vec3::ZERO,
         true,
-        Some(0.1),
+        Some(ColorKeyInput::new([hand])),
     );
 
-    // The hand covers u 0.3..0.7, v 0.1..0.45
+    // Near object: plain passthrough
     assert_eq!(out.alpha(0.5, 0.25), 0.0);
-    // Inside the grown border
-    assert!(out.alpha(0.23, 0.25) < 0.05);
-    assert!(out.alpha(0.77, 0.25) < 0.05);
-    assert!(out.alpha(0.5, 0.52) < 0.05);
-    // Outside
-    assert_eq!(out.alpha(0.1, 0.25), 1.0);
-    assert_eq!(out.alpha(0.5, 0.75), 1.0);
-    // Alpha is not premultiplied: the bottom layer shows this image without blending
-    for (u, v) in [(0.5, 0.25), (0.23, 0.25), (0.1, 0.25)] {
+    // Hand, where the depth map only sees the background: keyed passthrough
+    assert!((out.alpha(0.5, 0.75) - 0.5).abs() < 0.01);
+    // Game
+    assert_eq!(out.alpha(0.8, 0.75), 1.0);
+    // Alpha is not premultiplied
+    for (u, v) in [(0.5, 0.25), (0.5, 0.75), (0.8, 0.75)] {
         let gray = i32::from(out.at(u, v)[0]);
         assert!((gray - i32::from(STREAM_GRAY)).abs() <= 2, "{gray}");
     }

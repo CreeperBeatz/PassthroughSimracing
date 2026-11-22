@@ -1,12 +1,15 @@
-// Note: depth_common.wgsl is appended to this file at pipeline creation.
+// Note: depth_common.wgsl is appended to this file at pipeline creation. Keep `Immediate` the first
+// declaration, see stream_shader_source().
 //
-// Grows the depth passthrough mask into a coarse "focus area". The depth map lags behind the
-// passthrough image, so with the color key the mask only selects where to look, and the compositor
-// color keys the live passthrough image inside it.
+// Renders the area where the live passthrough is color keyed: the surroundings of the tracked hands.
+// Hands move faster than the depth map can follow, everything else is handled by the depth mask.
+
+struct Immediate {
+    view_idx: u32,
+}
+var<immediate> imm: Immediate;
 
 @group(0) @binding(0) var<uniform> depth_u: DepthUniforms;
-@group(0) @binding(1) var depth_mask: texture_2d<f32>;
-@group(0) @binding(2) var mask_sampler: sampler;
 
 struct VertexOutput {
     @builtin(position) position: vec4f,
@@ -24,24 +27,20 @@ fn vertex_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     return result;
 }
 
-const RINGS: u32 = 4u;
-const SAMPLES_PER_RING: u32 = 6u;
-
 @fragment
 fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
-    let growth = depth_u.lighting2.w;
+    let origin = depth_u.eyes[imm.view_idx].eye_position.xyz;
+    let dir = normalize((depth_u.eyes[imm.view_idx].uv_to_world_dir * vec4f(uv, 1.0, 0.0)).xyz);
+    let count = min(u32(depth_u.lighting2.w + 0.5), MAX_HAND_POINTS);
 
-    var coverage = textureSampleLevel(depth_mask, mask_sampler, uv, 0.0).r;
-    for (var ring = 1u; ring <= RINGS; ring++) {
-        let radius = growth * f32(ring) / f32(RINGS);
-        // The outer rings need more samples to leave no gaps
-        let count = ring * SAMPLES_PER_RING;
-        for (var i = 0u; i < count; i++) {
-            let angle = 6.2831853 * f32(i) / f32(count);
-            let offset = radius * vec2f(cos(angle), sin(angle));
-            coverage = max(coverage, textureSampleLevel(depth_mask, mask_sampler, uv + offset, 0.0).r);
-        }
+    var focus = 0.0;
+    for (var i = 0u; i < count; i++) {
+        let hand_point = depth_u.hand_points[i];
+        let to_point = hand_point.xyz - origin;
+        let t = max(dot(to_point, dir), 0.0);
+        let distance = length(to_point - dir * t);
+        focus = max(focus, 1.0 - smoothstep(hand_point.w * 0.8, hand_point.w * 1.2, distance));
     }
 
-    return vec4f(smoothstep(0.05, 0.35, coverage), 0.0, 0.0, 1.0);
+    return vec4f(focus, 0.0, 0.0, 1.0);
 }

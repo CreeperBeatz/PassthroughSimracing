@@ -18,6 +18,31 @@ pub struct DepthFrame {
     pub depth_views: [ViewParams; 2],
 }
 
+pub const MAX_HAND_POINTS: usize = 64;
+
+/// Spheres around the tracked hands, where the passthrough is color keyed
+#[derive(Clone, Copy)]
+pub struct ColorKeyInput {
+    /// xyz: position, w: radius
+    pub hand_points: [Vec4; MAX_HAND_POINTS],
+    pub hand_point_count: usize,
+}
+
+impl ColorKeyInput {
+    /// Points beyond `MAX_HAND_POINTS` are ignored
+    pub fn new(points: impl IntoIterator<Item = Vec4>) -> Self {
+        let mut this = Self {
+            hand_points: [Vec4::ZERO; MAX_HAND_POINTS],
+            hand_point_count: 0,
+        };
+        for (slot, point) in this.hand_points.iter_mut().zip(points) {
+            *slot = point;
+            this.hand_point_count += 1;
+        }
+        this
+    }
+}
+
 /// Per-frame depth inputs for the stream renderer
 #[derive(Clone, Copy)]
 pub struct DepthRenderInput {
@@ -25,12 +50,13 @@ pub struct DepthRenderInput {
     pub frame: Option<DepthFrame>,
     /// Eye positions at display time
     pub eye_positions: [Vec3; 2],
-    /// Set if the passthrough layer is color keyed: how much to grow the mask, in view uv
-    pub color_key_growth: Option<f32>,
+    /// Set if the passthrough is color keyed around the hands
+    pub color_key: Option<ColorKeyInput>,
 }
 
 const EYE_FLOAT_COUNT: usize = 16 + 4 + 16 + 16 + 4;
-pub const DEPTH_UNIFORMS_FLOAT_COUNT: usize = 2 * EYE_FLOAT_COUNT + 16 + 4 * 5;
+pub const DEPTH_UNIFORMS_FLOAT_COUNT: usize =
+    2 * EYE_FLOAT_COUNT + 16 + 4 * 5 + 4 * MAX_HAND_POINTS;
 pub const DEPTH_UNIFORMS_SIZE: usize = DEPTH_UNIFORMS_FLOAT_COUNT * size_of::<f32>();
 
 fn pose_to_mat4(pose: Pose) -> Mat4 {
@@ -153,10 +179,14 @@ pub fn depth_uniforms(
     } else {
         data.extend([0.0; 6]);
     }
+    let color_key = input.color_key.unwrap_or_else(|| ColorKeyInput::new([]));
     data.extend([
-        f32::from(u8::from(input.color_key_growth.is_some())),
-        input.color_key_growth.unwrap_or(0.0),
+        f32::from(u8::from(input.color_key.is_some())),
+        color_key.hand_point_count as f32,
     ]);
+    for point in color_key.hand_points {
+        data.extend(point.to_array());
+    }
 
     data.try_into().unwrap()
 }
@@ -204,7 +234,7 @@ mod tests {
     fn layout_size() {
         // std140: must be a multiple of 16 bytes
         assert_eq!(DEPTH_UNIFORMS_SIZE % 16, 0);
-        assert_eq!(DEPTH_UNIFORMS_SIZE, 592);
+        assert_eq!(DEPTH_UNIFORMS_SIZE, 592 + 16 * MAX_HAND_POINTS);
     }
 
     #[test]
@@ -275,7 +305,7 @@ mod tests {
         let input = DepthRenderInput {
             frame: None,
             eye_positions: [Vec3::ZERO; 2],
-            color_key_growth: None,
+            color_key: None,
         };
         let data = depth_uniforms(&cfg, &[view(), view()], &input, false);
 
@@ -313,7 +343,7 @@ mod tests {
         let input = DepthRenderInput {
             frame: None,
             eye_positions: [Vec3::ZERO; 2],
-            color_key_growth: None,
+            color_key: None,
         };
         let base = 2 * EYE_FLOAT_COUNT + 16 + 4 * 3;
 

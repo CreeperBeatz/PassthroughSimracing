@@ -2,6 +2,7 @@ use crate::{
     extra_extensions::EnvironmentDepthMETA,
     graphics::{self, ProjectionLayerAlphaConfig, ProjectionLayerBuilder},
     interaction::{self, InteractionContext, InteractionSourcesConfig},
+    passthrough::ColorKeyParams,
 };
 use alvr_client_core::{
     ClientCoreContext, VideoFrameMetadata,
@@ -16,7 +17,9 @@ use alvr_common::{
     info,
     parking_lot::RwLock,
 };
-use alvr_graphics::{DepthRenderInput, GraphicsContext, StreamRenderer, StreamViewParams};
+use alvr_graphics::{
+    ColorKeyInput, DepthRenderInput, GraphicsContext, StreamRenderer, StreamViewParams,
+};
 use alvr_packets::{ClientStreamConfig, RealTimeConfig, TrackingData};
 use alvr_session::{
     ClientsideFoveationConfig, ClientsideFoveationMode, ClientsidePostProcessingConfig, CodecType,
@@ -101,8 +104,8 @@ pub struct StreamContext {
     // Created on demand when the depth passthrough mode is selected
     environment_depth: Option<EnvironmentDepthMETA>,
     environment_depth_failed: bool,
-    // Set if the passthrough layer is color keyed
-    color_key_growth: Option<f32>,
+    // Set if the passthrough is color keyed around the hands
+    color_key: Option<ColorKeyParams>,
 }
 
 impl StreamContext {
@@ -252,7 +255,7 @@ impl StreamContext {
             decoder: None,
             environment_depth: None,
             environment_depth_failed: false,
-            color_key_growth: None,
+            color_key: None,
         };
 
         this.update_reference_space();
@@ -264,8 +267,54 @@ impl StreamContext {
         alvr_graphics::depth_passthrough_config(self.config.passthrough.as_ref()).is_some()
     }
 
-    pub fn set_color_key_growth(&mut self, growth: Option<f32>) {
-        self.color_key_growth = growth;
+    pub fn set_color_key(&mut self, params: Option<ColorKeyParams>) {
+        // The depth map shows the hands where they were a while ago. With the color key they are not
+        // needed there.
+        if self.color_key.is_some() != params.is_some()
+            && let Some(depth) = &self.environment_depth
+        {
+            depth.set_hand_removal(params.is_some());
+        }
+        self.color_key = params;
+    }
+
+    // Spheres around the hands, at the moment shown by the passthrough image
+    fn color_key_input(&self, display_time: xr::Time) -> Option<ColorKeyInput> {
+        let params = self.color_key?;
+        let delay = params.passthrough_delay.as_nanos() as i64;
+        let time = xr::Time::from_nanos(display_time.as_nanos() - delay);
+        let int_ctx = self.interaction_context.read();
+
+        let mut points = vec![];
+        for hand in &int_ctx.hands_interaction {
+            let Some(joints) = hand.skeleton_tracker.as_ref().and_then(|tracker| {
+                self.stage_reference_space
+                    .locate_hand_joints(tracker, time)
+                    .ok()
+                    .flatten()
+            }) else {
+                continue;
+            };
+
+            let position = |joint: xr::HandJointEXT| {
+                crate::from_xr_vec3(joints[joint.into_raw() as usize].pose.position)
+            };
+            points.extend(
+                joints
+                    .iter()
+                    .map(|joint| crate::from_xr_vec3(joint.pose.position).extend(params.radius_m)),
+            );
+
+            // The start of the forearm
+            let wrist = position(xr::HandJointEXT::WRIST);
+            let direction =
+                (wrist - position(xr::HandJointEXT::MIDDLE_METACARPAL)).normalize_or_zero();
+            points.extend(
+                [0.03, 0.07, 0.11].map(|d| (wrist + direction * d).extend(params.radius_m + 0.02)),
+            );
+        }
+
+        Some(ColorKeyInput::new(points))
     }
 
     pub fn uses_passthrough(&self) -> bool {
@@ -381,7 +430,7 @@ impl StreamContext {
         self.gfx_ctx.make_current();
 
         if self.environment_depth.is_none() && !self.environment_depth_failed {
-            match EnvironmentDepthMETA::new(&self.xr_session) {
+            match EnvironmentDepthMETA::new(&self.xr_session, self.color_key.is_some()) {
                 Ok(depth) => {
                     info!(
                         "Environment depth started: {} images, {}x{}",
@@ -397,7 +446,7 @@ impl StreamContext {
                     return Some(DepthRenderInput {
                         frame: None,
                         eye_positions: [Vec3::ZERO; 2],
-                        color_key_growth: self.color_key_growth,
+                        color_key: self.color_key_input(display_time),
                     });
                 }
                 Err(e) => {
@@ -423,7 +472,7 @@ impl StreamContext {
                 crate::from_xr_vec3(current_headset_views[0].pose.position),
                 crate::from_xr_vec3(current_headset_views[1].pose.position),
             ],
-            color_key_growth: self.color_key_growth,
+            color_key: self.color_key_input(display_time),
         })
     }
 
@@ -597,7 +646,7 @@ impl StreamContext {
                 .passthrough
                 .clone()
                 .map(|mode| ProjectionLayerAlphaConfig {
-                    premultiplied: self.color_key_growth.is_none()
+                    premultiplied: self.color_key.is_none()
                         && alvr_graphics::passthrough_requires_premultiplied_alpha(&mode),
                 }),
             clientside_post_processing,

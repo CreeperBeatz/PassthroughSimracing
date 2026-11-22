@@ -19,7 +19,7 @@ pub struct EnvironmentDepthMETA {
 
 impl EnvironmentDepthMETA {
     /// The GL context of the session must be current
-    pub fn new(session: &xr::Session<xr::OpenGlEs>) -> xr::Result<Self> {
+    pub fn new(session: &xr::Session<xr::OpenGlEs>, hand_removal: bool) -> xr::Result<Self> {
         let ext_fns = session
             .instance()
             .exts()
@@ -107,18 +107,31 @@ impl EnvironmentDepthMETA {
             return Err(sys::Result::ERROR_RUNTIME_FAILURE);
         }
 
-        // We want the hands in the depth map: they are what we need to see. This is the default,
-        // but set it explicitly. Fails harmlessly on systems without hand removal support.
-        let hand_removal = sys::EnvironmentDepthHandRemovalSetInfoMETA {
-            ty: sys::EnvironmentDepthHandRemovalSetInfoMETA::TYPE,
-            next: ptr::null(),
-            enabled: sys::FALSE,
-        };
-        unsafe { (ext_fns.set_environment_depth_hand_removal)(provider, &hand_removal) };
+        this.set_hand_removal(hand_removal);
 
         unsafe { super::xr_res((ext_fns.start_environment_depth_provider)(provider))? };
 
         Ok(this)
+    }
+
+    /// Whether the runtime replaces the hands in the depth map with an estimated background
+    pub fn set_hand_removal(&self, enabled: bool) {
+        let info = sys::EnvironmentDepthHandRemovalSetInfoMETA {
+            ty: sys::EnvironmentDepthHandRemovalSetInfoMETA::TYPE,
+            next: ptr::null(),
+            enabled: enabled.into(),
+        };
+        let result = unsafe {
+            super::xr_res((self.ext_fns.set_environment_depth_hand_removal)(
+                self.provider,
+                &info,
+            ))
+        };
+        if let Err(e) = result
+            && enabled
+        {
+            alvr_common::error!("Environment depth hand removal: {e}");
+        }
     }
 
     pub fn resolution(&self) -> UVec2 {

@@ -2,6 +2,8 @@
 // including shader must declare:
 //   var<uniform> depth_u: DepthUniforms;
 
+const MAX_HAND_POINTS: u32 = 64u;
+
 // All positions/poses are in the stage reference space
 struct DepthEye {
     // world direction = (uv_to_world_dir * vec4f(uv, 1, 0)).xyz, uv is the view-space uv
@@ -23,6 +25,8 @@ struct DepthUniforms {
     depth: vec4f,
     // x: lighting enabled (0/1), y: base brightness, z: strength, w: reference luminance
     lighting: vec4f,
-    // x: min brightness, y: locality, z: color key enabled (0/1), w: focus area growth (view uv)
+    // x: min brightness, y: locality, z: color key enabled (0/1), w: hand point count
     lighting2: vec4f,
+    // xyz: position, w: radius
+    hand_points: array<vec4f, MAX_HAND_POINTS>,
 }
