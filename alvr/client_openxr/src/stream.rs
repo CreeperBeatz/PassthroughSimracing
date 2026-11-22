@@ -20,7 +20,8 @@ use alvr_common::{
     parking_lot::RwLock,
 };
 use alvr_graphics::{
-    ColorKeyInput, DepthRenderInput, GraphicsContext, HandShape, StreamRenderer, StreamViewParams,
+    ColorKeyInput, DepthRenderInput, GraphicsContext, HAND_SEGMENTS, HandShape, SEGMENT_JOINTS,
+    StreamRenderer, StreamViewParams,
 };
 use alvr_packets::{ClientStreamConfig, RealTimeConfig, TrackingData};
 use alvr_session::{
@@ -39,6 +40,10 @@ use std::{
 };
 
 const DECODER_MAX_TIMEOUT_MULTIPLIER: f32 = 0.8;
+
+// The solid fill of the hands fades out between these speeds (m/s)
+const MIN_FILL_SPEED: f32 = 0.08;
+const MAX_FILL_SPEED: f32 = 0.25;
 
 pub struct ParsedStreamConfig {
     pub view_resolution: UVec2,
@@ -114,6 +119,7 @@ pub struct StreamContext {
     auto_color_key: Option<AutoColorKey>,
     // Smoothed, meters per second
     hand_speeds: [Cell<f32>; 2],
+    hand_solid: [Cell<[f32; HAND_SEGMENTS]>; 2],
 }
 
 impl StreamContext {
@@ -267,6 +273,7 @@ impl StreamContext {
             #[cfg(target_os = "android")]
             auto_color_key: None,
             hand_speeds: [const { Cell::new(0.0) }; 2],
+            hand_solid: [const { Cell::new([0.0; HAND_SEGMENTS]) }; 2],
         };
 
         this.update_reference_space();
@@ -315,6 +322,14 @@ impl StreamContext {
         let time = xr::Time::from_nanos(display_time.as_nanos() - delay);
         let int_ctx = self.interaction_context.read();
 
+        #[cfg(target_os = "android")]
+        let verified = self
+            .auto_color_key
+            .as_ref()
+            .map_or([[0.0; HAND_SEGMENTS]; 2], |key| key.verified_hands());
+        #[cfg(not(target_os = "android"))]
+        let verified = [[0.0; HAND_SEGMENTS]; 2];
+
         let hands = [0, 1].map(|i| {
             let tracker = int_ctx.hands_interaction[i].skeleton_tracker.as_ref()?;
             let (joints, velocities) = self
@@ -348,8 +363,39 @@ impl StreamContext {
                         .contains(xr::SpaceLocationFlags::POSITION_TRACKED)
                 })
                 .count();
-            let zones = params
-                .zones
+            // Verified segments are solid, as long as they don't move: the tracking is late
+            let mut solid = self.hand_solid[i].get();
+            for (segment, weight) in solid.iter_mut().enumerate() {
+                let (start, end) = SEGMENT_JOINTS[segment];
+                let is_tracked = [start, end].iter().all(|joint| {
+                    joints[*joint]
+                        .location_flags
+                        .contains(xr::SpaceLocationFlags::POSITION_TRACKED)
+                });
+                let segment_speed = [start, end]
+                    .map(|joint| crate::from_xr_vec3(velocities[joint].linear_velocity).length())
+                    .into_iter()
+                    .fold(0.0, f32::max);
+                let stillness = 1.0
+                    - ((segment_speed - MIN_FILL_SPEED) / (MAX_FILL_SPEED - MIN_FILL_SPEED))
+                        .clamp(0.0, 1.0);
+                let target = if is_tracked {
+                    verified[i][segment] * stillness
+                } else {
+                    0.0
+                };
+                // No popping, but let go quickly
+                *weight += (target - *weight) * if target < *weight { 0.35 } else { 0.1 };
+            }
+            self.hand_solid[i].set(solid);
+
+            let mut zones = params.zones;
+            for (zone, solid) in zones.solid.iter_mut().zip(solid) {
+                // Some segments may always be solid
+                *zone = f32::max(*zone, solid);
+            }
+
+            let zones = zones
                 .for_confidence(tracked_count as f32 / joints.len() as f32)
                 .for_speed(
                     speed,

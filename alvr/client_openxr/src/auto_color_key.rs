@@ -11,7 +11,9 @@ use alvr_common::{
     glam::{Quat, Vec2, Vec3},
     parking_lot::{Mutex, RwLock},
 };
-use alvr_graphics::{CameraView, ColorModel, HandColorSamples, HandShape, SampledHand};
+use alvr_graphics::{
+    CameraView, ColorModel, HAND_SEGMENTS, HandColorSamples, HandShape, SampledHand,
+};
 use openxr as xr;
 use std::{
     sync::Arc,
@@ -19,7 +21,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-const UPDATE_INTERVAL: Duration = Duration::from_millis(120);
+// The hands are verified at each update, the LUT is updated less often
+const UPDATE_INTERVAL: Duration = Duration::from_millis(60);
+const LUT_UPDATE_INTERVAL: Duration = Duration::from_millis(120);
+// Verified hands are not used if they are older
+const MAX_VERIFICATION_AGE: Duration = Duration::from_millis(300);
 const RETRY_INTERVAL: Duration = Duration::from_secs(3);
 const LOG_INTERVAL: Duration = Duration::from_secs(2);
 // The images and the hand poses don't match well enough for fast hands (m/s)
@@ -31,17 +37,21 @@ pub fn enabled() -> bool {
     debug_property("debug.alvr.auto_key").unwrap_or(0) > 0
 }
 
+type HandWeights = [[f32; HAND_SEGMENTS]; 2];
+
 struct Context {
     stage_space: Arc<xr::Space>,
     view_space: Arc<xr::Space>,
     interaction_context: Arc<RwLock<InteractionContext>>,
     running: Arc<RelaxedAtomic>,
     lut: Arc<Mutex<Option<Vec<u8>>>>,
+    verified: Arc<Mutex<Option<(Instant, HandWeights)>>>,
 }
 
 pub struct AutoColorKey {
     running: Arc<RelaxedAtomic>,
     lut: Arc<Mutex<Option<Vec<u8>>>>,
+    verified: Arc<Mutex<Option<(Instant, HandWeights)>>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -53,18 +63,29 @@ impl AutoColorKey {
     ) -> Self {
         let running = Arc::new(RelaxedAtomic::new(true));
         let lut = Arc::new(Mutex::new(None));
+        let verified = Arc::new(Mutex::new(None));
         let context = Context {
             stage_space,
             view_space,
             interaction_context,
             running: Arc::clone(&running),
             lut: Arc::clone(&lut),
+            verified: Arc::clone(&verified),
         };
 
         Self {
             running,
             lut,
+            verified,
             thread: Some(thread::spawn(move || learn_loop(&context))),
+        }
+    }
+
+    /// How sure it is that each segment of the hands is where the hand tracking says
+    pub fn verified_hands(&self) -> HandWeights {
+        match &*self.verified.lock() {
+            Some((time, weights)) if time.elapsed() < MAX_VERIFICATION_AGE => *weights,
+            _ => [[0.0; HAND_SEGMENTS]; 2],
         }
     }
 
@@ -92,6 +113,7 @@ fn sleep_while_running(context: &Context, duration: Duration) {
 
 fn learn_loop(context: &Context) {
     let mut model = ColorModel::default();
+    let mut weights: HandWeights = [[0.0; HAND_SEGMENTS]; 2];
 
     while context.running.value() {
         let camera = match PassthroughCamera::open() {
@@ -105,6 +127,7 @@ fn learn_loop(context: &Context) {
         camera::log(&format!("auto key: {:?}", camera.calibration));
 
         let mut last_update = Instant::now();
+        let mut last_lut_update = Instant::now();
         let mut last_log = Instant::now();
         while context.running.value() && !camera.is_lost() {
             let frame = camera.latest_frame();
@@ -119,27 +142,60 @@ fn learn_loop(context: &Context) {
             let elapsed = last_update.elapsed().as_secs_f32();
             last_update = Instant::now();
 
-            let Some(samples) = sample(context, &camera, &frame) else {
+            let Some((samples, view, hands)) = sample(context, &camera, &frame) else {
                 continue;
             };
             model.unknown_keep = percent("debug.alvr.key_unknown", 10);
             model.skin_bias = percent("debug.alvr.key_bias", 150);
-            model.tightness = percent("debug.alvr.key_tight", 20);
+            model.tightness = percent("debug.alvr.key_tight", 30);
             model.add_samples(&samples, elapsed);
-            let new_lut = model.update_lut();
+            let new_lut = if last_lut_update.elapsed() >= LUT_UPDATE_INTERVAL {
+                last_lut_update = Instant::now();
+                model.update_lut()
+            } else {
+                None
+            };
+
+            let background_kept = if samples.background.is_empty() {
+                0.0
+            } else {
+                model.kept_fraction(&samples.background)
+            };
+            for (weights, hand) in weights.iter_mut().zip(&hands) {
+                let targets = hand.as_ref().map_or([0.0; HAND_SEGMENTS], |hand| {
+                    model.verify_hand(
+                        &view,
+                        camera.calibration.width,
+                        camera.calibration.height,
+                        hand,
+                        background_kept,
+                        |x, y| frame.rgb(x, y),
+                    )
+                });
+                // Lose trust immediately, gain it slowly
+                for (weight, target) in weights.iter_mut().zip(targets) {
+                    *weight = if target < *weight {
+                        target
+                    } else {
+                        *weight + (target - *weight) * 0.5
+                    };
+                }
+            }
+            *context.verified.lock() = Some((Instant::now(), weights));
 
             if last_log.elapsed() > LOG_INTERVAL {
                 last_log = Instant::now();
                 camera::log(&format!(
                     "auto key: skin {} kept {:.2} mean {:?}, background {} kept {:.2} mean {:?}, \
-                     learned {}, update {:.1} ms",
+                     verified {:.2} {:.2}, update {:.1} ms",
                     samples.skin.len(),
                     model.kept_fraction(&samples.skin),
                     mean(&samples.skin),
                     samples.background.len(),
                     model.kept_fraction(&samples.background),
                     mean(&samples.background),
-                    new_lut.is_some(),
+                    weights[0].iter().sum::<f32>() / HAND_SEGMENTS as f32,
+                    weights[1].iter().sum::<f32>() / HAND_SEGMENTS as f32,
                     last_update.elapsed().as_secs_f32() * 1000.0,
                 ));
             }
@@ -164,7 +220,7 @@ fn sample(
     context: &Context,
     camera: &PassthroughCamera,
     frame: &CameraFrame,
-) -> Option<HandColorSamples> {
+) -> Option<(HandColorSamples, CameraView, [Option<SampledHand>; 2])> {
     // The OpenXR time of the Quest runtime is CLOCK_MONOTONIC, like the timestamps of the camera
     let time = xr::Time::from_nanos(frame.timestamp_ns);
 
@@ -228,11 +284,13 @@ fn sample(
     });
     drop(interaction_context);
 
-    Some(alvr_graphics::sample_hand_colors(
+    let samples = alvr_graphics::sample_hand_colors(
         &view,
         calibration.width,
         calibration.height,
         &hands,
         |x, y| frame.rgb(x, y),
-    ))
+    );
+
+    Some((samples, view, hands))
 }

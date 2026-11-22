@@ -30,8 +30,10 @@ struct DepthUniforms {
     lighting2: vec4f,
     // Confidence zones of each hand, as distances from its surface (negative inside).
     // x: end of the color keyed rim, y: start of the falloff (solid passthrough before it),
-    // z: width of the falloff, w: how many capsules are solid (the first ones are the wrist and palm)
+    // z: width of the falloff
     hand_zones: array<vec4f, 2>,
+    // How solid the core of each capsule is (0..1), 4 capsules per vector, left hand first
+    hand_solid: array<vec4f, 2u * HAND_SEGMENTS / 4u>,
     // Bounding spheres, xyz: position, w: radius (0: not tracked)
     hand_bounds: array<vec4f, 2>,
     // Start and end of each capsule, xyz: position, w: radius

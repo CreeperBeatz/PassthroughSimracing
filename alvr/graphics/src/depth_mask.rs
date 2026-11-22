@@ -23,6 +23,41 @@ pub const HAND_SEGMENTS: usize = 28;
 pub const WRIST_SEGMENTS: usize = 6;
 pub const PALM_SEGMENTS: usize = 9;
 
+/// OpenXR hand joints at the ends of each segment
+pub const SEGMENT_JOINTS: [(usize, usize); HAND_SEGMENTS] = [
+    // Palm
+    (0, 0),
+    (1, 2),
+    (1, 6),
+    (1, 11),
+    (1, 16),
+    (1, 21),
+    (7, 12),
+    (12, 17),
+    (17, 22),
+    // Thumb
+    (2, 3),
+    (3, 4),
+    (4, 5),
+    // Fingers
+    (6, 7),
+    (7, 8),
+    (8, 9),
+    (9, 10),
+    (11, 12),
+    (12, 13),
+    (13, 14),
+    (14, 15),
+    (16, 17),
+    (17, 18),
+    (18, 19),
+    (19, 20),
+    (21, 22),
+    (22, 23),
+    (23, 24),
+    (24, 25),
+];
+
 /// Start and end of the tapered capsules a hand is made of. xyz: position, w: radius
 #[derive(Clone, Copy)]
 pub struct HandShape {
@@ -55,39 +90,6 @@ impl HandShape {
     /// `joints`: position and radius of the OpenXR hand joints
     pub fn from_joints(joints: &[Vec4; 26]) -> Self {
         const TIPS: [usize; 5] = [5, 10, 15, 20, 25];
-        const PAIRS: [(usize, usize); HAND_SEGMENTS] = [
-            // Palm
-            (0, 0),
-            (1, 2),
-            (1, 6),
-            (1, 11),
-            (1, 16),
-            (1, 21),
-            (7, 12),
-            (12, 17),
-            (17, 22),
-            // Thumb
-            (2, 3),
-            (3, 4),
-            (4, 5),
-            // Fingers
-            (6, 7),
-            (7, 8),
-            (8, 9),
-            (9, 10),
-            (11, 12),
-            (12, 13),
-            (13, 14),
-            (14, 15),
-            (16, 17),
-            (17, 18),
-            (18, 19),
-            (19, 20),
-            (21, 22),
-            (22, 23),
-            (23, 24),
-            (24, 25),
-        ];
 
         // The tip joint is at the end of the finger: pull it back, so that the round end of the
         // capsule doesn't stick out
@@ -99,7 +101,7 @@ impl HandShape {
         }
 
         let mut segments = [[Vec4::ZERO; 2]; HAND_SEGMENTS];
-        for (segment, (start, end)) in segments.iter_mut().zip(PAIRS) {
+        for (segment, (start, end)) in segments.iter_mut().zip(SEGMENT_JOINTS) {
             *segment = [joints[start], joints[end]];
         }
 
@@ -143,8 +145,8 @@ pub struct HandZones {
     pub core: f32,
     pub falloff: f32,
     pub rim: f32,
-    /// Only the first segments have a solid core: hand tracking is too slow for the fingers
-    pub solid_segments: usize,
+    /// How solid the core of each segment is (0..1): only where the tracking is known to be right
+    pub solid: [f32; HAND_SEGMENTS],
 }
 
 impl HandZones {
@@ -192,7 +194,7 @@ pub struct DepthRenderInput {
 
 const EYE_FLOAT_COUNT: usize = 16 + 4 + 16 + 16 + 4;
 pub const DEPTH_UNIFORMS_FLOAT_COUNT: usize =
-    2 * EYE_FLOAT_COUNT + 16 + 4 * 5 + 4 * (2 + 2 + 2 * 2 * HAND_SEGMENTS);
+    2 * EYE_FLOAT_COUNT + 16 + 4 * 5 + 4 * (2 + 2 * HAND_SEGMENTS / 4 + 2 + 2 * 2 * HAND_SEGMENTS);
 pub const DEPTH_UNIFORMS_SIZE: usize = DEPTH_UNIFORMS_FLOAT_COUNT * size_of::<f32>();
 
 fn pose_to_mat4(pose: Pose) -> Mat4 {
@@ -319,13 +321,11 @@ pub fn depth_uniforms(
     data.extend([f32::from(u8::from(input.color_key.is_some())), 0.0]);
     for hand in &hands {
         data.extend(hand.map_or([0.0; 4], |(_, zones)| {
-            [
-                zones.rim,
-                zones.core,
-                zones.falloff,
-                zones.solid_segments as f32,
-            ]
+            [zones.rim, zones.core, zones.falloff, 0.0]
         }));
+    }
+    for hand in &hands {
+        data.extend(hand.map_or([0.0; HAND_SEGMENTS], |(_, zones)| zones.solid));
     }
     for hand in &hands {
         data.extend(
@@ -390,7 +390,7 @@ mod tests {
         assert_eq!(DEPTH_UNIFORMS_SIZE % 16, 0);
         assert_eq!(
             DEPTH_UNIFORMS_SIZE,
-            592 + 16 * (2 + 2 + 2 * 2 * HAND_SEGMENTS)
+            592 + 16 * (2 + 2 * HAND_SEGMENTS / 4 + 2 + 2 * 2 * HAND_SEGMENTS)
         );
     }
 

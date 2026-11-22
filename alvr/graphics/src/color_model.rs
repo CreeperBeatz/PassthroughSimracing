@@ -2,7 +2,7 @@
 //! tracked hands look like, and what is behind them. Only the colors are learned from the (late)
 //! camera images. The key itself is applied by the compositor to the image it displays.
 
-use crate::{HandShape, ray_capsule_distance};
+use crate::{HAND_SEGMENTS, HandShape, ray_capsule_distance};
 use alvr_common::glam::{Quat, Vec2, Vec3};
 
 pub const COLOR_LUT_RESOLUTION: usize = 32;
@@ -248,6 +248,62 @@ impl ColorModel {
         Some(lut)
     }
 
+    /// Check the tracked hand against the image. Returns for each segment if it is really there (0..1).
+    /// `background_kept`: fraction of the colors around the hand that look like the hand. If that is
+    /// high, nothing can be said.
+    pub fn verify_hand(
+        &self,
+        camera: &CameraView,
+        width: u32,
+        height: u32,
+        hand: &SampledHand,
+        background_kept: f32,
+        color: impl Fn(u32, u32) -> [u8; 3],
+    ) -> [f32; HAND_SEGMENTS] {
+        const MIN_POINTS: usize = 8;
+
+        let Some(alpha) = &self.alpha else {
+            return [0.0; HAND_SEGMENTS];
+        };
+        let reliability = 1.0 - smoothstep(0.35, 0.65, background_kept);
+
+        hand.shape.segments.map(|[start, end]| {
+            let axis = (end - start).truncate();
+            let middle = (start + end).truncate() / 2.0;
+            let side = axis
+                .cross(middle - camera.position)
+                .normalize_or(camera.orientation * Vec3::X);
+
+            let mut point_count = 0;
+            let mut skin_count = 0;
+            for along in [0.1, 0.3, 0.5, 0.7, 0.9] {
+                for offset in [-0.6, 0.0, 0.6] {
+                    let radius = start.w + (end.w - start.w) * along;
+                    let point = start.truncate() + axis * along + side * radius * offset;
+                    let Some((pixel, _)) = camera.project(point) else {
+                        continue;
+                    };
+                    if pixel.x < 0.0
+                        || pixel.y < 0.0
+                        || pixel.x >= width as f32
+                        || pixel.y >= height as f32
+                    {
+                        continue;
+                    }
+                    point_count += 1;
+                    if alpha[texel_index(color(pixel.x as u32, pixel.y as u32))] > 0.5 {
+                        skin_count += 1;
+                    }
+                }
+            }
+            if point_count < MIN_POINTS {
+                return 0.0;
+            }
+
+            reliability * smoothstep(0.7, 0.95, skin_count as f32 / point_count as f32)
+        })
+    }
+
     /// Fraction of the colors that are kept by the current LUT, for diagnostics
     pub fn kept_fraction(&self, colors: &[[u8; 3]]) -> f32 {
         let Some(alpha) = &self.alpha else {
@@ -260,6 +316,11 @@ impl ColorModel {
 
         kept as f32 / colors.len().max(1) as f32
     }
+}
+
+fn smoothstep(min: f32, max: f32, value: f32) -> f32 {
+    let x = ((value - min) / (max - min)).clamp(0.0, 1.0);
+    x * x * (3.0 - 2.0 * x)
 }
 
 /// Pinhole camera in world space. The camera looks at +z, with +x to the right and +y down.
@@ -689,6 +750,62 @@ mod tests {
             // Not on the arm
             assert!(x < 10.0, "{x} {y}");
         }
+    }
+
+    #[test]
+    fn verification_finds_misplaced_fingers() {
+        // Two fingers, one above the other, 0.5 m in front of the camera
+        let finger = |y: f32| {
+            [
+                Vec4::new(-0.05, y, 0.5, 0.01),
+                Vec4::new(0.05, y, 0.5, 0.01),
+            ]
+        };
+        let mut segments = [finger(-0.05); HAND_SEGMENTS];
+        segments[HAND_SEGMENTS - 1] = finger(0.05);
+        let hand = SampledHand {
+            shape: HandShape { segments },
+            wrist: Vec3::new(0.05, 0.0, 0.5),
+            arm_direction: Vec3::X,
+            is_still: true,
+        };
+        let camera = CameraView {
+            position: Vec3::ZERO,
+            orientation: Quat::IDENTITY,
+            focal_length: Vec2::splat(217.0),
+            center: Vec2::new(160.0, 120.0),
+        };
+        // The image only has the upper finger
+        let color = |_: u32, y: u32| {
+            if (90..106).contains(&y) {
+                SKIN
+            } else {
+                WHITE_WALL
+            }
+        };
+
+        let mut model = ColorModel::default();
+        assert_eq!(
+            model.verify_hand(&camera, 320, 240, &hand, 0.0, color),
+            [0.0; HAND_SEGMENTS]
+        );
+
+        model.add_samples(&samples(SKIN, WHITE_WALL), 0.1);
+        model.update_lut();
+        let result = model.verify_hand(&camera, 320, 240, &hand, 0.0, color);
+        assert_eq!(result[0], 1.0);
+        assert_eq!(result[HAND_SEGMENTS - 1], 0.0);
+
+        // The background looks the same
+        let result = model.verify_hand(&camera, 320, 240, &hand, 0.8, color);
+        assert_eq!(result[0], 0.0);
+
+        // Outside of the image
+        let far = CameraView {
+            center: Vec2::new(1000.0, 120.0),
+            ..camera
+        };
+        assert_eq!(model.verify_hand(&far, 320, 240, &hand, 0.0, color)[0], 0.0);
     }
 
     #[test]
