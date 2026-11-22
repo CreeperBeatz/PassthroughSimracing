@@ -18,7 +18,7 @@ pub struct DepthFrame {
     pub depth_views: [ViewParams; 2],
 }
 
-pub const HAND_SEGMENTS: usize = 29;
+pub const HAND_SEGMENTS: usize = 28;
 
 /// Start and end of the tapered capsules a hand is made of. xyz: position, w: radius
 #[derive(Clone, Copy)]
@@ -29,9 +29,8 @@ pub struct HandShape {
 impl HandShape {
     /// `joints`: position and radius of the OpenXR hand joints
     pub fn from_joints(joints: &[Vec4; 26]) -> Self {
-        const WRIST: usize = 1;
-        const FOREARM_LENGTH: f32 = 0.05;
-        const PAIRS: [(usize, usize); HAND_SEGMENTS - 1] = [
+        const TIPS: [usize; 5] = [5, 10, 15, 20, 25];
+        const PAIRS: [(usize, usize); HAND_SEGMENTS] = [
             // Palm
             (0, 0),
             (1, 2),
@@ -65,18 +64,19 @@ impl HandShape {
             (24, 25),
         ];
 
+        // The tip joint is at the end of the finger: pull it back, so that the round end of the
+        // capsule doesn't stick out
+        let mut joints = *joints;
+        for tip in TIPS {
+            let offset = (joints[tip - 1] - joints[tip]).truncate();
+            let shift = joints[tip].w.min(offset.length());
+            joints[tip] += (offset.normalize_or_zero() * shift).extend(0.0);
+        }
+
         let mut segments = [[Vec4::ZERO; 2]; HAND_SEGMENTS];
         for (segment, (start, end)) in segments.iter_mut().zip(PAIRS) {
             *segment = [joints[start], joints[end]];
         }
-
-        // The start of the forearm. The rest is handled by the depth mask
-        let wrist = joints[WRIST];
-        let direction = (wrist - joints[11]).truncate().normalize_or_zero();
-        segments[HAND_SEGMENTS - 1] = [
-            wrist,
-            (wrist.truncate() + direction * FOREARM_LENGTH).extend(wrist.w),
-        ];
 
         Self { segments }
     }

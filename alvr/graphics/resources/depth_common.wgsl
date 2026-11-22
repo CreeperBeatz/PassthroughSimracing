@@ -3,7 +3,7 @@
 //   var<uniform> depth_u: DepthUniforms;
 
 // Capsules per hand
-const HAND_SEGMENTS: u32 = 29u;
+const HAND_SEGMENTS: u32 = 28u;
 
 // All positions/poses are in the stage reference space
 struct DepthEye {

@@ -712,15 +712,20 @@ fn color_key_packs_mask_and_hand_area() {
 }
 
 #[test]
-fn hand_shape_contains_all_joints() {
-    let joints = std::array::from_fn(|i| Vec4::new(i as f32 * 0.01, 0.0, -0.4, 0.01));
+fn hand_shape_ends_at_the_fingertips() {
+    let joints: [Vec4; 26] = std::array::from_fn(|i| Vec4::new(i as f32 * 0.03, 0.0, -0.4, 0.01));
     let shape = HandShape::from_joints(&joints);
+    let points = shape.segments.as_flattened();
 
-    for joint in joints {
-        assert!(
-            shape.segments.as_flattened().contains(&joint),
-            "joint {joint} is not part of the shape"
-        );
+    for (i, joint) in joints.iter().enumerate() {
+        if [5, 10, 15, 20, 25].contains(&i) {
+            // The round end of the capsule touches the tip
+            let end = *joint - Vec4::new(joint.w, 0.0, 0.0, 0.0);
+            assert!(points.iter().any(|p| p.distance(end) < 1e-5), "tip {i}");
+            assert!(!points.contains(joint), "tip {i}");
+        } else {
+            assert!(points.contains(joint), "joint {i}");
+        }
     }
 }
 
