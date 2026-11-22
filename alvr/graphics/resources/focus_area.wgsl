@@ -74,8 +74,17 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         }
         let to_center = bounds.xyz - origin;
         let t = max(dot(to_center, dir), 0.0);
-        let is_near_hand = length(to_center - dir * t) < bounds.w + max(zones.x, PLAYZONE_RANGE) + SOFTNESS;
-        let has_arm = zones.w > 0.0;
+        let center_distance = length(to_center - dir * t);
+        let is_near_hand = center_distance < bounds.w + max(zones.x, 0.0) + SOFTNESS;
+        // Around the whole forearm
+        let arm_base = (hand * HAND_SEGMENTS + HAND_SEGMENTS - ARM_SEGMENTS) * 2u;
+        let has_arm = zones.w > 0.0
+            && ray_capsule_distance(
+                origin,
+                dir,
+                depth_u.hand_points[arm_base],
+                depth_u.hand_points[arm_base + ARM_SEGMENTS * 2u - 1u],
+            ) < zones.w + SOFTNESS;
 
         var distance = OUTSIDE;
         var arm_distance = OUTSIDE;
@@ -101,7 +110,11 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
             }
         }
 
-        near = max(near, 1.0 - smoothstep(0.7 * PLAYZONE_RANGE, PLAYZONE_RANGE, min(distance, arm_distance)));
+        // The bounding sphere is good enough here
+        near = max(
+            near,
+            1.0 - smoothstep(bounds.w + 0.5 * PLAYZONE_RANGE, bounds.w + PLAYZONE_RANGE, center_distance),
+        );
 
         // The further from the hand, the less likely that it is there: fade out, so that leaks of the
         // color key are weaker. Full strength up to half of the rim.

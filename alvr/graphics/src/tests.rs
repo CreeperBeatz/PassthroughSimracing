@@ -402,10 +402,10 @@ fn render_full(
     let probe_global = stream::create_light_probe_texture(device, 1)
         .create_view(&TextureViewDescriptor::default());
 
-    let depth_mask_view = stream::create_depth_mask_texture(device, UVec2::splat(TARGET_SIZE * 4))
+    let depth_mask_view = stream::create_depth_mask_texture(device, UVec2::splat(TARGET_SIZE * 5))
         .create_view(&TextureViewDescriptor::default());
 
-    let focus_area_view = stream::create_focus_area_texture(device, UVec2::splat(TARGET_SIZE * 4))
+    let focus_area_view = stream::create_focus_area_texture(device, UVec2::splat(TARGET_SIZE * 5))
         .create_view(&TextureViewDescriptor::default());
 
     let view_bind_group = device.create_bind_group(&BindGroupDescriptor {
@@ -616,7 +616,7 @@ fn render_full(
             &focus_area_view,
             &bind_group,
             0,
-            stream::focus_area_resolution(UVec2::splat(TARGET_SIZE * 4)),
+            stream::focus_area_resolution(UVec2::splat(TARGET_SIZE * 5)),
             rect,
         );
     }

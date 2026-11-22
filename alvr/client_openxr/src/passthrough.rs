@@ -136,7 +136,7 @@ impl ColorKeyParams {
                 core: -millimeters("debug.alvr.key_inset", 4),
                 falloff: millimeters("debug.alvr.key_falloff", 4),
                 rim: millimeters("debug.alvr.key_rim", 0),
-                arm_rim: millimeters("debug.alvr.key_arm_rim", 15),
+                arm_rim: millimeters("debug.alvr.key_arm_rim", 8),
                 solid,
             },
             // Milliseconds

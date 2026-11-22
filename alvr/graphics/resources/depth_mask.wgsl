@@ -130,6 +130,9 @@ fn current_mask(uv: vec2f) -> vec4f {
         return vec4f(0.0);
     }
 
+    // Most rays don't pass near an arm
+    let near_arms = vec2<bool>(is_near_arm(origin, dir, 0u), is_near_arm(origin, dir, 1u));
+
     // Classify the 3x3 neighborhood and blend the results (not the depths) with quadratic B-spline
     // weights. This hides the depth texel grid, without inventing surfaces between hand and wall.
     let center = floor(lookup.texel);
@@ -145,7 +148,16 @@ fn current_mask(uv: vec2f) -> vec4f {
             let depth = load_depth(vec2i(center) + vec2i(x - 1, y - 1), view_idx);
             if depth < MAX_DEPTH {
                 let hit = lookup_to_world(lookup, linearize_depth(depth), view_idx);
-                coverage += weights[x].x * weights[y].y * region_mask(hit, view_idx) * (1.0 - arm_removal(hit));
+                var inside = region_mask(hit, view_idx);
+                if inside > 0.0 {
+                    if near_arms.x {
+                        inside *= 1.0 - arm_removal(hit, 0u);
+                    }
+                    if near_arms.y {
+                        inside *= 1.0 - arm_removal(hit, 1u);
+                    }
+                }
+                coverage += weights[x].x * weights[y].y * inside;
             }
         }
     }
@@ -167,29 +179,38 @@ const MAX_DEPTH: f32 = 0.9999;
 
 // The depth map is late, so it shows the forearms where they were. Returns 1 if this point of the depth
 // map belongs to a forearm that is tracked: the tracked one is shown instead.
-fn arm_removal(point: vec3f) -> f32 {
-    var result = 0.0;
-    for (var hand = 0u; hand < 2u; hand++) {
-        let wrist = depth_u.arms[hand * 3u].xyz;
-        let axis = depth_u.arms[hand * 3u + 1u].xyz - wrist;
-        let trust = depth_u.arms[hand * 3u + 2u];
-        let length_squared = dot(axis, axis);
-        if length_squared < 1e-4 || all(trust <= vec4f(0.0)) {
-            continue;
-        }
+fn arm_removal(point: vec3f, hand: u32) -> f32 {
+    let wrist = depth_u.arms[hand * 3u].xyz;
+    let axis = depth_u.arms[hand * 3u + 1u].xyz - wrist;
+    let trust = depth_u.arms[hand * 3u + 2u];
 
-        let s = clamp(dot(point - wrist, axis) / length_squared, 0.0, 1.0);
-        let aside = length(point - wrist - axis * s);
-        // Interpolate between the centers of the quarters
-        let position = clamp(s * 4.0 - 0.5, 0.0, 3.0);
-        let quarter = u32(floor(position));
-        let next_quarter = min(quarter + 1u, 3u);
-        let amount = mix(trust[quarter], trust[next_quarter], fract(position));
+    let s = clamp(dot(point - wrist, axis) / max(dot(axis, axis), 1e-4), 0.0, 1.0);
+    let aside = length(point - wrist - axis * s);
+    // Interpolate between the centers of the quarters
+    let position = clamp(s * 4.0 - 0.5, 0.0, 3.0);
+    let blend = clamp(vec4f(position) - vec4f(0.0, 1.0, 2.0, 3.0), vec4f(-1.0), vec4f(1.0));
+    let amount = dot(trust, 1.0 - abs(blend));
 
-        let radius = mix(0.055, 0.07, s);
-        result = max(result, amount * (1.0 - smoothstep(radius, radius + 0.02, aside)));
+    let radius = mix(0.055, 0.07, s);
+    return amount * (1.0 - smoothstep(radius, radius + 0.02, aside));
+}
+
+// Whether the ray passes a forearm that is tracked, with a margin for its motion and the parallax
+fn is_near_arm(origin: vec3f, dir: vec3f, hand: u32) -> bool {
+    let trust = depth_u.arms[hand * 3u + 2u];
+    let start = depth_u.arms[hand * 3u].xyz;
+    let axis = depth_u.arms[hand * 3u + 1u].xyz - start;
+    let c = dot(axis, axis);
+    if c < 1e-4 || all(trust <= vec4f(0.0)) {
+        return false;
     }
-    return result;
+
+    let w = origin - start;
+    let b = dot(dir, axis);
+    let s = clamp((dot(axis, w) - b * dot(dir, w)) / max(c - b * b, 1e-6), 0.0, 1.0);
+    let point = start + axis * s;
+    let t = max(dot(point - origin, dir), 0.0);
+    return length(origin + dir * t - point) < 0.13;
 }
 
 struct DepthLookup {

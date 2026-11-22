@@ -438,11 +438,14 @@ pub fn hands_view_rect(
             } else {
                 JOINT_SEGMENTS
             };
-            let rim = f32::max(zones.rim, zones.arm_rim).max(PLAYZONE_RANGE) + MARGIN;
+            let rim = f32::max(zones.rim, zones.arm_rim).max(0.0) + MARGIN;
             shape.segments[..count]
                 .as_flattened()
                 .iter()
                 .map(move |point| (point.truncate(), point.w + rim))
+                // Where the playzone is used
+                .chain([(shape.bounds().truncate(), shape.bounds().w + PLAYZONE_RANGE)])
+                .collect::<Vec<_>>()
         })
         .map(|(position, radius)| {
             let local = view.pose.orientation.inverse() * (position - eye_position);

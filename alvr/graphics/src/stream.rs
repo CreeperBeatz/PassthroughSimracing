@@ -49,9 +49,9 @@ pub const LIGHT_PROBE_FORMAT: TextureFormat = TextureFormat::Rgba16Float;
 
 /// The depth passthrough mask is computed at 1 / DEPTH_MASK_DOWNSCALE of the view resolution. This
 /// still has more texels than the environment depth map (320x320 on Quest 3).
-const DEPTH_MASK_DOWNSCALE: u32 = 4;
+const DEPTH_MASK_DOWNSCALE: u32 = 5;
 /// The outline of the hands is visible, keep it sharp
-const FOCUS_AREA_DOWNSCALE: u32 = 4;
+const FOCUS_AREA_DOWNSCALE: u32 = 5;
 // Distances in meters
 const PLAYZONE_FORMAT: TextureFormat = LIGHT_PROBE_FORMAT;
 const DEPTH_MASK_FORMAT: TextureFormat = TextureFormat::Rgba8Unorm;
