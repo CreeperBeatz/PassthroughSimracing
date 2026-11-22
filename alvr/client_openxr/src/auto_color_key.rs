@@ -24,6 +24,8 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(3);
 const LOG_INTERVAL: Duration = Duration::from_secs(2);
 // The images and the hand poses don't match well enough for fast hands (m/s)
 const MAX_HAND_SPEED: f32 = 0.5;
+// Fingers included (m/s)
+const STILL_HAND_SPEED: f32 = 0.12;
 
 pub fn enabled() -> bool {
     debug_property("debug.alvr.auto_key").unwrap_or(0) > 0
@@ -122,6 +124,7 @@ fn learn_loop(context: &Context) {
             };
             model.unknown_keep = percent("debug.alvr.key_unknown", 10);
             model.skin_bias = percent("debug.alvr.key_bias", 150);
+            model.tightness = percent("debug.alvr.key_tight", 20);
             model.add_samples(&samples, elapsed);
             let new_lut = model.update_lut();
 
@@ -220,6 +223,7 @@ fn sample(
             wrist,
             arm_direction: (wrist - position(xr::HandJointEXT::MIDDLE_METACARPAL))
                 .normalize_or_zero(),
+            is_still: speed < STILL_HAND_SPEED,
         })
     });
     drop(interaction_context);

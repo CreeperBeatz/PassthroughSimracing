@@ -13,15 +13,18 @@ const SKIN_MEMORY: f32 = 5.0;
 const BACKGROUND_MEMORY: f32 = 3.0;
 // Backgrounds that were behind the hand before, and everything that the camera sees
 const PAST_BACKGROUND_MEMORY: f32 = 60.0;
+// The hand looks different in other places of the room
+const PAST_SKIN_MEMORY: f32 = 45.0;
+const PAST_SKIN_WEIGHT: f32 = 0.5;
 const SCENE_MEMORY: f32 = 20.0;
 const PAST_BACKGROUND_WEIGHT: f32 = 0.4;
 const SCENE_WEIGHT: f32 = 0.5;
 // Width of the smoothing of the color densities, in LUT texels. The camera colors are a bit different
 // from the colors seen by the compositor (about one texel).
-const SKIN_SMOOTHING: f32 = 1.4;
+const SKIN_SMOOTHING: f32 = 1.0;
 const BACKGROUND_SMOOTHING: f32 = 1.3;
-// Densities below this are not significant, see `ColorModel::unknown_keep`
-const FLOOR: f32 = 1e-6;
+// Densities below this are never significant
+const MIN_FLOOR: f32 = 1e-6;
 const LIKELIHOOD_SOFTNESS: f32 = 0.7;
 // How much of the new LUT is used at each update, to avoid visible jumps
 const BLEND: f32 = 0.35;
@@ -112,6 +115,7 @@ fn smooth(values: &[f32], sigma: f32) -> Vec<f32> {
 
 pub struct ColorModel {
     skin: Density,
+    past_skin: Vec<f32>,
     /// Around the hands
     background: Density,
     past_background: Vec<f32>,
@@ -123,6 +127,9 @@ pub struct ColorModel {
     /// How much skin is preferred if skin and background look the same. High values avoid holes in the
     /// hand, low values avoid leaks.
     pub skin_bias: f32,
+    /// How similar to the skin a color must be, as a fraction of the typical density of the skin colors.
+    /// Low values accept similar colors that were never seen, which shows complex backgrounds.
+    pub tightness: f32,
 }
 
 impl Default for ColorModel {
@@ -135,6 +142,8 @@ impl Default for ColorModel {
             alpha: None,
             unknown_keep: 0.1,
             skin_bias: 1.5,
+            past_skin: vec![0.0; TEXEL_COUNT],
+            tightness: 0.2,
         }
     }
 }
@@ -146,6 +155,12 @@ impl ColorModel {
         self.background.add(&samples.background, elapsed);
         self.scene.add(&samples.scene, elapsed);
 
+        if !samples.skin.is_empty() {
+            let keep = (-elapsed / PAST_SKIN_MEMORY).exp();
+            for (past, current) in self.past_skin.iter_mut().zip(&self.skin.values) {
+                *past = f32::max(*past * keep, *current);
+            }
+        }
         if !samples.background.is_empty() {
             let keep = (-elapsed / PAST_BACKGROUND_MEMORY).exp();
             for (past, current) in self.past_background.iter_mut().zip(&self.background.values) {
@@ -160,7 +175,23 @@ impl ColorModel {
             return None;
         }
 
-        let skin = smooth(&self.skin.values, SKIN_SMOOTHING);
+        let skin = self
+            .skin
+            .values
+            .iter()
+            .zip(&self.past_skin)
+            .map(|(current, past)| f32::max(*current, past * PAST_SKIN_WEIGHT))
+            .collect::<Vec<_>>();
+        let skin = smooth(&skin, SKIN_SMOOTHING);
+        // Density that is typical for the colors of the skin
+        let skin_sum = skin.iter().sum::<f32>().max(1e-6);
+        let typical_density = skin.iter().map(|d| d * d).sum::<f32>() / skin_sum;
+        // If unknown colors are kept, there is no limit of the similarity
+        let floor = if self.unknown_keep > 0.5 {
+            MIN_FLOOR
+        } else {
+            f32::max(typical_density * self.tightness, MIN_FLOOR)
+        };
         let background = self
             .background
             .values
@@ -173,7 +204,7 @@ impl ColorModel {
         let backgrounds = background.iter().zip(&scene);
         let skin_bias = self.skin_bias;
         let unknown_keep = self.unknown_keep.clamp(0.01, 0.99);
-        let skin_floor = FLOOR * (unknown_keep / (1.0 - unknown_keep)).powf(LIKELIHOOD_SOFTNESS);
+        let skin_floor = floor * (unknown_keep / (1.0 - unknown_keep)).powf(LIKELIHOOD_SOFTNESS);
         let target = skin
             .iter()
             .zip(backgrounds)
@@ -184,7 +215,7 @@ impl ColorModel {
                     (skin - background * CONTAMINATION).max(0.0),
                     (background - skin * CONTAMINATION).max(scene),
                 );
-                let score = ((background + FLOOR) / (skin * skin_bias + skin_floor)).ln();
+                let score = ((background + floor) / (skin * skin_bias + skin_floor)).ln();
                 let keep = 1.0 / (1.0 + (score / LIKELIHOOD_SOFTNESS).clamp(-30.0, 30.0).exp());
                 // Make it steeper
                 ((keep - 0.3) / 0.4).clamp(0.0, 1.0)
@@ -266,6 +297,8 @@ pub struct SampledHand {
     pub wrist: Vec3,
     /// From the hand to the arm
     pub arm_direction: Vec3,
+    /// The fingers are only tracked well enough if the hand doesn't move
+    pub is_still: bool,
 }
 
 #[derive(Default)]
@@ -286,6 +319,7 @@ pub fn sample_hand_colors(
 ) -> HandColorSamples {
     // Distances from the surface of the hand, with a margin for tracking and timing errors
     const SKIN_MAX: f32 = -0.005;
+    const FINGER_MAX: f32 = -0.004;
     const BACKGROUND_MIN: f32 = 0.02;
     const BACKGROUND_MAX: f32 = 0.07;
     const STEP: usize = 2;
@@ -335,7 +369,9 @@ pub fn sample_hand_colors(
                 let ray = camera.ray(Vec2::new(x as f32 + 0.5, y as f32 + 0.5));
                 let distance = hand.shape.ray_distance(camera.position, ray);
 
-                if hand.shape.palm_ray_distance(camera.position, ray) < SKIN_MAX {
+                let is_skin = hand.shape.palm_ray_distance(camera.position, ray) < SKIN_MAX
+                    || (hand.is_still && distance < FINGER_MAX);
+                if is_skin {
                     samples.skin.push(color(x, y));
                 } else if (BACKGROUND_MIN..BACKGROUND_MAX).contains(&distance) {
                     // The arm is not background
@@ -517,6 +553,51 @@ mod tests {
     }
 
     #[test]
+    fn similar_colors_are_removed_if_they_were_never_seen() {
+        let mut model = ColorModel::default();
+        for _ in 0..20 {
+            model.add_samples(&samples(SKIN, WHITE_WALL), 0.12);
+            model.update_lut();
+        }
+        let lut = model.update_lut().unwrap();
+
+        // Camera noise
+        for color in noisy(SKIN, 200) {
+            assert!(alpha(&lut, color) > 200, "{color:?} {}", alpha(&lut, color));
+        }
+        // Wood, cardboard, mixed colors at edges
+        for color in [
+            [190, 145, 105],
+            [150, 130, 120],
+            [110, 75, 45],
+            [175, 100, 85],
+        ] {
+            assert!(alpha(&lut, color) < 30, "{color:?} {}", alpha(&lut, color));
+        }
+    }
+
+    #[test]
+    fn remembers_the_skin_in_other_places() {
+        let lit = SKIN.map(|v| (f32::from(v) * 1.4) as u8);
+        let mut model = ColorModel::default();
+        for _ in 0..20 {
+            model.add_samples(&samples(lit, WHITE_WALL), 0.12);
+            model.update_lut();
+        }
+        // 15 seconds in the shade
+        let mut lut = vec![];
+        for _ in 0..125 {
+            model.add_samples(&samples(SKIN, GREEN_WALL), 0.12);
+            lut = model.update_lut().unwrap();
+        }
+
+        assert!(alpha(&lut, SKIN) > 240);
+        assert!(alpha(&lut, lit) > 200, "{}", alpha(&lut, lit));
+        assert!(alpha(&lut, WHITE_WALL) < 15);
+        assert!(alpha(&lut, GREEN_WALL) < 15);
+    }
+
+    #[test]
     fn learns_many_backgrounds_from_the_scene() {
         // A complex scene, the hand is in front of the white wall
         let colors = [GREEN_WALL, [200, 30, 40], [30, 90, 200], [20, 20, 20]];
@@ -529,6 +610,8 @@ mod tests {
 
         let mut model = ColorModel {
             unknown_keep: 0.95,
+            // Only the scene can remove colors
+            tightness: 1e-4,
             ..Default::default()
         };
         let mut lut = vec![];
@@ -569,6 +652,7 @@ mod tests {
             },
             wrist: Vec3::new(0.05, 0.0, 0.5),
             arm_direction: Vec3::X,
+            is_still: false,
         };
         let camera = CameraView {
             position: Vec3::ZERO,

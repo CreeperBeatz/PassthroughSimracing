@@ -91,6 +91,7 @@ impl PassthroughLayer<'_> {
 /// - `setprop debug.alvr.key_rim_max <mm>`: limit of that growth
 /// - `setprop debug.alvr.key_unknown <percent>`: how much to keep colors that were never seen
 /// - `setprop debug.alvr.key_bias <percent>`: preference for skin if the background looks the same
+/// - `setprop debug.alvr.key_tight <percent>`: how similar to the skin a color must be
 /// - `setprop debug.alvr.auto_key 1` before starting the app: learn the colors with the camera
 /// - `setprop debug.alvr.key_solid <n>`: solid capsules, 0: none, 6: wrist, 9: palm, 28: whole hand
 /// - `setprop debug.alvr.key_scale <percent>`: thickness of the hands
