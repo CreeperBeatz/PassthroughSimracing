@@ -52,12 +52,14 @@ const STREAM_WGSL: &str = include_str!("../resources/stream.wgsl");
 const LIGHT_PROBE_LOCAL_WGSL: &str = include_str!("../resources/light_probe_local.wgsl");
 const LIGHT_PROBE_GLOBAL_WGSL: &str = include_str!("../resources/light_probe_global.wgsl");
 
+// The common code must come last: wgpu-hal (GLES) resolves the types of the immediates using indices
+// that are only correct if those types are the first ones in the shader.
 pub(crate) fn stream_shader_source() -> String {
-    format!("{FOVEATION_COMMON_WGSL}\n{STREAM_WGSL}")
+    format!("{STREAM_WGSL}\n{FOVEATION_COMMON_WGSL}")
 }
 
 pub(crate) fn light_probe_local_shader_source() -> String {
-    format!("{FOVEATION_COMMON_WGSL}\n{LIGHT_PROBE_LOCAL_WGSL}")
+    format!("{LIGHT_PROBE_LOCAL_WGSL}\n{FOVEATION_COMMON_WGSL}")
 }
 
 pub(crate) fn light_probe_global_shader_source() -> String {

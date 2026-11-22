@@ -32,10 +32,10 @@ fn translate_to_gles(name: &str, source: &str, constants: &[(&str, f64)]) {
         valid::{Capabilities, ValidationFlags, Validator},
     };
 
-    let module = naga::front::wgsl::parse_str(source)
+    let source_module = naga::front::wgsl::parse_str(source)
         .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(source)));
     let info = Validator::new(ValidationFlags::all(), Capabilities::all())
-        .validate(&module)
+        .validate(&source_module)
         .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(source)));
 
     let mut pipeline_constants = naga::back::PipelineConstants::default();
@@ -43,9 +43,9 @@ fn translate_to_gles(name: &str, source: &str, constants: &[(&str, f64)]) {
         pipeline_constants.insert((*key).to_owned(), *value);
     }
 
-    for entry_point in &module.entry_points {
+    for entry_point in &source_module.entry_points {
         let (module, info) = naga::back::pipeline_constants::process_overrides(
-            &module,
+            &source_module,
             &info,
             Some((entry_point.stage, &entry_point.name)),
             &pipeline_constants,
@@ -66,7 +66,7 @@ fn translate_to_gles(name: &str, source: &str, constants: &[(&str, f64)]) {
         };
 
         let mut output = String::new();
-        glsl::Writer::new(
+        let reflection = glsl::Writer::new(
             &mut output,
             &module,
             &info,
@@ -76,6 +76,18 @@ fn translate_to_gles(name: &str, source: &str, constants: &[(&str, f64)]) {
         )
         .and_then(|mut writer| writer.write())
         .unwrap_or_else(|e| panic!("{name} {}: {e}", entry_point.name));
+
+        // wgpu-hal (GLES) looks up the type of each immediate in the *source* module, using handles
+        // that belong to the module compacted by process_overrides(). If the types used by the
+        // immediates are not the first ones in the shader, the lookup returns the wrong type, and
+        // wgpu panics at submit time or uploads garbage.
+        for item in &reflection.immediates_items {
+            assert_eq!(
+                source_module.types[item.ty].inner, module.types[item.ty].inner,
+                "{name} {}: wgpu would use the wrong type for `{}`. Declare immediates first",
+                entry_point.name, item.access_path
+            );
+        }
 
         // texelFetch on shadow samplers is invalid in GLSL ES
         assert!(

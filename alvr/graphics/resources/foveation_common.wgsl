@@ -1,4 +1,4 @@
-// Shared foveated-encoding decode. This snippet is prepended to shaders that sample the stream
+// Shared foveated-encoding decode. This snippet is appended to shaders that sample the stream
 // texture. The including shader must declare:
 //   var<uniform> foveation: FoveationUniforms;
 

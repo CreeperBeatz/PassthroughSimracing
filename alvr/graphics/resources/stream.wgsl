@@ -1,4 +1,5 @@
-// Note: foveation_common.wgsl is prepended to this file at pipeline creation.
+// Note: foveation_common.wgsl is appended to this file at pipeline creation. Keep `Immediate` the first
+// declaration, see stream_shader_source().
 
 struct Immediate {
     reprojection_transform: mat4x4f,

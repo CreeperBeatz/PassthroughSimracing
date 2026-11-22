@@ -1,4 +1,5 @@
-// Note: foveation_common.wgsl is prepended to this file at pipeline creation.
+// Note: foveation_common.wgsl is appended to this file at pipeline creation. Keep `Immediate` the first
+// declaration, see stream_shader_source().
 //
 // Renders a low resolution map of the (approximately linear) game color, in view-space uv. Each
 // output texel averages SAMPLES x SAMPLES points of the stream image inside its cell. The pipeline
