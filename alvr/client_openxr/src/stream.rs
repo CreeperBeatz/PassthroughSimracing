@@ -28,6 +28,7 @@ use alvr_session::{
 use alvr_system_info::Platform;
 use openxr as xr;
 use std::{
+    cell::Cell,
     ptr,
     rc::Rc,
     sync::Arc,
@@ -106,6 +107,8 @@ pub struct StreamContext {
     environment_depth_failed: bool,
     // Set if the passthrough is color keyed around the hands
     color_key: Option<ColorKeyParams>,
+    // Smoothed, meters per second
+    hand_speeds: [Cell<f32>; 2],
 }
 
 impl StreamContext {
@@ -256,6 +259,7 @@ impl StreamContext {
             environment_depth: None,
             environment_depth_failed: false,
             color_key: None,
+            hand_speeds: [const { Cell::new(0.0) }; 2],
         };
 
         this.update_reference_space();
@@ -285,26 +289,35 @@ impl StreamContext {
         let time = xr::Time::from_nanos(display_time.as_nanos() - delay);
         let int_ctx = self.interaction_context.read();
 
-        let locate_hand = |hand: &crate::interaction::HandInteraction| {
-            let joints = self
+        let hands = [0, 1].map(|i| {
+            let tracker = int_ctx.hands_interaction[i].skeleton_tracker.as_ref()?;
+            let (joints, velocities) = self
                 .stage_reference_space
-                .locate_hand_joints(hand.skeleton_tracker.as_ref()?, time)
+                .relate_hand_joints(tracker, time)
                 .ok()
                 .flatten()?;
 
-            Some(HandShape::from_joints(&joints.map(|joint| {
+            let shape = HandShape::from_joints(&joints.map(|joint| {
                 crate::from_xr_vec3(joint.pose.position).extend(joint.radius * params.radius_scale)
-            })))
-        };
+            }));
 
-        Some(ColorKeyInput {
-            hands: [
-                locate_hand(&int_ctx.hands_interaction[0]),
-                locate_hand(&int_ctx.hands_interaction[1]),
-            ],
-            rim: params.rim_m,
-            inset: params.inset_m,
-        })
+            // Some joints may have no valid velocity
+            let speed = velocities
+                .iter()
+                .filter(|v| {
+                    v.velocity_flags
+                        .contains(xr::SpaceVelocityFlags::LINEAR_VALID)
+                })
+                .map(|v| crate::from_xr_vec3(v.linear_velocity).length())
+                .fold(0.0, f32::max);
+            // Grow immediately, shrink slowly: velocities are noisy
+            let speed = speed.max(self.hand_speeds[i].get() * 0.9);
+            self.hand_speeds[i].set(speed);
+
+            Some((shape, params.zones.for_speed(speed, params.timing_error_s)))
+        });
+
+        Some(ColorKeyInput { hands })
     }
 
     pub fn uses_passthrough(&self) -> bool {

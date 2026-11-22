@@ -3,6 +3,7 @@ use alvr_common::{
     anyhow::{Result, bail},
     error,
 };
+use alvr_graphics::HandZones;
 use alvr_system_info::Platform;
 use openxr::{self as xr};
 use std::{
@@ -75,6 +76,8 @@ impl PassthroughLayer<'_> {
 /// - `setprop debug.alvr.color_key <n>`: 0 disables the key, another value (re)loads the LUT
 /// - `setprop debug.alvr.key_rim <mm>`: width of the color keyed rim around the hands
 /// - `setprop debug.alvr.key_inset <mm>`: how much the solid inside of the hands is shrunk
+/// - `setprop debug.alvr.key_falloff <mm>`: how gradually the solid inside fades out
+/// - `setprop debug.alvr.key_error <ms>`: assumed timing error, the rim grows with the hand speed
 /// - `setprop debug.alvr.key_scale <percent>`: thickness of the hands
 /// - `setprop debug.alvr.key_delay <ms>`: how late (may be negative) the passthrough image is, to locate the hands at
 ///   the moment it shows
@@ -86,8 +89,10 @@ pub struct ColorKey {
 
 #[derive(Clone, Copy)]
 pub struct ColorKeyParams {
-    pub rim_m: f32,
-    pub inset_m: f32,
+    /// Of a hand that doesn't move
+    pub zones: HandZones,
+    /// How wrong the timing of the hand pose may be
+    pub timing_error_s: f32,
     pub radius_scale: f32,
     /// Negative: predict ahead
     pub passthrough_delay_ms: i64,
@@ -100,14 +105,19 @@ fn millimeters(property: &str, default: i64) -> f32 {
 impl ColorKeyParams {
     fn load() -> Self {
         Self {
-            rim_m: millimeters("debug.alvr.key_rim", 8),
-            inset_m: millimeters("debug.alvr.key_inset", 2),
+            zones: HandZones {
+                core: -millimeters("debug.alvr.key_inset", 4),
+                falloff: millimeters("debug.alvr.key_falloff", 8),
+                rim: millimeters("debug.alvr.key_rim", 10),
+            },
+            // Milliseconds
+            timing_error_s: millimeters("debug.alvr.key_error", 20),
             radius_scale: debug_property("debug.alvr.key_scale")
                 .unwrap_or(100)
                 .clamp(0, 300) as f32
                 / 100.0,
             passthrough_delay_ms: debug_property("debug.alvr.key_delay")
-                .unwrap_or(0)
+                .unwrap_or(20)
                 .clamp(-100, 200),
         }
     }

@@ -3,7 +3,9 @@
 //! - the depth passthrough shader is run on the desktop GPU against a synthetic depth scene
 
 use crate::{
-    depth_mask::{self, ColorKeyInput, DepthFrame, DepthRenderInput, HAND_SEGMENTS, HandShape},
+    depth_mask::{
+        self, ColorKeyInput, DepthFrame, DepthRenderInput, HAND_SEGMENTS, HandShape, HandZones,
+    },
     stream::{self, FOVEATION_UNIFORM_SIZE, LIGHT_PROBE_SIZE, StreamPipelines, floats_to_bytes},
 };
 use alvr_common::{
@@ -684,12 +686,17 @@ fn color_key_packs_mask_and_hand_area() {
         Some(ColorKeyInput {
             hands: [
                 None,
-                Some(HandShape {
-                    segments: [segment; HAND_SEGMENTS],
-                }),
+                Some((
+                    HandShape {
+                        segments: [segment; HAND_SEGMENTS],
+                    },
+                    HandZones {
+                        core: -0.01,
+                        falloff: 0.01,
+                        rim: 0.04,
+                    },
+                )),
             ],
-            rim: 0.04,
-            inset: 0.0,
         }),
     );
 
@@ -709,6 +716,79 @@ fn color_key_packs_mask_and_hand_area() {
         let gray = i32::from(out.at(u, v)[0]);
         assert!((gray - i32::from(STREAM_GRAY)).abs() <= 2, "{gray}");
     }
+}
+
+#[test]
+fn hand_core_fades_out_gradually() {
+    let (device, queue) = gpu_or_skip!();
+    let config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
+
+    let segment = [
+        Vec4::new(-0.1, -0.25, -0.5, 0.05),
+        Vec4::new(0.1, -0.25, -0.5, 0.05),
+    ];
+    let shape = HandShape {
+        segments: [segment; HAND_SEGMENTS],
+    };
+    let zones = HandZones {
+        core: -0.03,
+        falloff: 0.06,
+        rim: 0.06,
+    };
+    let render_zones = |zones| {
+        render_with_key(
+            &device,
+            &queue,
+            &config,
+            &hand_scene(),
+            Vec3::ZERO,
+            Vec3::ZERO,
+            true,
+            Some(ColorKeyInput {
+                hands: [Some((shape, zones)), None],
+            }),
+        )
+    };
+
+    // From the center to the outside: never jumps from solid (0) to keyed (0.5)
+    let out = render_zones(zones);
+    let alphas = (0..20)
+        .map(|i| out.alpha(0.5, 0.75 + i as f32 * 0.01))
+        .collect::<Vec<_>>();
+    assert!(alphas[0] < 0.01);
+    assert!(
+        alphas.iter().any(|a| (0.1..0.4).contains(a)),
+        "no falloff: {alphas:?}"
+    );
+    for pair in alphas.windows(2).take(9) {
+        assert!((-0.01..0.25).contains(&(pair[1] - pair[0])), "{alphas:?}");
+    }
+
+    // A fast hand is keyed, not solid, also further away
+    let fast = render_zones(zones.for_speed(10.0, 0.02));
+    assert!(fast.alpha(0.5, 0.75) > out.alpha(0.5, 0.75) + 0.1);
+    assert_eq!(out.alpha(0.5, 0.9), 1.0);
+    assert!(fast.alpha(0.5, 0.9) < 0.55);
+}
+
+#[test]
+fn hand_zones_follow_the_speed() {
+    let zones = HandZones {
+        core: -0.004,
+        falloff: 0.008,
+        rim: 0.01,
+    };
+
+    let still = zones.for_speed(0.0, 0.02);
+    assert!((still.core - zones.core).abs() < 1e-6 && (still.rim - zones.rim).abs() < 1e-6);
+
+    // 1 m/s and 20 ms: 2 cm
+    let moving = zones.for_speed(1.0, 0.02);
+    assert!((moving.core - -0.024).abs() < 1e-6 && (moving.rim - 0.03).abs() < 1e-6);
+
+    // Limited
+    let fast = zones.for_speed(100.0, 0.02);
+    assert!((fast.rim - 0.05).abs() < 1e-6);
 }
 
 #[test]

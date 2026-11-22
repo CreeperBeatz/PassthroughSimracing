@@ -94,14 +94,36 @@ impl HandShape {
     }
 }
 
-/// The hands are solid passthrough, with a color keyed rim around them
+/// Confidence zones of a hand, as distances from its surface in meters (negative inside): solid
+/// passthrough up to `core`, fading out over `falloff`, and color keyed passthrough up to `rim`.
+#[derive(Clone, Copy, Debug)]
+pub struct HandZones {
+    pub core: f32,
+    pub falloff: f32,
+    pub rim: f32,
+}
+
+impl HandZones {
+    const MAX_UNCERTAINTY: f32 = 0.04;
+
+    /// Hand tracking is late and predicted, so the faster the hand, the less certain its position:
+    /// the solid core shrinks and the keyed rim grows.
+    /// `timing_error`: assumed error of the hand pose, in seconds
+    pub fn for_speed(self, speed: f32, timing_error: f32) -> Self {
+        let uncertainty = (speed * timing_error).clamp(0.0, Self::MAX_UNCERTAINTY);
+
+        Self {
+            core: self.core - uncertainty,
+            rim: self.rim + uncertainty,
+            ..self
+        }
+    }
+}
+
+/// The hands are passthrough, the color key decides where the hand tracking is not certain
 #[derive(Clone, Copy)]
 pub struct ColorKeyInput {
-    pub hands: [Option<HandShape>; 2],
-    /// Width of the rim (meters)
-    pub rim: f32,
-    /// How much the solid area is shrunk (meters)
-    pub inset: f32,
+    pub hands: [Option<(HandShape, HandZones)>; 2],
 }
 
 /// Per-frame depth inputs for the stream renderer
@@ -117,7 +139,7 @@ pub struct DepthRenderInput {
 
 const EYE_FLOAT_COUNT: usize = 16 + 4 + 16 + 16 + 4;
 pub const DEPTH_UNIFORMS_FLOAT_COUNT: usize =
-    2 * EYE_FLOAT_COUNT + 16 + 4 * 5 + 4 * (1 + 2 + 2 * 2 * HAND_SEGMENTS);
+    2 * EYE_FLOAT_COUNT + 16 + 4 * 5 + 4 * (2 + 2 + 2 * 2 * HAND_SEGMENTS);
 pub const DEPTH_UNIFORMS_SIZE: usize = DEPTH_UNIFORMS_FLOAT_COUNT * size_of::<f32>();
 
 fn pose_to_mat4(pose: Pose) -> Mat4 {
@@ -240,18 +262,23 @@ pub fn depth_uniforms(
     } else {
         data.extend([0.0; 6]);
     }
-    let color_key = input.color_key.unwrap_or(ColorKeyInput {
-        hands: [None; 2],
-        rim: 0.0,
-        inset: 0.0,
-    });
+    let hands = input.color_key.map_or([None; 2], |key| key.hands);
     data.extend([f32::from(u8::from(input.color_key.is_some())), 0.0]);
-    data.extend([color_key.rim, color_key.inset, 0.0, 0.0]);
-    for hand in &color_key.hands {
-        data.extend(hand.map_or(Vec4::ZERO, |h| h.bounds()).to_array());
+    for hand in &hands {
+        data.extend(hand.map_or([0.0; 4], |(_, zones)| {
+            [zones.rim, zones.core, zones.falloff, 0.0]
+        }));
     }
-    for hand in &color_key.hands {
-        let segments = hand.map_or([[Vec4::ZERO; 2]; HAND_SEGMENTS], |h| h.segments);
+    for hand in &hands {
+        data.extend(
+            hand.map_or(Vec4::ZERO, |(shape, _)| shape.bounds())
+                .to_array(),
+        );
+    }
+    for hand in &hands {
+        let segments = hand.map_or([[Vec4::ZERO; 2]; HAND_SEGMENTS], |(shape, _)| {
+            shape.segments
+        });
         for point in segments.as_flattened() {
             data.extend(point.to_array());
         }
@@ -305,7 +332,7 @@ mod tests {
         assert_eq!(DEPTH_UNIFORMS_SIZE % 16, 0);
         assert_eq!(
             DEPTH_UNIFORMS_SIZE,
-            592 + 16 * (1 + 2 + 2 * 2 * HAND_SEGMENTS)
+            592 + 16 * (2 + 2 + 2 * 2 * HAND_SEGMENTS)
         );
     }
 
