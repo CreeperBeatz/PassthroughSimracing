@@ -81,8 +81,34 @@ impl HandShape {
         Self { segments }
     }
 
+    /// Distance between a ray and the surface of the hand, negative inside. Same as in focus_area.wgsl
+    pub fn ray_distance(&self, origin: Vec3, direction: Vec3) -> f32 {
+        self.segments
+            .iter()
+            .map(|[start, end]| {
+                let axis = (*end - *start).truncate();
+                let w = origin - start.truncate();
+                let b = direction.dot(axis);
+                let c = axis.dot(axis);
+                let d = direction.dot(w);
+                let e = axis.dot(w);
+
+                let denominator = c - b * b;
+                let s = if denominator > 1e-9 {
+                    ((e - b * d) / denominator).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let point = start.truncate() + axis * s;
+                let t = (point - origin).dot(direction).max(0.0);
+
+                (origin + direction * t).distance(point) - (start.w + (end.w - start.w) * s)
+            })
+            .fold(f32::MAX, f32::min)
+    }
+
     /// Bounding sphere. xyz: position, w: radius
-    fn bounds(&self) -> Vec4 {
+    pub fn bounds(&self) -> Vec4 {
         let points = self.segments.as_flattened();
         let center = points.iter().map(|p| p.truncate()).sum::<Vec3>() / points.len() as f32;
         let radius = points
@@ -104,17 +130,27 @@ pub struct HandZones {
 }
 
 impl HandZones {
-    const MAX_UNCERTAINTY: f32 = 0.04;
+    const MAX_CORE_SHRINK: f32 = 0.04;
+    const UNTRACKED_CORE_SHRINK: f32 = 0.04;
+    const MAX_RIM_GROWTH: f32 = 0.12;
 
     /// Hand tracking is late and predicted, so the faster the hand, the less certain its position:
     /// the solid core shrinks and the keyed rim grows.
-    /// `timing_error`: assumed error of the hand pose, in seconds
-    pub fn for_speed(self, speed: f32, timing_error: f32) -> Self {
-        let uncertainty = (speed * timing_error).clamp(0.0, Self::MAX_UNCERTAINTY);
-
+    /// `tracked`: fraction of the joints that are seen by the cameras. The others are guessed, then the
+    /// solid core would show a hand-shaped piece of the room.
+    pub fn for_confidence(self, tracked: f32) -> Self {
         Self {
-            core: self.core - uncertainty,
-            rim: self.rim + uncertainty,
+            core: self.core - (1.0 - tracked.clamp(0.0, 1.0)) * Self::UNTRACKED_CORE_SHRINK,
+            ..self
+        }
+    }
+
+    /// The errors are the assumed timing errors of the hand pose, in seconds. The rim must contain the
+    /// hand even in the worst case, or the hand is cut off.
+    pub fn for_speed(self, speed: f32, core_error: f32, rim_error: f32) -> Self {
+        Self {
+            core: self.core - (speed * core_error).clamp(0.0, Self::MAX_CORE_SHRINK),
+            rim: self.rim + (speed * rim_error).clamp(0.0, Self::MAX_RIM_GROWTH),
             ..self
         }
     }

@@ -129,7 +129,7 @@ name = "com.oculus.permission.HAND_TRACKING"
 name = "com.oculus.permission.WIFI_LOCK"
 [[package.metadata.android.uses_permission]]
 name = "com.oculus.permission.USE_SCENE"
-# Only requested by the camera probe experiment
+# Only requested if the colors of the color key are learned automatically
 [[package.metadata.android.uses_permission]]
 name = "android.permission.CAMERA"
 [[package.metadata.android.uses_permission]]

@@ -63,6 +63,15 @@ impl PassthroughLayer<'_> {
         handle.color_key_layer().is_some()
     }
 
+    /// Replace the colors of the key, until the next change of its version
+    pub fn set_color_key_lut(&mut self, lut: &[u8]) {
+        if let Some(handle) = &mut self.handle_fb
+            && let Err(e) = handle.update_color_key(lut)
+        {
+            error!("Passthrough color key update: {e}");
+        }
+    }
+
     /// The color keyed layer, if `update_color_key` returned true
     pub fn color_key_layer(&self) -> Option<&xr::CompositionLayerBase<'_, xr::OpenGlEs>> {
         let layer = self.handle_fb.as_ref()?.color_key_layer()?;
@@ -77,7 +86,9 @@ impl PassthroughLayer<'_> {
 /// - `setprop debug.alvr.key_rim <mm>`: width of the color keyed rim around the hands
 /// - `setprop debug.alvr.key_inset <mm>`: how much the solid inside of the hands is shrunk
 /// - `setprop debug.alvr.key_falloff <mm>`: how gradually the solid inside fades out
-/// - `setprop debug.alvr.key_error <ms>`: assumed timing error, the rim grows with the hand speed
+/// - `setprop debug.alvr.key_error <ms>`: assumed timing error, the solid core shrinks with the speed
+/// - `setprop debug.alvr.key_rim_error <ms>`: worst timing error, the rim grows with the speed
+/// - `setprop debug.alvr.auto_key 1` before starting the app: learn the colors with the camera
 /// - `setprop debug.alvr.key_scale <percent>`: thickness of the hands
 /// - `setprop debug.alvr.key_delay <ms>`: how late (may be negative) the passthrough image is, to locate the hands at
 ///   the moment it shows
@@ -91,8 +102,9 @@ pub struct ColorKey {
 pub struct ColorKeyParams {
     /// Of a hand that doesn't move
     pub zones: HandZones,
-    /// How wrong the timing of the hand pose may be
-    pub timing_error_s: f32,
+    /// How wrong the timing of the hand pose may be: for the solid core, and in the worst case
+    pub core_error_s: f32,
+    pub rim_error_s: f32,
     pub radius_scale: f32,
     /// Negative: predict ahead
     pub passthrough_delay_ms: i64,
@@ -108,10 +120,11 @@ impl ColorKeyParams {
             zones: HandZones {
                 core: -millimeters("debug.alvr.key_inset", 4),
                 falloff: millimeters("debug.alvr.key_falloff", 8),
-                rim: millimeters("debug.alvr.key_rim", 10),
+                rim: millimeters("debug.alvr.key_rim", 6),
             },
             // Milliseconds
-            timing_error_s: millimeters("debug.alvr.key_error", 20),
+            core_error_s: millimeters("debug.alvr.key_error", 10),
+            rim_error_s: millimeters("debug.alvr.key_rim_error", 45),
             radius_scale: debug_property("debug.alvr.key_scale")
                 .unwrap_or(100)
                 .clamp(0, 300) as f32

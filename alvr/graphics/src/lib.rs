@@ -1,3 +1,4 @@
+mod color_model;
 mod depth_mask;
 mod lobby;
 mod staging;
@@ -6,6 +7,7 @@ mod stream;
 #[cfg(test)]
 mod tests;
 
+pub use color_model::*;
 pub use depth_mask::*;
 pub use lobby::*;
 pub use stream::*;

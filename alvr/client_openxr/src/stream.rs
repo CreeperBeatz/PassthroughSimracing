@@ -1,3 +1,5 @@
+#[cfg(target_os = "android")]
+use crate::auto_color_key::AutoColorKey;
 use crate::{
     extra_extensions::EnvironmentDepthMETA,
     graphics::{self, ProjectionLayerAlphaConfig, ProjectionLayerBuilder},
@@ -107,6 +109,9 @@ pub struct StreamContext {
     environment_depth_failed: bool,
     // Set if the passthrough is color keyed around the hands
     color_key: Option<ColorKeyParams>,
+    // Learns the colors of the key, if enabled
+    #[cfg(target_os = "android")]
+    auto_color_key: Option<AutoColorKey>,
     // Smoothed, meters per second
     hand_speeds: [Cell<f32>; 2],
 }
@@ -259,6 +264,8 @@ impl StreamContext {
             environment_depth: None,
             environment_depth_failed: false,
             color_key: None,
+            #[cfg(target_os = "android")]
+            auto_color_key: None,
             hand_speeds: [const { Cell::new(0.0) }; 2],
         };
 
@@ -280,6 +287,25 @@ impl StreamContext {
             depth.set_hand_removal(params.is_some());
         }
         self.color_key = params;
+
+        #[cfg(target_os = "android")]
+        if self.color_key.is_none() {
+            self.auto_color_key = None;
+        } else if self.auto_color_key.is_none() && crate::auto_color_key::enabled() {
+            self.auto_color_key = Some(AutoColorKey::new(
+                Arc::clone(&self.stage_reference_space),
+                Arc::clone(&self.view_reference_space),
+                Arc::clone(&self.interaction_context),
+            ));
+        }
+    }
+
+    /// New colors for the key, learned from the camera
+    pub fn take_color_key_lut(&self) -> Option<Vec<u8>> {
+        #[cfg(target_os = "android")]
+        return self.auto_color_key.as_ref()?.take_lut();
+        #[cfg(not(target_os = "android"))]
+        None
     }
 
     // The hands, at the moment shown by the passthrough image
@@ -314,7 +340,20 @@ impl StreamContext {
             let speed = speed.max(self.hand_speeds[i].get() * 0.9);
             self.hand_speeds[i].set(speed);
 
-            Some((shape, params.zones.for_speed(speed, params.timing_error_s)))
+            let tracked_count = joints
+                .iter()
+                .filter(|joint| {
+                    joint
+                        .location_flags
+                        .contains(xr::SpaceLocationFlags::POSITION_TRACKED)
+                })
+                .count();
+            let zones = params
+                .zones
+                .for_confidence(tracked_count as f32 / joints.len() as f32)
+                .for_speed(speed, params.core_error_s, params.rim_error_s);
+
+            Some((shape, zones))
         });
 
         Some(ColorKeyInput { hands })
@@ -661,6 +700,12 @@ impl StreamContext {
 
 impl Drop for StreamContext {
     fn drop(&mut self) {
+        // Closes the camera
+        #[cfg(target_os = "android")]
+        {
+            self.auto_color_key = None;
+        }
+
         self.input_thread_running.set(false);
         self.input_thread.take().unwrap().join().ok();
     }

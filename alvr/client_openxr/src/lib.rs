@@ -1,6 +1,8 @@
+#[cfg(target_os = "android")]
+mod auto_color_key;
 mod c_api;
 #[cfg(target_os = "android")]
-mod camera_probe;
+mod camera;
 mod extra_extensions;
 mod graphics;
 mod interaction;
@@ -284,9 +286,6 @@ pub fn entry_point() {
 
     let graphics_context = Rc::new(GraphicsContext::new_gl());
 
-    #[cfg(target_os = "android")]
-    camera_probe::spawn();
-
     let mut last_lobby_message = String::new();
 
     'session_loop: loop {
@@ -379,7 +378,7 @@ pub fn entry_point() {
                 }
 
                 #[cfg(target_os = "android")]
-                if camera_probe::enabled() {
+                if auto_color_key::enabled() {
                     permissions.push("android.permission.CAMERA");
                     permissions.push("horizonos.permission.HEADSET_CAMERA");
                 }
@@ -628,6 +627,13 @@ pub fn entry_point() {
                 .is_some_and(|layer| layer.update_color_key(color_key));
             if let Some(stream) = &mut stream_context {
                 stream.set_color_key(color_key.filter(|_| use_color_key).map(|key| key.params));
+
+                if use_color_key
+                    && let Some(lut) = stream.take_color_key_lut()
+                    && let Some(passthrough_layer) = &mut passthrough_layer
+                {
+                    passthrough_layer.set_color_key_lut(&lut);
+                }
             }
 
             xr_frame_stream.begin().unwrap();

@@ -178,6 +178,27 @@ impl PassthroughFB {
         result
     }
 
+    /// Replace the LUT of the color keyed layer, if it exists
+    pub fn update_color_key(&mut self, data: &[u8]) -> xr::Result<()> {
+        let (Some(lut_fns), Some(key)) = (&self.lut_fns, &self.key) else {
+            return Ok(());
+        };
+        if data.len() != COLOR_KEY_SIZE {
+            return Err(sys::Result::ERROR_VALIDATION_FAILURE);
+        }
+
+        let info = sys::PassthroughColorLutUpdateInfoMETA {
+            ty: sys::PassthroughColorLutUpdateInfoMETA::TYPE,
+            next: ptr::null(),
+            data: sys::PassthroughColorLutDataMETA {
+                buffer_size: data.len() as u32,
+                buffer: data.as_ptr(),
+            },
+        };
+
+        unsafe { super::xr_res((lut_fns.update_passthrough_color_lut)(key.lut, &info)) }
+    }
+
     fn destroy_color_key(&mut self) {
         if let Some(key) = self.key.take() {
             unsafe {

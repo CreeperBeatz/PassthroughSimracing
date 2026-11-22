@@ -765,7 +765,7 @@ fn hand_core_fades_out_gradually() {
     }
 
     // A fast hand is keyed, not solid, also further away
-    let fast = render_zones(zones.for_speed(10.0, 0.02));
+    let fast = render_zones(zones.for_speed(10.0, 0.02, 0.004));
     assert!(fast.alpha(0.5, 0.75) > out.alpha(0.5, 0.75) + 0.1);
     assert_eq!(out.alpha(0.5, 0.9), 1.0);
     assert!(fast.alpha(0.5, 0.9) < 0.55);
@@ -779,16 +779,16 @@ fn hand_zones_follow_the_speed() {
         rim: 0.01,
     };
 
-    let still = zones.for_speed(0.0, 0.02);
+    let still = zones.for_speed(0.0, 0.01, 0.04);
     assert!((still.core - zones.core).abs() < 1e-6 && (still.rim - zones.rim).abs() < 1e-6);
 
-    // 1 m/s and 20 ms: 2 cm
-    let moving = zones.for_speed(1.0, 0.02);
-    assert!((moving.core - -0.024).abs() < 1e-6 && (moving.rim - 0.03).abs() < 1e-6);
+    // 1 m/s: 1 cm and 4 cm
+    let moving = zones.for_speed(1.0, 0.01, 0.04);
+    assert!((moving.core - -0.014).abs() < 1e-6 && (moving.rim - 0.05).abs() < 1e-6);
 
     // Limited
-    let fast = zones.for_speed(100.0, 0.02);
-    assert!((fast.rim - 0.05).abs() < 1e-6);
+    let fast = zones.for_speed(100.0, 0.01, 0.04);
+    assert!((fast.core - -0.044).abs() < 1e-6 && (fast.rim - 0.13).abs() < 1e-6);
 }
 
 #[test]
