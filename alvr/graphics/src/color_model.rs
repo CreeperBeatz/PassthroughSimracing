@@ -2,7 +2,7 @@
 //! tracked hands look like, and what is behind them. Only the colors are learned from the (late)
 //! camera images. The key itself is applied by the compositor to the image it displays.
 
-use crate::HandShape;
+use crate::{HandShape, ray_capsule_distance};
 use alvr_common::glam::{Quat, Vec2, Vec3};
 
 pub const COLOR_LUT_RESOLUTION: usize = 32;
@@ -11,12 +11,15 @@ const TEXEL_COUNT: usize = COLOR_LUT_RESOLUTION * COLOR_LUT_RESOLUTION * COLOR_L
 // How long colors are remembered, in seconds
 const SKIN_MEMORY: f32 = 5.0;
 const BACKGROUND_MEMORY: f32 = 3.0;
+// Backgrounds that were behind the hand before, and everything that the camera sees
+const PAST_BACKGROUND_MEMORY: f32 = 60.0;
+const SCENE_MEMORY: f32 = 20.0;
+const PAST_BACKGROUND_WEIGHT: f32 = 0.4;
+const SCENE_WEIGHT: f32 = 0.5;
 // Width of the smoothing of the color densities, in LUT texels. The camera colors are a bit different
 // from the colors seen by the compositor (about one texel).
 const SKIN_SMOOTHING: f32 = 1.4;
 const BACKGROUND_SMOOTHING: f32 = 1.3;
-// If skin and background look the same, keep the hand and accept the leak
-const SKIN_BIAS: f32 = 2.0;
 // Densities below this are not significant, see `ColorModel::unknown_keep`
 const FLOOR: f32 = 1e-6;
 const LIKELIHOOD_SOFTNESS: f32 = 0.7;
@@ -24,6 +27,8 @@ const LIKELIHOOD_SOFTNESS: f32 = 0.7;
 const BLEND: f32 = 0.35;
 // How much of the samples may come from the wrong side, because the hand tracking is not exact
 const CONTAMINATION: f32 = 0.25;
+// The scene may contain arms and hands that are not tracked: it must not remove skin colors
+const SCENE_CONTAMINATION: f32 = 1.0;
 const MIN_SAMPLES: usize = 300;
 
 struct Density {
@@ -107,11 +112,17 @@ fn smooth(values: &[f32], sigma: f32) -> Vec<f32> {
 
 pub struct ColorModel {
     skin: Density,
+    /// Around the hands
     background: Density,
+    past_background: Vec<f32>,
+    scene: Density,
     alpha: Option<Vec<f32>>,
     /// Probability (0..1) that a color that is seen neither on the hand nor in the background belongs to
     /// the hand. High values keep e.g. watches and lit fingertips, low values remove clutter.
     pub unknown_keep: f32,
+    /// How much skin is preferred if skin and background look the same. High values avoid holes in the
+    /// hand, low values avoid leaks.
+    pub skin_bias: f32,
 }
 
 impl Default for ColorModel {
@@ -119,8 +130,11 @@ impl Default for ColorModel {
         Self {
             skin: Density::new(SKIN_MEMORY),
             background: Density::new(BACKGROUND_MEMORY),
+            past_background: vec![0.0; TEXEL_COUNT],
+            scene: Density::new(SCENE_MEMORY),
             alpha: None,
-            unknown_keep: 0.3,
+            unknown_keep: 0.1,
+            skin_bias: 1.5,
         }
     }
 }
@@ -130,6 +144,14 @@ impl ColorModel {
     pub fn add_samples(&mut self, samples: &HandColorSamples, elapsed: f32) {
         self.skin.add(&samples.skin, elapsed);
         self.background.add(&samples.background, elapsed);
+        self.scene.add(&samples.scene, elapsed);
+
+        if !samples.background.is_empty() {
+            let keep = (-elapsed / PAST_BACKGROUND_MEMORY).exp();
+            for (past, current) in self.past_background.iter_mut().zip(&self.background.values) {
+                *past = f32::max(*past * keep, *current);
+            }
+        }
     }
 
     /// Returns a RGBA LUT indexed by `[b][g][r]`, or None if there are not enough samples yet
@@ -139,20 +161,34 @@ impl ColorModel {
         }
 
         let skin = smooth(&self.skin.values, SKIN_SMOOTHING);
-        let background = smooth(&self.background.values, BACKGROUND_SMOOTHING);
+        let background = self
+            .background
+            .values
+            .iter()
+            .zip(&self.past_background)
+            .map(|(current, past)| f32::max(*current, past * PAST_BACKGROUND_WEIGHT))
+            .collect::<Vec<_>>();
+        let background = smooth(&background, BACKGROUND_SMOOTHING);
+        let scene = smooth(&self.scene.values, BACKGROUND_SMOOTHING);
+        let backgrounds = background.iter().zip(&scene);
+        let skin_bias = self.skin_bias;
         let unknown_keep = self.unknown_keep.clamp(0.01, 0.99);
         let skin_floor = FLOOR * (unknown_keep / (1.0 - unknown_keep)).powf(LIKELIHOOD_SOFTNESS);
-        let target = skin.iter().zip(&background).map(|(skin, background)| {
-            // Remove the part of each that can be explained by samples of the other one
-            let (skin, background) = (
-                (skin - background * CONTAMINATION).max(0.0),
-                (background - skin * CONTAMINATION).max(0.0),
-            );
-            let score = ((background + FLOOR) / (skin * SKIN_BIAS + skin_floor)).ln();
-            let keep = 1.0 / (1.0 + (score / LIKELIHOOD_SOFTNESS).clamp(-30.0, 30.0).exp());
-            // Make it steeper
-            ((keep - 0.2) / 0.5).clamp(0.0, 1.0)
-        });
+        let target = skin
+            .iter()
+            .zip(backgrounds)
+            .map(|(skin, (background, scene))| {
+                // Remove the part of each that can be explained by samples of the other one
+                let scene = (scene * SCENE_WEIGHT - skin * SCENE_CONTAMINATION).max(0.0);
+                let (skin, background) = (
+                    (skin - background * CONTAMINATION).max(0.0),
+                    (background - skin * CONTAMINATION).max(scene),
+                );
+                let score = ((background + FLOOR) / (skin * skin_bias + skin_floor)).ln();
+                let keep = 1.0 / (1.0 + (score / LIKELIHOOD_SOFTNESS).clamp(-30.0, 30.0).exp());
+                // Make it steeper
+                ((keep - 0.3) / 0.4).clamp(0.0, 1.0)
+            });
 
         let alpha = if let Some(mut alpha) = self.alpha.take() {
             for (alpha, target) in alpha.iter_mut().zip(target) {
@@ -236,6 +272,8 @@ pub struct SampledHand {
 pub struct HandColorSamples {
     pub skin: Vec<[u8; 3]>,
     pub background: Vec<[u8; 3]>,
+    /// Everything except the hands and arms
+    pub scene: Vec<[u8; 3]>,
 }
 
 /// Collect the colors inside of the hands, and around them. `color` returns the RGB color of a pixel.
@@ -251,8 +289,30 @@ pub fn sample_hand_colors(
     const BACKGROUND_MIN: f32 = 0.02;
     const BACKGROUND_MAX: f32 = 0.07;
     const STEP: usize = 2;
+    const SCENE_STEP: usize = 8;
+    const ARM_LENGTH: f32 = 0.5;
+    const ARM_RADIUS: f32 = 0.1;
 
     let mut samples = HandColorSamples::default();
+
+    for y in (0..height).step_by(SCENE_STEP) {
+        for x in (0..width).step_by(SCENE_STEP) {
+            let ray = camera.ray(Vec2::new(x as f32 + 0.5, y as f32 + 0.5));
+            let is_hand_or_arm = hands.iter().flatten().any(|hand| {
+                hand.shape.ray_distance(camera.position, ray) < BACKGROUND_MIN
+                    || ray_capsule_distance(
+                        camera.position,
+                        ray,
+                        hand.wrist.extend(ARM_RADIUS),
+                        (hand.wrist + hand.arm_direction * ARM_LENGTH).extend(ARM_RADIUS),
+                    ) < 0.0
+            });
+            if !is_hand_or_arm {
+                samples.scene.push(color(x, y));
+            }
+        }
+    }
+
     for (hand_index, hand) in hands.iter().enumerate() {
         let Some(hand) = hand else {
             continue;
@@ -321,6 +381,7 @@ mod tests {
         HandColorSamples {
             skin: noisy(skin, 600),
             background: noisy(background, 600),
+            scene: vec![],
         }
     }
 
@@ -363,7 +424,7 @@ mod tests {
         model.add_samples(
             &HandColorSamples {
                 skin: noisy(SKIN, 1000),
-                background: vec![],
+                ..Default::default()
             },
             0.1,
         );
@@ -395,7 +456,16 @@ mod tests {
         model.add_samples(&samples(SKIN, SKIN), 0.1);
         let lut = model.update_lut().unwrap();
 
-        assert!(alpha(&lut, SKIN) > 200, "{}", alpha(&lut, SKIN));
+        assert!(alpha(&lut, SKIN) > 100, "{}", alpha(&lut, SKIN));
+
+        // Preferring the hand
+        let mut model = ColorModel {
+            skin_bias: 3.0,
+            ..Default::default()
+        };
+        model.add_samples(&samples(SKIN, SKIN), 0.1);
+        let lut = model.update_lut().unwrap();
+        assert!(alpha(&lut, SKIN) > 240, "{}", alpha(&lut, SKIN));
     }
 
     #[test]
@@ -410,6 +480,7 @@ mod tests {
             &HandColorSamples {
                 skin: mixed(SKIN, GREEN_WALL),
                 background: mixed(GREEN_WALL, SKIN),
+                scene: vec![],
             },
             0.1,
         );
@@ -424,6 +495,54 @@ mod tests {
         for color in noisy(GREEN_WALL, 200) {
             assert!(alpha(&lut, color) < 55, "{color:?}");
         }
+    }
+
+    #[test]
+    fn remembers_previous_backgrounds() {
+        let mut model = ColorModel::default();
+        for _ in 0..20 {
+            model.add_samples(&samples(SKIN, GREEN_WALL), 0.12);
+            model.update_lut();
+        }
+        // 30 seconds in front of another wall
+        let mut lut = vec![];
+        for _ in 0..250 {
+            model.add_samples(&samples(SKIN, WHITE_WALL), 0.12);
+            lut = model.update_lut().unwrap();
+        }
+
+        assert_eq!(alpha(&lut, GREEN_WALL), 0);
+        assert_eq!(alpha(&lut, WHITE_WALL), 0);
+        assert_eq!(alpha(&lut, SKIN), 255);
+    }
+
+    #[test]
+    fn learns_many_backgrounds_from_the_scene() {
+        // A complex scene, the hand is in front of the white wall
+        let colors = [GREEN_WALL, [200, 30, 40], [30, 90, 200], [20, 20, 20]];
+        let mut scene = colors
+            .iter()
+            .flat_map(|color| noisy(*color, 200))
+            .collect::<Vec<_>>();
+        // The other arm is in the view, and not tracked
+        scene.extend(noisy(SKIN, 150));
+
+        let mut model = ColorModel {
+            unknown_keep: 0.95,
+            ..Default::default()
+        };
+        let mut lut = vec![];
+        for _ in 0..20 {
+            let mut samples = samples(SKIN, WHITE_WALL);
+            samples.scene = scene.clone();
+            model.add_samples(&samples, 0.12);
+            lut = model.update_lut().unwrap();
+        }
+
+        for color in colors {
+            assert_eq!(alpha(&lut, color), 0, "{color:?}");
+        }
+        assert_eq!(alpha(&lut, SKIN), 255);
     }
 
     #[test]
@@ -469,6 +588,14 @@ mod tests {
             let (x, y) = (f32::from(*x) * 2.0 - 160.0, f32::from(*y) - 120.0);
             // 0.016 m and 0.066 m at 0.5 m
             assert!(y.abs() < 8.0 && x.abs() < 31.0, "{x} {y}");
+        }
+        assert!(result.scene.len() > 600, "{}", result.scene.len());
+        for [x, y, _] in &result.scene {
+            let (x, y) = (f32::from(*x) * 2.0 - 160.0, f32::from(*y) - 120.0);
+            // Neither the hand nor the arm (radius 0.1 m, to the right)
+            let arm_distance = Vec2::new((21.7 - x).max(0.0), y).length();
+            let hand_distance = Vec2::new((x.abs() - 21.7).max(0.0), y).length();
+            assert!(arm_distance > 41.0 && hand_distance > 16.0, "{x} {y}");
         }
         for [x, y, _] in &result.background {
             let (x, y) = (f32::from(*x) * 2.0 - 160.0, f32::from(*y) - 120.0);

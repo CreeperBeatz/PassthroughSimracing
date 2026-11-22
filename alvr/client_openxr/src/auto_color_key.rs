@@ -120,10 +120,8 @@ fn learn_loop(context: &Context) {
             let Some(samples) = sample(context, &camera, &frame) else {
                 continue;
             };
-            model.unknown_keep = debug_property("debug.alvr.key_unknown")
-                .unwrap_or(30)
-                .clamp(0, 100) as f32
-                / 100.0;
+            model.unknown_keep = percent("debug.alvr.key_unknown", 10);
+            model.skin_bias = percent("debug.alvr.key_bias", 150);
             model.add_samples(&samples, elapsed);
             let new_lut = model.update_lut();
 
@@ -148,6 +146,10 @@ fn learn_loop(context: &Context) {
             }
         }
     }
+}
+
+fn percent(property: &str, default: i64) -> f32 {
+    debug_property(property).unwrap_or(default).clamp(0, 1000) as f32 / 100.0
 }
 
 fn mean(colors: &[[u8; 3]]) -> [u32; 3] {
@@ -221,10 +223,6 @@ fn sample(
         })
     });
     drop(interaction_context);
-
-    if hands.iter().all(Option::is_none) {
-        return None;
-    }
 
     Some(alvr_graphics::sample_hand_colors(
         &view,

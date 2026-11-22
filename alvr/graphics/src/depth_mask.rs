@@ -29,6 +29,28 @@ pub struct HandShape {
     pub segments: [[Vec4; 2]; HAND_SEGMENTS],
 }
 
+/// Distance between a ray and the surface of a tapered capsule (xyz: position, w: radius), negative
+/// inside. Same as in focus_area.wgsl
+pub fn ray_capsule_distance(origin: Vec3, direction: Vec3, start: Vec4, end: Vec4) -> f32 {
+    let axis = (end - start).truncate();
+    let w = origin - start.truncate();
+    let b = direction.dot(axis);
+    let c = axis.dot(axis);
+    let d = direction.dot(w);
+    let e = axis.dot(w);
+
+    let denominator = c - b * b;
+    let s = if denominator > 1e-9 {
+        ((e - b * d) / denominator).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let point = start.truncate() + axis * s;
+    let t = (point - origin).dot(direction).max(0.0);
+
+    (origin + direction * t).distance(point) - (start.w + (end.w - start.w) * s)
+}
+
 impl HandShape {
     /// `joints`: position and radius of the OpenXR hand joints
     pub fn from_joints(joints: &[Vec4; 26]) -> Self {
@@ -97,25 +119,7 @@ impl HandShape {
     fn segments_ray_distance(&self, count: usize, origin: Vec3, direction: Vec3) -> f32 {
         self.segments[..count]
             .iter()
-            .map(|[start, end]| {
-                let axis = (*end - *start).truncate();
-                let w = origin - start.truncate();
-                let b = direction.dot(axis);
-                let c = axis.dot(axis);
-                let d = direction.dot(w);
-                let e = axis.dot(w);
-
-                let denominator = c - b * b;
-                let s = if denominator > 1e-9 {
-                    ((e - b * d) / denominator).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                };
-                let point = start.truncate() + axis * s;
-                let t = (point - origin).dot(direction).max(0.0);
-
-                (origin + direction * t).distance(point) - (start.w + (end.w - start.w) * s)
-            })
+            .map(|[start, end]| ray_capsule_distance(origin, direction, *start, *end))
             .fold(f32::MAX, f32::min)
     }
 
