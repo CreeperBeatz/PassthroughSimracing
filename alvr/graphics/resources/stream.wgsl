@@ -1,5 +1,5 @@
-// Note: foveation_common.wgsl is appended to this file at pipeline creation. Keep `Immediate` the first
-// declaration, see stream_shader_source().
+// Note: foveation_common.wgsl and depth_common.wgsl are appended to this file at pipeline creation.
+// Keep `Immediate` the first declaration, see stream_shader_source().
 
 struct Immediate {
     reprojection_transform: mat4x4f,
@@ -37,36 +37,10 @@ override UPSCALE_EDGE_SHARPNESS: f32 = 2.0;
 @group(0) @binding(3) var light_probe_local: texture_2d<f32>;
 // 1x1 average of light_probe_local
 @group(0) @binding(4) var light_probe_global: texture_2d<f32>;
+// Low resolution depth passthrough mask (view-space uv). See depth_mask.wgsl
+@group(0) @binding(5) var depth_mask: texture_2d<f32>;
 
-// All positions/poses are in the stage reference space
-struct DepthEye {
-    // world direction = (uv_to_world_dir * vec4f(uv, 1, 0)).xyz, uv is the view-space uv
-    uv_to_world_dir: mat4x4f,
-    // Current eye position (xyz)
-    eye_position: vec4f,
-    world_to_depth_view: mat4x4f,
-    depth_view_to_world: mat4x4f,
-    // Tangents of the depth view fov: left, right, down, up
-    depth_tan: vec4f,
-}
-struct DepthUniforms {
-    eyes: array<DepthEye, 2>,
-    world_to_volume: mat4x4f,
-    volume_half_extents: vec4f,
-    // x: region mode (0: distance, 1: volume), y: max distance, z: edge feathering, w: debug view
-    region: vec4f,
-    // x: near, y: far (0 = infinite), z: depth available (0/1), w: flip y (0/1)
-    depth: vec4f,
-    // x: lighting enabled (0/1), y: base brightness, z: strength, w: reference luminance
-    lighting: vec4f,
-    // x: min brightness, y: locality
-    lighting2: vec4f,
-}
 @group(1) @binding(0) var<uniform> depth_u: DepthUniforms;
-// Environment depth (GL_DEPTH_COMPONENT16 on Quest), one layer per eye. Bound as unfilterable
-// float instead of a depth texture: naga would otherwise emit a shadow sampler, which cannot be
-// used with texelFetch in GLSL ES.
-@group(1) @binding(1) var depth_texture: texture_2d_array<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4f,
@@ -123,7 +97,7 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         alpha = mask;
     } else if imm.passthrough_mode == PASSTHROUGH_MODE_DEPTH {
         // Note: requires premultiplied alpha in the XR layer
-        return depth_passthrough(color, uv, imm.view_idx);
+        return depth_passthrough(color, uv);
     }
 
     return vec4f(color, alpha);
@@ -132,31 +106,30 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
 //============================================================================================================
 // Depth passthrough
 //
-// For each pixel, find the real-world surface seen along the pixel ray using the headset depth
-// map, then decide whether that surface belongs to the "keep real" region (close to the eyes, or
-// inside the cockpit box). Inside the region the game is cut out and the passthrough layer below
-// shows through, optionally darkened to match the game lighting.
+// Where the mask is set the game is cut out and the passthrough layer below shows through, optionally
+// darkened to match the game lighting.
 //============================================================================================================
 
 const DEBUG_VIEW_TINT_MASK: u32 = 1u;
 const DEBUG_VIEW_SHOW_DEPTH: u32 = 2u;
 
-fn depth_passthrough(game_color: vec3f, uv: vec2f, view_idx: u32) -> vec4f {
+// The mask edge is where the coverage crosses this range. It is centered below 0.5 to slightly grow
+// near objects (fingers) instead of eroding them.
+const MASK_EDGE_MIN: f32 = 0.05;
+const MASK_EDGE_MAX: f32 = 0.35;
+
+fn depth_passthrough(game_color: vec3f, uv: vec2f) -> vec4f {
     let debug_view = u32(depth_u.region.w + 0.5);
 
-    let real_point = find_real_point(uv, view_idx);
-    var mask = 0.0;
-    if real_point.w > 0.5 {
-        mask = region_mask(real_point.xyz, view_idx);
-    }
+    let mask_sample = textureSampleLevel(depth_mask, stream_sampler, uv, 0.0);
+    let mask = smoothstep(MASK_EDGE_MIN, MASK_EDGE_MAX, mask_sample.r);
 
     if debug_view == DEBUG_VIEW_SHOW_DEPTH {
-        if real_point.w < 0.5 {
+        if mask_sample.b < 0.5 {
             // No depth data for this pixel
             return vec4f(0.3, 0.0, 0.0, 1.0);
         }
-        let dist = length(real_point.xyz - depth_u.eyes[view_idx].eye_position.xyz);
-        let gray = clamp(1.0 - dist / 3.0, 0.0, 1.0);
+        let gray = mask_sample.g;
         // Masked pixels are tinted green
         return vec4f(gray * (1.0 - 0.6 * mask), gray, gray * (1.0 - 0.6 * mask), 1.0);
     }
@@ -173,115 +146,6 @@ fn depth_passthrough(game_color: vec3f, uv: vec2f, view_idx: u32) -> vec4f {
     }
 
     return vec4f(rgb, 1.0 - mask * brightness);
-}
-
-// Returns the world-space real surface point seen through view-space `uv`, w = 1 if valid
-fn find_real_point(uv: vec2f, view_idx: u32) -> vec4f {
-    if depth_u.depth.z < 0.5 {
-        return vec4f(0.0);
-    }
-
-    let eye = depth_u.eyes[view_idx];
-    let origin = eye.eye_position.xyz;
-    let dir = normalize((eye.uv_to_world_dir * vec4f(uv, 1.0, 0.0)).xyz);
-
-    // The depth camera is close to (but not exactly at) the eye. Project a guess point along the
-    // ray into the depth map, read the real surface there, and refine the guess distance.
-    var t = 0.7;
-    for (var i = 0u; i < 2u; i++) {
-        let hit = sample_real_point(origin + dir * t, view_idx, false);
-        if hit.w < 0.5 {
-            return vec4f(0.0);
-        }
-        t = max(dot(hit.xyz - origin, dir), 0.05);
-    }
-
-    // Final lookup takes the closest depth in a 3x3 neighborhood, to slightly grow near objects
-    // (fingers) instead of eroding them
-    return sample_real_point(origin + dir * t, view_idx, true);
-}
-
-fn load_depth(coord: vec2i, layer: u32) -> f32 {
-    let value = textureLoad(depth_texture, coord, layer, 0).r;
-    // Treat 0 as "no data"
-    return select(value, 1.0, value <= 0.0);
-}
-
-// Projects `world_point` into the depth view and returns the real surface along that direction
-fn sample_real_point(world_point: vec3f, view_idx: u32, dilate: bool) -> vec4f {
-    let eye = depth_u.eyes[view_idx];
-
-    let view_point = (eye.world_to_depth_view * vec4f(world_point, 1.0)).xyz;
-    if view_point.z > -0.001 {
-        return vec4f(0.0);
-    }
-
-    let tan_xy = view_point.xy / -view_point.z;
-    let tan_min = eye.depth_tan.xz; // left, down
-    let tan_max = eye.depth_tan.yw; // right, up
-    let ndc_uv = (tan_xy - tan_min) / (tan_max - tan_min); // origin bottom-left
-    if any(ndc_uv < vec2f(0.0)) || any(ndc_uv > vec2f(1.0)) {
-        return vec4f(0.0);
-    }
-
-    // GL convention: texel row 0 is the bottom of the image
-    var tex_uv = ndc_uv;
-    if depth_u.depth.w > 0.5 {
-        tex_uv.y = 1.0 - tex_uv.y;
-    }
-
-    let dims = vec2i(textureDimensions(depth_texture));
-    let coord = clamp(vec2i(tex_uv * vec2f(dims)), vec2i(0), dims - 1);
-
-    var depth = load_depth(coord, view_idx);
-    if dilate {
-        for (var dy = -1; dy <= 1; dy++) {
-            for (var dx = -1; dx <= 1; dx++) {
-                let c = clamp(coord + vec2i(dx, dy), vec2i(0), dims - 1);
-                depth = min(depth, load_depth(c, view_idx));
-            }
-        }
-    }
-
-    if depth >= 0.9999 {
-        return vec4f(0.0);
-    }
-
-    let z = linearize_depth(depth);
-    let world_hit = (eye.depth_view_to_world * vec4f(tan_xy * z, -z, 1.0)).xyz;
-
-    return vec4f(world_hit, 1.0);
-}
-
-// Converts a [0, 1] depth buffer value (OpenGL convention) to a positive view-space distance
-fn linearize_depth(depth: f32) -> f32 {
-    let near = depth_u.depth.x;
-    let far = depth_u.depth.y;
-    let ndc = depth * 2.0 - 1.0;
-
-    if far <= near {
-        // Infinite far plane
-        return 2.0 * near / max(1.0 - ndc, 1e-6);
-    }
-
-    return 2.0 * near * far / ((far + near) - ndc * (far - near));
-}
-
-// 1 inside the region, 0 outside, with a soft edge of `feathering` meters
-fn region_mask(world_point: vec3f, view_idx: u32) -> f32 {
-    let feathering = max(depth_u.region.z, 0.0005);
-
-    var signed_distance: f32;
-    if depth_u.region.x < 0.5 {
-        let dist = length(world_point - depth_u.eyes[view_idx].eye_position.xyz);
-        signed_distance = dist - depth_u.region.y;
-    } else {
-        let local_point = (depth_u.world_to_volume * vec4f(world_point, 1.0)).xyz;
-        let e = abs(local_point) - depth_u.volume_half_extents.xyz;
-        signed_distance = length(max(e, vec3f(0.0))) + min(max(e.x, max(e.y, e.z)), 0.0);
-    }
-
-    return 1.0 - smoothstep(-feathering, feathering, signed_distance);
 }
 
 // Brightness factor (0..1) applied to the passthrough, following the game lighting

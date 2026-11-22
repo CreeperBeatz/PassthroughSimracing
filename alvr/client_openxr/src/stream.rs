@@ -12,7 +12,7 @@ use alvr_common::{
     HAND_LEFT_ID, HAND_RIGHT_ID, HEAD_ID, Pose, RelaxedAtomic, ViewParams,
     anyhow::Result,
     error,
-    glam::{UVec2, Vec2},
+    glam::{UVec2, Vec2, Vec3},
     info,
     parking_lot::RwLock,
 };
@@ -380,8 +380,13 @@ impl StreamContext {
                     );
                     self.renderer
                         .set_depth_swapchain(depth.images(), depth.resolution());
-                    self.gfx_ctx.make_current();
                     self.environment_depth = Some(depth);
+
+                    // The runtime refuses to acquire depth images until the next xrBeginFrame
+                    return Some(DepthRenderInput {
+                        frame: None,
+                        eye_positions: [Vec3::ZERO; 2],
+                    });
                 }
                 Err(e) => {
                     error!(

@@ -32,7 +32,7 @@ const CK_CHANNEL0_CONST_OFFSET: u32 = ALPHA_CONST_OFFSET + FLOAT_SIZE + U32_SIZE
 const CK_CHANNEL1_CONST_OFFSET: u32 = CK_CHANNEL0_CONST_OFFSET + VEC4_SIZE;
 const CK_CHANNEL2_CONST_OFFSET: u32 = CK_CHANNEL1_CONST_OFFSET + VEC4_SIZE;
 const IMMEDIATE_SIZE: u32 = CK_CHANNEL2_CONST_OFFSET + VEC4_SIZE;
-const PROBE_IMMEDIATE_SIZE: u32 = U32_SIZE;
+const VIEW_IDX_IMMEDIATE_SIZE: u32 = U32_SIZE;
 const FOVEATION_EYE_UNIFORM_VEC4_COUNT: usize = 5;
 const FOVEATION_UNIFORM_VEC4_COUNT: usize = 1 + FOVEATION_EYE_UNIFORM_VEC4_COUNT * 2;
 pub(crate) const FOVEATION_UNIFORM_SIZE: usize =
@@ -47,7 +47,14 @@ const PASSTHROUGH_MODE_DEPTH: u32 = 3;
 pub const LIGHT_PROBE_SIZE: u32 = 16;
 pub const LIGHT_PROBE_FORMAT: TextureFormat = TextureFormat::Rgba16Float;
 
+/// The depth passthrough mask is computed at 1 / DEPTH_MASK_DOWNSCALE of the view resolution. This
+/// still has more texels than the environment depth map (320x320 on Quest 3).
+const DEPTH_MASK_DOWNSCALE: u32 = 4;
+const DEPTH_MASK_FORMAT: TextureFormat = TextureFormat::Rgba8Unorm;
+
 const FOVEATION_COMMON_WGSL: &str = include_str!("../resources/foveation_common.wgsl");
+const DEPTH_COMMON_WGSL: &str = include_str!("../resources/depth_common.wgsl");
+const DEPTH_MASK_WGSL: &str = include_str!("../resources/depth_mask.wgsl");
 const STREAM_WGSL: &str = include_str!("../resources/stream.wgsl");
 const LIGHT_PROBE_LOCAL_WGSL: &str = include_str!("../resources/light_probe_local.wgsl");
 const LIGHT_PROBE_GLOBAL_WGSL: &str = include_str!("../resources/light_probe_global.wgsl");
@@ -55,7 +62,11 @@ const LIGHT_PROBE_GLOBAL_WGSL: &str = include_str!("../resources/light_probe_glo
 // The common code must come last: wgpu-hal (GLES) resolves the types of the immediates using indices
 // that are only correct if those types are the first ones in the shader.
 pub(crate) fn stream_shader_source() -> String {
-    format!("{STREAM_WGSL}\n{FOVEATION_COMMON_WGSL}")
+    format!("{STREAM_WGSL}\n{FOVEATION_COMMON_WGSL}\n{DEPTH_COMMON_WGSL}")
+}
+
+pub(crate) fn depth_mask_shader_source() -> String {
+    format!("{DEPTH_MASK_WGSL}\n{DEPTH_COMMON_WGSL}")
 }
 
 pub(crate) fn light_probe_local_shader_source() -> String {
@@ -115,11 +126,13 @@ fn uniform_entry(binding: u32) -> BindGroupLayoutEntry {
 /// Pipelines and layouts of the stream renderer. Separated from `StreamRenderer` so they can be
 /// built on any wgpu backend (tests run them on the desktop GPU).
 pub(crate) struct StreamPipelines {
-    /// stream texture, sampler, foveation uniforms, local light probe, global light probe
+    /// stream texture, sampler, foveation uniforms, local light probe, global light probe, depth mask
     pub view_layout: BindGroupLayout,
     /// depth uniforms, depth texture array
     pub depth_layout: BindGroupLayout,
     pub main: RenderPipeline,
+    /// Uses `depth_layout`
+    pub depth_mask: RenderPipeline,
     /// stream texture, sampler, foveation uniforms
     pub probe_local_layout: BindGroupLayout,
     pub probe_local: RenderPipeline,
@@ -143,6 +156,7 @@ impl StreamPipelines {
                 uniform_entry(2),
                 texture_entry(3, true, TextureViewDimension::D2),
                 texture_entry(4, true, TextureViewDimension::D2),
+                texture_entry(5, true, TextureViewDimension::D2),
             ],
         });
 
@@ -195,6 +209,37 @@ impl StreamPipelines {
             cache: None,
         });
 
+        let depth_mask_module = shader_module(device, "depth mask", depth_mask_shader_source());
+        let depth_mask = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("depth mask"),
+            layout: Some(&device.create_pipeline_layout(&PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[Some(&depth_layout)],
+                immediate_size: VIEW_IDX_IMMEDIATE_SIZE,
+            })),
+            vertex: VertexState {
+                module: &depth_mask_module,
+                entry_point: None,
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(FragmentState {
+                module: &depth_mask_module,
+                entry_point: None,
+                compilation_options: Default::default(),
+                targets: &[Some(ColorTargetState {
+                    format: DEPTH_MASK_FORMAT,
+                    blend: None,
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
         let probe_local_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("light probe local"),
             entries: &[
@@ -227,7 +272,7 @@ impl StreamPipelines {
             layout: Some(&device.create_pipeline_layout(&PipelineLayoutDescriptor {
                 label: None,
                 bind_group_layouts: &[Some(&probe_local_layout)],
-                immediate_size: PROBE_IMMEDIATE_SIZE,
+                immediate_size: VIEW_IDX_IMMEDIATE_SIZE,
             })),
             vertex: VertexState {
                 module: &probe_local_module,
@@ -298,6 +343,7 @@ impl StreamPipelines {
             view_layout,
             depth_layout,
             main,
+            depth_mask,
             probe_local_layout,
             probe_local,
             probe_global_layout,
@@ -318,6 +364,25 @@ pub(crate) fn create_light_probe_texture(device: &Device, size: u32) -> Texture 
         sample_count: 1,
         dimension: TextureDimension::D2,
         format: LIGHT_PROBE_FORMAT,
+        usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    })
+}
+
+pub(crate) fn create_depth_mask_texture(device: &Device, view_resolution: UVec2) -> Texture {
+    let size = (view_resolution / DEPTH_MASK_DOWNSCALE).max(UVec2::ONE);
+
+    device.create_texture(&TextureDescriptor {
+        label: Some("depth mask"),
+        size: Extent3d {
+            width: size.x,
+            height: size.y,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: DEPTH_MASK_FORMAT,
         usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     })
@@ -400,6 +465,7 @@ struct ViewObjects {
     bind_group: BindGroup,
     render_target: Vec<TextureView>,
     light_probe: LightProbe,
+    depth_mask: TextureView,
 }
 
 pub struct StreamRenderer {
@@ -516,6 +582,9 @@ impl StreamRenderer {
                 &foveation_buffer,
             );
 
+            let depth_mask = create_depth_mask_texture(device, target_view_resolution)
+                .create_view(&TextureViewDescriptor::default());
+
             let bind_group = create_view_bind_group(
                 device,
                 &pipelines,
@@ -523,6 +592,7 @@ impl StreamRenderer {
                 &sampler,
                 &foveation_buffer,
                 &light_probe,
+                &depth_mask,
             );
 
             let render_target = super::create_gl_swapchain(
@@ -536,6 +606,7 @@ impl StreamRenderer {
                 bind_group,
                 render_target,
                 light_probe,
+                depth_mask,
             });
 
             #[cfg(not(any(target_os = "macos", target_os = "ios")))]
@@ -715,6 +786,18 @@ impl StreamRenderer {
             }
         }
 
+        if depth_config.is_some() {
+            for (view_idx, objects) in self.views_objects.iter().enumerate() {
+                encode_depth_mask(
+                    &mut encoder,
+                    &self.pipelines,
+                    &objects.depth_mask,
+                    depth_bind_group,
+                    view_idx as u32,
+                );
+            }
+        }
+
         for (view_idx, view_params) in view_params.iter().enumerate() {
             let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: None,
@@ -802,6 +885,7 @@ fn create_view_bind_group(
     sampler: &Sampler,
     foveation_buffer: &Buffer,
     light_probe: &LightProbe,
+    depth_mask: &TextureView,
 ) -> BindGroup {
     device.create_bind_group(&BindGroupDescriptor {
         label: Some("stream view"),
@@ -827,8 +911,38 @@ fn create_view_bind_group(
                 binding: 4,
                 resource: BindingResource::TextureView(&light_probe.global_view),
             },
+            BindGroupEntry {
+                binding: 5,
+                resource: BindingResource::TextureView(depth_mask),
+            },
         ],
     })
+}
+
+pub(crate) fn encode_depth_mask(
+    encoder: &mut wgpu::CommandEncoder,
+    pipelines: &StreamPipelines,
+    target: &TextureView,
+    depth_bind_group: &BindGroup,
+    view_idx: u32,
+) {
+    let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+        label: Some("depth mask"),
+        color_attachments: &[Some(RenderPassColorAttachment {
+            view: target,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: LoadOp::Clear(Color::TRANSPARENT),
+                store: StoreOp::Store,
+            },
+        })],
+        ..Default::default()
+    });
+    pass.set_pipeline(&pipelines.depth_mask);
+    pass.set_bind_group(0, depth_bind_group, &[]);
+    pass.set_immediates(0, &view_idx.to_le_bytes());
+    pass.draw(0..3, 0..1);
 }
 
 fn encode_light_probe_update(

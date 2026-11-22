@@ -8,7 +8,7 @@ use crate::{
 };
 use alvr_common::{
     Fov, Pose, ViewParams,
-    glam::{Mat4, Vec3},
+    glam::{Mat4, UVec2, Vec3},
 };
 use alvr_session::{
     CockpitVolumeConfig, DepthMaskRegion, DepthPassthroughConfig, DepthPassthroughDebugView,
@@ -113,6 +113,11 @@ fn stream_shader_translates_to_gles() {
             );
         }
     }
+}
+
+#[test]
+fn depth_mask_shader_translates_to_gles() {
+    translate_to_gles("depth mask", &stream::depth_mask_shader_source(), &[]);
 }
 
 #[test]
@@ -334,6 +339,9 @@ fn render(
     let probe_global = stream::create_light_probe_texture(device, 1)
         .create_view(&TextureViewDescriptor::default());
 
+    let depth_mask_view = stream::create_depth_mask_texture(device, UVec2::splat(TARGET_SIZE * 4))
+        .create_view(&TextureViewDescriptor::default());
+
     let view_bind_group = device.create_bind_group(&BindGroupDescriptor {
         label: None,
         layout: &pipelines.view_layout,
@@ -357,6 +365,10 @@ fn render(
             BindGroupEntry {
                 binding: 4,
                 resource: BindingResource::TextureView(&probe_global),
+            },
+            BindGroupEntry {
+                binding: 5,
+                resource: BindingResource::TextureView(&depth_mask_view),
             },
         ],
     });
@@ -493,6 +505,14 @@ fn render(
         }
     }
 
+    stream::encode_depth_mask(
+        &mut encoder,
+        &pipelines,
+        &depth_mask_view,
+        &depth_bind_group,
+        0,
+    );
+
     {
         let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
             label: None,
@@ -601,6 +621,73 @@ fn distance_mode_shows_near_objects_only() {
     assert!((i32::from(background[0]) - i32::from(STREAM_GRAY)).abs() <= 2);
     // Left of the hand: background
     assert_eq!(out.alpha(0.1, 0.25), 1.0);
+}
+
+#[test]
+fn thin_objects_are_not_eroded() {
+    let (device, queue) = gpu_or_skip!();
+    let config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
+
+    // A finger, one depth texel wide
+    let center = 32.5 / DEPTH_SIZE as f32;
+    let half_width = 0.4 / DEPTH_SIZE as f32;
+    let scene = Scene::new(
+        3.0,
+        [center - half_width, 0.55, center + half_width, 0.9],
+        0.4,
+    );
+    let out = render(
+        &device,
+        &queue,
+        &config,
+        &scene,
+        Vec3::ZERO,
+        Vec3::ZERO,
+        true,
+    );
+
+    assert!(out.alpha(center, 0.25) < 0.1);
+    assert_eq!(out.alpha(center - 0.1, 0.25), 1.0);
+    assert_eq!(out.alpha(center + 0.1, 0.25), 1.0);
+}
+
+#[test]
+fn diagonal_edges_are_smooth() {
+    let (device, queue) = gpu_or_skip!();
+    let config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
+
+    // Near surface left of a slanted edge: depth steps one texel every 4 rows
+    let mut scene = Scene::new(3.0, [2.0, 2.0, 2.0, 2.0], 0.4);
+    for y in 0..DEPTH_SIZE {
+        for x in 0..DEPTH_SIZE {
+            if x < 24 + y / 4 {
+                scene.depth[(y * DEPTH_SIZE + x) as usize] =
+                    depth_mask::encode_depth(0.4, NEAR, f32::INFINITY);
+            }
+        }
+    }
+    let out = render(
+        &device,
+        &queue,
+        &config,
+        &scene,
+        Vec3::ZERO,
+        Vec3::ZERO,
+        true,
+    );
+
+    // Covered width of each row, in texels. A blocky mask jumps by a whole texel at once.
+    let widths = (8..TARGET_SIZE - 8)
+        .map(|y| {
+            (0..TARGET_SIZE)
+                .map(|x| 1.0 - f32::from(out.pixels[(y * TARGET_SIZE + x) as usize][3]) / 255.0)
+                .sum::<f32>()
+        })
+        .collect::<Vec<_>>();
+    for pair in widths.windows(2) {
+        let step = pair[0] - pair[1];
+        assert!((-0.05..0.7).contains(&step), "step {step}: {widths:?}");
+    }
 }
 
 #[test]

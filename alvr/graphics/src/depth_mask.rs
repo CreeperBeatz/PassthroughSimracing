@@ -1,4 +1,4 @@
-//! CPU side of the depth passthrough: per-frame uniforms consumed by `stream.wgsl`
+//! CPU side of the depth passthrough: per-frame uniforms consumed by `depth_mask.wgsl` and `stream.wgsl`
 //! (`DepthUniforms`). All poses are expected in the same reference space (stage space).
 
 use alvr_common::{
@@ -156,7 +156,7 @@ pub fn depth_uniforms(
 }
 
 /// Encode a positive view-space distance as a [0, 1] OpenGL depth buffer value (inverse of
-/// `linearize_depth` in stream.wgsl). Used for tests and synthetic data.
+/// `linearize_depth` in depth_mask.wgsl). Used for tests and synthetic data.
 pub fn encode_depth(distance: f32, near: f32, far: f32) -> f32 {
     let ndc = if far.is_finite() && far > near {
         ((far + near) - 2.0 * near * far / distance) / (far - near)
