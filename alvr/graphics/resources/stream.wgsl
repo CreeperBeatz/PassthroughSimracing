@@ -156,7 +156,16 @@ fn depth_passthrough(game_color: vec3f, uv: vec2f) -> vec4f {
             // Where the rim is narrowed
             rgb = mix(rgb, vec3f(0.9, 0.0, 0.0), 0.7 * hand.a);
         }
-        return vec4f(rgb, 0.5 * (lower_alpha + upper_alpha));
+        var alpha = 0.5 * (lower_alpha + upper_alpha);
+        // Where the lower layer is cropped away or not used, the upper one shows what both would show
+        // over colors that the key doesn't keep: upper + (1 - upper) * lower
+        let lower_rect = depth_u.key_lower[imm.view_idx];
+        if any(uv < lower_rect.xy) || any(uv >= lower_rect.zw) {
+            let lower = min(2.0 * alpha, 1.0);
+            let upper = max(2.0 * alpha - 1.0, 0.0);
+            alpha = 0.5 + 0.5 * (upper + (1.0 - upper) * lower);
+        }
+        return vec4f(rgb, alpha);
     }
 
     var brightness = 1.0;

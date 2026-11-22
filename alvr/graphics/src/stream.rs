@@ -962,6 +962,7 @@ impl StreamRenderer {
                 color_key: None,
                 arms: [None; 2],
                 capture_playzone: false,
+                key_lower_rects: None,
             });
 
             // Fall back to "no depth" if the swapchain image is unknown

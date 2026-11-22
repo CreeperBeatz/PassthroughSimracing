@@ -334,7 +334,7 @@ impl StreamContext {
             leak_lookup_time: Cell::new((Duration::ZERO, 0)),
         };
 
-        this.update_reference_space();
+        this.update_reference_space(None);
 
         this
     }
@@ -408,7 +408,7 @@ impl StreamContext {
         capture_time: xr::Time,
         views: &[xr::View],
     ) -> [Option<ArmMotion>; 2] {
-        // Bigger displacements are tracking errors
+        // Bigger displacements are tracking errors: plain depth for this arm
         const MAX_DISPLACEMENT: f32 = 0.25;
         // Rough position of the elbows, relative to the head
         const ELBOW_OFFSET: Vec3 = Vec3::new(0.2, -0.5, 0.05);
@@ -442,13 +442,18 @@ impl StreamContext {
                     .locate_hand_joints(tracker, time)
                     .ok()
                     .flatten()?;
+                let wrist = joints[xr::HandJointEXT::WRIST];
 
-                Some(crate::from_xr_vec3(
-                    joints[xr::HandJointEXT::WRIST].pose.position,
-                ))
+                wrist
+                    .location_flags
+                    .contains(xr::SpaceLocationFlags::POSITION_VALID)
+                    .then(|| crate::from_xr_vec3(wrist.pose.position))
             };
             let wrist_now = wrist(now)?;
             let displacement = wrist_now - wrist(capture_time)?;
+            if displacement.length() > MAX_DISPLACEMENT {
+                return None;
+            }
 
             let side = if i == 0 { -1.0 } else { 1.0 };
             let elbow = head_position + yaw * (ELBOW_OFFSET * Vec3::new(side, 1.0, 1.0));
@@ -456,7 +461,7 @@ impl StreamContext {
             Some(ArmMotion {
                 wrist: wrist_now,
                 direction: (elbow - wrist_now).normalize_or(Vec3::NEG_Y),
-                displacement: displacement.clamp_length_max(MAX_DISPLACEMENT),
+                displacement,
             })
         })
     }
@@ -697,12 +702,15 @@ impl StreamContext {
         self.config.passthrough.is_some()
     }
 
-    pub fn update_reference_space(&mut self) {
+    /// `change_time`: when the change takes effect, None: now
+    pub fn update_reference_space(&mut self, change_time: Option<xr::Time>) {
         self.renderer.clear_playzone();
         #[cfg(target_os = "android")]
         if let Some(key) = &self.auto_color_key {
-            key.clear_leak_map();
+            key.clear_leak_map(change_time.unwrap_or(xr::Time::from_nanos(0)));
         }
+        #[cfg(not(target_os = "android"))]
+        let _ = change_time;
         self.input_thread_running.set(false);
 
         self.stage_reference_space = Arc::new(interaction::get_reference_space(
@@ -830,6 +838,7 @@ impl StreamContext {
                         color_key: self.color_key_input(display_time, None),
                         arms: [None; 2],
                         capture_playzone: false,
+                        key_lower_rects: None,
                     });
                 }
                 Err(e) => {
@@ -867,6 +876,7 @@ impl StreamContext {
             color_key,
             arms,
             capture_playzone,
+            key_lower_rects: None,
         })
     }
 
@@ -964,9 +974,65 @@ impl StreamContext {
             openxr_display_time = vsync_time;
         }
 
-        let depth_input = self.update_environment_depth(xr_vsync_time, &current_headset_views);
+        let mut depth_input = self.update_environment_depth(xr_vsync_time, &current_headset_views);
 
-        let hand_rects = self.renderer.render(
+        // Part of each view with the hands, the same as in the renderer
+        let hand_rects = depth_input
+            .as_ref()
+            .and_then(|input| Some((input, input.color_key?)))
+            .map_or([None; 2], |(input, key)| {
+                [0, 1].map(|i| {
+                    alvr_graphics::hands_view_rect(
+                        &input_view_params[i],
+                        input.eye_positions[i],
+                        &key,
+                    )
+                })
+            });
+        if hand_rects.iter().any(Option::is_some) {
+            self.last_hand_rect_time = Some(Instant::now());
+        }
+        for (last, rect) in self.last_hand_rects.iter_mut().zip(hand_rects) {
+            if rect.is_some() {
+                *last = rect;
+            }
+        }
+        let key_frame = ColorKeyFrame {
+            tracked_hands: self.tracked_hands.get(),
+            hand_rects,
+            hands_in_view: self
+                .last_hand_rect_time
+                .is_some_and(|time| time.elapsed() < KEY_LAYERS_HOLD),
+        };
+
+        // Outside the hands the lower color key layer is covered by the upper one, or shows the same
+        // passthrough. For a view without hands the last rect is used, the content there is the same.
+        let crop = self.color_key.map_or(0, |params| params.crop);
+        let resolution = self.target_view_resolution;
+        let lower_crops = (crop > 0 && !self.use_custom_reprojection).then(|| {
+            [0, 1].map(|i| {
+                self.last_hand_rects[i].map(|rect| {
+                    let fov = output_view_params[i].fov;
+                    alvr_graphics::crop_view(fov, resolution, rect, KEY_CROP_MARGIN, crop == 2)
+                })
+            })
+        });
+        // Where there is no lower layer the shader makes the upper one look like both
+        if let Some(params) = self.color_key
+            && params.crop > 0
+            && let Some(input) = &mut depth_input
+        {
+            let extra_layers = params.extra_layers(key_frame.hands_in_view);
+            input.key_lower_rects = Some([0, 1].map(|i| match lower_crops.map(|crops| crops[i]) {
+                _ if !extra_layers => (Vec2::ZERO, Vec2::ZERO),
+                Some(Some((offset, size, _))) => {
+                    alvr_graphics::crop_view_uv(resolution, offset, size, crop == 2)
+                }
+                _ => (Vec2::ZERO, Vec2::ONE),
+            }));
+        }
+
+        self.renderer.render(
             buffer_ptr,
             [
                 StreamViewParams {
@@ -986,23 +1052,6 @@ impl StreamContext {
                 .map(|centers| centers.map(Vec2::from_array)),
             depth_input.as_ref(),
         );
-
-        let hand_rects = hand_rects.unwrap_or_default();
-        if hand_rects.iter().any(Option::is_some) {
-            self.last_hand_rect_time = Some(Instant::now());
-        }
-        for (last, rect) in self.last_hand_rects.iter_mut().zip(hand_rects) {
-            if rect.is_some() {
-                *last = rect;
-            }
-        }
-        let key_frame = ColorKeyFrame {
-            tracked_hands: self.tracked_hands.get(),
-            hand_rects,
-            hands_in_view: self
-                .last_hand_rect_time
-                .is_some_and(|time| time.elapsed() < KEY_LAYERS_HOLD),
-        };
 
         self.swapchains[0].release_image().unwrap();
         self.swapchains[1].release_image().unwrap();
@@ -1063,21 +1112,11 @@ impl StreamContext {
             clientside_post_processing,
         );
 
-        // Outside the hands the lower color key layer is covered by the upper one, or shows the same
-        // passthrough. For a view without hands the last rect is used, the content there is the same.
-        let crop = self.color_key.map_or(0, |params| params.crop);
-        let layer = if crop > 0 && !self.use_custom_reprojection {
+        let layer = if let Some(crops) = lower_crops {
             let swapchains = &self.swapchains;
-            let resolution = self.target_view_resolution;
-            let last_rects = self.last_hand_rects;
             layer.crop_lower_key_layer([0, 1].map(|i| {
-                let fov = output_view_params[i].fov;
-                let (offset, size, fov) = match last_rects[i] {
-                    Some(rect) => {
-                        alvr_graphics::crop_view(fov, resolution, rect, KEY_CROP_MARGIN, crop == 2)
-                    }
-                    None => (UVec2::ZERO, resolution, fov),
-                };
+                let (offset, size, fov) =
+                    crops[i].unwrap_or((UVec2::ZERO, resolution, output_view_params[i].fov));
 
                 xr::CompositionLayerProjectionView::new()
                     .pose(crate::to_xr_pose(output_view_params[i].pose))

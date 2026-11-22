@@ -51,12 +51,14 @@ soft edge goes; the gain is for moving hands. Leaks inside the hand capsules sta
 map can narrow the rim alone: L = max(ring L, weight x map L). The learning thread turns 1200 camera
 pixels per update into directions around the head (an octahedral map of about 2 degrees per cell,
 anchored where the head was, `graphics/src/leak_map.rs`). Pixels behind a located hand (bounding sphere
-+ 3 cm + 80 ms of its motion) are skipped, and a color is only stored if no hand came near it for 1 s.
++ 3 cm + 80 ms of its motion) or its forearm (spheres along 50 cm from the wrist, 10 cm radius + 80 ms of
+motion) are skipped, and a color is only stored if no hand came near it for 1 s.
 The cells keep colors, so each new LUT re-evaluates the whole map. At render time each hand looks up the
 cells behind its 28 segments from both eyes; the mean of the 7 leakiest gives the map value, which goes
 through `key_leak_map_lo` / `key_leak_map_hi` like the ring. Fewer than half of the cells known: the
 ring alone. The map is forgotten when the head moves more than 5 cm for 1 s, when most colors change
-(light), after `key_leak_memory`, and when the reference space changes. A hand that is in view but not
+(light), after `key_leak_memory`, and when the reference space changes (camera images from before the
+change time are dropped). A hand that is in view but not
 tracked is learned as room. Unknown: whether the camera registration is good enough for 2 degree cells.
 
 ## What works
@@ -140,9 +142,10 @@ Measured in the SteamVR home, 72 Hz, with color key on unless noted:
   while streaming: level stayed 2, 456 MHz.
 - The next commit (**not tested**): the two extra layers only while a hand is in view (plus 0.3 s);
   hands behind or beside the head no longer count. The lower game layer only covers the hands plus
-  3% of the view; outside it the upper layer is opaque or both are transparent, so only soft mask edges
-  can differ. Without the extra layers the game layer uses the upper alpha (2a - 1), the same as the
-  four layers away from the hands. The focus pass is skipped without hands. Switches below
+  3% of the view. Where the lower layer is cropped away or not used (2 layers), the shader writes the
+  alpha so that the upper layer alone shows what both would (upper + (1 - upper) x lower), so soft mask
+  edges don't change at the crop border. Only colors that the key keeps can still differ there, at soft
+  mask edges outside the hand rect. The focus pass is skipped without hands. Switches below
   (`key_layers`, `key_crop`, `key_hands`, `arm_shift`) to measure each part; the performance level
   is also requested at stream start, results and the layers in use are logged with `ALVR_CAM`.
 - CI builds the APK in the dev profile. Without `CARGO_PROFILE_DEV_OPT_LEVEL=3` one color update took
@@ -184,7 +187,7 @@ Measured in the SteamVR home, 72 Hz, with color key on unless noted:
 | `key_layers` | 4 | 4: extra layers only with hands in view, 2: never, 5: always, 30 / 31: always three (no upper game layer / no keyed passthrough). Not tested |
 | `key_crop` | 1 | Lower game layer only around the hands. 0: full, 2: y origin at the top (if 1 is upside down). Not tested |
 | `key_hands` | 1 | 0: no hands in the GPU passes. Not tested |
-| `arm_shift` | 1 | 1: the depth around each arm is shifted by the motion of the wrist, 0: plain depth. Also without the key. Not tested |
+| `arm_shift` | 1 | 1: the depth around each arm is shifted by the motion of the wrist (with the key only up to the wrist, the hands are removed from the depth map; plain depth for a wrist that moved more than 25 cm or has no valid position), 0: plain depth. Also without the key. Not tested |
 | `key_leak` | 0 % | Narrower rim where the background around a hand looks like it, 0: off, 100: on. Needs `auto_key`. Not tested |
 | `key_leak_lo` / `key_leak_hi` | 5 / 20 % | Share of the colors around the hand that the key keeps: where the narrowing starts / is complete |
 | `key_leak_inset` | 3 mm | Rim at full narrowing, inside the hand. 0: down to the soft edge only |

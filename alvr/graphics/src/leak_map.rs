@@ -36,6 +36,11 @@ const MAX_PENDING: usize = 32;
 // Exclusion around a hand, see `hand_exclusion`
 const EXCLUSION_MARGIN: f32 = 0.03;
 const EXCLUSION_TIME: f32 = 0.08;
+// Forearm, the same capsule as for the scene samples of `sample_hand_colors`, as spheres 10 cm apart
+// (they cover 8.7 cm around the axis)
+const ARM_EXCLUSION_LENGTH: f32 = 0.5;
+const ARM_EXCLUSION_RADIUS: f32 = 0.1;
+pub const ARM_EXCLUSION_SPHERES: usize = 6;
 // The camera rays are moved to the anchor assuming the background is this far away, in meters
 const OBSERVE_DEPTH: f32 = 0.8;
 // The anchor moves if the camera is farther than this for this long
@@ -180,6 +185,20 @@ pub fn hand_exclusion(bounds: Vec4, speed: f32) -> Vec4 {
     bounds
         .truncate()
         .extend(bounds.w + EXCLUSION_MARGIN + speed.max(0.0) * EXCLUSION_TIME)
+}
+
+/// Exclusion spheres along a forearm: from the `wrist` along `arm_direction` (unit, away from the
+/// fingers, stage space), 50 cm long, 10 cm radius grown by the distance it moves in 80 ms at `speed`.
+pub fn arm_exclusions(
+    wrist: Vec3,
+    arm_direction: Vec3,
+    speed: f32,
+) -> [Vec4; ARM_EXCLUSION_SPHERES] {
+    let radius = ARM_EXCLUSION_RADIUS + speed.max(0.0) * EXCLUSION_TIME;
+    std::array::from_fn(|i| {
+        let along = ARM_EXCLUSION_LENGTH * i as f32 / (ARM_EXCLUSION_SPHERES - 1) as f32;
+        (wrist + arm_direction * along).extend(radius)
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -940,6 +959,30 @@ mod tests {
         };
         run(&mut control, &untracked, step, step + steps(3.0));
         assert!(control.snapshot().unwrap().direction_leak(behind).unwrap() > 0.9);
+    }
+
+    #[test]
+    fn forearm_is_excluded() {
+        // Down and back to the elbow, in front of the camera
+        let wrist = Vec3::new(0.05, -0.2, -0.45);
+        let arm_direction = Vec3::new(0.3, -0.5, 0.4).normalize();
+        let spheres = arm_exclusions(wrist, arm_direction, 0.0);
+        let camera = Vec3::ZERO;
+        let hits = |point: Vec3| {
+            spheres
+                .iter()
+                .any(|sphere| ray_hits_sphere(camera, (point - camera).normalize(), *sphere))
+        };
+        let side = arm_direction.cross(Vec3::Y).normalize();
+        // Skin of the forearm, all along it, 6 cm from the axis
+        for along in [0.0, 0.05, 0.15, 0.25, 0.35, 0.45, 0.5] {
+            for offset in [side * 0.06, -side * 0.06, Vec3::Y * 0.06] {
+                assert!(hits(wrist + arm_direction * along + offset), "{along}");
+            }
+        }
+        // 25 cm beside the arm
+        assert!(!hits(wrist + arm_direction * 0.25 + side * 0.25));
+        assert!(!hits(wrist + arm_direction * 0.25 - side * 0.25));
     }
 
     #[test]

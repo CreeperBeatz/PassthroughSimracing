@@ -218,6 +218,16 @@ impl ColorKeyParams {
                 / 100.0,
         }
     }
+
+    /// Whether the frame has the lower game layer and the keyed passthrough (`debug.alvr.key_layers`).
+    /// Otherwise only one game layer: the lower one if it is not cropped, else the upper one.
+    pub fn extra_layers(&self, hands_in_view: bool) -> bool {
+        match self.layers {
+            2 => false,
+            5 | 30 | 31 => true,
+            _ => hands_in_view,
+        }
+    }
 }
 
 const COLOR_KEY_PATHS: [&str; 2] = [

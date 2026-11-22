@@ -219,13 +219,16 @@ pub struct DepthRenderInput {
     pub arms: [Option<ArmMotion>; 2],
     /// Remember the current depth image as the playzone. There must be no hands in it
     pub capture_playzone: bool,
+    /// With the color key: the part of each view (min and max view uv) where the lower game layer is
+    /// shown. Outside of it the upper layer shows what both would. None: the whole view
+    pub key_lower_rects: Option<[(Vec2, Vec2); 2]>,
 }
 
 const EYE_FLOAT_COUNT: usize = 16 + 4 + 16 + 16 + 4;
 pub const DEPTH_UNIFORMS_FLOAT_COUNT: usize = 2 * EYE_FLOAT_COUNT
     + 16
     + 4 * 5
-    + 4 * (2 + 2 * HAND_SEGMENTS / 4 + 2 + 2 * 2 * HAND_SEGMENTS + 6 + 2 * 9 + 1);
+    + 4 * (2 + 2 * HAND_SEGMENTS / 4 + 2 + 2 * 2 * HAND_SEGMENTS + 6 + 2 * 9 + 1 + 2);
 pub const DEPTH_UNIFORMS_SIZE: usize = DEPTH_UNIFORMS_FLOAT_COUNT * size_of::<f32>();
 
 fn pose_to_mat4(pose: Pose) -> Mat4 {
@@ -400,6 +403,12 @@ pub fn depth_uniforms(
         leak[1],
         0.0,
     ]);
+    for (min, max) in input
+        .key_lower_rects
+        .unwrap_or([(Vec2::ZERO, Vec2::ONE); 2])
+    {
+        data.extend([min.x, min.y, max.x, max.y]);
+    }
 
     data.try_into().unwrap()
 }
@@ -533,6 +542,27 @@ pub fn crop_view(
     )
 }
 
+/// The pixels of `crop_view` (offset and size) as min and max view uv (origin top-left). A pixel is
+/// inside if its center is >= min and < max.
+pub fn crop_view_uv(
+    resolution: UVec2,
+    offset: UVec2,
+    size: UVec2,
+    top_origin: bool,
+) -> (Vec2, Vec2) {
+    let resolution = resolution.max(UVec2::ONE).as_vec2();
+    let start = offset.as_vec2() / resolution;
+    let end = (offset + size).as_vec2() / resolution;
+    if top_origin {
+        (start, end)
+    } else {
+        (
+            Vec2::new(start.x, 1.0 - end.y),
+            Vec2::new(end.x, 1.0 - start.y),
+        )
+    }
+}
+
 /// Encode a positive view-space distance as a [0, 1] OpenGL depth buffer value (inverse of
 /// `linearize_depth` in depth_mask.wgsl). Used for tests and synthetic data.
 pub fn encode_depth(distance: f32, near: f32, far: f32) -> f32 {
@@ -578,10 +608,10 @@ mod tests {
         assert_eq!(DEPTH_UNIFORMS_SIZE % 16, 0);
         assert_eq!(
             DEPTH_UNIFORMS_SIZE,
-            592 + 16 * (2 + 2 * HAND_SEGMENTS / 4 + 2 + 2 * 2 * HAND_SEGMENTS + 6 + 2 * 9 + 1)
+            592 + 16 * (2 + 2 * HAND_SEGMENTS / 4 + 2 + 2 * 2 * HAND_SEGMENTS + 6 + 2 * 9 + 1 + 2)
         );
         // 28 capsules per hand, no forearm
-        assert_eq!(DEPTH_UNIFORMS_SIZE, 3072);
+        assert_eq!(DEPTH_UNIFORMS_SIZE, 3104);
     }
 
     #[test]
@@ -655,6 +685,7 @@ mod tests {
             color_key: None,
             arms: [None; 2],
             capture_playzone: false,
+            key_lower_rects: None,
         };
         let data = depth_uniforms(&cfg, &[view(), view()], &input, None, false);
 
@@ -695,6 +726,7 @@ mod tests {
             color_key: None,
             arms: [None; 2],
             capture_playzone: false,
+            key_lower_rects: None,
         };
         let base = 2 * EYE_FLOAT_COUNT + 16 + 4 * 3;
 

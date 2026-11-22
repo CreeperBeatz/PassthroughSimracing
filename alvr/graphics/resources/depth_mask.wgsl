@@ -208,9 +208,19 @@ const ARM_RADIUS: f32 = 0.14;
 // The depth map is late: how much the real surface at this point has moved since it was captured. The
 // arm moves with the wrist, less towards the elbow. Zero without arm motions (plain depth).
 fn arm_displacement(point: vec3f) -> vec3f {
+    // Past the wrist the hand is moved too, but with the color key the runtime removes the hands from
+    // the depth map: there it would move what is around the palm
+    var hand_edge = vec2f(-0.2, -0.1);
+    if depth_u.lighting2.z > 0.5 {
+        hand_edge = vec2f(-0.03, 0.02);
+    }
     var result = vec3f(0.0);
     for (var hand = 0u; hand < 2u; hand++) {
         let displacement = depth_u.arms[hand * 3u + 2u].xyz;
+        // Still or not tracked
+        if dot(displacement, displacement) < 1e-6 {
+            continue;
+        }
         let from_wrist = point - depth_u.arms[hand * 3u].xyz;
         let direction = depth_u.arms[hand * 3u + 1u].xyz;
         let along = dot(from_wrist, direction);
@@ -222,7 +232,7 @@ fn arm_displacement(point: vec3f) -> vec3f {
         let aside = length(offset + motion * s);
 
         let weight = (1.0 - smoothstep(0.0, ARM_LENGTH, along))
-            * smoothstep(-0.2, -0.1, along)
+            * smoothstep(hand_edge.x, hand_edge.y, along)
             * (1.0 - smoothstep(0.6 * ARM_RADIUS, ARM_RADIUS, aside));
         result += displacement * weight;
     }

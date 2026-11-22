@@ -495,7 +495,7 @@ pub fn entry_point() {
                         lobby.update_reference_space();
 
                         if let Some(stream) = &mut stream_context {
-                            stream.update_reference_space();
+                            stream.update_reference_space(Some(event.change_time()));
                         }
                     }
                     xr::Event::PerfSettingsEXT(event) => {
@@ -711,16 +711,16 @@ pub fn entry_point() {
                         let [lower, upper] = &key_layers;
                         // Without the extra layers, look like the four layers away from the hands:
                         // there only the upper one is visible if the lower one is cropped
+                        // (the shader writes the alpha for this, see `key_lower_rects`)
                         let single = if params.crop > 0 { upper } else { lower };
-                        match params.layers {
-                            2 => &[passthrough_layer, single],
-                            5 => &[passthrough_layer, lower, color_key_layer, upper],
-                            30 => &[passthrough_layer, lower, color_key_layer],
-                            31 => &[passthrough_layer, lower, upper],
-                            _ if key_frame.hands_in_view => {
-                                &[passthrough_layer, lower, color_key_layer, upper]
+                        if !params.extra_layers(key_frame.hands_in_view) {
+                            &[passthrough_layer, single]
+                        } else {
+                            match params.layers {
+                                30 => &[passthrough_layer, lower, color_key_layer],
+                                31 => &[passthrough_layer, lower, upper],
+                                _ => &[passthrough_layer, lower, color_key_layer, upper],
                             }
-                            _ => &[passthrough_layer, single],
                         }
                     } else {
                         &[passthrough_layer, &layer.build()]

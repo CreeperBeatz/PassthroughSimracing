@@ -336,6 +336,7 @@ fn render_with_key(
         color_key,
         [None; 2],
         None,
+        None,
     )
 }
 
@@ -351,6 +352,7 @@ fn render_full(
     color_key: Option<ColorKeyInput>,
     arms: [Option<ArmMotion>; 2],
     playzone: Option<&Scene>,
+    key_lower_rects: Option<[(Vec2, Vec2); 2]>,
 ) -> Output {
     let target_format = TextureFormat::Rgba8Unorm;
     let constants = [
@@ -518,6 +520,7 @@ fn render_full(
         color_key,
         arms,
         capture_playzone: false,
+        key_lower_rects,
     };
     let lighting_enabled = config.lighting.as_option().is_some();
     let playzone_views = [view(depth_camera_position); 2];
@@ -795,6 +798,59 @@ fn color_key_packs_mask_and_hand_area() {
 }
 
 #[test]
+fn color_key_upper_layer_alone_matches_both() {
+    let (device, queue) = gpu_or_skip!();
+    let config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
+    let no_hands = ColorKeyInput {
+        hands: [None; 2],
+        leak: [0.0; 2],
+    };
+    let render_rects = |rects| {
+        render_full(
+            &device,
+            &queue,
+            &config,
+            &hand_scene(),
+            Vec3::ZERO,
+            Vec3::ZERO,
+            true,
+            Some(no_hands),
+            [None; 2],
+            None,
+            rects,
+        )
+    };
+    let whole = render_rects(None);
+    let full = render_rects(Some([(Vec2::ZERO, Vec2::ONE); 2]));
+    // Only the left half has the lower layer
+    let half = render_rects(Some([(Vec2::ZERO, Vec2::new(0.5, 1.0)); 2]));
+    // No lower layer (two layers)
+    let none = render_rects(Some([(Vec2::ZERO, Vec2::ZERO); 2]));
+
+    // The packed alpha as the compositor shows it, over colors the key doesn't keep
+    let lower = |a: f32| (2.0 * a).min(1.0);
+    let upper = |a: f32| (2.0 * a - 1.0).max(0.0);
+    let both = |a: f32| upper(a) + (1.0 - upper(a)) * lower(a);
+    for v in (0..64).map(|i| (i as f32 + 0.5) / 64.0) {
+        for u in [0.3, 0.7] {
+            assert_eq!(full.at(u, v), whole.at(u, v));
+            let a = whole.alpha(u, v);
+            let alone = upper(none.alpha(u, v));
+            assert!(
+                (alone - both(a)).abs() < 0.02,
+                "{u} {v}: {alone} {}",
+                both(a)
+            );
+        }
+        assert_eq!(half.at(0.3, v), whole.at(0.3, v));
+        assert_eq!(half.at(0.7, v), none.at(0.7, v));
+    }
+    // Game, near object
+    assert_eq!(none.alpha(0.5, 0.95), 1.0);
+    assert!(upper(none.alpha(0.5, 0.25)) < 0.01);
+}
+
+#[test]
 fn hand_core_fades_out_gradually() {
     let (device, queue) = gpu_or_skip!();
     let config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
@@ -1004,6 +1060,7 @@ fn late_arms_are_moved() {
             None,
             [None, arm],
             None,
+            None,
         )
     };
     let motion = |displacement| ArmMotion {
@@ -1025,6 +1082,28 @@ fn late_arms_are_moved() {
     let plain = render_arm(None);
     assert_eq!(plain.alpha(0.45, 0.48), 0.0);
     assert_eq!(plain.alpha(0.55, 0.48), 1.0);
+
+    // 8 cm past the wrist (the palm) the depth is moved too
+    assert!(moved.alpha(0.45, 0.37) > 0.9, "{}", moved.alpha(0.45, 0.37));
+    // But not with the color key: the runtime removes the hands, there the depth is the surroundings
+    let keyed = render_full(
+        &device,
+        &queue,
+        &config,
+        &scene,
+        Vec3::ZERO,
+        Vec3::ZERO,
+        true,
+        Some(ColorKeyInput {
+            hands: [None; 2],
+            leak: [0.0; 2],
+        }),
+        [None, Some(motion(Vec3::new(0.1, 0.0, 0.0)))],
+        None,
+        None,
+    );
+    assert_eq!(keyed.alpha(0.45, 0.37), 0.0);
+    assert!(keyed.alpha(0.55, 0.48) < 0.1, "{}", keyed.alpha(0.55, 0.48));
 }
 
 #[test]
@@ -1148,6 +1227,27 @@ fn crop_view_matches_the_full_view() {
         assert!(crop.down.tan() <= lerp(fov.down, fov.up, 1.0 - max.y) + 1e-5);
     }
 
+    // The same pixels in view uv
+    for top_origin in [false, true] {
+        let (offset, crop_size, _) =
+            depth_mask::crop_view(fov, resolution, rect, MARGIN, top_origin);
+        let (min, max) = depth_mask::crop_view_uv(resolution, offset, crop_size, top_origin);
+        assert!(min.cmple(rect.0 - MARGIN).all() && max.cmpge(rect.1 + MARGIN).all());
+        let (start, end) = (offset.as_ivec2(), (offset + crop_size).as_ivec2());
+        for pixel in [start, end - 1, start - 1, end] {
+            // Pixel center in view uv
+            let row = if top_origin {
+                pixel.y
+            } else {
+                resolution.y as i32 - 1 - pixel.y
+            };
+            let uv = (Vec2::new(pixel.x as f32, row as f32) + 0.5) / size;
+            let is_inside = uv.cmpge(min).all() && uv.cmplt(max).all();
+            let is_cropped = pixel.cmpge(start).all() && pixel.cmplt(end).all();
+            assert_eq!(is_inside, is_cropped, "{top_origin} {pixel}");
+        }
+    }
+
     // The top of the view is at the last rows in OpenGL
     let top = (Vec2::new(0.4, 0.0), Vec2::new(0.6, 0.1));
     let (offset, crop_size, _) = depth_mask::crop_view(fov, resolution, top, 0.0, false);
@@ -1211,6 +1311,7 @@ fn playzone_fills_objects_removed_near_the_hand() {
             Some(key),
             [None; 2],
             playzone,
+            None,
         )
     };
 

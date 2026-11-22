@@ -66,6 +66,14 @@ pub struct LeakMapState {
     pub probes: Vec<Vec3>,
 }
 
+/// Shared between the render thread and the learner, one lock so that a clear can't be overwritten
+#[derive(Default)]
+struct SharedLeakMap {
+    state: Option<Arc<LeakMapState>>,
+    // Forget the map at the first camera image from this time on (ns, CLOCK_MONOTONIC like the images)
+    clear_at: Option<i64>,
+}
+
 struct Context {
     stage_space: Arc<xr::Space>,
     view_space: Arc<xr::Space>,
@@ -73,16 +81,14 @@ struct Context {
     running: Arc<RelaxedAtomic>,
     lut: Arc<Mutex<Option<Vec<u8>>>>,
     verified: Arc<Mutex<Option<Verified>>>,
-    leak_map: Arc<Mutex<Option<Arc<LeakMapState>>>>,
-    leak_map_clear: Arc<RelaxedAtomic>,
+    leak_map: Arc<Mutex<SharedLeakMap>>,
 }
 
 pub struct AutoColorKey {
     running: Arc<RelaxedAtomic>,
     lut: Arc<Mutex<Option<Vec<u8>>>>,
     verified: Arc<Mutex<Option<Verified>>>,
-    leak_map: Arc<Mutex<Option<Arc<LeakMapState>>>>,
-    leak_map_clear: Arc<RelaxedAtomic>,
+    leak_map: Arc<Mutex<SharedLeakMap>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -95,8 +101,7 @@ impl AutoColorKey {
         let running = Arc::new(RelaxedAtomic::new(true));
         let lut = Arc::new(Mutex::new(None));
         let verified = Arc::new(Mutex::new(None));
-        let leak_map = Arc::new(Mutex::new(None));
-        let leak_map_clear = Arc::new(RelaxedAtomic::new(false));
+        let leak_map = Arc::new(Mutex::new(SharedLeakMap::default()));
         let context = Context {
             stage_space,
             view_space,
@@ -105,7 +110,6 @@ impl AutoColorKey {
             lut: Arc::clone(&lut),
             verified: Arc::clone(&verified),
             leak_map: Arc::clone(&leak_map),
-            leak_map_clear: Arc::clone(&leak_map_clear),
         };
 
         Self {
@@ -113,7 +117,6 @@ impl AutoColorKey {
             lut,
             verified,
             leak_map,
-            leak_map_clear,
             thread: Some(thread::spawn(move || learn_loop(&context))),
         }
     }
@@ -144,15 +147,19 @@ impl AutoColorKey {
     pub fn leak_map(&self) -> Option<Arc<LeakMapState>> {
         self.leak_map
             .lock()
+            .state
             .as_ref()
             .filter(|state| state.time.elapsed() < LEAK_HOLD)
             .cloned()
     }
 
-    /// Forget the leak map, e.g. when the reference space changed
-    pub fn clear_leak_map(&self) {
-        self.leak_map_clear.set(true);
-        *self.leak_map.lock() = None;
+    /// Forget the leak map when the reference space changes at `change_time` (camera images from before
+    /// it are not used)
+    pub fn clear_leak_map(&self, change_time: xr::Time) {
+        let mut shared = self.leak_map.lock();
+        let time = change_time.as_nanos();
+        shared.clear_at = Some(shared.clear_at.map_or(time, |pending| pending.max(time)));
+        shared.state = None;
     }
 }
 
@@ -365,7 +372,7 @@ impl LeakLearner {
 
     fn clear(&mut self, context: &Context) {
         self.map.clear();
-        *context.leak_map.lock() = None;
+        context.leak_map.lock().state = None;
     }
 
     // Observe the camera image, then publish the map against the published LUT
@@ -384,8 +391,16 @@ impl LeakLearner {
             dump_lut(lut);
         }
         let is_clear_requested = is_new_value(&mut self.last_clear, "debug.alvr.key_leak_clear");
-        if context.leak_map_clear.value() || is_clear_requested {
-            context.leak_map_clear.set(false);
+        // The images before a change of the reference space are in the old one
+        let clear_at = context.leak_map.lock().clear_at;
+        let is_old_space = clear_at.is_some_and(|time| frame.timestamp_ns < time);
+        if (clear_at.is_some() && !is_old_space) || is_clear_requested {
+            if !is_old_space {
+                let mut shared = context.leak_map.lock();
+                if shared.clear_at == clear_at {
+                    shared.clear_at = None;
+                }
+            }
             self.clear(context);
             camera::log("leak map: cleared");
         }
@@ -412,6 +427,10 @@ impl LeakLearner {
             self.alpha_changed = false;
         }
 
+        if is_old_space {
+            return;
+        }
+
         // Scene pixels as stage space rays, other pixels at each update
         let (offset_x, offset_y) =
             alvr_graphics::leak_sample_offset(self.sample_index, LEAK_MAP_STEP);
@@ -435,19 +454,21 @@ impl LeakLearner {
         if is_dump_requested {
             dump_leak_map(snapshot.as_ref(), view, calibration, exclusions);
         }
-        if let Some(snapshot) = snapshot
-            && !context.leak_map_clear.value()
-        {
+        if let Some(snapshot) = snapshot {
             let probes = if view_mode == 2 {
                 snapshot.top_clusters(HAND_SEGMENTS)
             } else {
                 Vec::new()
             };
-            *context.leak_map.lock() = Some(Arc::new(LeakMapState {
-                time: Instant::now(),
-                snapshot,
-                probes,
-            }));
+            let mut shared = context.leak_map.lock();
+            // Not if a clear came in the meantime
+            if shared.clear_at.is_none() {
+                shared.state = Some(Arc::new(LeakMapState {
+                    time: Instant::now(),
+                    snapshot,
+                    probes,
+                }));
+            }
         }
 
         self.update_ms = start.elapsed().as_secs_f32() * 1000.0;
@@ -568,7 +589,7 @@ fn sample(context: &Context, camera: &PassthroughCamera, frame: &CameraFrame) ->
     };
 
     let interaction_context = context.interaction_context.read();
-    let mut exclusions = Vec::with_capacity(2);
+    let mut exclusions = Vec::with_capacity(2 * (1 + alvr_graphics::ARM_EXCLUSION_SPHERES));
     let hands = [0, 1].map(|i| {
         let tracker = interaction_context.hands_interaction[i]
             .skeleton_tracker
@@ -600,20 +621,26 @@ fn sample(context: &Context, camera: &PassthroughCamera, frame: &CameraFrame) ->
             })
             .map(|v| crate::from_xr_vec3(v.linear_velocity).length())
             .fold(0.0, f32::max);
+        let position = |joint: xr::HandJointEXT| crate::from_xr_vec3(joints[joint].pose.position);
+        let wrist = position(xr::HandJointEXT::WRIST);
+        // Opposite to the fingers: the skin of the forearm is not background
+        let arm_direction =
+            (wrist - position(xr::HandJointEXT::MIDDLE_METACARPAL)).normalize_or_zero();
+
         exclusions.push(alvr_graphics::hand_exclusion(shape.bounds(), valid_speed));
+        exclusions.extend(alvr_graphics::arm_exclusions(
+            wrist,
+            arm_direction,
+            valid_speed,
+        ));
         if !all_tracked || speed > MAX_HAND_SPEED {
             return None;
         }
 
-        let position = |joint: xr::HandJointEXT| crate::from_xr_vec3(joints[joint].pose.position);
-        let wrist = position(xr::HandJointEXT::WRIST);
-
         Some(SampledHand {
             shape,
             wrist,
-            // Opposite to the fingers: the skin of the forearm is not background
-            arm_direction: (wrist - position(xr::HandJointEXT::MIDDLE_METACARPAL))
-                .normalize_or_zero(),
+            arm_direction,
             is_still: speed < STILL_HAND_SPEED,
         })
     });
