@@ -2,7 +2,8 @@
 // including shader must declare:
 //   var<uniform> depth_u: DepthUniforms;
 
-const MAX_HAND_POINTS: u32 = 64u;
+// Capsules per hand
+const HAND_SEGMENTS: u32 = 29u;
 
 // All positions/poses are in the stage reference space
 struct DepthEye {
@@ -25,8 +26,12 @@ struct DepthUniforms {
     depth: vec4f,
     // x: lighting enabled (0/1), y: base brightness, z: strength, w: reference luminance
     lighting: vec4f,
-    // x: min brightness, y: locality, z: color key enabled (0/1), w: hand point count
+    // x: min brightness, y: locality, z: color key enabled (0/1)
     lighting2: vec4f,
-    // xyz: position, w: radius
-    hand_points: array<vec4f, MAX_HAND_POINTS>,
+    // x: width of the color keyed rim around the hands, y: inset of the solid inside
+    hand_params: vec4f,
+    // Bounding spheres, xyz: position, w: radius (0: not tracked)
+    hand_bounds: array<vec4f, 2>,
+    // Start and end of each capsule, xyz: position, w: radius
+    hand_points: array<vec4f, 2u * 2u * HAND_SEGMENTS>,
 }

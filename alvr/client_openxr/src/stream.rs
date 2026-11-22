@@ -18,7 +18,7 @@ use alvr_common::{
     parking_lot::RwLock,
 };
 use alvr_graphics::{
-    ColorKeyInput, DepthRenderInput, GraphicsContext, StreamRenderer, StreamViewParams,
+    ColorKeyInput, DepthRenderInput, GraphicsContext, HandShape, StreamRenderer, StreamViewParams,
 };
 use alvr_packets::{ClientStreamConfig, RealTimeConfig, TrackingData};
 use alvr_session::{
@@ -278,43 +278,33 @@ impl StreamContext {
         self.color_key = params;
     }
 
-    // Spheres around the hands, at the moment shown by the passthrough image
+    // The hands, at the moment shown by the passthrough image
     fn color_key_input(&self, display_time: xr::Time) -> Option<ColorKeyInput> {
         let params = self.color_key?;
-        let delay = params.passthrough_delay.as_nanos() as i64;
+        let delay = params.passthrough_delay_ms * 1_000_000;
         let time = xr::Time::from_nanos(display_time.as_nanos() - delay);
         let int_ctx = self.interaction_context.read();
 
-        let mut points = vec![];
-        for hand in &int_ctx.hands_interaction {
-            let Some(joints) = hand.skeleton_tracker.as_ref().and_then(|tracker| {
-                self.stage_reference_space
-                    .locate_hand_joints(tracker, time)
-                    .ok()
-                    .flatten()
-            }) else {
-                continue;
-            };
+        let locate_hand = |hand: &crate::interaction::HandInteraction| {
+            let joints = self
+                .stage_reference_space
+                .locate_hand_joints(hand.skeleton_tracker.as_ref()?, time)
+                .ok()
+                .flatten()?;
 
-            let position = |joint: xr::HandJointEXT| {
-                crate::from_xr_vec3(joints[joint.into_raw() as usize].pose.position)
-            };
-            points.extend(
-                joints
-                    .iter()
-                    .map(|joint| crate::from_xr_vec3(joint.pose.position).extend(params.radius_m)),
-            );
+            Some(HandShape::from_joints(&joints.map(|joint| {
+                crate::from_xr_vec3(joint.pose.position).extend(joint.radius * params.radius_scale)
+            })))
+        };
 
-            // The start of the forearm
-            let wrist = position(xr::HandJointEXT::WRIST);
-            let direction =
-                (wrist - position(xr::HandJointEXT::MIDDLE_METACARPAL)).normalize_or_zero();
-            points.extend(
-                [0.03, 0.07, 0.11].map(|d| (wrist + direction * d).extend(params.radius_m + 0.02)),
-            );
-        }
-
-        Some(ColorKeyInput::new(points))
+        Some(ColorKeyInput {
+            hands: [
+                locate_hand(&int_ctx.hands_interaction[0]),
+                locate_hand(&int_ctx.hands_interaction[1]),
+            ],
+            rim: params.rim_m,
+            inset: params.inset_m,
+        })
     }
 
     pub fn uses_passthrough(&self) -> bool {

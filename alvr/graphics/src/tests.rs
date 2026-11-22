@@ -3,7 +3,7 @@
 //! - the depth passthrough shader is run on the desktop GPU against a synthetic depth scene
 
 use crate::{
-    depth_mask::{self, ColorKeyInput, DepthFrame, DepthRenderInput},
+    depth_mask::{self, ColorKeyInput, DepthFrame, DepthRenderInput, HAND_SEGMENTS, HandShape},
     stream::{self, FOVEATION_UNIFORM_SIZE, LIGHT_PROBE_SIZE, StreamPipelines, floats_to_bytes},
 };
 use alvr_common::{
@@ -370,7 +370,7 @@ fn render_with_key(
     let depth_mask_view = stream::create_depth_mask_texture(device, UVec2::splat(TARGET_SIZE * 4))
         .create_view(&TextureViewDescriptor::default());
 
-    let focus_area_view = stream::create_focus_area_texture(device, UVec2::splat(TARGET_SIZE * 16))
+    let focus_area_view = stream::create_focus_area_texture(device, UVec2::splat(TARGET_SIZE * 4))
         .create_view(&TextureViewDescriptor::default());
 
     let view_bind_group = device.create_bind_group(&BindGroupDescriptor {
@@ -668,8 +668,11 @@ fn color_key_packs_mask_and_hand_area() {
     let (device, queue) = gpu_or_skip!();
     let config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
 
-    // A tracked hand below the near object, 0.5 m away: view uv (0.5, 0.75)
-    let hand = Vec4::new(0.0, -0.25, -0.5, 0.05);
+    // A tracked hand (a horizontal bar) below the near object, 0.5 m away: view uv v = 0.75
+    let segment = [
+        Vec4::new(-0.1, -0.25, -0.5, 0.05),
+        Vec4::new(0.1, -0.25, -0.5, 0.05),
+    ];
     let out = render_with_key(
         &device,
         &queue,
@@ -678,19 +681,46 @@ fn color_key_packs_mask_and_hand_area() {
         Vec3::ZERO,
         Vec3::ZERO,
         true,
-        Some(ColorKeyInput::new([hand])),
+        Some(ColorKeyInput {
+            hands: [
+                None,
+                Some(HandShape {
+                    segments: [segment; HAND_SEGMENTS],
+                }),
+            ],
+            rim: 0.04,
+            inset: 0.0,
+        }),
     );
 
     // Near object: plain passthrough
     assert_eq!(out.alpha(0.5, 0.25), 0.0);
-    // Hand, where the depth map only sees the background: keyed passthrough
-    assert!((out.alpha(0.5, 0.75) - 0.5).abs() < 0.01);
+    // Inside of the hand: also plain passthrough
+    for u in [0.4, 0.5, 0.6] {
+        assert!(out.alpha(u, 0.75) < 0.01, "{}", out.alpha(u, 0.75));
+    }
+    // Rim: keyed passthrough. The radius is 0.05 m, about 0.045 in view uv at this angle
+    assert!((out.alpha(0.5, 0.835) - 0.5).abs() < 0.02);
     // Game
-    assert_eq!(out.alpha(0.8, 0.75), 1.0);
+    assert_eq!(out.alpha(0.85, 0.75), 1.0);
+    assert_eq!(out.alpha(0.5, 0.95), 1.0);
     // Alpha is not premultiplied
-    for (u, v) in [(0.5, 0.25), (0.5, 0.75), (0.8, 0.75)] {
+    for (u, v) in [(0.5, 0.25), (0.5, 0.75), (0.5, 0.835), (0.85, 0.75)] {
         let gray = i32::from(out.at(u, v)[0]);
         assert!((gray - i32::from(STREAM_GRAY)).abs() <= 2, "{gray}");
+    }
+}
+
+#[test]
+fn hand_shape_contains_all_joints() {
+    let joints = std::array::from_fn(|i| Vec4::new(i as f32 * 0.01, 0.0, -0.4, 0.01));
+    let shape = HandShape::from_joints(&joints);
+
+    for joint in joints {
+        assert!(
+            shape.segments.as_flattened().contains(&joint),
+            "joint {joint} is not part of the shape"
+        );
     }
 }
 

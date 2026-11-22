@@ -18,29 +18,90 @@ pub struct DepthFrame {
     pub depth_views: [ViewParams; 2],
 }
 
-pub const MAX_HAND_POINTS: usize = 64;
+pub const HAND_SEGMENTS: usize = 29;
 
-/// Spheres around the tracked hands, where the passthrough is color keyed
+/// Start and end of the tapered capsules a hand is made of. xyz: position, w: radius
 #[derive(Clone, Copy)]
-pub struct ColorKeyInput {
-    /// xyz: position, w: radius
-    pub hand_points: [Vec4; MAX_HAND_POINTS],
-    pub hand_point_count: usize,
+pub struct HandShape {
+    pub segments: [[Vec4; 2]; HAND_SEGMENTS],
 }
 
-impl ColorKeyInput {
-    /// Points beyond `MAX_HAND_POINTS` are ignored
-    pub fn new(points: impl IntoIterator<Item = Vec4>) -> Self {
-        let mut this = Self {
-            hand_points: [Vec4::ZERO; MAX_HAND_POINTS],
-            hand_point_count: 0,
-        };
-        for (slot, point) in this.hand_points.iter_mut().zip(points) {
-            *slot = point;
-            this.hand_point_count += 1;
+impl HandShape {
+    /// `joints`: position and radius of the OpenXR hand joints
+    pub fn from_joints(joints: &[Vec4; 26]) -> Self {
+        const WRIST: usize = 1;
+        const FOREARM_LENGTH: f32 = 0.05;
+        const PAIRS: [(usize, usize); HAND_SEGMENTS - 1] = [
+            // Palm
+            (0, 0),
+            (1, 2),
+            (1, 6),
+            (1, 11),
+            (1, 16),
+            (1, 21),
+            (7, 12),
+            (12, 17),
+            (17, 22),
+            // Thumb
+            (2, 3),
+            (3, 4),
+            (4, 5),
+            // Fingers
+            (6, 7),
+            (7, 8),
+            (8, 9),
+            (9, 10),
+            (11, 12),
+            (12, 13),
+            (13, 14),
+            (14, 15),
+            (16, 17),
+            (17, 18),
+            (18, 19),
+            (19, 20),
+            (21, 22),
+            (22, 23),
+            (23, 24),
+            (24, 25),
+        ];
+
+        let mut segments = [[Vec4::ZERO; 2]; HAND_SEGMENTS];
+        for (segment, (start, end)) in segments.iter_mut().zip(PAIRS) {
+            *segment = [joints[start], joints[end]];
         }
-        this
+
+        // The start of the forearm. The rest is handled by the depth mask
+        let wrist = joints[WRIST];
+        let direction = (wrist - joints[11]).truncate().normalize_or_zero();
+        segments[HAND_SEGMENTS - 1] = [
+            wrist,
+            (wrist.truncate() + direction * FOREARM_LENGTH).extend(wrist.w),
+        ];
+
+        Self { segments }
     }
+
+    /// Bounding sphere. xyz: position, w: radius
+    fn bounds(&self) -> Vec4 {
+        let points = self.segments.as_flattened();
+        let center = points.iter().map(|p| p.truncate()).sum::<Vec3>() / points.len() as f32;
+        let radius = points
+            .iter()
+            .map(|p| p.truncate().distance(center) + p.w)
+            .fold(0.0, f32::max);
+
+        center.extend(radius)
+    }
+}
+
+/// The hands are solid passthrough, with a color keyed rim around them
+#[derive(Clone, Copy)]
+pub struct ColorKeyInput {
+    pub hands: [Option<HandShape>; 2],
+    /// Width of the rim (meters)
+    pub rim: f32,
+    /// How much the solid area is shrunk (meters)
+    pub inset: f32,
 }
 
 /// Per-frame depth inputs for the stream renderer
@@ -56,7 +117,7 @@ pub struct DepthRenderInput {
 
 const EYE_FLOAT_COUNT: usize = 16 + 4 + 16 + 16 + 4;
 pub const DEPTH_UNIFORMS_FLOAT_COUNT: usize =
-    2 * EYE_FLOAT_COUNT + 16 + 4 * 5 + 4 * MAX_HAND_POINTS;
+    2 * EYE_FLOAT_COUNT + 16 + 4 * 5 + 4 * (1 + 2 + 2 * 2 * HAND_SEGMENTS);
 pub const DEPTH_UNIFORMS_SIZE: usize = DEPTH_UNIFORMS_FLOAT_COUNT * size_of::<f32>();
 
 fn pose_to_mat4(pose: Pose) -> Mat4 {
@@ -179,13 +240,21 @@ pub fn depth_uniforms(
     } else {
         data.extend([0.0; 6]);
     }
-    let color_key = input.color_key.unwrap_or_else(|| ColorKeyInput::new([]));
-    data.extend([
-        f32::from(u8::from(input.color_key.is_some())),
-        color_key.hand_point_count as f32,
-    ]);
-    for point in color_key.hand_points {
-        data.extend(point.to_array());
+    let color_key = input.color_key.unwrap_or(ColorKeyInput {
+        hands: [None; 2],
+        rim: 0.0,
+        inset: 0.0,
+    });
+    data.extend([f32::from(u8::from(input.color_key.is_some())), 0.0]);
+    data.extend([color_key.rim, color_key.inset, 0.0, 0.0]);
+    for hand in &color_key.hands {
+        data.extend(hand.map_or(Vec4::ZERO, |h| h.bounds()).to_array());
+    }
+    for hand in &color_key.hands {
+        let segments = hand.map_or([[Vec4::ZERO; 2]; HAND_SEGMENTS], |h| h.segments);
+        for point in segments.as_flattened() {
+            data.extend(point.to_array());
+        }
     }
 
     data.try_into().unwrap()
@@ -234,7 +303,10 @@ mod tests {
     fn layout_size() {
         // std140: must be a multiple of 16 bytes
         assert_eq!(DEPTH_UNIFORMS_SIZE % 16, 0);
-        assert_eq!(DEPTH_UNIFORMS_SIZE, 592 + 16 * MAX_HAND_POINTS);
+        assert_eq!(
+            DEPTH_UNIFORMS_SIZE,
+            592 + 16 * (1 + 2 + 2 * 2 * HAND_SEGMENTS)
+        );
     }
 
     #[test]

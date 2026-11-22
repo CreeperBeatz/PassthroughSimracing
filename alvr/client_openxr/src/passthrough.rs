@@ -73,8 +73,10 @@ impl PassthroughLayer<'_> {
 /// Experimental passthrough color key, controlled with adb:
 /// - push a LUT (see `COLOR_KEY_SIZE`) to one of `COLOR_KEY_PATHS`
 /// - `setprop debug.alvr.color_key <n>`: 0 disables the key, another value (re)loads the LUT
-/// - `setprop debug.alvr.key_radius <mm>`: size of the keyed area around the hand joints
-/// - `setprop debug.alvr.key_delay <ms>`: how late the passthrough image is, to locate the hands at
+/// - `setprop debug.alvr.key_rim <mm>`: width of the color keyed rim around the hands
+/// - `setprop debug.alvr.key_inset <mm>`: how much the solid inside of the hands is shrunk
+/// - `setprop debug.alvr.key_scale <percent>`: thickness of the hands
+/// - `setprop debug.alvr.key_delay <ms>`: how late (may be negative) the passthrough image is, to locate the hands at
 ///   the moment it shows
 pub struct ColorKey {
     version: u32,
@@ -84,23 +86,29 @@ pub struct ColorKey {
 
 #[derive(Clone, Copy)]
 pub struct ColorKeyParams {
-    pub radius_m: f32,
-    pub passthrough_delay: Duration,
+    pub rim_m: f32,
+    pub inset_m: f32,
+    pub radius_scale: f32,
+    /// Negative: predict ahead
+    pub passthrough_delay_ms: i64,
+}
+
+fn millimeters(property: &str, default: i64) -> f32 {
+    debug_property(property).unwrap_or(default).clamp(0, 300) as f32 / 1000.0
 }
 
 impl ColorKeyParams {
     fn load() -> Self {
         Self {
-            radius_m: debug_property("debug.alvr.key_radius")
-                .unwrap_or(40)
-                .min(300) as f32
-                / 1000.0,
-            passthrough_delay: Duration::from_millis(
-                debug_property("debug.alvr.key_delay")
-                    .unwrap_or(35)
-                    .min(200)
-                    .into(),
-            ),
+            rim_m: millimeters("debug.alvr.key_rim", 8),
+            inset_m: millimeters("debug.alvr.key_inset", 2),
+            radius_scale: debug_property("debug.alvr.key_scale")
+                .unwrap_or(100)
+                .clamp(0, 300) as f32
+                / 100.0,
+            passthrough_delay_ms: debug_property("debug.alvr.key_delay")
+                .unwrap_or(0)
+                .clamp(-100, 200),
         }
     }
 }
@@ -129,7 +137,9 @@ impl ColorKeyLoader {
         if self.last_poll.elapsed() > Duration::from_millis(500) {
             self.last_poll = Instant::now();
 
-            let version = debug_property("debug.alvr.color_key").unwrap_or(0);
+            let version = debug_property("debug.alvr.color_key")
+                .and_then(|version| u32::try_from(version).ok())
+                .unwrap_or(0);
             if version != self.last_version {
                 self.last_version = version;
                 self.key = (version != 0).then(|| load_color_key(version)).flatten();
@@ -163,7 +173,7 @@ fn load_color_key(version: u32) -> Option<ColorKey> {
 
 /// Integer Android system property. `debug.*` properties can be set with adb.
 #[allow(unused_variables)]
-fn debug_property(name: &str) -> Option<u32> {
+fn debug_property(name: &str) -> Option<i64> {
     #[cfg(target_os = "android")]
     {
         let name = std::ffi::CString::new(name).unwrap();

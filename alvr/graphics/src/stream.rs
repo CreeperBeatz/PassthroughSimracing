@@ -50,8 +50,8 @@ pub const LIGHT_PROBE_FORMAT: TextureFormat = TextureFormat::Rgba16Float;
 /// The depth passthrough mask is computed at 1 / DEPTH_MASK_DOWNSCALE of the view resolution. This
 /// still has more texels than the environment depth map (320x320 on Quest 3).
 const DEPTH_MASK_DOWNSCALE: u32 = 4;
-/// The focus area is smooth and coarse
-const FOCUS_AREA_DOWNSCALE: u32 = 16;
+/// The outline of the hands is visible, keep it sharp
+const FOCUS_AREA_DOWNSCALE: u32 = 4;
 const DEPTH_MASK_FORMAT: TextureFormat = TextureFormat::Rgba8Unorm;
 
 const FOVEATION_COMMON_WGSL: &str = include_str!("../resources/foveation_common.wgsl");

@@ -1,8 +1,10 @@
 // Note: depth_common.wgsl is appended to this file at pipeline creation. Keep `Immediate` the first
 // declaration, see stream_shader_source().
 //
-// Renders the area where the live passthrough is color keyed: the surroundings of the tracked hands.
-// Hands move faster than the depth map can follow, everything else is handled by the depth mask.
+// Renders the shape of the tracked hands, made of tapered capsules. Hands move faster than the depth
+// map can follow, everything else is handled by the depth mask.
+//
+// Output: r: the hand with a rim around it (the rim is color keyed), g: inside of the hand
 
 struct Immediate {
     view_idx: u32,
@@ -27,20 +29,59 @@ fn vertex_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     return result;
 }
 
+const OUTSIDE: f32 = 1000.0;
+const SOFTNESS: f32 = 0.0015;
+
+// Distance between a ray and the surface of a tapered capsule, negative inside
+fn ray_capsule_distance(origin: vec3f, dir: vec3f, start: vec4f, end: vec4f) -> f32 {
+    let axis = end.xyz - start.xyz;
+    let w = origin - start.xyz;
+    let b = dot(dir, axis);
+    let c = dot(axis, axis);
+    let d = dot(dir, w);
+    let e = dot(axis, w);
+
+    // Closest point on the segment. Degenerates to the start when parallel or zero length
+    let denominator = c - b * b;
+    var s = 0.0;
+    if denominator > 1e-9 {
+        s = clamp((e - b * d) / denominator, 0.0, 1.0);
+    }
+    let point = start.xyz + axis * s;
+    let t = max(dot(point - origin, dir), 0.0);
+
+    return length(origin + dir * t - point) - mix(start.w, end.w, s);
+}
+
 @fragment
 fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     let origin = depth_u.eyes[imm.view_idx].eye_position.xyz;
     let dir = normalize((depth_u.eyes[imm.view_idx].uv_to_world_dir * vec4f(uv, 1.0, 0.0)).xyz);
-    let count = min(u32(depth_u.lighting2.w + 0.5), MAX_HAND_POINTS);
+    let rim = depth_u.hand_params.x;
+    let inset = depth_u.hand_params.y;
 
-    var focus = 0.0;
-    for (var i = 0u; i < count; i++) {
-        let hand_point = depth_u.hand_points[i];
-        let to_point = hand_point.xyz - origin;
-        let t = max(dot(to_point, dir), 0.0);
-        let distance = length(to_point - dir * t);
-        focus = max(focus, 1.0 - smoothstep(hand_point.w * 0.8, hand_point.w * 1.2, distance));
+    var distance = OUTSIDE;
+    for (var hand = 0u; hand < 2u; hand++) {
+        let bounds = depth_u.hand_bounds[hand];
+        if bounds.w <= 0.0 {
+            continue;
+        }
+        let to_center = bounds.xyz - origin;
+        let t = max(dot(to_center, dir), 0.0);
+        if length(to_center - dir * t) > bounds.w + rim + SOFTNESS {
+            continue;
+        }
+
+        for (var i = 0u; i < HAND_SEGMENTS; i++) {
+            let base = (hand * HAND_SEGMENTS + i) * 2u;
+            let start = depth_u.hand_points[base];
+            let end = depth_u.hand_points[base + 1u];
+            distance = min(distance, ray_capsule_distance(origin, dir, start, end));
+        }
     }
 
-    return vec4f(focus, 0.0, 0.0, 1.0);
+    let outer = 1.0 - smoothstep(rim - SOFTNESS, rim + SOFTNESS, distance);
+    let inner = 1.0 - smoothstep(-inset - SOFTNESS, -inset + SOFTNESS, distance);
+
+    return vec4f(outer, inner, 0.0, 1.0);
 }
