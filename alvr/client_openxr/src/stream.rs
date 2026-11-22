@@ -154,6 +154,8 @@ pub struct StreamContext {
     // Smoothed, meters per second
     hand_speeds: [Cell<f32>; 2],
     hand_solid: [Cell<[f32; HAND_SEGMENTS]>; 2],
+    // How much the rim of each hand is narrowed over backgrounds that look like it (0..1), smoothed
+    hand_leak: [Cell<f32>; 2],
 }
 
 impl StreamContext {
@@ -316,6 +318,7 @@ impl StreamContext {
             last_playzone_request: 0,
             hand_speeds: [const { Cell::new(0.0) }; 2],
             hand_solid: [const { Cell::new([0.0; HAND_SEGMENTS]) }; 2],
+            hand_leak: [const { Cell::new(0.0) }; 2],
         };
 
         this.update_reference_space();
@@ -444,6 +447,16 @@ impl StreamContext {
         #[cfg(not(target_os = "android"))]
         let verified = [[0.0; HAND_SEGMENTS]; 2];
 
+        let uses_leak = params.leak_gain > 0.0 || params.leak_force > 0.0;
+        #[cfg(target_os = "android")]
+        let ring_leak = self
+            .auto_color_key
+            .as_ref()
+            .filter(|_| uses_leak)
+            .map_or([0.0; 2], |key| key.ring_leak());
+        #[cfg(not(target_os = "android"))]
+        let ring_leak = [0.0; 2];
+
         let hands = [0, 1].map(|i| {
             let tracker = int_ctx.hands_interaction[i].skeleton_tracker.as_ref()?;
             let (joints, velocities) = self
@@ -534,6 +547,26 @@ impl StreamContext {
                     params.max_rim_growth_m,
                 );
 
+            // Where the background around the hand looks like it, the rim would show it
+            let zones = if uses_leak {
+                let x = ((ring_leak[i] - params.leak_lo)
+                    / (params.leak_hi - params.leak_lo).max(0.001))
+                .clamp(0.0, 1.0);
+                let target = f32::max(
+                    params.leak_force,
+                    params.leak_gain * x * x * (3.0 - 2.0 * x),
+                );
+                let leak = self.hand_leak[i].get();
+                // Narrow quickly, widen slowly
+                let leak = leak + (target - leak) * if target > leak { 0.2 } else { 0.05 };
+                self.hand_leak[i].set(leak);
+
+                zones.for_leak(leak, params.leak_inset_m, params.leak_arm_keep)
+            } else {
+                self.hand_leak[i].set(0.0);
+                zones
+            };
+
             Some((shape, zones))
         });
 
@@ -541,8 +574,13 @@ impl StreamContext {
 
         // To measure the cost of the hands on the GPU. The playzone still knows about them.
         let hands = if params.hands { hands } else { [None; 2] };
+        let leak = if params.leak_view {
+            self.hand_leak.each_ref().map(Cell::get)
+        } else {
+            [0.0; 2]
+        };
 
-        Some(ColorKeyInput { hands })
+        Some(ColorKeyInput { hands, leak })
     }
 
     pub fn uses_passthrough(&self) -> bool {

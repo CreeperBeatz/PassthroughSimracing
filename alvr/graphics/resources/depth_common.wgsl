@@ -50,6 +50,6 @@ struct DepthUniforms {
     // depth of each quarter (from the wrist) is replaced by the tracked arm (0..1)
     arms: array<vec4f, 6>,
     playzone_eyes: array<PlayzoneEye, 2>,
-    // x: available (0/1)
+    // x: available (0/1), y, z: debug view, how much the rim of each hand is narrowed (0..1)
     playzone: vec4f,
 }

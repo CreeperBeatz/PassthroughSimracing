@@ -6,7 +6,7 @@
 // estimate, so the solid inside fades out gradually into the color keyed rim.
 //
 // Output: r: the hand with its rim (the rim is color keyed), g: solid passthrough, b: near the hand, where
-// the runtime may remove objects from the depth map
+// the runtime may remove objects from the depth map, a: debug view, how much the rim is narrowed
 
 struct Immediate {
     view_idx: u32,
@@ -66,6 +66,7 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     var outer = 0.0;
     var inner = 0.0;
     var near = 0.0;
+    var tint = 0.0;
     for (var hand = 0u; hand < 2u; hand++) {
         let bounds = depth_u.hand_bounds[hand];
         let zones = depth_u.hand_zones[hand];
@@ -117,14 +118,18 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         );
 
         // The further from the hand, the less likely that it is there: fade out, so that leaks of the
-        // color key are weaker. Full strength up to half of the rim.
-        let outer_distance = max(zones.x, 0.0) + SOFTNESS;
-        outer = max(outer, 1.0 - smoothstep(0.5 * outer_distance, outer_distance, distance));
+        // color key are weaker. Full strength up to half of the rim. A negative rim ends inside the
+        // hand, with the soft edge only.
+        let rim_end = zones.x + SOFTNESS;
+        let rim_start = min(0.5 * rim_end, rim_end - 0.5 * SOFTNESS);
+        var hand_outer = 1.0 - smoothstep(rim_start, rim_end, distance);
         if zones.w > 0.0 {
             let arm_rim = zones.w + SOFTNESS;
-            outer = max(outer, 1.0 - smoothstep(0.5 * arm_rim, arm_rim, arm_distance));
+            hand_outer = max(hand_outer, 1.0 - smoothstep(0.5 * arm_rim, arm_rim, arm_distance));
         }
+        outer = max(outer, hand_outer);
+        tint = max(tint, depth_u.playzone[1u + hand] * hand_outer);
     }
 
-    return vec4f(outer, inner, near, 1.0);
+    return vec4f(outer, inner, near, tint);
 }

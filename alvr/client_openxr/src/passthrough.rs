@@ -107,6 +107,14 @@ impl PassthroughLayer<'_> {
 /// - `setprop debug.alvr.key_hands 0`: no hands in the GPU passes (to measure them)
 /// - `setprop debug.alvr.arm_removal 0`: don't remove the late forearms from the depth map
 /// - `setprop debug.alvr.playzone -1`: forget the remembered playzone
+/// - `setprop debug.alvr.key_leak <percent>`: narrow the rim where the background around a hand looks like
+///   the hand (needs `auto_key`), 0: off, 100: on
+/// - `setprop debug.alvr.key_leak_lo <percent>` / `key_leak_hi`: share of the background around the hand
+///   that is kept by the key, from where the rim is narrowed to where it is narrowest
+/// - `setprop debug.alvr.key_leak_inset <mm>`: the narrowest rim, inside of the hand
+/// - `setprop debug.alvr.key_leak_arm <percent>`: share of the forearm rim that stays (at least 1 mm)
+/// - `setprop debug.alvr.key_leak_force <percent>`: narrow the rim of both hands this much, without the camera
+/// - `setprop debug.alvr.key_leak_view 1`: with the "Tint mask" debug view the narrowed rim is red
 pub struct ColorKey {
     version: u32,
     lut: Vec<u8>,
@@ -131,10 +139,25 @@ pub struct ColorKeyParams {
     /// Whether the GPU passes get the hands, and remove the forearms from the depth map
     pub hands: bool,
     pub arm_removal: bool,
+    /// Narrower rim over backgrounds that look like the hand: gain (0..1), the shares of the background
+    /// that is kept where it starts and where it is complete, the narrowest rim (inside of the hand), the
+    /// share of the forearm rim that stays, a fixed amount (0..1), and whether it is shown
+    pub leak_gain: f32,
+    pub leak_lo: f32,
+    pub leak_hi: f32,
+    pub leak_inset_m: f32,
+    pub leak_arm_keep: f32,
+    pub leak_force: f32,
+    pub leak_view: bool,
 }
 
 fn millimeters(property: &str, default: i64) -> f32 {
     debug_property(property).unwrap_or(default).clamp(0, 300) as f32 / 1000.0
+}
+
+// 0..1
+fn percent(property: &str, default: i64) -> f32 {
+    debug_property(property).unwrap_or(default).clamp(0, 100) as f32 / 100.0
 }
 
 impl ColorKeyParams {
@@ -168,6 +191,13 @@ impl ColorKeyParams {
             crop: debug_property("debug.alvr.key_crop").unwrap_or(1),
             hands: debug_property("debug.alvr.key_hands").unwrap_or(1) != 0,
             arm_removal: debug_property("debug.alvr.arm_removal").unwrap_or(1) != 0,
+            leak_gain: percent("debug.alvr.key_leak", 0),
+            leak_lo: percent("debug.alvr.key_leak_lo", 5),
+            leak_hi: percent("debug.alvr.key_leak_hi", 20),
+            leak_inset_m: millimeters("debug.alvr.key_leak_inset", 3),
+            leak_arm_keep: percent("debug.alvr.key_leak_arm", 0),
+            leak_force: percent("debug.alvr.key_leak_force", 0),
+            leak_view: debug_property("debug.alvr.key_leak_view").unwrap_or(0) != 0,
         }
     }
 }

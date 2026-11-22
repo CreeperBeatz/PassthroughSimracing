@@ -145,7 +145,7 @@ fn depth_passthrough(game_color: vec3f, uv: vec2f) -> vec4f {
         // Both alpha values are packed in one channel: 0 in the first holes, 0.5 in the rim, 1
         // elsewhere. They are unpacked by the color scale and bias of the layers (2a and 2a - 1).
         // Alpha is not premultiplied.
-        let hand = textureSampleLevel(focus_area, stream_sampler, uv, 0.0).rg;
+        let hand = textureSampleLevel(focus_area, stream_sampler, uv, 0.0);
         let focus = hand.r;
         let solid = max(mask, hand.g);
         let lower_alpha = 1.0 - solid;
@@ -153,6 +153,8 @@ fn depth_passthrough(game_color: vec3f, uv: vec2f) -> vec4f {
         var rgb = game_color;
         if debug_view == DEBUG_VIEW_TINT_MASK {
             rgb = mix(rgb, vec3f(0.0, 0.8, 0.0), 0.5 * focus);
+            // Where the rim is narrowed
+            rgb = mix(rgb, vec3f(0.9, 0.0, 0.0), 0.7 * hand.a);
         }
         return vec4f(rgb, 0.5 * (lower_alpha + upper_alpha));
     }

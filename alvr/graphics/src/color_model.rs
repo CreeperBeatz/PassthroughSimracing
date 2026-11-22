@@ -317,6 +317,14 @@ impl ColorModel {
 
         kept as f32 / colors.len().max(1) as f32
     }
+
+    /// Same as `kept_fraction`, for the colors around one hand: how much of its background would show
+    /// in the key. None without a learned LUT or with too few colors.
+    pub fn leak_fraction(&self, colors: &[[u8; 3]]) -> Option<f32> {
+        const MIN_COLORS: usize = 50;
+
+        (self.alpha.is_some() && colors.len() >= MIN_COLORS).then(|| self.kept_fraction(colors))
+    }
 }
 
 fn smoothstep(min: f32, max: f32, value: f32) -> f32 {
@@ -370,8 +378,20 @@ pub struct SampledHand {
 pub struct HandColorSamples {
     pub skin: Vec<[u8; 3]>,
     pub background: Vec<[u8; 3]>,
+    /// How many of the background colors belong to each hand, the first hand comes first
+    pub background_counts: [usize; 2],
     /// Everything except the hands and arms
     pub scene: Vec<[u8; 3]>,
+}
+
+impl HandColorSamples {
+    /// The background colors around one hand
+    pub fn hand_background(&self, hand: usize) -> &[[u8; 3]] {
+        let start = self.background_counts[..hand].iter().sum::<usize>();
+        self.background
+            .get(start..start + self.background_counts[hand])
+            .unwrap_or(&[])
+    }
 }
 
 /// Collect the colors inside of the hands, and around them. `color` returns the RGB color of a pixel.
@@ -462,6 +482,7 @@ pub fn sample_hand_colors(
                     });
                     if !is_arm && !is_other_hand {
                         samples.background.push(color(x, y));
+                        samples.background_counts[hand_index] += 1;
                     }
                 }
             }
@@ -495,7 +516,7 @@ mod tests {
         HandColorSamples {
             skin: noisy(skin, 600),
             background: noisy(background, 600),
-            scene: vec![],
+            ..Default::default()
         }
     }
 
@@ -594,7 +615,7 @@ mod tests {
             &HandColorSamples {
                 skin: mixed(SKIN, GREEN_WALL),
                 background: mixed(GREEN_WALL, SKIN),
-                scene: vec![],
+                ..Default::default()
             },
             0.1,
         );
@@ -768,6 +789,69 @@ mod tests {
             // Not on the arm
             assert!(x < 10.0, "{x} {y}");
         }
+    }
+
+    #[test]
+    fn background_is_split_per_hand() {
+        // Two horizontal hands 0.5 m in front of the camera, left and right. The arms point down
+        let hand = |x: f32| {
+            let segment = [
+                Vec4::new(x - 0.03, 0.0, 0.5, 0.02),
+                Vec4::new(x + 0.03, 0.0, 0.5, 0.02),
+            ];
+            SampledHand {
+                shape: HandShape {
+                    segments: [segment; HAND_SEGMENTS],
+                },
+                wrist: Vec3::new(x, 0.02, 0.5),
+                arm_direction: Vec3::Y,
+                is_still: false,
+                arm_trust: None,
+            }
+        };
+        let camera = CameraView {
+            position: Vec3::ZERO,
+            orientation: Quat::IDENTITY,
+            focal_length: Vec2::splat(217.0),
+            center: Vec2::new(160.0, 120.0),
+        };
+
+        // Encode the pixel position in the color. 320 doesn't fit in a byte: x / 2
+        let result = sample_hand_colors(
+            &camera,
+            320,
+            240,
+            &[Some(hand(-0.15)), Some(hand(0.15))],
+            |x, y| [(x / 2) as u8, y as u8, 0],
+        );
+        let counts = result.background_counts;
+        assert!(counts[0] > 100 && counts[1] > 100, "{counts:?}");
+        assert_eq!(counts[0] + counts[1], result.background.len());
+
+        // Left hand at x = 160 - 65, right hand at x = 160 + 65
+        for [x, _, _] in result.hand_background(0) {
+            assert!(f32::from(*x) * 2.0 < 160.0, "{x}");
+        }
+        for [x, _, _] in result.hand_background(1) {
+            assert!(f32::from(*x) * 2.0 > 160.0, "{x}");
+        }
+    }
+
+    #[test]
+    fn leak_fraction_needs_a_lut_and_enough_colors() {
+        let mut model = ColorModel::default();
+        // Without a LUT nothing is known
+        assert_eq!(model.leak_fraction(&noisy(SKIN, 200)), None);
+
+        model.add_samples(&samples(SKIN, WHITE_WALL), 0.1);
+        model.update_lut().unwrap();
+        assert_eq!(model.leak_fraction(&[SKIN; 49]), None);
+        assert_eq!(model.leak_fraction(&[SKIN; 200]), Some(1.0));
+        assert_eq!(model.leak_fraction(&[WHITE_WALL; 200]), Some(0.0));
+
+        let mut half = vec![SKIN; 100];
+        half.extend([WHITE_WALL; 100]);
+        assert_eq!(model.leak_fraction(&half), Some(0.5));
     }
 
     #[test]

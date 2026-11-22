@@ -773,6 +773,7 @@ fn color_key_packs_mask_and_hand_area() {
                     },
                 )),
             ],
+            leak: [0.0; 2],
         }),
     );
 
@@ -824,6 +825,7 @@ fn hand_core_fades_out_gradually() {
             true,
             Some(ColorKeyInput {
                 hands: [Some((shape, zones)), None],
+                leak: [0.0; 2],
             }),
         )
     };
@@ -866,6 +868,55 @@ fn hand_core_fades_out_gradually() {
 }
 
 #[test]
+fn negative_rim_ends_inside_the_capsule() {
+    let (device, queue) = gpu_or_skip!();
+    let config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
+
+    // Same bar as in color_key_packs_mask_and_hand_area, nothing solid
+    let segment = [
+        Vec4::new(-0.1, -0.25, -0.5, 0.05),
+        Vec4::new(0.1, -0.25, -0.5, 0.05),
+    ];
+    let render_rim = |rim| {
+        render_with_key(
+            &device,
+            &queue,
+            &config,
+            &hand_scene(),
+            Vec3::ZERO,
+            Vec3::ZERO,
+            true,
+            Some(ColorKeyInput {
+                hands: [
+                    None,
+                    Some((
+                        HandShape {
+                            segments: [segment; HAND_SEGMENTS],
+                        },
+                        HandZones {
+                            core: -0.01,
+                            falloff: 0.01,
+                            rim,
+                            arm_rim: 0.0,
+                            solid: [0.0; HAND_SEGMENTS],
+                        },
+                    )),
+                ],
+                leak: [0.0; 2],
+            }),
+        )
+    };
+
+    let narrow = render_rim(-0.01);
+    let normal = render_rim(0.0);
+    // Center of the bar: keyed
+    assert!((narrow.alpha(0.5, 0.75) - 0.5).abs() < 0.01);
+    // About 3 mm inside of the edge of the bar: game, only keyed with the rim of 0
+    assert_eq!(narrow.alpha(0.5, 0.8), 1.0);
+    assert!((normal.alpha(0.5, 0.8) - 0.5).abs() < 0.01);
+}
+
+#[test]
 fn hand_zones_follow_the_speed() {
     let zones = HandZones {
         core: -0.004,
@@ -885,6 +936,50 @@ fn hand_zones_follow_the_speed() {
     // Limited
     let fast = zones.for_speed(100.0, 0.01, 0.04, 0.05);
     assert!((fast.core - -0.044).abs() < 1e-6 && (fast.rim - 0.06).abs() < 1e-6);
+}
+
+#[test]
+fn hand_zones_shrink_over_leaks() {
+    let mut zones = HandZones {
+        core: -0.004,
+        falloff: 0.004,
+        rim: 0.0,
+        arm_rim: 0.008,
+        solid: [1.0; HAND_SEGMENTS],
+    };
+    zones.solid[3] = 0.5;
+
+    // No leak: the same
+    let same = zones.for_leak(0.0, 0.003, 0.0);
+    assert_eq!(same.rim.to_bits(), zones.rim.to_bits());
+    assert_eq!(same.arm_rim.to_bits(), zones.arm_rim.to_bits());
+    assert_eq!(same.core.to_bits(), zones.core.to_bits());
+
+    // A moving hand over a full leak: the rim ends inside the hand, the core stays
+    let moving = zones.for_speed(1.0, 0.01, 0.04, 0.016);
+    let leaky = moving.for_leak(1.0, 0.003, 0.0);
+    assert!((leaky.rim - -0.003).abs() < 1e-6, "{}", leaky.rim);
+    assert_eq!(leaky.core, moving.core);
+    assert_eq!(leaky.falloff, moving.falloff);
+    assert_eq!(leaky.solid, moving.solid);
+    // The forearm rim goes down to 1 mm
+    assert!((leaky.arm_rim - 0.001).abs() < 1e-6, "{}", leaky.arm_rim);
+
+    // Half: in between, the forearm keeps a share
+    let half = moving.for_leak(0.5, 0.003, 0.5);
+    assert!(
+        (half.rim - (0.5 * 0.016 - 0.5 * 0.003)).abs() < 1e-6,
+        "{}",
+        half.rim
+    );
+    assert!((half.arm_rim - 0.006).abs() < 1e-6, "{}", half.arm_rim);
+
+    // A forearm that is not tracked stays so
+    let no_arm = HandZones {
+        arm_rim: 0.0,
+        ..zones
+    };
+    assert_eq!(no_arm.for_leak(1.0, 0.003, 0.0).arm_rim, 0.0);
 }
 
 #[test]
@@ -962,6 +1057,7 @@ fn hands_rect_contains_the_hands() {
     };
     let key = ColorKeyInput {
         hands: [None, Some((shape, zones))],
+        leak: [0.0; 2],
     };
     let (min, max) = depth_mask::hands_view_rect(&view(Vec3::ZERO), Vec3::ZERO, &key).unwrap();
 
@@ -980,7 +1076,10 @@ fn hands_rect_contains_the_hands() {
     assert!(min.x > 0.1, "{min}");
 
     // Behind the viewer or not tracked
-    let none = ColorKeyInput { hands: [None; 2] };
+    let none = ColorKeyInput {
+        hands: [None; 2],
+        leak: [0.0; 2],
+    };
     assert!(depth_mask::hands_view_rect(&view(Vec3::ZERO), Vec3::ZERO, &none).is_none());
 }
 
@@ -997,6 +1096,7 @@ fn hands_rect_ignores_hands_out_of_view() {
         };
         let key = ColorKeyInput {
             hands: [Some((HandShape::from_joints(&joints, None), zones)), None],
+            leak: [0.0; 2],
         };
         depth_mask::hands_view_rect(&view(Vec3::ZERO), Vec3::ZERO, &key)
     };
@@ -1120,6 +1220,7 @@ fn playzone_fills_objects_removed_near_the_hand() {
             )),
             None,
         ],
+        leak: [0.0; 2],
     };
     let render_playzone = |playzone| {
         render_full(
@@ -1357,6 +1458,58 @@ fn lighting_darkens_passthrough() {
     assert_eq!(&out.at(0.5, 0.25)[..3], &[0, 0, 0]);
     // Game unaffected
     assert_eq!(out.alpha(0.5, 0.75), 1.0);
+}
+
+#[test]
+fn tint_debug_view_marks_the_narrowed_rim() {
+    let (device, queue) = gpu_or_skip!();
+    let mut config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
+    config.debug_view = DepthPassthroughDebugView::TintMask;
+
+    let segment = [
+        Vec4::new(-0.1, -0.25, -0.5, 0.05),
+        Vec4::new(0.1, -0.25, -0.5, 0.05),
+    ];
+    let render_leak = |leak| {
+        render_with_key(
+            &device,
+            &queue,
+            &config,
+            &hand_scene(),
+            Vec3::ZERO,
+            Vec3::ZERO,
+            true,
+            Some(ColorKeyInput {
+                hands: [
+                    None,
+                    Some((
+                        HandShape {
+                            segments: [segment; HAND_SEGMENTS],
+                        },
+                        HandZones {
+                            core: -0.01,
+                            falloff: 0.01,
+                            rim: 0.04,
+                            arm_rim: 0.0,
+                            solid: [0.0; HAND_SEGMENTS],
+                        },
+                    )),
+                ],
+                leak,
+            }),
+        )
+    };
+
+    // The rim of the hand
+    let (u, v) = (0.5, 0.835);
+    let plain = render_leak([0.0; 2]).at(u, v);
+    assert!(plain[1] > plain[0], "{plain:?}");
+    // The value of the other hand doesn't matter
+    assert_eq!(render_leak([1.0, 0.0]).at(u, v), plain);
+
+    let red = render_leak([0.0, 1.0]).at(u, v);
+    assert!(red[0] > 2 * red[1], "{red:?}");
+    assert_eq!(red[3], plain[3]);
 }
 
 #[test]

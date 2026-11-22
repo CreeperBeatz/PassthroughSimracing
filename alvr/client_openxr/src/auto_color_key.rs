@@ -38,6 +38,8 @@ const LOG_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_HAND_SPEED: f32 = 0.5;
 // Fingers included (m/s)
 const STILL_HAND_SPEED: f32 = 0.12;
+// How long the leak of a hand is kept when it's not seen, and when it is not used any more
+const LEAK_HOLD: Duration = Duration::from_secs(1);
 
 pub fn enabled() -> bool {
     debug_property("debug.alvr.auto_key").unwrap_or(0) > 0
@@ -51,6 +53,7 @@ struct Verified {
     time: Instant,
     weights: HandWeights,
     arm_trust: ArmTrust,
+    leak: [f32; 2],
 }
 
 struct Context {
@@ -114,6 +117,15 @@ impl AutoColorKey {
         }
     }
 
+    /// For each hand, the share of the colors around it that the key keeps (0..1): there the background
+    /// shows through the rim
+    pub fn ring_leak(&self) -> [f32; 2] {
+        match &*self.verified.lock() {
+            Some(verified) if verified.time.elapsed() < LEAK_HOLD => verified.leak,
+            _ => [0.0; 2],
+        }
+    }
+
     /// New colors, if there are any
     pub fn take_lut(&self) -> Option<Vec<u8>> {
         self.lut.lock().take()
@@ -141,6 +153,8 @@ fn learn_loop(context: &Context) {
     let mut weights: HandWeights = [[0.0; HAND_SEGMENTS]; 2];
     let mut arm_trust: ArmTrust = [[0.0; ARM_SEGMENTS]; 2];
     let mut last_arm_check = [Instant::now(); 2];
+    let mut leak = [0.0; 2];
+    let mut last_leak = [Instant::now(); 2];
     let mut last_lut = vec![];
 
     while context.running.value() {
@@ -189,7 +203,29 @@ fn learn_loop(context: &Context) {
             } else {
                 model.kept_fraction(&samples.background)
             };
+            // Per hand: rise at once, fall slowly, hold it for a moment when the hand is not seen
+            let hand_kept = [0, 1].map(|i| model.leak_fraction(samples.hand_background(i)));
+            for ((leak, last_leak), kept) in leak.iter_mut().zip(&mut last_leak).zip(hand_kept) {
+                if let Some(kept) = kept {
+                    *leak = if kept > *leak {
+                        kept
+                    } else {
+                        *leak + (kept - *leak) * 0.3
+                    };
+                    *last_leak = Instant::now();
+                } else if last_leak.elapsed() > LEAK_HOLD {
+                    *leak = 0.0;
+                }
+            }
+            // With the narrower rim each hand is verified against its own background
+            let use_hand_kept = debug_property("debug.alvr.key_leak").unwrap_or(0) > 0;
+
             for (i, (weights, hand)) in weights.iter_mut().zip(&hands).enumerate() {
+                let background_kept = if use_hand_kept {
+                    hand_kept[i].unwrap_or(background_kept)
+                } else {
+                    background_kept
+                };
                 let targets = hand.as_ref().map_or([0.0; HAND_SEGMENTS], |hand| {
                     model.verify_hand(
                         &view,
@@ -230,13 +266,15 @@ fn learn_loop(context: &Context) {
                 time: Instant::now(),
                 weights,
                 arm_trust,
+                leak,
             });
 
             if last_log.elapsed() > LOG_INTERVAL {
                 last_log = Instant::now();
                 camera::log(&format!(
                     "auto key: skin {} kept {:.2} mean {:?}, background {} kept {:.2} mean {:?}, \
-                     verified {:.2} {:.2}, arms {:.1?} {:.1?}, update {:.1} ms",
+                     verified {:.2} {:.2}, arms {:.1?} {:.1?}, leak {:.2} {:.2}, scene {} kept {:.2}, \
+                     update {:.1} ms",
                     samples.skin.len(),
                     model.kept_fraction(&samples.skin),
                     mean(&samples.skin),
@@ -247,6 +285,10 @@ fn learn_loop(context: &Context) {
                     weights[1].iter().sum::<f32>() / HAND_SEGMENTS as f32,
                     arm_trust[0],
                     arm_trust[1],
+                    leak[0],
+                    leak[1],
+                    samples.scene.len(),
+                    model.kept_fraction(&samples.scene),
                     last_update.elapsed().as_secs_f32() * 1000.0,
                 ));
             }

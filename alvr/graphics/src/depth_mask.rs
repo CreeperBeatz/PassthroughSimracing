@@ -203,12 +203,35 @@ impl HandZones {
             ..self
         }
     }
+
+    /// Where the background around the hand looks like the hand, the color key shows it: `leak` (0..1)
+    /// narrows the rim down to `inset` inside the hand, and the forearm rim to the share `arm_keep`.
+    pub fn for_leak(self, leak: f32, inset: f32, arm_keep: f32) -> Self {
+        // Smallest rim of a tracked forearm, 0 would mean that it's not tracked
+        const MIN_ARM_RIM: f32 = 0.001;
+
+        if leak <= 0.0 {
+            return self;
+        }
+        let leak = leak.min(1.0);
+        Self {
+            rim: self.rim * (1.0 - leak) - inset * leak,
+            arm_rim: if self.arm_rim > 0.0 {
+                f32::max(self.arm_rim * (1.0 - leak * (1.0 - arm_keep)), MIN_ARM_RIM)
+            } else {
+                0.0
+            },
+            ..self
+        }
+    }
 }
 
 /// The hands are passthrough, the color key decides where the hand tracking is not certain
 #[derive(Clone, Copy)]
 pub struct ColorKeyInput {
     pub hands: [Option<(HandShape, HandZones)>; 2],
+    /// Debug view: how much the rim of each hand is narrowed (0..1), shown in red with the tint
+    pub leak: [f32; 2],
 }
 
 /// A forearm when the depth image was captured
@@ -410,7 +433,13 @@ pub fn depth_uniforms(
         data.extend(pose.to_cols_array());
         data.extend(tangents.to_array());
     }
-    data.extend([f32::from(u8::from(playzone.is_some())), 0.0, 0.0, 0.0]);
+    let leak = input.color_key.map_or([0.0; 2], |key| key.leak);
+    data.extend([
+        f32::from(u8::from(playzone.is_some())),
+        leak[0],
+        leak[1],
+        0.0,
+    ]);
 
     data.try_into().unwrap()
 }

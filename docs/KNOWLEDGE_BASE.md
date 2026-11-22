@@ -36,6 +36,14 @@ Words used here:
 6. **Verification.** Each hand segment is compared with the camera image. Only confirmed segments that
    don't move are solid.
 
+**Narrower rim over leaky backgrounds** (`key_leak`, **not tested**). The learning thread measures for
+each hand which share of the colors 2-7 cm around it the key keeps. Where that share is high the
+background looks like the hand and would show in the rim, so the rim of that hand shrinks, down to 3 mm
+inside the hand, and the forearm rim down to 1 mm. It narrows within about 0.2 s and widens slowly. With
+`key_leak` on, each hand is also verified against its own background instead of both together. At rest
+the rim is already 0, so only the soft edge goes; the gain is for moving hands and the forearm. Leaks
+inside the hand capsules stay.
+
 ## What works
 
 - **Color keying in the compositor.** An RGBA `XR_META_passthrough_color_lut` makes the passthrough
@@ -155,6 +163,12 @@ Measured in the SteamVR home, 72 Hz, with color key on unless noted:
 | `key_layers` | 4 | 4: extra layers only with hands in view, 2: never, 5: always, 30 / 31: always three (no upper game layer / no keyed passthrough). Not tested |
 | `key_crop` | 1 | Lower game layer only around the hands. 0: full, 2: y origin at the top (if 1 is upside down). Not tested |
 | `key_hands` / `arm_removal` | 1 / 1 | 0: no hands in the GPU passes / no forearm removal in the depth mask. Not tested |
+| `key_leak` | 0 % | Narrower rim where the background around a hand looks like it, 0: off, 100: on. Needs `auto_key`. Not tested |
+| `key_leak_lo` / `key_leak_hi` | 5 / 20 % | Share of the colors around the hand that the key keeps: where the narrowing starts / is complete |
+| `key_leak_inset` | 3 mm | Rim at full narrowing, inside the hand. 0: down to the soft edge only |
+| `key_leak_arm` | 0 % | Share of the forearm rim that stays at full narrowing (at least 1 mm) |
+| `key_leak_force` | 0 % | Narrow both hands this much, without the camera |
+| `key_leak_view` | 0 | 1: with the "Tint mask" debug view the narrowed rim is red |
 
 The LUT file must exist even with `auto_key`: 32x32x32 RGBA bytes, indexed `[b][g][r]`. It is used until
 enough colors are learned.
