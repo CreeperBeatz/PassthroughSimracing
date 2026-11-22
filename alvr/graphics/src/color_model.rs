@@ -17,9 +17,8 @@ const SKIN_SMOOTHING: f32 = 1.4;
 const BACKGROUND_SMOOTHING: f32 = 1.3;
 // If skin and background look the same, keep the hand and accept the leak
 const SKIN_BIAS: f32 = 2.0;
-// Colors that are seen neither on the hand nor in the background are kept
-const SKIN_FLOOR: f32 = 3e-6;
-const BACKGROUND_FLOOR: f32 = 1e-7;
+// Densities below this are not significant, see `ColorModel::unknown_keep`
+const FLOOR: f32 = 1e-6;
 const LIKELIHOOD_SOFTNESS: f32 = 0.7;
 // How much of the new LUT is used at each update, to avoid visible jumps
 const BLEND: f32 = 0.35;
@@ -110,6 +109,9 @@ pub struct ColorModel {
     skin: Density,
     background: Density,
     alpha: Option<Vec<f32>>,
+    /// Probability (0..1) that a color that is seen neither on the hand nor in the background belongs to
+    /// the hand. High values keep e.g. watches and lit fingertips, low values remove clutter.
+    pub unknown_keep: f32,
 }
 
 impl Default for ColorModel {
@@ -118,6 +120,7 @@ impl Default for ColorModel {
             skin: Density::new(SKIN_MEMORY),
             background: Density::new(BACKGROUND_MEMORY),
             alpha: None,
+            unknown_keep: 0.3,
         }
     }
 }
@@ -137,13 +140,15 @@ impl ColorModel {
 
         let skin = smooth(&self.skin.values, SKIN_SMOOTHING);
         let background = smooth(&self.background.values, BACKGROUND_SMOOTHING);
+        let unknown_keep = self.unknown_keep.clamp(0.01, 0.99);
+        let skin_floor = FLOOR * (unknown_keep / (1.0 - unknown_keep)).powf(LIKELIHOOD_SOFTNESS);
         let target = skin.iter().zip(&background).map(|(skin, background)| {
             // Remove the part of each that can be explained by samples of the other one
             let (skin, background) = (
                 (skin - background * CONTAMINATION).max(0.0),
                 (background - skin * CONTAMINATION).max(0.0),
             );
-            let score = ((background + BACKGROUND_FLOOR) / (skin * SKIN_BIAS + SKIN_FLOOR)).ln();
+            let score = ((background + FLOOR) / (skin * SKIN_BIAS + skin_floor)).ln();
             let keep = 1.0 / (1.0 + (score / LIKELIHOOD_SOFTNESS).clamp(-30.0, 30.0).exp());
             // Make it steeper
             ((keep - 0.2) / 0.5).clamp(0.0, 1.0)
@@ -332,8 +337,18 @@ mod tests {
         assert_eq!(lut.len(), TEXEL_COUNT * 4);
         assert_eq!(alpha(&lut, SKIN), 255);
         assert_eq!(alpha(&lut, WHITE_WALL), 0);
-        // Never seen: e.g. a watch
-        assert_eq!(alpha(&lut, [20, 40, 200]), 255);
+        // Never seen: clutter, or a watch
+        assert!(alpha(&lut, [20, 40, 200]) < 80);
+
+        let mut keep_unknown = ColorModel {
+            unknown_keep: 0.95,
+            ..Default::default()
+        };
+        keep_unknown.add_samples(&samples(SKIN, WHITE_WALL), 0.1);
+        let keep_unknown_lut = keep_unknown.update_lut().unwrap();
+        assert_eq!(alpha(&keep_unknown_lut, [20, 40, 200]), 255);
+        assert_eq!(alpha(&keep_unknown_lut, WHITE_WALL), 0);
+
         // The colors are not changed
         let index = texel_index(SKIN) * 4;
         for c in 0..3 {

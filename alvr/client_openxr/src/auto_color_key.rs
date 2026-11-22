@@ -120,6 +120,10 @@ fn learn_loop(context: &Context) {
             let Some(samples) = sample(context, &camera, &frame) else {
                 continue;
             };
+            model.unknown_keep = debug_property("debug.alvr.key_unknown")
+                .unwrap_or(30)
+                .clamp(0, 100) as f32
+                / 100.0;
             model.add_samples(&samples, elapsed);
             let new_lut = model.update_lut();
 

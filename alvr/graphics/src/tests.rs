@@ -777,7 +777,10 @@ fn hand_core_fades_out_gradually() {
     let fast = render_zones(zones.for_speed(10.0, 0.02, 0.004, 0.05));
     assert!(fast.alpha(0.5, 0.75) > out.alpha(0.5, 0.75) + 0.1);
     assert_eq!(out.alpha(0.5, 0.9), 1.0);
-    assert!(fast.alpha(0.5, 0.9) < 0.55);
+    // Near the end of the rim the key fades out
+    let faded = fast.alpha(0.5, 0.9);
+    assert!((0.55..0.95).contains(&faded), "{faded}");
+    assert!(fast.alpha(0.5, 0.85) < faded);
 }
 
 #[test]

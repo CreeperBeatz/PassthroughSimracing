@@ -88,7 +88,10 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
             }
         }
 
-        outer = max(outer, 1.0 - smoothstep(zones.x - SOFTNESS, zones.x + SOFTNESS, distance));
+        // The further from the hand, the less likely that it is there: fade out, so that leaks of the
+        // color key are weaker. Full strength up to half of the rim.
+        let outer_distance = max(zones.x, 0.0) + SOFTNESS;
+        outer = max(outer, 1.0 - smoothstep(0.5 * outer_distance, outer_distance, distance));
         inner = max(inner, 1.0 - smoothstep(zones.y, zones.y + max(zones.z, 0.0005), solid_distance));
     }
 
