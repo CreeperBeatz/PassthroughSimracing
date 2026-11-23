@@ -256,7 +256,7 @@ Measured in the SteamVR home, 72 Hz, with color key on unless noted:
 | `key_speed` | 2 | Joints whose speed grows the zone. 2: the wrist only (the arm moves; not tested), 1: palm, wrist and knuckles (fine for waving and closing the fingers, but a hand that turns in place grows it), 0: the fastest joint (moving fingers grow it too) |
 | `key_sweep` | 1 | 1: the zone grows along the motion of the hand, 0: in all directions as before. Not tested |
 | `key_sweep_max` / `key_sweep_iso` / `key_sweep_bias` | 40 mm / 25 % / 0 % | Limit of the growth along the motion (each side, before the bias), share of the growth that stays in all directions (limited by `key_rim_max`), -100..100: more ahead (positive) or behind |
-| `key_inset` / `key_falloff` | 4 mm / 4 mm | Where the solid fill starts and how it fades out |
+| `key_inset` / `key_falloff` | 4 mm / 4 mm | Where the solid fill starts and how it fades out. 2 / 2 and 3 / 3 compared on the headset: a spread hand seen from the back is fuller, dark parts (palm, fist) are the same, the background is cut slightly less precisely; user: 4 / 4 is the best |
 | `key_error` | 10 ms | How much the fill shrinks with the speed |
 | `key_solid` | 6 | Segments that are always solid: 0 none, 6 wrist, 9 palm, 28 hand |
 | `key_tight` / `key_bias` / `key_unknown` | 30 / 150 / 10 % | Strictness, preference for skin, unknown colors |
