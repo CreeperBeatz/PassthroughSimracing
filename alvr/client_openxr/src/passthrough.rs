@@ -139,6 +139,11 @@ impl PassthroughLayer<'_> {
 ///   a value other than 0 also learns the map
 /// - `setprop debug.alvr.key_leak_probe <cm>`: distance of the spheres of `key_leak_view 2`
 /// - `setprop debug.alvr.key_lut_dump <n>`: another value writes the learned LUT to the files folder of the app
+/// - `setprop debug.alvr.key_dump <n>`: another value other than 0 writes the next learning passes to the files
+///   folder of the app, `alvr_dump_<n>_<index>`: the camera image as the learner reads it (`.rgb`), the hands,
+///   the camera and the counts of the pass (`.json`), with the first pass the key table (`_key.lut`), the
+///   alpha of the key table as the learner uses it (`_key_alpha.lut`) and of the confirm table (`_confirm.lut`)
+/// - `setprop debug.alvr.key_dump_burst <n>`: that many consecutive passes (1..30)
 /// - `setprop debug.alvr.key_wrist_len <mm>`: length of the key zone from the wrist towards the forearm, its
 ///   direction is chosen with the camera (`auto_key`), 0: off
 /// - `setprop debug.alvr.key_wrist_scale <percent>`: its radius, of the radius of the wrist joint

@@ -162,6 +162,19 @@ LINEAR_VALID (`nv`). With `key_confirm` also `confirm kept` of the skin and of t
   (4-10 % dropped): shadowed sides, creases, nails, knuckles and very bright skin, same hue as the kept
   skin but darker. The key keeps a median 0.79 of its own skin samples on the headset, 0.94 in an offline
   copy of the model: the difference is not explained.
+- **A shape detector for the hand: designed, not built** (2026-11-23). Two variants: an outline mask from
+  the camera image as a texture, and capsules fitted to the camera (width, offset, tip). Offline best
+  case (4 raw screenshots, simulated camera, skeleton placed by hand): hand kept 0.86 -> 0.93, darkest
+  quarter 0.73 -> 0.87, room within 1 cm 2.1 -> 3.1 %. Limits: one camera pixel is about 2 mm at the hand
+  and the loss band of a still hand is the outer 1-2 mm ("4 px" of a screenshot), so the edge stays with
+  the key; a camera result is 45-160 ms old when used (5-15 mm at 0.1 m/s), so still and slow hands
+  only. The simulation does not match the headset (it also predicted no leak for `key_smooth` 70), so
+  nothing is built before a test on real captures (`key_dump`).
+- **Camera coverage** (measured with the user, looking ahead): hands at the wheel position are inside
+  the camera image and about 90 % of the voted segments are confirmed; a reach to the shifter leaves
+  the image, there only the key decides.
+- **`key_confirm` does not fill dark segments** (palm in shade, fist; user: no difference): 10 of the 15
+  points of a segment, the ones beside the axis, vote with the key table.
 - **Closing holes of the table in color space.** The kept colors are one block without holes: gains
   nothing (learned tables simulated, `skin.lut` / `skin2.lut` measured).
 - **Widening the skin along the brightness.** One cell darker and brighter: +1.4 to +2.5 points of the
@@ -281,12 +294,43 @@ Measured in the SteamVR home, 72 Hz, with color key on unless noted:
 | `key_leak_dump` | 0 | New value: log the leak map of the camera view, 40x30 (`#` leaks, `.` doesn't, `?` unknown, `H` hand). Not 0: the map is learned |
 | `key_leak_probe` | 60 cm | Distance of the spheres of `key_leak_view 2` from the anchor of the map |
 | `key_lut_dump` | 0 | New value: write the learned LUT to `/sdcard/Android/data/alvr.client.dev/files/alvr_learned_key_<time>.lut` |
+| `key_dump` / `key_dump_burst` | 0 / 1 | New value `n` other than 0: write the next `key_dump_burst` (1..30) learning passes to the same folder, `alvr_dump_<n>_<00..>`, also without hands. Each line `dump <n>/<index>: <path>` on `ALVR_CAM`. Not tested |
 | `key_wrist_len` | 80 mm | Keyed bridge from the wrist towards the forearm, 0: off (as before), up to 300. The direction and the solid fill need `auto_key`, without it: opposite to the fingers, never solid. Not tested |
 | `key_wrist_scale` / `key_wrist_conf` | 100 / 60 % | Its radius (of the wrist joint radius), how sure the camera must be of its direction for the solid fill |
 | `key_wrist_follow` | 30 % | Below this score of the best direction (share of points the key keeps, 0 over skin-like backgrounds) the bridge goes back to the default direction. 0: always the best one. Not tested |
 
 The LUT file must exist even with `auto_key`: 32x32x32 RGBA bytes, indexed `[b][g][r]`. It is used until
 enough colors are learned.
+
+**`key_dump` files**, what the learner saw in one pass (the camera image with the hands of the same
+instant, for offline tests of the learner):
+- `.rgb`: width x height x 3 bytes, row major, the RGB of each pixel as the learner converts it from YUV.
+- `_key.lut` (published key table, same format as `key_lut_dump`), `_key_alpha.lut` (alpha of the key
+  table as the learner uses it, one byte per cell in the same cell order; the published one only follows
+  it by steps of more than 10/255) and `_confirm.lut` (alpha of the confirm table, same layout, only while
+  `key_confirm` is on): only with index 00 of a burst, `tables` in the JSON names the files that belong to
+  each pass (null: not written). Files are overwritten by name: an older burst of the same `n` can leave
+  higher indices behind, they have another `burst_ns`.
+- `.json`: `n`, `index`, `count` (passes of the burst), `burst_ns` (`image_ns` of index 00), `image_ns`
+  (CLOCK_MONOTONIC), `image_age_ms` (when the pass started),
+  `pass_interval_ms`, `monotonic_ms`; `camera`: `width`, `height`, `fx`, `fy`, `cx`, `cy`, `pose` and
+  `head` (`position` m, `orientation` quaternion xyzw, stage space at the time of the image; the camera
+  looks at +z with +y down); `params` (`key_tight` ... as fractions, `key_steady` 0 / 1); `counts` (skin,
+  background and scene samples of the pass, shares of skin and background kept by the key and the confirm
+  table); `left` / `right`: `located`, `learned` (all joints tracked and slow), `verified`, `reliability`,
+  `eligible`, `shares` (28, null: none) and `weights` (28, smoothed, after the pass); if located also
+  `joints` (26: `position`, `radius`, `tracked`, `velocity`, `velocity_valid`, stage space, time of the
+  image) and `capsules` (28 x start xyz r, end xyz r, as the learner uses them: tips pulled back, radii
+  not scaled by `key_scale`). Numbers that are not finite are null.
+
+A reader for offline tests: load the JSON, read the `.rgb` as a `height x width x 3` byte array, read the
+tables of the burst from the file names in `tables` (key: `[b][g][r]` RGBA, alpha in the 4th byte;
+key_alpha and confirm: one byte per cell; cell `r + 32 * g + 1024 * b` with each channel
+`(v * 31 + 127) // 255`, a color is kept above 0.5, a byte of 128 or more). `shares` (key_alpha beside
+the axis, confirm on it, key_alpha while confirm is off) and the `*_kept` counts use key_alpha and
+confirm, not the published key. Keep only the files whose `burst_ns` matches the one of index 00.
+Project the capsules with the camera pose and `fx`, `fy`, `cx`, `cy`: `pixel = (x / z * fx + cx, y / z * fy + cy)` for a point `(x, y, z)` in the
+camera frame (`orientation` inverse times the point minus `position`).
 
 **Testing the leak map on the headset** (`adb logcat -s ALVR_CAM`, `auto_key 1`, debug view "Tint mask"):
 - [ ] `key_leak_map 0`: same look and same App / TW times as before; no `leak map` lines in the log.

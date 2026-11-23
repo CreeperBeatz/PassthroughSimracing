@@ -8,13 +8,13 @@ use crate::{
     stream::PALM_JOINTS,
 };
 use alvr_common::{
-    RelaxedAtomic,
+    Pose, RelaxedAtomic,
     glam::{Quat, Vec2, Vec3, Vec4},
     parking_lot::{Mutex, RwLock},
 };
 use alvr_graphics::{
-    BridgeChoice, CameraView, ColorModel, HAND_SEGMENTS, HandColorSamples, HandShape, LeakMap,
-    LeakSnapshot, SEGMENT_JOINTS, SampledHand, WristAxes,
+    BridgeChoice, CameraView, ColorModel, DumpHand, DumpJoint, HAND_SEGMENTS, HandColorSamples,
+    HandShape, KeyDump, LeakMap, LeakSnapshot, LocatedHand, SEGMENT_JOINTS, SampledHand, WristAxes,
 };
 use openxr as xr;
 use std::{
@@ -45,7 +45,7 @@ const BRIDGE_HOLD: Duration = Duration::from_secs(1);
 const LEAK_MAP_STEP: u32 = 8;
 // Grid of the camera view for `debug.alvr.key_leak_dump`
 const LEAK_DUMP_SIZE: [u32; 2] = [40, 30];
-// For `debug.alvr.key_lut_dump`
+// For `debug.alvr.key_lut_dump` and `debug.alvr.key_dump`
 const LEARNED_LUT_DIR: &str = "/sdcard/Android/data/alvr.client.dev/files";
 
 pub fn enabled() -> bool {
@@ -218,6 +218,8 @@ fn learn_loop(context: &Context) {
     // Flexion and deviation of each bridge, for the log
     let mut bridge_angles = [(0.0, 0.0); 2];
     let mut gates = [GateCounts::default(); 2];
+    let mut last_dump_value = None;
+    let mut dump = None;
 
     while context.running.value() {
         let camera = match PassthroughCamera::open() {
@@ -246,6 +248,24 @@ fn learn_loop(context: &Context) {
             let elapsed = last_update.elapsed().as_secs_f32();
             last_update = Instant::now();
 
+            if is_new_value(&mut last_dump_value, "debug.alvr.key_dump") {
+                dump = last_dump_value.filter(|n| *n != 0).map(|n| DumpRequest {
+                    n,
+                    count: debug_property("debug.alvr.key_dump_burst")
+                        .unwrap_or(1)
+                        .clamp(1, 30) as u32,
+                    index: 0,
+                    burst_ns: 0,
+                    key_table: None,
+                    key_alpha_table: None,
+                    confirm_table: None,
+                    pass_start_ns: 0,
+                });
+            }
+            if let Some(dump) = &mut dump {
+                dump.pass_start_ns = monotonic_ns();
+            }
+
             // Once the camera is sure where the forearm is, it is not background
             let wrist = WristParams::load();
             let arm_directions = bridges.map(|bridge| {
@@ -262,7 +282,16 @@ fn learn_loop(context: &Context) {
                 exclusions,
                 verify_hands,
                 verify_rings,
-            }) = sample(context, &camera, &frame, arm_directions, steady, &mut gates)
+                located,
+            }) = sample(
+                context,
+                &camera,
+                &frame,
+                arm_directions,
+                steady,
+                &mut gates,
+                dump.is_some(),
+            )
             else {
                 continue;
             };
@@ -332,8 +361,12 @@ fn learn_loop(context: &Context) {
                 }
             });
 
+            // For the dump
+            let mut pass_shares = [None; 2];
+            let mut reliabilities = [0.0; 2];
             for (i, (weights, hand)) in weights.iter_mut().zip(&verify_hands).enumerate() {
                 let reliability = alvr_graphics::verification_reliability(verify_kept[i]);
+                reliabilities[i] = reliability;
                 let shares = hand.as_ref().and_then(|(hand, eligible)| {
                     model.segment_shares(
                         &view,
@@ -344,6 +377,7 @@ fn learn_loop(context: &Context) {
                         |x, y| frame.rgb(x, y),
                     )
                 });
+                pass_shares[i] = shares;
                 let targets = shares.map_or([0.0; HAND_SEGMENTS], |shares| {
                     shares.map(|share| alvr_graphics::verification_weight(share, reliability))
                 });
@@ -490,6 +524,76 @@ fn learn_loop(context: &Context) {
                     *context.lut.lock() = Some(new_lut);
                     leak_learner.alpha_changed = true;
                 }
+            }
+
+            if let Some(request) = &mut dump
+                && let Some(located) = located
+            {
+                let (head, located) = *located;
+                let dump_hands = [0, 1].map(|i| DumpHand {
+                    located: located[i],
+                    learned: hands[i].is_some(),
+                    verified: verify_hands[i].is_some(),
+                    eligible: verify_hands[i]
+                        .as_ref()
+                        .map_or([false; HAND_SEGMENTS], |(_, eligible)| *eligible),
+                    shares: pass_shares[i],
+                    weights: weights[i],
+                    reliability: reliabilities[i],
+                });
+                let calibration = &camera.calibration;
+                let pass = KeyDump {
+                    n: request.n,
+                    index: request.index,
+                    count: request.count,
+                    burst_ns: 0,
+                    image_ns: frame.timestamp_ns,
+                    image_age_ms: (request.pass_start_ns - frame.timestamp_ns) as f64 * 1e-6,
+                    pass_interval_ms: elapsed * 1000.0,
+                    monotonic_ms: request.pass_start_ns as f64 * 1e-6,
+                    width: calibration.width,
+                    height: calibration.height,
+                    intrinsics: calibration.intrinsics,
+                    camera: Pose {
+                        orientation: view.orientation,
+                        position: view.position,
+                    },
+                    head,
+                    params: vec![
+                        ("key_tight", model.tightness),
+                        ("key_confirm", model.confirm_tightness),
+                        ("key_smooth", model.skin_smoothing),
+                        ("key_bias", model.skin_bias),
+                        ("key_unknown", model.unknown_keep),
+                        ("key_steady", f32::from(u8::from(steady))),
+                    ],
+                    counts: vec![
+                        ("skin", samples.skin.len() as f32),
+                        ("background", samples.background.len() as f32),
+                        ("scene", samples.scene.len() as f32),
+                        ("skin_kept", model.kept_fraction(&samples.skin)),
+                        (
+                            "skin_kept_confirm",
+                            model.confirm_kept_fraction(&samples.skin),
+                        ),
+                        ("background_kept", model.kept_fraction(&samples.background)),
+                        (
+                            "background_kept_confirm",
+                            model.confirm_kept_fraction(&samples.background),
+                        ),
+                    ],
+                    key_table: None,
+                    key_alpha_table: None,
+                    confirm_table: None,
+                    hands: dump_hands,
+                };
+                write_dump(request, pass, &frame, &last_lut, &model);
+            }
+            if dump
+                .as_ref()
+                .is_some_and(|request| request.index >= request.count)
+            {
+                dump = None;
             }
 
             leak_learner.update(
@@ -710,6 +814,88 @@ fn dump_lut(lut: &[u8]) {
     }
 }
 
+/// A burst of `debug.alvr.key_dump`
+struct DumpRequest {
+    n: i64,
+    count: u32,
+    // Of the next pass
+    index: u32,
+    // Image time of the first pass
+    burst_ns: i64,
+    // Names of the table files of the first pass, if they were written
+    key_table: Option<String>,
+    key_alpha_table: Option<String>,
+    confirm_table: Option<String>,
+    // CLOCK_MONOTONIC
+    pass_start_ns: i64,
+}
+
+fn monotonic_ns() -> i64 {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) };
+
+    time.tv_sec * 1_000_000_000 + time.tv_nsec
+}
+
+// For offline tests: the camera image as the learner reads it, the hands and the tables (with the
+// first pass of a burst only, they change slowly)
+fn write_dump(
+    request: &mut DumpRequest,
+    mut pass: KeyDump,
+    frame: &CameraFrame,
+    lut: &[u8],
+    model: &ColorModel,
+) {
+    let name = format!("alvr_dump_{}_{:02}", request.n, request.index);
+    let label = format!("dump {}/{:02}", request.n, request.index);
+    let is_first = request.index == 0;
+    request.index += 1;
+
+    let result = fs::create_dir_all(LEARNED_LUT_DIR).and_then(|()| {
+        if is_first {
+            request.burst_ns = pass.image_ns;
+            if !lut.is_empty() {
+                let file = format!("{name}_key.lut");
+                fs::write(format!("{LEARNED_LUT_DIR}/{file}"), lut)?;
+                request.key_table = Some(file);
+            }
+            if let Some(key) = model.key_table() {
+                let file = format!("{name}_key_alpha.lut");
+                fs::write(format!("{LEARNED_LUT_DIR}/{file}"), key)?;
+                request.key_alpha_table = Some(file);
+            }
+            if let Some(confirm) = model.confirm_table() {
+                let file = format!("{name}_confirm.lut");
+                fs::write(format!("{LEARNED_LUT_DIR}/{file}"), confirm)?;
+                request.confirm_table = Some(file);
+            }
+        }
+        pass.burst_ns = request.burst_ns;
+        pass.key_table.clone_from(&request.key_table);
+        pass.key_alpha_table.clone_from(&request.key_alpha_table);
+        pass.confirm_table.clone_from(&request.confirm_table);
+
+        let mut rgb = Vec::with_capacity(pass.width as usize * pass.height as usize * 3);
+        for y in 0..pass.height {
+            for x in 0..pass.width {
+                rgb.extend(frame.rgb(x, y));
+            }
+        }
+        fs::write(format!("{LEARNED_LUT_DIR}/{name}.rgb"), rgb)?;
+        let path = format!("{LEARNED_LUT_DIR}/{name}.json");
+        fs::write(&path, pass.to_json())?;
+
+        Ok(path)
+    });
+    match result {
+        Ok(path) => camera::log(&format!("{label}: {path}")),
+        Err(e) => camera::log(&format!("{label}: {e}")),
+    }
+}
+
 fn percent(property: &str, default: i64) -> f32 {
     debug_property(property).unwrap_or(default).clamp(0, 1000) as f32 / 100.0
 }
@@ -732,11 +918,13 @@ struct Sampled {
     verify_hands: [Option<(SampledHand, [bool; HAND_SEGMENTS])>; 2],
     /// The background colors of verified hands whose colors are not learned. Not learned either
     verify_rings: [Vec<[u8; 3]>; 2],
+    /// The head and the located hands, only for `debug.alvr.key_dump`
+    located: Option<Box<(Pose, [Option<LocatedHand>; 2])>>,
 }
 
 // `arm_directions`: of the forearms where the camera is sure, in the space of the wrist joint. None: the
 // default, opposite to the fingers. `steady`: see `debug.alvr.key_steady`. `gates`: counts why
-// segments are not verified
+// segments are not verified. `keep_located`: for `debug.alvr.key_dump`
 fn sample(
     context: &Context,
     camera: &PassthroughCamera,
@@ -744,6 +932,7 @@ fn sample(
     arm_directions: [Option<Vec3>; 2],
     steady: bool,
     gates: &mut [GateCounts; 2],
+    keep_located: bool,
 ) -> Option<Sampled> {
     // The OpenXR time of the Quest runtime is CLOCK_MONOTONIC, like the timestamps of the camera
     let time = xr::Time::from_nanos(frame.timestamp_ns);
@@ -773,6 +962,7 @@ fn sample(
     let mut exclusions = Vec::with_capacity(2 * (1 + alvr_graphics::ARM_EXCLUSION_SPHERES));
     let mut wrists = [None; 2];
     let mut verify_hands = [None; 2];
+    let mut located = [None; 2];
     let hands = [0, 1].map(|i| {
         let tracker = interaction_context.hands_interaction[i]
             .skeleton_tracker
@@ -801,6 +991,18 @@ fn sample(
         let shape = HandShape::from_joints(
             &joints.map(|joint| crate::from_xr_vec3(joint.pose.position).extend(joint.radius)),
         );
+        if keep_located {
+            let joints = std::array::from_fn(|joint| DumpJoint {
+                position: crate::from_xr_vec3(joints[joint].pose.position),
+                radius: joints[joint].radius,
+                tracked: tracked[joint],
+                velocity: crate::from_xr_vec3(velocities[joint].linear_velocity),
+                velocity_valid: velocities[joint]
+                    .velocity_flags
+                    .contains(xr::SpaceVelocityFlags::LINEAR_VALID),
+            });
+            located[i] = Some(LocatedHand { joints, shape });
+        }
         // Also partly tracked and fast hands: the leak map must not learn them
         let valid_speed = velocities
             .iter()
@@ -913,5 +1115,6 @@ fn sample(
         exclusions,
         verify_hands,
         verify_rings,
+        located: keep_located.then(|| Box::new((head, located))),
     })
 }

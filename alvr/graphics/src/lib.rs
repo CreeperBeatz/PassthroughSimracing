@@ -1,5 +1,6 @@
 mod color_model;
 mod depth_mask;
+mod key_dump;
 mod leak_map;
 mod lobby;
 mod staging;
@@ -10,6 +11,7 @@ mod tests;
 
 pub use color_model::*;
 pub use depth_mask::*;
+pub use key_dump::*;
 pub use leak_map::*;
 pub use lobby::*;
 pub use stream::*;

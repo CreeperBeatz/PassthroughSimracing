@@ -410,6 +410,18 @@ impl ColorModel {
         })
     }
 
+    /// The alpha of the key table as `segment_shares` and `kept_fraction` use it, one byte per cell in
+    /// the order of the LUT. The published LUT only follows it by steps of more than `MIN_LUT_CHANGE`
+    /// of the client. None without a LUT
+    pub fn key_table(&self) -> Option<Vec<u8>> {
+        self.alpha.as_deref().map(table_bytes)
+    }
+
+    /// The alpha of the confirm table, one byte per cell in the order of the LUT. None while it is off
+    pub fn confirm_table(&self) -> Option<Vec<u8>> {
+        self.confirm.as_deref().map(table_bytes)
+    }
+
     /// Fraction of the colors that are kept by the current LUT, for diagnostics
     pub fn kept_fraction(&self, colors: &[[u8; 3]]) -> f32 {
         self.alpha
@@ -455,6 +467,13 @@ impl ColorModel {
 
         lost.map(|count| count as f32 / colors.len().max(1) as f32)
     }
+}
+
+fn table_bytes(alpha: &[f32]) -> Vec<u8> {
+    alpha
+        .iter()
+        .map(|alpha| (alpha * 255.0).round() as u8)
+        .collect()
 }
 
 fn kept_by(alpha: &[f32], colors: &[[u8; 3]]) -> f32 {
