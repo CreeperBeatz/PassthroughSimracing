@@ -43,7 +43,7 @@ const DECODER_MAX_TIMEOUT_MULTIPLIER: f32 = 0.8;
 
 // Joints that move with the arm, not with the fingers: palm, wrist and the knuckles of the four
 // fingers (indices of `xr::HandJointEXT`). The wrist alone barely moves when the hand turns in place
-const PALM_JOINTS: [usize; 6] = [0, 1, 7, 12, 17, 22];
+pub(crate) const PALM_JOINTS: [usize; 6] = [0, 1, 7, 12, 17, 22];
 const WRIST_JOINT: usize = 1;
 
 // The solid fill of the hands fades out between these speeds (m/s)

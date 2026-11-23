@@ -98,6 +98,14 @@ impl PassthroughLayer<'_> {
 /// - `setprop debug.alvr.key_unknown <percent>`: how much to keep colors that were never seen
 /// - `setprop debug.alvr.key_bias <percent>`: preference for skin if the background looks the same
 /// - `setprop debug.alvr.key_tight <percent>`: how similar to the skin a color must be
+/// - `setprop debug.alvr.key_smooth <percent>`: width of the smoothing of the skin colors, of a LUT texel
+///   (70..100). `key_tight` is scaled by its cube: 70 keeps rarer skin colors, not more around common ones
+/// - `setprop debug.alvr.key_confirm <percent>`: `key_tight` of a second table (never uploaded) for the points
+///   on the axis of each segment when hand segments are verified, and for its reliability. At most
+///   `key_tight`. 0: off, the key table
+/// - `setprop debug.alvr.key_steady 0`: a hand is verified only if all its joints are tracked and slow, as
+///   before. 1: if its palm is, each segment whose two joints are. Its reliability then comes from its own
+///   background only
 /// - `setprop debug.alvr.playzone <n>`: another value remembers the playzone now (keep the hands away)
 /// - `setprop debug.alvr.playzone_auto 0`: don't remember the playzone when no hands are tracked
 /// - `setprop debug.alvr.auto_key 1` before starting the app: learn the colors with the camera

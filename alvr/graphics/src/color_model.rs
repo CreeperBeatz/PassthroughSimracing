@@ -20,8 +20,11 @@ const SCENE_MEMORY: f32 = 20.0;
 const PAST_BACKGROUND_WEIGHT: f32 = 0.4;
 const SCENE_WEIGHT: f32 = 0.5;
 // Width of the smoothing of the color densities, in LUT texels. The camera colors are a bit different
-// from the colors seen by the compositor (about one texel).
-const SKIN_SMOOTHING: f32 = 1.0;
+// from the colors seen by the compositor (about one texel). The one of the skin is
+// `ColorModel::skin_smoothing`, within these limits
+const MIN_SKIN_SMOOTHING: f32 = 0.7;
+// Wider than 1 keeps more colors around the skin colors: no use
+const MAX_SKIN_SMOOTHING: f32 = 1.0;
 const BACKGROUND_SMOOTHING: f32 = 1.3;
 // Densities below this are never significant
 const MIN_FLOOR: f32 = 1e-6;
@@ -33,6 +36,10 @@ const CONTAMINATION: f32 = 0.25;
 // The scene may contain arms and hands that are not tracked: it must not remove skin colors
 const SCENE_CONTAMINATION: f32 = 1.0;
 const MIN_SAMPLES: usize = 300;
+// Fewer colors around a hand tell nothing about its background
+const MIN_RING_COLORS: usize = 50;
+// A segment is only checked if this many of its points are in the image
+const MIN_SEGMENT_POINTS: usize = 8;
 
 struct Density {
     // Sums up to 1 (or it's all zeros)
@@ -113,6 +120,18 @@ fn smooth(values: &[f32], sigma: f32) -> Vec<f32> {
     current
 }
 
+// Move the alpha of a table towards the new targets, or start with them
+fn blend(alpha: Option<Vec<f32>>, targets: Vec<f32>) -> Vec<f32> {
+    if let Some(mut alpha) = alpha {
+        for (alpha, target) in alpha.iter_mut().zip(targets) {
+            *alpha += (target - *alpha) * BLEND;
+        }
+        alpha
+    } else {
+        targets
+    }
+}
+
 pub struct ColorModel {
     skin: Density,
     past_skin: Vec<f32>,
@@ -121,6 +140,10 @@ pub struct ColorModel {
     past_background: Vec<f32>,
     scene: Density,
     alpha: Option<Vec<f32>>,
+    /// Like `alpha` with `confirm_tightness`, never uploaded. None while it is off
+    confirm: Option<Vec<f32>>,
+    /// Cells that the last table would keep if no background or scene color was seen there, for the log
+    kept_without_background: Vec<bool>,
     /// Probability (0..1) that a color that is seen neither on the hand nor in the background belongs to
     /// the hand. High values keep e.g. watches and lit fingertips, low values remove clutter.
     pub unknown_keep: f32,
@@ -130,6 +153,14 @@ pub struct ColorModel {
     /// How similar to the skin a color must be, as a fraction of the typical density of the skin colors.
     /// Low values accept similar colors that were never seen, which shows complex backgrounds.
     pub tightness: f32,
+    /// Width of the smoothing of the skin colors, in LUT texels (0.7..1.5). The tightness is scaled by
+    /// its cube: a narrower one spreads less of each skin color to its neighbours, so rarer skin colors
+    /// can be kept without keeping more around the common ones.
+    pub skin_smoothing: f32,
+    /// Tightness of a second table that only confirms the hand segments (see `segment_shares`), with
+    /// the same colors and formula. Below `tightness` it keeps everything the key keeps and more of
+    /// the rare skin colors. 0: off, the key table is used.
+    pub confirm_tightness: f32,
 }
 
 impl Default for ColorModel {
@@ -140,10 +171,14 @@ impl Default for ColorModel {
             past_background: vec![0.0; TEXEL_COUNT],
             scene: Density::new(SCENE_MEMORY),
             alpha: None,
+            confirm: None,
+            kept_without_background: vec![false; TEXEL_COUNT],
             unknown_keep: 0.1,
             skin_bias: 1.5,
             past_skin: vec![0.0; TEXEL_COUNT],
             tightness: 0.2,
+            skin_smoothing: 1.0,
+            confirm_tightness: 0.0,
         }
     }
 }
@@ -182,16 +217,28 @@ impl ColorModel {
             .zip(&self.past_skin)
             .map(|(current, past)| f32::max(*current, past * PAST_SKIN_WEIGHT))
             .collect::<Vec<_>>();
-        let skin = smooth(&skin, SKIN_SMOOTHING);
+        let skin_smoothing = self
+            .skin_smoothing
+            .clamp(MIN_SKIN_SMOOTHING, MAX_SKIN_SMOOTHING);
+        let skin = smooth(&skin, skin_smoothing);
         // Density that is typical for the colors of the skin
         let skin_sum = skin.iter().sum::<f32>().max(1e-6);
         let typical_density = skin.iter().map(|d| d * d).sum::<f32>() / skin_sum;
         // If unknown colors are kept, there is no limit of the similarity
-        let floor = if self.unknown_keep > 0.5 {
-            MIN_FLOOR
-        } else {
-            f32::max(typical_density * self.tightness, MIN_FLOOR)
+        let floor_for = |tightness: f32| {
+            if self.unknown_keep > 0.5 {
+                MIN_FLOOR
+            } else {
+                f32::max(
+                    typical_density * tightness * skin_smoothing.powi(3),
+                    MIN_FLOOR,
+                )
+            }
         };
+        let floor = floor_for(self.tightness);
+        // Never stricter than the key, so that it keeps at least what the key keeps
+        let confirm_floor = (self.confirm_tightness > 0.0)
+            .then(|| floor_for(self.confirm_tightness.min(self.tightness)));
         let background = self
             .background
             .values
@@ -201,34 +248,40 @@ impl ColorModel {
             .collect::<Vec<_>>();
         let background = smooth(&background, BACKGROUND_SMOOTHING);
         let scene = smooth(&self.scene.values, BACKGROUND_SMOOTHING);
-        let backgrounds = background.iter().zip(&scene);
         let skin_bias = self.skin_bias;
         let unknown_keep = self.unknown_keep.clamp(0.01, 0.99);
-        let skin_floor = floor * (unknown_keep / (1.0 - unknown_keep)).powf(LIKELIHOOD_SOFTNESS);
-        let target = skin
-            .iter()
-            .zip(backgrounds)
-            .map(|(skin, (background, scene))| {
-                // Remove the part of each that can be explained by samples of the other one
-                let scene = (scene * SCENE_WEIGHT - skin * SCENE_CONTAMINATION).max(0.0);
-                let (skin, background) = (
-                    (skin - background * CONTAMINATION).max(0.0),
-                    (background - skin * CONTAMINATION).max(scene),
-                );
-                let score = ((background + floor) / (skin * skin_bias + skin_floor)).ln();
-                let keep = 1.0 / (1.0 + (score / LIKELIHOOD_SOFTNESS).clamp(-30.0, 30.0).exp());
-                // Make it steeper
-                ((keep - 0.3) / 0.4).clamp(0.0, 1.0)
-            });
-
-        let alpha = if let Some(mut alpha) = self.alpha.take() {
-            for (alpha, target) in alpha.iter_mut().zip(target) {
-                *alpha += (target - *alpha) * BLEND;
-            }
-            alpha
-        } else {
-            target.collect()
+        let unknown_ratio = (unknown_keep / (1.0 - unknown_keep)).powf(LIKELIHOOD_SOFTNESS);
+        let skin_floor = floor * unknown_ratio;
+        let target = |skin: f32, background: f32, floor: f32| {
+            let score = ((background + floor) / (skin * skin_bias + floor * unknown_ratio)).ln();
+            let keep = 1.0 / (1.0 + (score / LIKELIHOOD_SOFTNESS).clamp(-30.0, 30.0).exp());
+            // Make it steeper
+            ((keep - 0.3) / 0.4).clamp(0.0, 1.0)
         };
+
+        let mut targets = Vec::with_capacity(TEXEL_COUNT);
+        let mut confirm_targets = Vec::with_capacity(confirm_floor.map_or(0, |_| TEXEL_COUNT));
+        for (i, kept_without_background) in self.kept_without_background.iter_mut().enumerate() {
+            // Remove the part of each that can be explained by samples of the other one
+            let scene = (scene[i] * SCENE_WEIGHT - skin[i] * SCENE_CONTAMINATION).max(0.0);
+            let (skin_left, background) = (
+                (skin[i] - background[i] * CONTAMINATION).max(0.0),
+                (background[i] - skin[i] * CONTAMINATION).max(scene),
+            );
+            targets.push(target(skin_left, background, floor));
+            if let Some(confirm_floor) = confirm_floor {
+                confirm_targets.push(target(skin_left, background, confirm_floor));
+            }
+            // Same as a target above 0.5 with no background and no scene
+            *kept_without_background = skin[i] * skin_bias + skin_floor > floor;
+        }
+
+        // The confirm table starts from the key table, so that it always keeps at least as much
+        self.confirm = confirm_floor.map(|_| {
+            let start = self.confirm.take().or_else(|| self.alpha.clone());
+            blend(start, confirm_targets)
+        });
+        let alpha = blend(self.alpha.take(), targets);
 
         let channel = |i: usize| (i * 255 / (COLOR_LUT_RESOLUTION - 1)) as u8;
         let lut = alpha
@@ -248,26 +301,28 @@ impl ColorModel {
         Some(lut)
     }
 
-    /// Check the tracked hand against the image. Returns for each segment if it is really there (0..1).
-    /// `background_kept`: fraction of the colors around the hand that look like the hand. If that is
-    /// high, nothing can be said.
-    pub fn verify_hand(
+    /// Check the tracked hand against the image: for each segment, the share of its points whose color
+    /// is kept (0..1), see `verification_weight`. The points on its axis are checked with the confirm
+    /// table if it is on, the points beside the axis always with the key table, so that a hand tracked
+    /// beside the real one is found as well as with the key alone. None for segments that are not
+    /// `eligible` or have too few points in the image. None without a LUT.
+    pub fn segment_shares(
         &self,
         camera: &CameraView,
         width: u32,
         height: u32,
         hand: &SampledHand,
-        background_kept: f32,
+        eligible: &[bool; HAND_SEGMENTS],
         color: impl Fn(u32, u32) -> [u8; 3],
-    ) -> [f32; HAND_SEGMENTS] {
-        const MIN_POINTS: usize = 8;
+    ) -> Option<[Option<f32>; HAND_SEGMENTS]> {
+        let alpha = self.alpha.as_ref()?;
+        let confirm = self.confirm.as_ref().unwrap_or(alpha);
 
-        let Some(alpha) = &self.alpha else {
-            return [0.0; HAND_SEGMENTS];
-        };
-        let reliability = verification_reliability(background_kept);
-
-        hand.shape.segments.map(|[start, end]| {
+        Some(std::array::from_fn(|segment| {
+            if !eligible[segment] {
+                return None;
+            }
+            let [start, end] = hand.shape.segments[segment];
             let axis = (end - start).truncate();
             let middle = (start + end).truncate() / 2.0;
             let side = axis
@@ -277,7 +332,7 @@ impl ColorModel {
             let mut point_count = 0;
             let mut skin_count = 0;
             for along in [0.1, 0.3, 0.5, 0.7, 0.9] {
-                for offset in [-0.6, 0.0, 0.6] {
+                for (offset, table) in [(-0.6, alpha), (0.0, confirm), (0.6, alpha)] {
                     let radius = start.w + (end.w - start.w) * along;
                     let point = start.truncate() + axis * along + side * radius * offset;
                     let Some((pixel, _)) = camera.project(point) else {
@@ -291,17 +346,14 @@ impl ColorModel {
                         continue;
                     }
                     point_count += 1;
-                    if alpha[texel_index(color(pixel.x as u32, pixel.y as u32))] > 0.5 {
+                    if table[texel_index(color(pixel.x as u32, pixel.y as u32))] > 0.5 {
                         skin_count += 1;
                     }
                 }
             }
-            if point_count < MIN_POINTS {
-                return 0.0;
-            }
 
-            reliability * smoothstep(0.5, 0.8, skin_count as f32 / point_count as f32)
-        })
+            (point_count >= MIN_SEGMENT_POINTS).then(|| skin_count as f32 / point_count as f32)
+        }))
     }
 
     /// Score of each candidate direction of the wrist bridge (see `WristAxes`): the share of the points
@@ -360,30 +412,70 @@ impl ColorModel {
 
     /// Fraction of the colors that are kept by the current LUT, for diagnostics
     pub fn kept_fraction(&self, colors: &[[u8; 3]]) -> f32 {
-        let Some(alpha) = &self.alpha else {
-            return 1.0;
-        };
-        let kept = colors
-            .iter()
-            .filter(|color| alpha[texel_index(**color)] > 0.5)
-            .count();
-
-        kept as f32 / colors.len().max(1) as f32
+        self.alpha
+            .as_ref()
+            .map_or(1.0, |alpha| kept_by(alpha, colors))
     }
 
     /// Same as `kept_fraction`, for the colors around one hand: how much of its background would show
     /// in the key. None without a learned LUT or with too few colors.
     pub fn leak_fraction(&self, colors: &[[u8; 3]]) -> Option<f32> {
-        const MIN_COLORS: usize = 50;
-
-        (self.alpha.is_some() && colors.len() >= MIN_COLORS).then(|| self.kept_fraction(colors))
+        (self.alpha.is_some() && colors.len() >= MIN_RING_COLORS)
+            .then(|| self.kept_fraction(colors))
     }
+
+    /// Same as `kept_fraction`, with the confirm table if it is on: what `segment_shares` sees as skin
+    pub fn confirm_kept_fraction(&self, colors: &[[u8; 3]]) -> f32 {
+        match &self.confirm {
+            Some(confirm) => kept_by(confirm, colors),
+            None => self.kept_fraction(colors),
+        }
+    }
+
+    /// Same as `leak_fraction`, with the confirm table if it is on
+    pub fn confirm_leak_fraction(&self, colors: &[[u8; 3]]) -> Option<f32> {
+        (self.alpha.is_some() && colors.len() >= MIN_RING_COLORS)
+            .then(|| self.confirm_kept_fraction(colors))
+    }
+
+    /// Of the colors, the fractions that the key doesn't keep: [too rare as skin colors, removed because
+    /// of the background or the scene]. The second ones would be kept by the last table if no
+    /// background or scene color was seen there. For diagnostics, [0, 0] without a LUT.
+    pub fn lost_fractions(&self, colors: &[[u8; 3]]) -> [f32; 2] {
+        let Some(alpha) = &self.alpha else {
+            return [0.0; 2];
+        };
+        let mut lost = [0; 2];
+        for color in colors {
+            let index = texel_index(*color);
+            if alpha[index] <= 0.5 {
+                lost[usize::from(self.kept_without_background[index])] += 1;
+            }
+        }
+
+        lost.map(|count| count as f32 / colors.len().max(1) as f32)
+    }
+}
+
+fn kept_by(alpha: &[f32], colors: &[[u8; 3]]) -> f32 {
+    let kept = colors
+        .iter()
+        .filter(|color| alpha[texel_index(**color)] > 0.5)
+        .count();
+
+    kept as f32 / colors.len().max(1) as f32
 }
 
 /// How much the camera can tell about the hand (0..1): nothing if most of the colors around it look like
 /// it (`background_kept`, 0..1)
 pub fn verification_reliability(background_kept: f32) -> f32 {
     1.0 - smoothstep(0.35, 0.65, background_kept)
+}
+
+/// Weight of a segment for the solid fill (0..1): from its share (see `ColorModel::segment_shares`, None:
+/// 0) and the `verification_reliability`
+pub fn verification_weight(share: Option<f32>, reliability: f32) -> f32 {
+    share.map_or(0.0, |share| reliability * smoothstep(0.5, 0.8, share))
 }
 
 fn smoothstep(min: f32, max: f32, value: f32) -> f32 {
@@ -638,6 +730,12 @@ impl HandColorSamples {
     }
 }
 
+// Distances from the surface of the hand, with a margin for tracking and timing errors
+const SKIN_MAX: f32 = -0.005;
+const FINGER_MAX: f32 = -0.004;
+const BACKGROUND_MIN: f32 = 0.02;
+const BACKGROUND_MAX: f32 = 0.07;
+
 /// Collect the colors inside of the hands, and around them. `color` returns the RGB color of a pixel.
 pub fn sample_hand_colors(
     camera: &CameraView,
@@ -646,12 +744,6 @@ pub fn sample_hand_colors(
     hands: &[Option<SampledHand>; 2],
     color: impl Fn(u32, u32) -> [u8; 3],
 ) -> HandColorSamples {
-    // Distances from the surface of the hand, with a margin for tracking and timing errors
-    const SKIN_MAX: f32 = -0.005;
-    const FINGER_MAX: f32 = -0.004;
-    const BACKGROUND_MIN: f32 = 0.02;
-    const BACKGROUND_MAX: f32 = 0.07;
-    const STEP: usize = 2;
     const SCENE_STEP: usize = 8;
     const ARM_LENGTH: f32 = 0.5;
     const ARM_RADIUS: f32 = 0.1;
@@ -680,47 +772,102 @@ pub fn sample_hand_colors(
         let Some(hand) = hand else {
             continue;
         };
-        let other_hand = hands[1 - hand_index].as_ref();
+        let start = samples.background.len();
+        sample_hand(
+            camera,
+            width,
+            height,
+            hand,
+            hands[1 - hand_index].as_ref(),
+            &color,
+            Some(&mut samples.skin),
+            &mut samples.background,
+        );
+        samples.background_counts[hand_index] = samples.background.len() - start;
+    }
 
-        let bounds = hand.shape.bounds();
-        let Some((center, depth)) = camera.project(bounds.truncate()) else {
-            continue;
-        };
-        let radius = camera.focal_length * (bounds.w + BACKGROUND_MAX) / depth;
-        let min = (center - radius).max(Vec2::ZERO).as_uvec2();
-        let max = (center + radius)
-            .max(Vec2::ZERO)
-            .as_uvec2()
-            .min(alvr_common::glam::UVec2::new(width, height));
+    samples
+}
 
-        for y in (min.y..max.y).step_by(STEP) {
-            for x in (min.x..max.x).step_by(STEP) {
-                let ray = camera.ray(Vec2::new(x as f32 + 0.5, y as f32 + 0.5));
-                let distance = hand.shape.ray_distance(camera.position, ray);
+/// Only the colors around one hand, like the background of `sample_hand_colors`: for a hand whose
+/// colors are not learned. `other_hand` is not background.
+pub fn sample_ring_colors(
+    camera: &CameraView,
+    width: u32,
+    height: u32,
+    hand: &SampledHand,
+    other_hand: Option<&SampledHand>,
+    color: impl Fn(u32, u32) -> [u8; 3],
+) -> Vec<[u8; 3]> {
+    let mut background = Vec::new();
+    sample_hand(
+        camera,
+        width,
+        height,
+        hand,
+        other_hand,
+        &color,
+        None,
+        &mut background,
+    );
 
+    background
+}
+
+// Skin (if wanted) and background colors of one hand
+#[expect(clippy::too_many_arguments)]
+fn sample_hand(
+    camera: &CameraView,
+    width: u32,
+    height: u32,
+    hand: &SampledHand,
+    other_hand: Option<&SampledHand>,
+    color: &impl Fn(u32, u32) -> [u8; 3],
+    mut skin: Option<&mut Vec<[u8; 3]>>,
+    background: &mut Vec<[u8; 3]>,
+) {
+    const STEP: usize = 2;
+
+    let bounds = hand.shape.bounds();
+    let Some((center, depth)) = camera.project(bounds.truncate()) else {
+        return;
+    };
+    let radius = camera.focal_length * (bounds.w + BACKGROUND_MAX) / depth;
+    let min = (center - radius).max(Vec2::ZERO).as_uvec2();
+    let max = (center + radius)
+        .max(Vec2::ZERO)
+        .as_uvec2()
+        .min(alvr_common::glam::UVec2::new(width, height));
+
+    for y in (min.y..max.y).step_by(STEP) {
+        for x in (min.x..max.x).step_by(STEP) {
+            let ray = camera.ray(Vec2::new(x as f32 + 0.5, y as f32 + 0.5));
+            let distance = hand.shape.ray_distance(camera.position, ray);
+
+            // Without skin the palm test is not needed: skin is never in the ring
+            if let Some(skin) = skin.as_deref_mut() {
                 let is_skin = hand.shape.palm_ray_distance(camera.position, ray) < SKIN_MAX
                     || (hand.is_still && distance < FINGER_MAX);
                 if is_skin {
-                    samples.skin.push(color(x, y));
-                } else if (BACKGROUND_MIN..BACKGROUND_MAX).contains(&distance) {
-                    // The arm is not background
-                    let to_wrist = hand.wrist - camera.position;
-                    let point = camera.position + ray * to_wrist.dot(ray);
-                    let is_arm = (point - hand.wrist).dot(hand.arm_direction) > -0.03;
-                    let is_other_hand = other_hand.is_some_and(|other| {
-                        other.shape.ray_distance(camera.position, ray) < BACKGROUND_MIN
-                            || (point - other.wrist).length() < 0.15
-                    });
-                    if !is_arm && !is_other_hand {
-                        samples.background.push(color(x, y));
-                        samples.background_counts[hand_index] += 1;
-                    }
+                    skin.push(color(x, y));
+                    continue;
+                }
+            }
+            if (BACKGROUND_MIN..BACKGROUND_MAX).contains(&distance) {
+                // The arm is not background
+                let to_wrist = hand.wrist - camera.position;
+                let point = camera.position + ray * to_wrist.dot(ray);
+                let is_arm = (point - hand.wrist).dot(hand.arm_direction) > -0.03;
+                let is_other_hand = other_hand.is_some_and(|other| {
+                    other.shape.ray_distance(camera.position, ray) < BACKGROUND_MIN
+                        || (point - other.wrist).length() < 0.15
+                });
+                if !is_arm && !is_other_hand {
+                    background.push(color(x, y));
                 }
             }
         }
     }
-
-    samples
 }
 
 #[cfg(test)]
@@ -782,6 +929,91 @@ mod tests {
         let index = texel_index(SKIN) * 4;
         for c in 0..3 {
             assert!((i32::from(lut[index + c]) - i32::from(SKIN[c])).abs() <= 5);
+        }
+    }
+
+    // The next alpha of the key table, with the formula from before `skin_smoothing`
+    fn reference_alpha(model: &ColorModel) -> Vec<f32> {
+        let skin = model
+            .skin
+            .values
+            .iter()
+            .zip(&model.past_skin)
+            .map(|(current, past)| f32::max(*current, past * PAST_SKIN_WEIGHT))
+            .collect::<Vec<_>>();
+        let skin = smooth(&skin, 1.0);
+        let skin_sum = skin.iter().sum::<f32>().max(1e-6);
+        let typical_density = skin.iter().map(|d| d * d).sum::<f32>() / skin_sum;
+        let floor = if model.unknown_keep > 0.5 {
+            MIN_FLOOR
+        } else {
+            f32::max(typical_density * model.tightness, MIN_FLOOR)
+        };
+        let background = model
+            .background
+            .values
+            .iter()
+            .zip(&model.past_background)
+            .map(|(current, past)| f32::max(*current, past * PAST_BACKGROUND_WEIGHT))
+            .collect::<Vec<_>>();
+        let background = smooth(&background, BACKGROUND_SMOOTHING);
+        let scene = smooth(&model.scene.values, BACKGROUND_SMOOTHING);
+        let unknown_keep = model.unknown_keep.clamp(0.01, 0.99);
+        let skin_floor = floor * (unknown_keep / (1.0 - unknown_keep)).powf(LIKELIHOOD_SOFTNESS);
+
+        (0..TEXEL_COUNT)
+            .map(|i| {
+                let scene = (scene[i] * SCENE_WEIGHT - skin[i] * SCENE_CONTAMINATION).max(0.0);
+                let (skin, background) = (
+                    (skin[i] - background[i] * CONTAMINATION).max(0.0),
+                    (background[i] - skin[i] * CONTAMINATION).max(scene),
+                );
+                let score = ((background + floor) / (skin * model.skin_bias + skin_floor)).ln();
+                let keep = 1.0 / (1.0 + (score / LIKELIHOOD_SOFTNESS).clamp(-30.0, 30.0).exp());
+                let target = ((keep - 0.3) / 0.4).clamp(0.0, 1.0);
+                model
+                    .alpha
+                    .as_ref()
+                    .map_or(target, |alpha| alpha[i] + (target - alpha[i]) * BLEND)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn default_skin_kernel_is_unchanged() {
+        let bright = |c: [u8; 3]| c.map(|v| (f32::from(v) * 1.5).min(255.0) as u8);
+        let mut mixed = samples(SKIN, GREEN_WALL);
+        mixed.skin.extend(noisy(GREEN_WALL, 150));
+        mixed.background.extend(noisy(SKIN, 150));
+        mixed.scene = noisy([200, 30, 40], 300);
+        let steps = [
+            (samples(SKIN, WHITE_WALL), 3),
+            (samples(SKIN, SKIN), 2),
+            (mixed, 3),
+            (samples(bright(SKIN), bright(GREEN_WALL)), 3),
+        ];
+        // The confirm table doesn't change the key table
+        for (unknown_keep, skin_bias, tightness, confirm_tightness) in [
+            (0.1, 1.5, 0.3, 0.0),
+            (0.1, 1.5, 0.3, 0.12),
+            (0.95, 3.0, 1e-4, 0.0),
+        ] {
+            let mut model = ColorModel {
+                unknown_keep,
+                skin_bias,
+                tightness,
+                skin_smoothing: 1.0,
+                confirm_tightness,
+                ..Default::default()
+            };
+            for (samples, count) in &steps {
+                for _ in 0..*count {
+                    model.add_samples(samples, 0.12);
+                    let expected = reference_alpha(&model);
+                    model.update_lut().unwrap();
+                    assert!(model.alpha.as_ref().unwrap() == &expected);
+                }
+            }
         }
     }
 
@@ -1119,18 +1351,18 @@ mod tests {
 
         let mut model = ColorModel::default();
         assert_eq!(
-            model.verify_hand(&camera, 320, 240, &hand, 0.0, color),
+            verify(&model, &camera, &hand, 0.0, color),
             [0.0; HAND_SEGMENTS]
         );
 
         model.add_samples(&samples(SKIN, WHITE_WALL), 0.1);
         model.update_lut();
-        let result = model.verify_hand(&camera, 320, 240, &hand, 0.0, color);
+        let result = verify(&model, &camera, &hand, 0.0, color);
         assert_eq!(result[0], 1.0);
         assert_eq!(result[HAND_SEGMENTS - 1], 0.0);
 
         // The background looks the same
-        let result = model.verify_hand(&camera, 320, 240, &hand, 0.8, color);
+        let result = verify(&model, &camera, &hand, 0.8, color);
         assert_eq!(result[0], 0.0);
 
         // Outside of the image
@@ -1138,7 +1370,319 @@ mod tests {
             center: Vec2::new(1000.0, 120.0),
             ..camera
         };
-        assert_eq!(model.verify_hand(&far, 320, 240, &hand, 0.0, color)[0], 0.0);
+        assert_eq!(verify(&model, &far, &hand, 0.0, color)[0], 0.0);
+
+        // Segments that are not eligible are not checked
+        let mut eligible = [true; HAND_SEGMENTS];
+        eligible[0] = false;
+        let shares = model
+            .segment_shares(&camera, 320, 240, &hand, &eligible, color)
+            .unwrap();
+        assert_eq!(shares[0], None);
+        assert_eq!(shares[1], Some(1.0));
+    }
+
+    // The verification before the confirm table: all points with the key table
+    fn reference_verify(
+        model: &ColorModel,
+        camera: &CameraView,
+        hand: &SampledHand,
+        background_kept: f32,
+        color: impl Fn(u32, u32) -> [u8; 3],
+    ) -> [f32; HAND_SEGMENTS] {
+        let Some(alpha) = &model.alpha else {
+            return [0.0; HAND_SEGMENTS];
+        };
+        let reliability = verification_reliability(background_kept);
+
+        hand.shape.segments.map(|[start, end]| {
+            let axis = (end - start).truncate();
+            let middle = (start + end).truncate() / 2.0;
+            let side = axis
+                .cross(middle - camera.position)
+                .normalize_or(camera.orientation * Vec3::X);
+
+            let mut point_count = 0;
+            let mut skin_count = 0;
+            for along in [0.1, 0.3, 0.5, 0.7, 0.9] {
+                for offset in [-0.6, 0.0, 0.6] {
+                    let radius = start.w + (end.w - start.w) * along;
+                    let point = start.truncate() + axis * along + side * radius * offset;
+                    let Some((pixel, _)) = camera.project(point) else {
+                        continue;
+                    };
+                    if pixel.x < 0.0 || pixel.y < 0.0 || pixel.x >= 320.0 || pixel.y >= 240.0 {
+                        continue;
+                    }
+                    point_count += 1;
+                    if alpha[texel_index(color(pixel.x as u32, pixel.y as u32))] > 0.5 {
+                        skin_count += 1;
+                    }
+                }
+            }
+            if point_count < 8 {
+                return 0.0;
+            }
+
+            reliability * smoothstep(0.5, 0.8, skin_count as f32 / point_count as f32)
+        })
+    }
+
+    // A shadow on the skin: a few percent of the skin samples
+    const SHADOW: [u8; 3] = [90, 66, 51];
+
+    fn shadow_samples(shadow_count: usize) -> HandColorSamples {
+        let mut samples = samples(SKIN, WHITE_WALL);
+        samples.skin.extend([SHADOW].repeat(shadow_count));
+        samples
+    }
+
+    // Horizontal fingers, 0.5 m in front of the camera, 1 cm radius, at these heights (pixels from the
+    // center of the image, about 4 pixels per cm)
+    fn finger_scene(heights: impl Fn(usize) -> f32) -> (CameraView, SampledHand) {
+        let camera = CameraView {
+            position: Vec3::ZERO,
+            orientation: Quat::IDENTITY,
+            focal_length: Vec2::splat(217.0),
+            center: Vec2::new(160.0, 120.0),
+        };
+        let segments = std::array::from_fn(|i| {
+            let y = heights(i) / 217.0 * 0.5;
+            [
+                Vec4::new(-0.05, y, 0.5, 0.01),
+                Vec4::new(0.05, y, 0.5, 0.01),
+            ]
+        });
+        let hand = SampledHand {
+            shape: HandShape { segments },
+            wrist: Vec3::new(0.05, 0.0, 0.5),
+            arm_direction: Vec3::X,
+            is_still: true,
+        };
+
+        (camera, hand)
+    }
+
+    #[test]
+    fn confirm_off_verifies_like_before() {
+        // The segments move across the finger in the image: all shares from 0 to 1
+        let (camera, hand) = finger_scene(|i| i as f32 * 0.5 - 7.0);
+        // The axis of the finger is in the shadow
+        let color = |_: u32, y: u32| match y {
+            119..=121 => SHADOW,
+            114..=126 => SKIN,
+            _ => WHITE_WALL,
+        };
+        let mut model = ColorModel {
+            tightness: 0.3,
+            ..Default::default()
+        };
+        model.add_samples(&shadow_samples(20), 0.1);
+        model.update_lut();
+        assert!(model.confirm.is_none());
+        assert_eq!(model.kept_fraction(&[SHADOW]), 0.0);
+        for background_kept in [0.0, 0.5, 1.0] {
+            assert_eq!(
+                verify(&model, &camera, &hand, background_kept, color),
+                reference_verify(&model, &camera, &hand, background_kept, color)
+            );
+        }
+        let before = verify(&model, &camera, &hand, 0.0, color);
+        assert!(before.iter().any(|weight| *weight > 0.0 && *weight < 1.0));
+
+        // The confirm table never verifies less
+        model.confirm_tightness = 0.12;
+        for _ in 0..10 {
+            model.add_samples(&shadow_samples(20), 0.1);
+            model.update_lut();
+        }
+        let after = verify(&model, &camera, &hand, 0.0, color);
+        for (before, after) in before.iter().zip(after) {
+            assert!(after >= *before, "{before:?} {after:?}");
+        }
+        assert!(
+            after.iter().sum::<f32>() > before.iter().sum::<f32>() + 1.0,
+            "{before:?} {after:?}"
+        );
+    }
+
+    #[test]
+    fn confirm_table_keeps_what_the_key_keeps() {
+        let mut mixed = samples(SKIN, GREEN_WALL);
+        mixed.skin.extend(noisy(GREEN_WALL, 150));
+        mixed.background.extend(noisy(SKIN, 150));
+        mixed.scene = noisy([200, 30, 40], 300);
+        for samples in [shadow_samples(20), mixed, samples(SKIN, SKIN)] {
+            // Below the key tightness, and above it (capped at it)
+            for (skin_smoothing, confirm_tightness) in [(1.0, 0.12), (0.7, 0.12), (1.0, 0.5)] {
+                // On from the start, and switched on later
+                for first_confirmed in [0, 3] {
+                    let mut model = ColorModel {
+                        tightness: 0.3,
+                        skin_smoothing,
+                        ..Default::default()
+                    };
+                    for update in 0..8 {
+                        model.confirm_tightness = if update >= first_confirmed {
+                            confirm_tightness
+                        } else {
+                            0.0
+                        };
+                        model.add_samples(&samples, 0.12);
+                        model.update_lut();
+                        let Some(confirm) = &model.confirm else {
+                            continue;
+                        };
+                        let alpha = model.alpha.as_ref().unwrap();
+                        for (alpha, confirm) in alpha.iter().zip(confirm) {
+                            assert!(*alpha <= 0.5 || *confirm > 0.5, "{alpha} {confirm}");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Off: not built
+        let mut model = ColorModel::default();
+        model.add_samples(&shadow_samples(20), 0.1);
+        model.update_lut();
+        assert!(model.confirm.is_none());
+    }
+
+    #[test]
+    fn confirm_table_only_checks_the_axis() {
+        let (camera, hand) = finger_scene(|_| 0.0);
+        let mut model = ColorModel {
+            tightness: 0.3,
+            confirm_tightness: 0.12,
+            ..Default::default()
+        };
+        model.add_samples(&shadow_samples(20), 0.1);
+        model.update_lut();
+        assert_eq!(model.kept_fraction(&[SHADOW]), 0.0);
+        assert_eq!(model.confirm_kept_fraction(&[SHADOW]), 1.0);
+
+        // A shadow along the axis is confirmed
+        let shadow_line = |_: u32, y: u32| match y {
+            119..=121 => SHADOW,
+            114..=126 => SKIN,
+            _ => WHITE_WALL,
+        };
+        assert_eq!(verify(&model, &camera, &hand, 0.0, shadow_line)[0], 1.0);
+        // Beside the axis only the key counts: not a hand
+        let all_shadow = |_: u32, _: u32| SHADOW;
+        assert_eq!(verify(&model, &camera, &hand, 0.0, all_shadow)[0], 0.0);
+        // Moved off the hand: as with the key alone
+        let (_, moved) = finger_scene(|_| 4.0);
+        assert_eq!(
+            verify(&model, &camera, &moved, 0.0, shadow_line)[0],
+            reference_verify(&model, &camera, &moved, 0.0, shadow_line)[0]
+        );
+    }
+
+    #[test]
+    fn reliability_comes_from_the_confirm_table() {
+        // The key keeps nothing, the confirm table keeps the skin colored background
+        let mut model = ColorModel {
+            tightness: 10.0,
+            confirm_tightness: 0.12,
+            ..Default::default()
+        };
+        model.add_samples(&samples(SKIN, WHITE_WALL), 0.1);
+        model.update_lut();
+        let ring = noisy(SKIN, 200);
+        assert_eq!(model.kept_fraction(&ring), 0.0);
+        let kept = model.confirm_leak_fraction(&ring).unwrap();
+        assert_eq!(verification_reliability(kept), 0.0, "{kept}");
+        assert_eq!(model.leak_fraction(&ring), Some(0.0));
+    }
+
+    #[test]
+    fn narrow_skin_kernel_keeps_rare_skin_colors() {
+        // A narrow skin peak and a rare skin color (7% of the typical density)
+        let mut skin = vec![SKIN; 600];
+        skin.extend([SHADOW; 15]);
+        let samples = HandColorSamples {
+            skin,
+            background: noisy(GREEN_WALL, 600),
+            ..Default::default()
+        };
+        let lut = |skin_smoothing: f32| {
+            let mut model = ColorModel {
+                tightness: 0.3,
+                skin_smoothing,
+                ..Default::default()
+            };
+            model.add_samples(&samples, 0.1);
+            model.update_lut().unwrap()
+        };
+        let (wide, narrow) = (lut(1.0), lut(0.7));
+
+        assert!(alpha(&wide, SHADOW) < 128, "{}", alpha(&wide, SHADOW));
+        assert!(alpha(&narrow, SHADOW) > 128, "{}", alpha(&narrow, SHADOW));
+        // Around the peak nothing more
+        let center = SKIN.map(|v| texel(v) as i32);
+        for offset in 0..7 * 7 * 7 {
+            let texels = [offset % 7, offset / 7 % 7, offset / 49].map(|o| o - 3);
+            let color = [0, 1, 2].map(|c| {
+                let texel = (center[c] + texels[c]).clamp(0, COLOR_LUT_RESOLUTION as i32 - 1);
+                (texel * 255 / (COLOR_LUT_RESOLUTION as i32 - 1)) as u8
+            });
+            assert!(
+                alpha(&narrow, color) <= alpha(&wide, color),
+                "{texels:?} {} {}",
+                alpha(&narrow, color),
+                alpha(&wide, color)
+            );
+        }
+        // Clamped
+        assert_eq!(lut(0.1), lut(0.7));
+    }
+
+    #[test]
+    fn lost_skin_colors_are_split_by_reason() {
+        let mut model = ColorModel::default();
+        assert_eq!(model.lost_fractions(&[SKIN]), [0.0, 0.0]);
+        let mixed = |main, other| {
+            let mut colors = noisy(main, 850);
+            colors.extend(noisy(other, 150));
+            colors
+        };
+        model.add_samples(
+            &HandColorSamples {
+                skin: mixed(SKIN, GREEN_WALL),
+                background: mixed(GREEN_WALL, SKIN),
+                ..Default::default()
+            },
+            0.1,
+        );
+        model.update_lut();
+
+        assert_eq!(model.lost_fractions(&[SKIN]), [0.0, 0.0]);
+        // Seen as skin, but more in the background
+        assert_eq!(model.lost_fractions(&[GREEN_WALL]), [0.0, 1.0]);
+        // Never seen
+        assert_eq!(model.lost_fractions(&[[20, 40, 200]]), [1.0, 0.0]);
+        assert_eq!(
+            model.lost_fractions(&[SKIN, GREEN_WALL, [20, 40, 200], [20, 40, 200]]),
+            [0.5, 0.25]
+        );
+    }
+
+    // Weights of all segments
+    fn verify(
+        model: &ColorModel,
+        camera: &CameraView,
+        hand: &SampledHand,
+        background_kept: f32,
+        color: impl Fn(u32, u32) -> [u8; 3],
+    ) -> [f32; HAND_SEGMENTS] {
+        let reliability = verification_reliability(background_kept);
+        model
+            .segment_shares(camera, 320, 240, hand, &[true; HAND_SEGMENTS], color)
+            .map_or([0.0; HAND_SEGMENTS], |shares| {
+                shares.map(|share| verification_weight(share, reliability))
+            })
     }
 
     // A hand 0.5 m in front of the camera, the fingers to the left. In the wrist space (turned in some

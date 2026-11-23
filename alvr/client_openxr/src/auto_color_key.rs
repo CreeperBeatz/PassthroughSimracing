@@ -5,6 +5,7 @@ use crate::{
     camera::{self, CameraCalibration, CameraFrame, PassthroughCamera},
     interaction::InteractionContext,
     passthrough::{WristParams, debug_property},
+    stream::PALM_JOINTS,
 };
 use alvr_common::{
     RelaxedAtomic,
@@ -13,7 +14,7 @@ use alvr_common::{
 };
 use alvr_graphics::{
     BridgeChoice, CameraView, ColorModel, HAND_SEGMENTS, HandColorSamples, HandShape, LeakMap,
-    LeakSnapshot, SampledHand, WristAxes,
+    LeakSnapshot, SEGMENT_JOINTS, SampledHand, WristAxes,
 };
 use openxr as xr;
 use std::{
@@ -59,6 +60,20 @@ struct Verified {
     weights: HandWeights,
     leak: [f32; 2],
     bridges: [BridgeChoice; 2],
+}
+
+/// Segments of one hand by why they were or were not verified, and joint velocities without
+/// LINEAR_VALID, counted over the passes since the last log
+#[derive(Clone, Copy, Default)]
+struct GateCounts {
+    fast: usize,
+    untracked: usize,
+    // Fewer than 8 points in the image
+    outside: usize,
+    // Share of kept points below 0.5
+    voted_off: usize,
+    confirmed: usize,
+    no_valid_velocity: usize,
 }
 
 /// The leak map for the render thread
@@ -202,6 +217,7 @@ fn learn_loop(context: &Context) {
     let mut last_bridges = [Instant::now(); 2];
     // Flexion and deviation of each bridge, for the log
     let mut bridge_angles = [(0.0, 0.0); 2];
+    let mut gates = [GateCounts::default(); 2];
 
     while context.running.value() {
         let camera = match PassthroughCamera::open() {
@@ -237,14 +253,24 @@ fn learn_loop(context: &Context) {
                     wrist.is_some_and(|wrist| bridge.confidence >= wrist.min_confidence)
                 })
             });
-            let Some((samples, view, hands, wrists, exclusions)) =
-                sample(context, &camera, &frame, arm_directions)
+            let steady = debug_property("debug.alvr.key_steady").unwrap_or(1) > 0;
+            let Some(Sampled {
+                samples,
+                view,
+                hands,
+                wrists,
+                exclusions,
+                verify_hands,
+                verify_rings,
+            }) = sample(context, &camera, &frame, arm_directions, steady, &mut gates)
             else {
                 continue;
             };
             model.unknown_keep = percent("debug.alvr.key_unknown", 10);
             model.skin_bias = percent("debug.alvr.key_bias", 150);
             model.tightness = percent("debug.alvr.key_tight", 30);
+            model.skin_smoothing = percent("debug.alvr.key_smooth", 100);
+            model.confirm_tightness = percent("debug.alvr.key_confirm", 0);
             model.add_samples(&samples, elapsed);
             let new_lut = if last_lut_update.elapsed() >= LUT_UPDATE_INTERVAL {
                 last_lut_update = Instant::now();
@@ -282,17 +308,44 @@ fn learn_loop(context: &Context) {
                 }
             });
 
-            for (i, (weights, hand)) in weights.iter_mut().zip(&hands).enumerate() {
-                let background_kept = background_kept[i];
-                let targets = hand.as_ref().map_or([0.0; HAND_SEGMENTS], |hand| {
-                    model.verify_hand(
+            // The verification sees the backgrounds of all hands it checks, with the confirm table. The
+            // bridge and the narrower rim keep the key table above
+            let mut verify_background = samples.background.clone();
+            verify_background.extend(verify_rings.iter().flatten());
+            let verify_kept = if !verify_background.is_empty() {
+                model.confirm_kept_fraction(&verify_background)
+            } else if steady {
+                // Nothing around the hands: nothing can be said
+                1.0
+            } else {
+                0.0
+            };
+            let verify_kept = [0, 1].map(|i| {
+                if hands[i].is_none() && verify_hands[i].is_some() {
+                    // Checked but not learned (a finger is fast): only its own ring tells what is
+                    // behind it, the ring of the other hand doesn't. Too few colors: nothing is known
+                    return model.confirm_leak_fraction(&verify_rings[i]).unwrap_or(1.0);
+                }
+                match model.confirm_leak_fraction(samples.hand_background(i)) {
+                    Some(kept) if use_hand_kept => kept,
+                    _ => verify_kept,
+                }
+            });
+
+            for (i, (weights, hand)) in weights.iter_mut().zip(&verify_hands).enumerate() {
+                let reliability = alvr_graphics::verification_reliability(verify_kept[i]);
+                let shares = hand.as_ref().and_then(|(hand, eligible)| {
+                    model.segment_shares(
                         &view,
                         camera.calibration.width,
                         camera.calibration.height,
                         hand,
-                        background_kept,
+                        eligible,
                         |x, y| frame.rgb(x, y),
                     )
+                });
+                let targets = shares.map_or([0.0; HAND_SEGMENTS], |shares| {
+                    shares.map(|share| alvr_graphics::verification_weight(share, reliability))
                 });
                 // Lose trust immediately, gain it slowly
                 for (weight, target) in weights.iter_mut().zip(targets) {
@@ -302,6 +355,17 @@ fn learn_loop(context: &Context) {
                         *weight + (target - *weight) * 0.5
                     };
                 }
+
+                if let (Some((_, eligible)), Some(shares)) = (hand, shares) {
+                    for (is_eligible, share) in eligible.iter().zip(shares) {
+                        match share {
+                            None if *is_eligible => gates[i].outside += 1,
+                            Some(share) if share < 0.5 => gates[i].voted_off += 1,
+                            _ => (),
+                        }
+                    }
+                }
+                gates[i].confirmed += weights.iter().filter(|weight| **weight > 0.0).count();
             }
 
             // Which way from the wrist the camera sees the forearm
@@ -370,10 +434,35 @@ fn learn_loop(context: &Context) {
                 } else {
                     String::new()
                 };
+                // Segments: fast, untracked, outside of the image, voted off, confirmed; joint
+                // velocities without LINEAR_VALID
+                let [left, right] = gates.map(|gate| {
+                    format!(
+                        "f{} u{} o{} v{} c{} nv{}",
+                        gate.fast,
+                        gate.untracked,
+                        gate.outside,
+                        gate.voted_off,
+                        gate.confirmed,
+                        gate.no_valid_velocity
+                    )
+                });
+                gates = [GateCounts::default(); 2];
+                let [lost_floor, lost_background] = model.lost_fractions(&samples.skin);
+                let confirm_log = if model.confirm_tightness > 0.0 {
+                    format!(
+                        ", confirm kept {:.2} {:.2}",
+                        model.confirm_kept_fraction(&samples.skin),
+                        model.confirm_kept_fraction(&verify_background),
+                    )
+                } else {
+                    String::new()
+                };
                 camera::log(&format!(
                     "auto key: skin {} kept {:.2} mean {:?}, background {} kept {:.2} mean {:?}, \
                      verified {:.2} {:.2}, leak {:.2} {:.2}, scene {} kept {:.2}, \
-                     update {:.1} ms{wrist_log}{leak_map}",
+                     update {:.1} ms{wrist_log}{leak_map}, lost floor {lost_floor:.2} \
+                     bg {lost_background:.2}, gate L {left}, R {right}{confirm_log}",
                     samples.skin.len(),
                     model.kept_fraction(&samples.skin),
                     mean(&samples.skin),
@@ -630,23 +719,31 @@ fn mean(colors: &[[u8; 3]]) -> [u32; 3] {
     [0, 1, 2].map(|c| colors.iter().map(|color| u32::from(color[c])).sum::<u32>() / count)
 }
 
-// Colors, camera, hands, the orientation and the axes of their wrists, and spheres around every located
-// hand for the leak map
-type Sampled = (
-    HandColorSamples,
-    CameraView,
-    [Option<SampledHand>; 2],
-    [Option<(Quat, WristAxes)>; 2],
-    Vec<Vec4>,
-);
+struct Sampled {
+    samples: HandColorSamples,
+    view: CameraView,
+    /// The hands whose colors are learned
+    hands: [Option<SampledHand>; 2],
+    /// The orientation and the axes of their wrists
+    wrists: [Option<(Quat, WristAxes)>; 2],
+    /// Spheres around every located hand for the leak map
+    exclusions: Vec<Vec4>,
+    /// The hands that are verified, and which of their segments
+    verify_hands: [Option<(SampledHand, [bool; HAND_SEGMENTS])>; 2],
+    /// The background colors of verified hands whose colors are not learned. Not learned either
+    verify_rings: [Vec<[u8; 3]>; 2],
+}
 
 // `arm_directions`: of the forearms where the camera is sure, in the space of the wrist joint. None: the
-// default, opposite to the fingers
+// default, opposite to the fingers. `steady`: see `debug.alvr.key_steady`. `gates`: counts why
+// segments are not verified
 fn sample(
     context: &Context,
     camera: &PassthroughCamera,
     frame: &CameraFrame,
     arm_directions: [Option<Vec3>; 2],
+    steady: bool,
+    gates: &mut [GateCounts; 2],
 ) -> Option<Sampled> {
     // The OpenXR time of the Quest runtime is CLOCK_MONOTONIC, like the timestamps of the camera
     let time = xr::Time::from_nanos(frame.timestamp_ns);
@@ -675,6 +772,7 @@ fn sample(
     let interaction_context = context.interaction_context.read();
     let mut exclusions = Vec::with_capacity(2 * (1 + alvr_graphics::ARM_EXCLUSION_SPHERES));
     let mut wrists = [None; 2];
+    let mut verify_hands = [None; 2];
     let hands = [0, 1].map(|i| {
         let tracker = interaction_context.hands_interaction[i]
             .skeleton_tracker
@@ -685,15 +783,21 @@ fn sample(
             .ok()
             .flatten()?;
 
-        let all_tracked = joints.iter().all(|joint| {
+        let tracked = joints.map(|joint| {
             joint
                 .location_flags
                 .contains(xr::SpaceLocationFlags::POSITION_TRACKED)
         });
-        let speed = velocities
+        let speeds = velocities.map(|v| crate::from_xr_vec3(v.linear_velocity).length());
+        let all_tracked = tracked.iter().all(|is_tracked| *is_tracked);
+        let speed = speeds.iter().copied().fold(0.0, f32::max);
+        gates[i].no_valid_velocity += velocities
             .iter()
-            .map(|v| crate::from_xr_vec3(v.linear_velocity).length())
-            .fold(0.0, f32::max);
+            .filter(|v| {
+                !v.velocity_flags
+                    .contains(xr::SpaceVelocityFlags::LINEAR_VALID)
+            })
+            .count();
         let shape = HandShape::from_joints(
             &joints.map(|joint| crate::from_xr_vec3(joint.pose.position).extend(joint.radius)),
         );
@@ -729,6 +833,40 @@ fn sample(
             arm_direction,
             valid_speed,
         ));
+        let hand = SampledHand {
+            shape,
+            wrist,
+            arm_direction,
+            is_still: speed < STILL_HAND_SPEED,
+        };
+
+        // Verified are the segments whose joints and the palm are tracked and slow (`steady`), or all
+        // of them if the whole hand is. A joint that is not tracked has no meaningful speed
+        let palm_untracked = PALM_JOINTS.iter().any(|joint| !tracked[*joint]);
+        let palm_fast = PALM_JOINTS
+            .iter()
+            .any(|joint| speeds[*joint] > MAX_HAND_SPEED);
+        let mut eligible = [false; HAND_SEGMENTS];
+        for (segment, (start, end)) in SEGMENT_JOINTS.into_iter().enumerate() {
+            let (is_untracked, is_fast) = if steady {
+                (
+                    palm_untracked || !tracked[start] || !tracked[end],
+                    palm_fast || speeds[start] > MAX_HAND_SPEED || speeds[end] > MAX_HAND_SPEED,
+                )
+            } else {
+                (!all_tracked, speed > MAX_HAND_SPEED)
+            };
+            if is_untracked {
+                gates[i].untracked += 1;
+            } else if is_fast {
+                gates[i].fast += 1;
+            } else {
+                eligible[segment] = true;
+            }
+        }
+        verify_hands[i] = eligible.contains(&true).then_some((hand, eligible));
+
+        // The colors only of the whole hand
         if !all_tracked || speed > MAX_HAND_SPEED {
             return None;
         }
@@ -743,12 +881,7 @@ fn sample(
             Some((orientation, axes))
         });
 
-        Some(SampledHand {
-            shape,
-            wrist,
-            arm_direction,
-            is_still: speed < STILL_HAND_SPEED,
-        })
+        Some(hand)
     });
     drop(interaction_context);
 
@@ -759,6 +892,26 @@ fn sample(
         &hands,
         |x, y| frame.rgb(x, y),
     );
+    // Verified hands whose colors are not learned: only their backgrounds, for the reliability
+    let verify_rings = [0, 1].map(|i| match (&hands[i], &verify_hands[i]) {
+        (None, Some((hand, _))) => alvr_graphics::sample_ring_colors(
+            &view,
+            calibration.width,
+            calibration.height,
+            hand,
+            verify_hands[1 - i].as_ref().map(|(other, _)| other),
+            |x, y| frame.rgb(x, y),
+        ),
+        _ => Vec::new(),
+    });
 
-    Some((samples, view, hands, wrists, exclusions))
+    Some(Sampled {
+        samples,
+        view,
+        hands,
+        wrists,
+        exclusions,
+        verify_hands,
+        verify_rings,
+    })
 }

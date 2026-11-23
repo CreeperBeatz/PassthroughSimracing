@@ -114,6 +114,18 @@ the 28 (two for a moving bridge with solid fill); no texture samples. `key_wrist
 same as before (GPU test). The `auto key` line of `ALVR_CAM` logs `wrist` flexion / deviation (degrees)
 and the confidence of each hand.
 
+**Steadier verification** (`key_steady`, `key_confirm`, `key_smooth`, **not tested**). Aim: fewer holes
+and less flicker on the hand without showing more of the room. One fast or untracked finger no longer
+stops the verification of the whole hand (`key_steady`); the axis of a segment can be verified with a
+less strict table (`key_confirm`), its sides stay with the key, so a hand tracked beside the real one is
+found as before; a narrower skin smoothing with a lower floor (`key_smooth`). Exit and weights are
+unchanged: a segment drops at once below a share of 0.5. The `auto key` line of `ALVR_CAM` ends with
+`lost floor` / `bg`: the shares of this update's skin samples that the key drops because they are too
+rare as skin, or because of background or scene colors (kept without them). Then `gate L ..., R ...`,
+per hand since the last line: segments not verified because fast (`f`) or untracked (`u`), with fewer
+than 8 points in the image (`o`), voted below 0.5 (`v`), confirmed (`c`), and joint velocities without
+LINEAR_VALID (`nv`). With `key_confirm` also `confirm kept` of the skin and of the background.
+
 ## What works
 
 - **Color keying in the compositor.** An RGBA `XR_META_passthrough_color_lut` makes the passthrough
@@ -144,6 +156,16 @@ and the confidence of each hand.
 
 ## What doesn't work
 
+- **Noise on the hand: where it is** (measured 2026-11-23 on 8 hand crops of screenshots, 1 M pixels, and
+  on the log). A still hand is clean inside (0-0.1 % holes deeper than 12 px). The loss is in the outer
+  4 px, where only the key decides (6-28 % dropped, 29-49 % half transparent), and on moving hands
+  (4-10 % dropped): shadowed sides, creases, nails, knuckles and very bright skin, same hue as the kept
+  skin but darker. The key keeps a median 0.79 of its own skin samples on the headset, 0.94 in an offline
+  copy of the model: the difference is not explained.
+- **Closing holes of the table in color space.** The kept colors are one block without holes: gains
+  nothing (learned tables simulated, `skin.lut` / `skin2.lut` measured).
+- **Widening the skin along the brightness.** One cell darker and brighter: +1.4 to +2.5 points of the
+  hand for +5 to +10 points of the background next to it (simulated on 2 raw hands).
 - **Depth alone for hands.** 320x320 texels at 30 Hz (measured), data about 20 ms old plus 11-15 ms of
   processing. Fingers are jagged, and hands lag roughly 65-90 ms (estimate).
 - **Hand removal can't be turned off.** While hand tracking runs, the runtime removes tracked hands from
@@ -238,6 +260,9 @@ Measured in the SteamVR home, 72 Hz, with color key on unless noted:
 | `key_error` | 10 ms | How much the fill shrinks with the speed |
 | `key_solid` | 6 | Segments that are always solid: 0 none, 6 wrist, 9 palm, 28 hand |
 | `key_tight` / `key_bias` / `key_unknown` | 30 / 150 / 10 % | Strictness, preference for skin, unknown colors |
+| `key_smooth` | 100 % | Smoothing of the skin colors, of a LUT texel (70..100). `key_tight` is scaled by its cube, so 70 is about a third of the floor: rarer skin colors are kept, not more around the common ones, but the tails of a widely spread skin (varied light) reach further (computed: 36 % more cells at 70). 100: as before. Try 70. Not tested |
+| `key_confirm` | 0 % | `key_tight` of a second table that is never uploaded: the points on the axis of a segment are verified with it (the points beside it with the key), and the reliability comes from the share of the background around the hands that it keeps. Capped at `key_tight`, so it keeps everything the key keeps. 0: off. Try 12. Not tested |
+| `key_steady` | 1 | 1: a hand is verified while its palm (palm, wrist, knuckles) is tracked and slower than 0.5 m/s, each segment while its own two joints are too; its background is then sampled for the reliability only, and a hand with a fast finger is judged by its own background (fewer than 50 colors: no fill). Colors are still learned only from whole hands. 0: the whole hand or nothing, as before. Not tested |
 | `key_delay` / `key_scale` | 0 ms / 100 % | Hand pose offset (negative predicts), thickness |
 | `playzone` / `playzone_auto` | 0 / 1 | New value: remember now, -1 forgets it (not tested). Automatic after 1.5 s without hands |
 | `key_layers` | 4 | 4: extra layers only with hands in view, 2: never, 5: always, 30 / 31: always three (no upper game layer / no keyed passthrough). Not tested |
