@@ -42,8 +42,9 @@ use std::{
 const DECODER_MAX_TIMEOUT_MULTIPLIER: f32 = 0.8;
 
 // Joints that move with the arm, not with the fingers: palm, wrist and the knuckles of the four
-// fingers (indices of `xr::HandJointEXT`)
+// fingers (indices of `xr::HandJointEXT`). The wrist alone barely moves when the hand turns in place
 const PALM_JOINTS: [usize; 6] = [0, 1, 7, 12, 17, 22];
+const WRIST_JOINT: usize = 1;
 
 // The solid fill of the hands fades out between these speeds (m/s)
 const MIN_FILL_SPEED: f32 = 0.08;
@@ -559,15 +560,19 @@ impl StreamContext {
             }));
 
             // The fastest joint, in the stage space like the shape. Some joints may have no valid
-            // velocity. Of the whole hand only (palm, wrist, knuckles): fingers that bend while the
-            // arm rests don't grow the rim
+            // velocity. Of the wrist only: fingers that bend and a hand that turns while the arm
+            // rests don't grow the rim
             let velocity = velocities
                 .iter()
                 .enumerate()
                 .filter(|(joint, v)| {
-                    (!params.palm_speed || PALM_JOINTS.contains(joint))
-                        && v.velocity_flags
-                            .contains(xr::SpaceVelocityFlags::LINEAR_VALID)
+                    (match params.speed_joints {
+                        0 => true,
+                        1 => PALM_JOINTS.contains(joint),
+                        _ => *joint == WRIST_JOINT,
+                    }) && v
+                        .velocity_flags
+                        .contains(xr::SpaceVelocityFlags::LINEAR_VALID)
                 })
                 .map(|(_, v)| crate::from_xr_vec3(v.linear_velocity))
                 .fold(Vec3::ZERO, |fastest, v| {

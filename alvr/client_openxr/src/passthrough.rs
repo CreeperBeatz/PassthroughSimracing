@@ -89,8 +89,8 @@ impl PassthroughLayer<'_> {
 /// - `setprop debug.alvr.key_error <ms>`: assumed timing error, the solid core shrinks with the speed
 /// - `setprop debug.alvr.key_rim_error <ms>`: worst timing error, the rim grows with the speed
 /// - `setprop debug.alvr.key_rim_max <mm>`: limit of that growth
-/// - `setprop debug.alvr.key_speed 0`: that speed is of the fastest joint (moving fingers grow the rim), not
-///   of the palm, the wrist and the knuckles only
+/// - `setprop debug.alvr.key_speed <n>`: that speed is of the wrist (2), of the palm, the wrist and the
+///   knuckles (1: a hand that turns in place grows the rim) or of the fastest joint (0: also moving fingers)
 /// - `setprop debug.alvr.key_sweep 0`: the rim grows in all directions, not along the motion of the hand
 /// - `setprop debug.alvr.key_sweep_max <mm>`: limit of the growth along the motion, ahead and behind
 /// - `setprop debug.alvr.key_sweep_iso <percent>`: share of the growth that stays in all directions
@@ -152,8 +152,8 @@ pub struct ColorKeyParams {
     pub core_error_s: f32,
     pub rim_error_s: f32,
     pub max_rim_growth_m: f32,
-    /// The speed is of the palm, the wrist and the knuckles: fingers alone don't grow the rim
-    pub palm_speed: bool,
+    /// Joints whose speed grows the rim, see `debug.alvr.key_speed`
+    pub speed_joints: i64,
     /// The rim grows along the motion of the hand. None: in all directions
     pub sweep: Option<SweepParams>,
     pub radius_scale: f32,
@@ -243,7 +243,7 @@ impl ColorKeyParams {
             core_error_s: millimeters("debug.alvr.key_error", 10),
             rim_error_s: millimeters("debug.alvr.key_rim_error", 45),
             max_rim_growth_m: millimeters("debug.alvr.key_rim_max", 16),
-            palm_speed: debug_property("debug.alvr.key_speed").unwrap_or(1) != 0,
+            speed_joints: debug_property("debug.alvr.key_speed").unwrap_or(2),
             sweep: (debug_property("debug.alvr.key_sweep").unwrap_or(1) != 0).then(|| {
                 SweepParams {
                     max: millimeters("debug.alvr.key_sweep_max", 40),
