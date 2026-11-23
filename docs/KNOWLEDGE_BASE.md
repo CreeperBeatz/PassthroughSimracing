@@ -1,25 +1,205 @@
 # Passthrough for sim racing: knowledge base
 
-What was tried on a Quest 3, what works, what doesn't, and why. Status: 2026-11-22, branch
+What was tried on a Quest 3, what works, what doesn't, and why. Status: 2026-11-23, branch
 `auto-color-key`. Everything after "Depth passthrough" is experimental and controlled with adb.
+**Start with "Where it stands and how to continue"**, the rest is the detailed record.
 
 Words used here:
 - **measured**: numbers from the headset logs or the runtime.
 - **observed**: judged by eye by the person in the headset, or on screenshots.
 - **offline**: tested on screenshots, not live.
 - **not tested**: compiles and passes the unit tests only.
+- **capture**: a `key_dump` of the headset (camera image, joints, tables, depth), see "Settings".
+
+## Where it stands (2026-11-23) and how to continue
+
+**State.** The headset has the build of 83a11bc7. The code after it only changes two defaults to what
+was used on the headset by property: `key_wrist_len` 0 and `key_rim_max` 8. With the build that is on
+the headset, set those two again after a reboot (its defaults are 80 and 16). SteamVR home, hands in
+view: 72 fps, GPU load 80 % (median), peaks of 95-97 % (measured).
+
+**A session.** Streamer and SteamVR on the PC as in the README (the dashboard doesn't start SteamVR),
+Passthrough = Depth (Quest 3), region distance 0.9 m. On the headset a 32x32x32 RGBA LUT at
+`/data/local/tmp/alvr_color_key.lut` (`adb push`; a learned one from `key_lut_dump`, or one made with
+`tools/color_key_wand.py`), `auto_key 1` before the app starts (it asks for the camera), `color_key` to a
+new value other than 0 at any time. Everything else is a default.
+
+**Verdict of the user on that state.**
+- Hands: good enough. Parts of the hand are still missing, "but at this point it's not noticeable". No
+  more work on filling the hand.
+- What bothers now: "elements in view not precisely cut, gripping objects in playable area and still,
+  background leakage". In detail: the forearm and things held in the hand (a bottle) should be completely
+  visible, but are cut out where the color mask for the fingers is made; the cap and upper part of a
+  gripped bottle disappear; what the depth mask shows has jagged edges ("the quality is bad when I hold an
+  object next to a VR area"); the room still shows as thin lines and patches next to the hand.
+- Decided by the user: `key_inset` / `key_falloff` 4 / 4; `key_confirm` 12 ("the best one so far");
+  `key_smooth` 70 leaks; the zone grows with the speed of the wrist only (`key_speed` 2); the skeleton is
+  for the hand up to the wrist, no arm extension from it (`key_wrist_len` 0).
+- The real rig will have QR codes as anchors, and the play area is set around them, not around the head.
+
+**Open for the user.** Way A or way B first (below)? Is the rig a motion rig? Where will the QR codes be
+(in the camera's view when looking ahead: wheel deck or monitor stand, not the base behind the legs), how
+many, what size? Does "no arm extension" also mean `arm_shift 0` (the depth is shifted along a 45 cm arm
+from the wrist) and dropping the 50 cm forearm that the learner excludes from its samples? When can
+captures be taken with a real wheel?
+
+**What the day established** (from captures unless noted; points 1-4 and 6 were re-measured by a second,
+independent analysis, which changed several first results; 5 is from the logs, 7 was measured with the
+user, 8 on 2 captures).
+1. *Room next to the hand.* 11-13 % of the hand's area in the camera image, mostly a fringe within 12 mm
+   of the hand's edge. About 45 % of it (36-57 % depending on the hand mask and on the offset of point 2)
+   is shown by the solid fill, which shows any color: the round ends of the always solid wrist capsules
+   past the wrist and the heel of the palm, and confirmed capsules that sit beside the hand. The wrist
+   bridge gave an estimated 16-23 % (its direction is not in the captures and was reconstructed; off now),
+   the growth with the speed at least 17 %. Part of the "thin lines" may not be the key at all: in one
+   screenshot a fringe runs along the sleeve 17-22 cm from the wrist, beyond any key zone, so most likely
+   the coarse edge of the depth mask.
+2. *The projected skeleton sits beside the hand in the camera image*, by 5-6 px (about 10-12 mm) in the
+   first 27 bursts, as if the hand were 1.5-2.7 cm nearer than it is (the same as a 4.5-6.5 % scale about
+   the image center, depending on the target; hands alone can't tell the two apart). Probably not a
+   camera error: the crop arithmetic of `camera.rs` reproduces the logged intrinsics, no other crop or
+   binning assumption predicts the fit, and one later set of captures (same boot, same calibration) shows
+   no offset at all. Not excluded: the lens distortion and the active array are never read or logged. A
+   time skew doesn't explain it (0-13 ms). Most likely the hand tracking places the hand too near,
+   depending on pose or session. A fixed correction makes the set without offset worse (1.1 -> 2.0 px),
+   so none is built. Where the offset is present, a replay with the projection moved by 2.7 cm raises
+   the skin samples that land on the hand from 0.75 to 0.83 and the true segments voted in from 0.77 to
+   0.90 (offline, tables learned with the old projection). How much of the 0.8 of its own skin samples
+   that the key keeps on the headset this explains is open: that number also rises where there is no
+   offset.
+3. *A background model with places* (the user's idea: remember how each place of the background looks
+   and compare) is not what the code does: the color table has no place, the leak map only rates leaks.
+   Tested on 19 captures: as a gate on the key (drop a kept pixel that equals the remembered background
+   at its place) it removes 35-37 % of the key's room leak for 1.5 % of the hand, 24 % without any depth;
+   per capture 4-78 %, and skin over a beige desk lost 16 % of the hand. As the mask itself it fails on
+   the near desk (wrongly marked background 13 -> 34 % without a depth fitted to the image). It finds
+   what the key can't: sleeve 70 % (key 1 %), watch 70 % (10 %). A held bottle: one bottle, 3 captures,
+   held where it usually stands, so nothing is known (captures of a bottle held in the air exist, see
+   way A). The same flat room point varies by 2-3 levels (standard deviation; a tenth by 10 or more, and
+   a quarter of the sightings fall into a neighbouring table cell) after a gain per frame; without the
+   gain the exposure changes it by up to 48 %. None of this is built.
+4. *A shape detector for the hand* cannot be exact: one camera pixel is 2 mm at the hand, a camera result
+   is 45-160 ms old when used, and the camera outline inherits the offset of point 2. Measured in the
+   camera image (probably optimistic: the outline and the hand mask it is scored against share their
+   seeds): an outline that only limits the solid fill removes 21-28 % of the room for 0.6-1 % of the hand;
+   flags per capsule side ("the camera sees an edge here") 19.5 % for 0.9 %, without a texture; a full
+   outline that cuts everything 30-52 % for 3-6 %. What it cuts of a moving hand is not known (3 passes
+   per speed range; 8-16 % above 0.25 m/s in those).
+5. *The remembered playzone* can't help a carried object (it knows where things stood). With the new
+   trigger it was copied whenever no hand was near the depth view for 1.5 s: 39 times in 20 minutes. But
+   not reliably: in two streams the runtime kept the hands near the view for minutes, also during a 10 s
+   sweep with the hands at the user's sides, and the copy was 150 s old when the bottle was gripped.
+   While driving the hands never leave, so it is not refreshed then. Only useful for a wheel or shifter.
+6. *The ring of background colors around the hand* is empty or under 50 colors in about 12 % of the log
+   lines with a learned hand: the half-space that excludes the forearm removes everything when the arm
+   direction is close to the line of sight (computed: empty up to 20-30 degrees). In 4 captures a bridge
+   direction turned towards the camera caused it, but in the logs it is as frequent without a bent
+   bridge. When no ring has colors (or a hand with a fast finger has fewer than 50 of its own) the
+   reliability is 0 and the solid fill is off (mean weight 0.07 against 0.56); an empty ring of one hand
+   is covered by the other hand's. No effect on the leak could be shown.
+7. *The camera sees hands at the wheel position* (looking ahead): about 90 % of the voted segments are
+   confirmed. A reach to the shifter leaves the image.
+8. *The depth capture works on the headset* (GLES readback, 48 of 48), and the region really is a sphere
+   around the eye (2 captures: the mask follows the radial distance in 99.8 % of the texels where sphere
+   and plane differ).
+
+**Method: what cost time today.**
+- Offline tests on screenshots of the display with a skeleton placed by hand were wrong twice (no leak
+  predicted for `key_smooth` 70; gains of a shape detector against a baseline the headset doesn't have).
+  Test on captures, and let a second analysis re-measure the numbers a decision rests on: it found a
+  screenshot matched to the wrong capture, an improvement that came from pooling two different sets, and
+  fits that only held in-sample.
+- Say which pixels: 4 px of a screenshot are 1-2 mm, one camera pixel is 2 mm at the hand.
+- Captures: `adb logcat -s ALVR_CAM` running, `setprop debug.alvr.key_dump_burst 2`, then for each moment
+  `setprop debug.alvr.key_dump <a new n>`; wait for `dump <n>/..` and `depth dump <n>: 9 files`, then
+  `adb pull` the files folder of the app. Pair screenshots with captures by the time of those log lines,
+  not by what the images show.
+- Ask the user what they see before building for a number: the log said 21-30 % of the skin was dropped
+  while the user no longer noticed missing parts, and wanted the leaks and the objects fixed.
+- A live setting first, then a build: `key_inset`, `key_solid`, `key_confirm`, `key_smooth`,
+  `key_wrist_len` can each be judged within a minute.
+
+**Data and tools** (outside the repository, on the development PC: the captures show a private room and
+are never committed).
+- Captures of one room: 31 moments with the camera image and joints (poses, a cluttered desk, wheel
+  position), 48 more with depth, mask and focus area in three sets: 2 of a gripped bottle; 21 taken while
+  the compositor of SteamVR was dead (no game on the display, camera and depth are fine; the skeleton
+  has no offset in this set); 25 with a sweep without hands, a bottle held in the air and gripped on the
+  desk, and a sleeve (offset about 5 %). Screenshots of the display from the same minutes.
+- A viewer that draws the capsules and the key's decision into the camera image, and the scripts and
+  results of the analyses above (leak, ring, background model, camera model), each with its re-check.
+
+**To continue, way A: iterate on what is there.** In the order of what it should bring:
+1. Live, no build: is the skeleton tail gone with `key_wrist_len` 0; `arm_shift 0` if the arm still looks
+   wrong (it shifts the depth along a 45 cm arm from the wrist); `key_solid 0` (predicted: 18 % less room
+   for 1.25 % of the hand) and `key_inset` 6-8 (11-20 % for 0.65-1.2 %). Predictions from the camera
+   images: only the user's eyes decide.
+2. The background gate of point 3. First measure on the captures with depth: the registration with the
+   depth of the sensor instead of a fitted one, the gate applied one pass late with the head pose of the
+   display, a lamp change, and a session in the driving seat: behind hands that stay in place the
+   background is never seen (about 16 cm of head motion is needed at 0.45 m), so the model needs a
+   moment with the hands away, and hands that stay may end up in it; the turning wheel and the legs are
+   not static. In the code the leak map already keeps colors per direction; it has no depth and moves
+   with the head.
+3. Edges of objects (the user's idea): move the border of the depth mask to the edges that the camera
+   sees. Objects move little, so the late camera image doesn't matter if the result is kept in the room.
+   Prototype on the captures with depth before any GPU work. A camera image of 320x240 is coarse (2 mm at
+   0.45 m, about 5 mm at 1 m): the camera offers up to 1728x1728.
+4. Held objects and the forearm near the hand: nothing works yet. Candidates: the difference from the
+   remembered background on and near the forearm (sleeve 1 -> 45 %, but 21 % of the background near the
+   forearm wrongly marked, mostly desk), and continuing an object from the part of it that the depth map
+   still shows into the area the runtime removed. Captures of a bottle held in the air exist with depth
+   and are not analysed yet: start there. Still missing: a wheel being turned with the hands on it.
+5. Edge flags per capsule side for the solid fill (point 4), and capsule ends that don't stick out past
+   the wrist.
+6. The ring (point 6): the forearm as a wedge of capsules instead of a half-space, and keeping the last
+   reliability for 0.5 s. On the captures no ring stays under 50 colors, but what it lets in of the arm
+   is not known (0.7-25 % of the added pixels, depending on how the arm is outlined), and in a grip pose
+   it samples the other, untracked fist as background. Low priority: no effect on the leak was shown.
+7. An offset of the hands along the view for the learner only (point 2): move the joints and capsules,
+   not the camera (the leak map, the scene samples and the captures use it). 0 by default, first as a
+   property for tests (18-27 mm fits the first captures, 0 the set without offset), later chosen for
+   still hands, smoothed over many passes, from image edges, within 0-30 mm. Check that segments on the
+   hand and beside it still vote differently: that got worse in both later sets.
+
+**To continue, way B: anchors on the rig and a mapped play area.** This turns the play area from a bubble
+around the head into a box fixed to the rig, and most of way A gets easier in the rig's frame: the rig
+and what is behind it can be learned once and stay valid, and only hands, arms, the turning wheel, the
+shifter and held things have to be decided live.
+1. What exists: the region "Cockpit volume" (an oriented box in stage space: center, yaw, size) in the
+   settings and in the shader (`region_mask`, `world_to_volume`). Never calibrated, never used on the
+   headset; entering stage coordinates by hand is not practical.
+2. The anchors. The runtime lists `XR_EXT_spatial_marker_tracking` for this app (client log of
+   2026-11-22, the list of available extensions). It hides `XR_EXT_spatial_entity`, `XR_EXT_spatial_anchor`,
+   `XR_FB_spatial_entity` and the persistence extensions, because the manifest lacks
+   `horizonos.permission.USE_ANCHOR_API` (`skipping extension ... missing uses-permission` in logcat).
+   First step: add the permission, enable these extensions, and log whether QR codes are a supported
+   marker type, how often and how exactly they are found, from which distance and angle. Not known: whether
+   it works at all for a native app; Meta documents QR tracking for its own SDKs, as experimental and not
+   for moving objects. Otherwise: find the codes in the passthrough camera image (it must be larger than
+   320x240 for that; 22 ms late is fine for something that doesn't move), or touch points of the rig with
+   a controller once and keep them as a spatial anchor. A world-anchored box breaks on a motion rig.
+3. From the anchors to the box: its pose every time the anchors are seen, its size once (settings), then
+   `world_to_volume` as now. Test: the border stays on the rig when the head moves and after a recenter.
+4. The map in the rig's frame, built while the hands are away (the user accepts a short moment for that):
+   depth of the rig at a finer grid than one depth image (many images from a moving head), its edges
+   from the camera, and the colors of what is behind it as seen from the seat. This is the background
+   model of point 3 and the edge idea of way A with a fixed frame. The wheel turns and the legs move:
+   they are not part of a static map.
+5. The camera coverage (point 7) and the offset of the tracked hands (point 2) stay as they are.
 
 ## Short version
 
 | Goal | Best approach so far | State |
 |---|---|---|
 | Desk, rig, wheel as real objects | Environment depth, "closer than X" region | Works, coarse edges |
-| Hands | Live color key on the passthrough, in a small zone around the tracked hand, with automatically learned colors | Over simple backgrounds "basically solved" (observed) |
-| Holes in a still hand | Solid fill of the hand segments that the camera confirms | Better, some noise left |
-| Hands over complex backgrounds | Same, stricter colors, small zone | Leaks much lower, not gone |
-| Forearms | Depth map only, shifted by the motion of the wrist (`arm_shift`), plus a keyed bridge from the wrist whose direction the camera chooses | Coarse edge, lags or jitters. The body tracking forearm was removed: not accurate enough. Bridge not tested |
-| Held objects (wheel, shifter) | Remember the depth map without hands | First test: a gripped bottle cap disappeared, most likely nothing was ever remembered (see below). New trigger not tested |
-| GPU budget | - | **Main open problem**: 58-73 fps with the last tested build |
+| Hands | Live color key on the passthrough, in a small zone around the tracked hand, with automatically learned colors | Good enough for the user (2026-11-23): what is still missing is "not noticeable" |
+| Holes in a still hand | Solid fill of the hand segments that the camera confirms, checked with a wider table (`key_confirm`) | "The best one so far" |
+| Room next to the hand | Small zone, strict colors | Still shows as thin lines and patches; roughly 40-50 % of it (camera image) comes from the solid fill, not from the key |
+| Forearms | Depth map only, shifted by the motion of the wrist (`arm_shift`) | Coarse, jagged edge, lags or jitters; cut out near the hand. Removed: the body tracking forearm (not accurate enough) and the keyed bridge from the wrist (a "skeleton tail") |
+| Held objects | Remember the depth map without hands | Doesn't help: the upper part of a gripped bottle disappears. A memory can't follow a carried object and is only refreshed while the hands are away. Open |
+| Edges of objects | Depth mask | Jagged ("the quality is bad"). Idea: move the border to the edges the camera sees. Open |
+| GPU budget | - | 72 fps, 80 % load with hands in view, peaks of 95-97 % |
 
 ## How it works now
 
@@ -27,8 +207,8 @@ Words used here:
    it belongs to the region (distance or box). Computed at low resolution, upscaled. The arms come only
    from here: around each arm the depth is shifted by the motion of the wrist since the depth image was
    captured (`arm_shift`).
-2. **Hand zones.** Capsules from the hand tracking joints, no forearm, plus a short bridge from the wrist
-   (see below). They say *where to look*.
+2. **Hand zones.** Capsules from the hand tracking joints, up to the wrist, no forearm. They say *where to
+   look*.
 3. **Color key.** The compositor applies a RGBA color table (LUT) to a second passthrough layer. It works
    on the image that is displayed, so its edge can't lag.
 4. **Layers**, from the bottom: passthrough, game with holes (mask, solid fill), keyed passthrough, game
@@ -36,8 +216,10 @@ Words used here:
    one channel and unpacked with `XR_KHR_composition_layer_color_scale_bias` (2a and 2a - 1).
 5. **Color learning.** The passthrough camera (Camera2, 320x240) shows what the tracked hand looks like and
    what is around it. A thread builds the LUT from that several times per second.
-6. **Verification.** Each hand segment is compared with the camera image. Only confirmed segments that
-   don't move are solid.
+6. **Verification.** Each hand segment is compared with the camera image. Confirmed segments that don't
+   move are solid, and the 6 wrist segments always are (`key_solid` 6). Solid shows any color: a large part
+   of the room seen next to the hand comes from it (the round ends of the wrist capsules, capsules that
+   sit beside the hand).
 
 **Narrower rim over leaky backgrounds** (`key_leak`, **not tested**). The learning thread measures for
 each hand which share of the colors 2-7 cm around it the key keeps. Where that share is high the
@@ -65,7 +247,7 @@ The map is forgotten when most colors change
 change time are dropped). A hand that is in view but not
 tracked is learned as room. Unknown: whether the camera registration is good enough for 2 degree cells.
 
-**Growth along the motion** (`key_sweep`, **not tested**). Without growth (`key_rim_max 0`) leaks were
+**Growth along the motion** (`key_sweep`, on the headset since c566b48e, never compared with 0). Without growth (`key_rim_max 0`) leaks were
 clearly better, but the cutout did not follow a fast hand immediately (observed). Now the zone of a
 moving hand is the hand moved anywhere along the velocity of its fastest joint, up to speed x
 `key_rim_error` (limit `key_sweep_max`) ahead and behind; `key_sweep_bias` shifts this ahead or behind
@@ -83,7 +265,9 @@ capsule test per hand and pixel), not a sphere grown by the sweep in all directi
 measured. The `key:` line of `ALVR_CAM` logs `rim` and `sweep`
 (ahead / behind, mm) of each hand.
 
-**Bridge from the wrist to the forearm** (`key_wrist_len`, **not tested**). Between the hand zone (it ends
+**Bridge from the wrist to the forearm** (`key_wrist_len`, off since 2026-11-23: on the headset the user
+saw it as a tail of the skeleton that "messes up where the arm continues", and it gave 16-23 % of the room
+shown next to the hand, estimated). How it works, if it is ever needed again: between the hand zone (it ends
 at the wrist joint) and the forearm of the depth mask a wedge showed the game (observed): the runtime
 removes the hand and a bit of the wrist from the depth map. Now each hand has one more capsule from the
 wrist joint, `key_wrist_len` long, radius: the wrist joint radius x `key_wrist_scale`. The camera chooses
@@ -114,7 +298,12 @@ the 28 (two for a moving bridge with solid fill); no texture samples. `key_wrist
 same as before (GPU test). The `auto key` line of `ALVR_CAM` logs `wrist` flexion / deviation (degrees)
 and the confidence of each hand.
 
-**Remembered playzone** (`playzone`, `playzone_auto`, `playzone_view`, **not tested**). The runtime removes
+**Remembered playzone** (`playzone`, `playzone_auto`, `playzone_view`). On the headset (83a11bc7): it is
+remembered at the start of a stream and whenever no hand is near the depth view for 1.5 s (39 times in
+20 minutes), and its age shows in the `key:` line. In two streams it was not refreshed for minutes ("a
+hand is near the depth view", also with the hands at the user's sides): it was 150 s old when a bottle
+was gripped, and the upper part of the bottle still disappeared. The tint view was not tried. The runtime
+removes
 tracked hands and what they hold from the depth map, so within 6 cm of a hand (bounding sphere, across the
 view ray) the mask also shows what a copy of the depth map taken without hands shows. First test on the
 headset (bottle on the desk, hands hidden for 5 s, then gripped): the cap disappeared. The log had
@@ -145,6 +334,16 @@ LINEAR_VALID (`nv`). With `key_confirm` also `confirm kept` of the skin and of t
 
 ## What works
 
+- **The zone grows with the speed of the wrist only** (`key_speed` 2). With the fastest joint, moving
+  fingers blew up the zone; with palm and knuckles, a hand that turns in place did. User: "it looks good".
+- **Verifying the axis of a segment with a wider table** (`key_confirm` 12): 71 % of the voted segments
+  confirmed instead of 65 %, fill weight 0.55 instead of 0.44, the background unchanged (measured); user:
+  "the best one so far".
+- **Captures** (`key_dump`): the camera image as the learner reads it with the joints of the same instant,
+  the tables and votes, and from the render thread the depth in meters, the mask and the focus area of
+  both eyes. The readback works on GLES. The poses of two passes 60-80 ms apart agree to about one camera
+  pixel (91 % of textured patches within 1 px).
+- **Hands at the wheel position are in the camera image**, see "Where it stands".
 - **Color keying in the compositor.** An RGBA `XR_META_passthrough_color_lut` makes the passthrough
   really transparent by color (observed, control test with an inverted LUT). 72 fps in all variants of
   the first test, load 55% instead of 50% (measured). We found nobody else who uses it like this.
@@ -166,13 +365,32 @@ LINEAR_VALID (`nv`). With `key_confirm` also `confirm kept` of the skin and of t
   clutter that is kept dropped from 67-90% to 2-27% with 92-100% of the skin kept.
 - **Small zone.** Offline (hand pasted on clutter, zone of 4 cm): key only 16% leak; sparse areas removed
   7-10%; connected to the hand 5%; zone limited to 1 cm 3%, with 99% of the hand kept.
-- **0-2 mm rim at rest, up to 16 mm when moving** (grows 45 ms x speed): nothing cut off at rest, fast
+- **0-2 mm rim at rest, up to 8 mm when moving** (grows 45 ms x speed, `key_rim_max`; 16 until
+  2026-11-23): nothing cut off at rest, fast
   motion "good enough" (observed).
 - **Verified skeleton.** The solid fill comes back without the old halo, because wrong segments are not
-  confirmed.
+  confirmed. But solid capsules that sit a little beside the hand still show the room, see "Where it
+  stands", points 1 and 2.
 
 ## What doesn't work
 
+- **A looser skin model** (`key_smooth` 70). Skin kept 0.70 -> 0.84, but the background around the hand
+  1 -> 4 % and the scene 1 -> 11 %; user: "leaks a lot more". The offline simulation had predicted less
+  leak in all 28 cases. The dark parts of the hand are rare colors, and making rare colors pass lets the
+  room pass.
+- **A keyed bridge from the wrist to the forearm.** A tail of the skeleton that disturbs where the arm
+  continues (user), and an estimated 16-23 % of the room shown next to the hand. In 4 captures its
+  direction emptied the ring of background colors.
+- **Remembering the depth map for held objects.** See "Where it stands", point 5. The first trigger (no
+  tracked hands) never fired. The second fires when the hands are away, not while they stay in front,
+  and a carried object is not where it was remembered.
+- **A fixed correction of the camera model.** See "Where it stands", point 2: the offset is not constant
+  (none in one set with the same calibration) and most likely not the camera's.
+- **The difference from a remembered background as the mask itself.** Too many false marks on a near
+  desk without exact depth, and one pass late. As a gate on the key it looks promising offline (not
+  built), see point 3.
+- **Tighter solid fill by `key_inset`.** 2 / 2 and 3 / 3 against 4 / 4: fuller spread hand from the back,
+  dark parts the same, background cut slightly less precisely; the user kept 4 / 4.
 - **Noise on the hand: where it is** (measured 2026-11-23 on 8 hand crops of screenshots, 1 M pixels, and
   on the log). A still hand is clean inside (0-0.1 % holes deeper than 12 px). The loss is in the outer
   4 px, where only the key decides (6-28 % dropped, 29-49 % half transparent), and on moving hands
@@ -237,15 +455,17 @@ Measured in the SteamVR home, 72 Hz, with color key on unless noted:
 | d8010e3b | Key, learning, wrist fill | 71-74 | 76-83% | 6.1 ms |
 | 23701e5f | + verified skeleton, arm shift | 71-74 | 77-92% | 6.8 ms |
 | 11654b86 | + forearm, playzone map | **58-73** | **88-99%** | **9.5 ms** |
+| 83a11bc7 | Key, learning, verification, sweep, no body tracking forearm | 72 | 76% without hands (2 layers), 80% median and peaks of 96% with hands (4 layers) | about 7 ms |
 
 - The last build ran at 456 MHz and 48-50 degrees, so heat may be part of it.
 - Suspects: the forearm test for all 9 depth samples of every pixel, and the bigger area of the hand pass.
   The next commit reduced both and used 1/5 resolution. Since then the body tracking forearm (capsules, arm
-  removal) has been removed, so its cost is gone. **Not measured.**
+  removal) has been removed, so its cost is gone. Measured 2026-11-23, see the table.
 - 3609efde, no hands in view (measured): 4 layers were submitted; key off took TW from 4.69 to about
   2.0 ms and load from about 85% to 62%, App time barely changed. Boost or SustainedHigh requested
   while streaming: level stayed 2, 456 MHz.
-- The next commit (**not tested**): the two extra layers only while a hand is in view (plus 0.3 s);
+- Since 4a0a59d5 (runs on the headset: `layers 2` without hands, `layers 4` with, in the `key:` line):
+  the two extra layers only while a hand is in view (plus 0.3 s);
   hands behind or beside the head no longer count. The lower game layer only covers the hands plus
   3% of the view. Where the lower layer is cropped away or not used (2 layers), the shader writes the
   alpha so that the upper layer alone shows what both would (upper + (1 - upper) x lower), so soft mask
@@ -279,6 +499,17 @@ Measured in the SteamVR home, 72 Hz, with color key on unless noted:
   does and aborts. Code that may fail on the GL side (the readback of `key_dump`) must clear the flags itself
   (`GraphicsContext::take_gl_error`).
 - **Leaving the play area** pauses the app and restarts the stream. The key comes back by itself.
+- **Hands at the user's sides can stay "near the depth view"** for the runtime, for minutes. Nothing may
+  rely on the hands being gone.
+- **"Only a plane in front of me, no VR space"**: the compositor of SteamVR had died while the streamer
+  and `vrserver` kept running, and the stream showed no scene. Close SteamVR and start it again; captures
+  from such minutes are worthless.
+- **adb over Wi-Fi also drops whenever the headset sleeps.** `adb disconnect`, then `adb connect` once it
+  is on the head again; a log capture has to be restarted. Properties survive until a reboot.
+- **A watcher on the log** acted on the last matching line, which was older than the watcher. Compare the
+  time of the line.
+- **No background colors around the hands** (all rings empty) switches the solid fill off (`key_steady`
+  1), see "Where it stands", point 6.
 
 ## Settings
 
@@ -288,9 +519,9 @@ Measured in the SteamVR home, 72 Hz, with color key on unless noted:
 |---|---|---|
 | `color_key` | 0 | 0 off, another value (re)loads `/data/local/tmp/alvr_color_key.lut` |
 | `auto_key` | 0 | 1 before starting the app: learn the colors, asks for the camera permission |
-| `key_rim` / `key_rim_error` / `key_rim_max` | 0 mm / 45 ms / 16 mm | Zone at rest, growth with the speed, limit |
-| `key_speed` | 2 | Joints whose speed grows the zone. 2: the wrist only (the arm moves; not tested), 1: palm, wrist and knuckles (fine for waving and closing the fingers, but a hand that turns in place grows it), 0: the fastest joint (moving fingers grow it too) |
-| `key_sweep` | 1 | 1: the zone grows along the motion of the hand, 0: in all directions as before. Not tested |
+| `key_rim` / `key_rim_error` / `key_rim_max` | 0 mm / 45 ms / 8 mm | Zone at rest, growth with the speed, limit. 8 since 2026-11-23: the value on the headset for every verdict of that day (16 before; 0 clips fast hands) |
+| `key_speed` | 2 | Joints whose speed grows the zone. 2: the wrist only (the arm moves; user: "it looks good"), 1: palm, wrist and knuckles (fine for waving and closing the fingers, but a hand that turns in place grows it), 0: the fastest joint (moving fingers grow it too) |
+| `key_sweep` | 1 | 1: the zone grows along the motion of the hand, 0: in all directions as before. On the headset since c566b48e, never compared with 0 |
 | `key_sweep_max` / `key_sweep_iso` / `key_sweep_bias` | 40 mm / 25 % / 0 % | Limit of the growth along the motion (each side, before the bias), share of the growth that stays in all directions (limited by `key_rim_max`), -100..100: more ahead (positive) or behind |
 | `key_inset` / `key_falloff` | 4 mm / 4 mm | Where the solid fill starts and how it fades out. 2 / 2 and 3 / 3 compared on the headset: a spread hand seen from the back is fuller, dark parts (palm, fist) are the same, the background is cut slightly less precisely; user: 4 / 4 is the best |
 | `key_error` | 10 ms | How much the fill shrinks with the speed |
@@ -300,12 +531,12 @@ Measured in the SteamVR home, 72 Hz, with color key on unless noted:
 | `key_confirm` | 12 % | `key_tight` of a second table that is never uploaded: the points on the axis of a segment are verified with it (the points beside it with the key), and the reliability comes from the share of the background around the hands that it keeps. Capped at `key_tight`, so it keeps everything the key keeps. 0: off. On the headset with 12: of the segments that are voted on 71 % are confirmed (65 % without), verified weight 0.55 (0.44), background unchanged; user: "the best one so far", in some cases the hand is still not full enough |
 | `key_steady` | 1 | 1: a hand is verified while its palm (palm, wrist, knuckles) is tracked and slower than 0.5 m/s, each segment while its own two joints are too; its background is then sampled for the reliability only, and a hand with a fast finger is judged by its own background (fewer than 50 colors: no fill). Colors are still learned only from whole hands. 0: the whole hand or nothing, as before. Runs on the headset, not compared with 0 |
 | `key_delay` / `key_scale` | 0 ms / 100 % | Hand pose offset (negative predicts), thickness |
-| `playzone` / `playzone_auto` | 0 / 1 | New positive value: remember at the next depth image, -1 forgets it; the value at the start of the stream is not a request. Automatic after 1.5 s without a hand near the view of the depth cameras. Not tested |
+| `playzone` / `playzone_auto` | 0 / 1 | New positive value: remember at the next depth image, -1 forgets it; the value at the start of the stream is not a request. Automatic after 1.5 s without a hand near the view of the depth cameras: fires at the start of a stream and when the hands are away; the runtime can keep hands near the view for minutes |
 | `playzone_view` | 0 | 1: with the "Tint mask" debug view what only the remembered playzone shows is half opaque blue, where it is used (near the hands) faintly blue. Not tested |
 | `key_layers` | 4 | 4: extra layers only with hands in view, 2: never, 5: always, 30 / 31: always three (no upper game layer / no keyed passthrough). Not tested |
 | `key_crop` | 1 | Lower game layer only around the hands. 0: full, 2: y origin at the top (if 1 is upside down). Not tested |
 | `key_hands` | 1 | 0: no hands in the GPU passes. Not tested |
-| `arm_shift` | 1 | 1: the depth around each arm is shifted by the motion of the wrist (with the key only up to the wrist, the hands are removed from the depth map; plain depth for a wrist that moved more than 25 cm or has no valid position), 0: plain depth. Also without the key. Not tested |
+| `arm_shift` | 1 | 1: the depth around each arm is shifted by the motion of the wrist (with the key only up to the wrist, the hands are removed from the depth map; plain depth for a wrist that moved more than 25 cm or has no valid position), 0: plain depth. Also without the key. 1 runs on the headset, 0 not tested |
 | `key_leak` | 0 % | Narrower rim where the background around a hand looks like it, 0: off, 100: on. Needs `auto_key`. Not tested |
 | `key_leak_lo` / `key_leak_hi` | 5 / 20 % | Share of the colors around the hand that the key keeps: where the narrowing starts / is complete |
 | `key_leak_inset` | 3 mm | Rim at full narrowing, inside the hand. 0: down to the soft edge only |
@@ -318,7 +549,7 @@ Measured in the SteamVR home, 72 Hz, with color key on unless noted:
 | `key_leak_dump` | 0 | New value: log the leak map of the camera view, 40x30 (`#` leaks, `.` doesn't, `?` unknown, `H` hand). Not 0: the map is learned |
 | `key_leak_probe` | 60 cm | Distance of the spheres of `key_leak_view 2` from the anchor of the map |
 | `key_lut_dump` | 0 | New value: write the learned LUT to `/sdcard/Android/data/alvr.client.dev/files/alvr_learned_key_<time>.lut` |
-| `key_dump` / `key_dump_burst` | 0 / 1 | New value `n` other than 0: write the next `key_dump_burst` (1..30) learning passes to the same folder, `alvr_dump_<n>_<00..>`, also without hands. Each line `dump <n>/<index>: <path>` on `ALVR_CAM`. The render thread also writes the depth of one frame, `alvr_dump_<n>_depth*` (below), also without `auto_key`; `depth dump <n>: ...` on `ALVR_CAM`. Not tested |
+| `key_dump` / `key_dump_burst` | 0 / 1 | New value `n` other than 0: write the next `key_dump_burst` (1..30) learning passes to the same folder, `alvr_dump_<n>_<00..>`, also without hands. Each line `dump <n>/<index>: <path>` on `ALVR_CAM`. The render thread also writes the depth of one frame, `alvr_dump_<n>_depth*` (below), also without `auto_key`; `depth dump <n>: ...` on `ALVR_CAM`. Works on the headset; 25 requests 3 s apart cost no visible frames |
 | `key_wrist_len` | 0 mm | Keyed bridge from the wrist towards the forearm, 0: off, up to 300. Was 80 until 2026-11-23: the user sees it as a tail of the skeleton that "messes up where the arm continues"; the skeleton is for the hand up to the wrist only, the arm is not to be extended from it. The direction and the solid fill need `auto_key`, without it: opposite to the fingers, never solid |
 | `key_wrist_scale` / `key_wrist_conf` | 100 / 60 % | Its radius (of the wrist joint radius), how sure the camera must be of its direction for the solid fill |
 | `key_wrist_follow` | 30 % | Below this score of the best direction (share of points the key keeps, 0 over skin-like backgrounds) the bridge goes back to the default direction. 0: always the best one. Not tested |
@@ -356,7 +587,7 @@ confirm, not the published key. Keep only the files whose `burst_ns` matches the
 Project the capsules with the camera pose and `fx`, `fy`, `cx`, `cy`: `pixel = (x / z * fx + cx, y / z * fy + cy)` for a point `(x, y, z)` in the
 camera frame (`orientation` inverse times the point minus `position`).
 
-**`key_dump` depth files** (render thread, **not tested** on the headset), once per new `n`, from the next frame
+**`key_dump` depth files** (render thread, works on the headset), once per new `n`, from the next frame
 with a depth image. If nothing arrives within 1 s, or a copy or the file fails, one `depth dump <n>: <error>`
 line and nothing else (`depth dump <n>: replaced by <m>` if a new value came before a depth frame). A dump may cost a frame or two: the first one compiles its shader, and the frame
 whose readback is ready copies about 4 MB of mapped memory on the render thread (decoded and written on
@@ -402,15 +633,19 @@ dumps: `pose` and `fx`, `fy`, `cx`, `cy` there, at its `image_ns`.
 
 ## Open problems, in order
 
-1. GPU budget (see above). The four layers are most likely a big part of it.
-2. Still hand with spread fingers: background is visible between them.
-3. Complex and skin-colored backgrounds.
-4. Forearms: depth only, coarse and late (shifted: jitters, plain: lags). Sleeves and watches. The wrist
-   bridge (not tested) should close the gap at the wrist; whether a long one (up to 250 mm) can replace
-   the edge of the depth is open, the late depth behind a moving forearm still shows the room.
-5. Playzone map: verify with a wheel or a shifter. Turned spokes and levers are filled where they were.
-6. Cockpit volume instead of a distance, with calibration. Lighting match was never tested on the headset.
-7. A real drive with a wheel. Hands on a wheel were only approximated with a bottle and a monitor.
+The order of the user on 2026-11-23; how to go on with each is in "Where it stands and how to continue".
+
+1. The forearm and held objects are cut out near the hand. Nothing works yet.
+2. Jagged edges of what the depth mask shows (sleeve, bottle, later the rig).
+3. The room next to the hand: thin lines and patches. Roughly 40-50 % of it from the solid fill.
+4. The play area around anchors on the rig (QR codes) instead of around the head: the box region exists,
+   the calibration doesn't.
+5. A real drive with a wheel. Hands on a wheel were only approximated with a bottle and a monitor, and
+   the playzone map was never tried with a wheel or a shifter.
+6. GPU budget: 80 % with hands in view, peaks of 95-97 %. The extra layers of the key are a big part
+   (key off: about 85 -> 62 % in one measurement); anything new on the GPU has to be cheap.
+7. Never tested on the headset: the lighting match, the leak map (`key_leak_map`), the narrower rim
+   (`key_leak`), `arm_shift 0`.
 
 ## Privacy
 

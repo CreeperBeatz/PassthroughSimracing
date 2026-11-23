@@ -265,7 +265,7 @@ impl ColorKeyParams {
             // Milliseconds
             core_error_s: millimeters("debug.alvr.key_error", 10),
             rim_error_s: millimeters("debug.alvr.key_rim_error", 45),
-            max_rim_growth_m: millimeters("debug.alvr.key_rim_max", 16),
+            max_rim_growth_m: millimeters("debug.alvr.key_rim_max", 8),
             speed_joints: debug_property("debug.alvr.key_speed").unwrap_or(2),
             sweep: (debug_property("debug.alvr.key_sweep").unwrap_or(1) != 0).then(|| {
                 SweepParams {
