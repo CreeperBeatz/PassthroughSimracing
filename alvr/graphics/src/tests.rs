@@ -1324,6 +1324,73 @@ fn wrist_bridge_extends_the_hand_zone() {
     assert!((with.alpha(0.49, 0.77) - 0.5).abs() < 0.01);
 }
 
+// `debug.alvr.marker_hands`: a hand that reaches out of a marker box shows inside it only, with the
+// bridge from the wrist
+#[test]
+fn hand_limited_to_a_marker_box() {
+    let (device, queue) = gpu_or_skip!();
+    let config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
+
+    // The box holds everything left of x = -0.10 (u = 0.40 at 0.5 m)
+    let region = depth_mask::RegionOverride {
+        volume_to_world: Mat4::from_translation(Vec3::new(-0.6, 0.0, 0.0)),
+        half_extents: Vec3::new(0.5, 2.0, 2.0),
+    };
+    // A bar of short capsules (2 cm, like the bones of the fingers) from x = -0.25 to -0.05 at
+    // v = 0.75, the wrist at x = -0.12 and the bridge from it to x = -0.02
+    let joint = |x: f32| Vec4::new(x, -0.25, -0.5, 0.015);
+    let shape = HandShape {
+        segments: std::array::from_fn(|i| {
+            let x = -0.25 + (i % 10) as f32 * 0.02;
+            [joint(x), joint(x + 0.02)]
+        }),
+    };
+    let zones = HandZones {
+        core: -0.01,
+        falloff: 0.005,
+        rim: 0.0,
+        solid: [0.0; HAND_SEGMENTS],
+        sweep: HandSweep::NONE,
+    };
+    let bridge = WristBridge::new(Vec3::new(-0.12, -0.25, -0.5), Vec3::X, 0.1, 0.015, 0.0);
+    let render_hand = |shape, bridge| {
+        render_with_key(
+            &device,
+            &queue,
+            &config,
+            &hand_scene(),
+            Vec3::ZERO,
+            Vec3::ZERO,
+            true,
+            Some(ColorKeyInput {
+                hands: [None, Some((shape, zones))],
+                leak: [0.0; 2],
+                bridges: [None, bridge],
+            }),
+        )
+    };
+    let plain = render_hand(shape, bridge);
+    let (limited_shape, limited_bridge) = depth_mask::limit_hand_to_region(
+        &shape,
+        &zones,
+        bridge,
+        &region,
+        depth_mask::HAND_REGION_FEATHER,
+    );
+    let limited = render_hand(limited_shape, limited_bridge);
+
+    // Inside the box, 3 cm and more from its face: keyed as before
+    for u in [0.27, 0.3, 0.37] {
+        assert_eq!(limited.at(u, 0.75), plain.at(u, 0.75), "{u}");
+        assert!((limited.alpha(u, 0.75) - 0.5).abs() < 0.01, "{u}");
+    }
+    // Outside, 3 cm and more from the face: the hand and the bridge are gone (the game shows)
+    for u in [0.43, 0.46] {
+        assert!((plain.alpha(u, 0.75) - 0.5).abs() < 0.01, "{u}");
+        assert_eq!(limited.alpha(u, 0.75), 1.0, "{u}");
+    }
+}
+
 #[test]
 fn hands_rect_contains_the_bridge() {
     let joints = std::array::from_fn(|i| Vec4::new(0.05 + i as f32 * 0.004, 0.1, -0.5, 0.01));

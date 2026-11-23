@@ -742,8 +742,10 @@ dumps: `pose` and `fx`, `fy`, `cx`, `cy` there, at its `image_ns`.
 - [ ] The `leak map ... ms` part of the `auto key` line and the `lookup ... us` of the render thread.
 - [ ] `key_lut_dump 1`, then `adb pull` the file for offline tests.
 
-**QR code markers and the box placed from them** (the tracker ran on the headset once, see "First run on
-the headset" below; the box and the size gate are not tested: they compile and pass the unit tests only).
+**QR code markers and the box placed from them** (the tracker, the size gate and the box ran on the
+headset, see "First run on the headset" and "Second run on the headset" below; the measured baseline of
+the pose, the box carried through a stage change, the hands limited by the box and the changes of the
+size gate of 2026-11-24 are not tested: they compile and pass the unit tests only).
 Step one of way B: does the runtime give this
 app QR code poses (`XR_EXT_spatial_entity` and `XR_EXT_spatial_marker_tracking`), how good are they, and
 the box region placed from one. The manifest now declares `com.oculus.permission.USE_ANCHOR_API` and
@@ -792,9 +794,36 @@ separated); the printed `RIG1` in the same two minutes: 1.4 / 0.9 / 2.4 mm and 0
 its heading is the weaker part (2 deg move the far end of a 1 m box by 3.5 cm). White at full brightness,
 room light on; a dimmer white, a smaller code and the game running on the same monitor are not tested.
 
-**Size gate** (not tested). Each code has a baseline size: the one given with `marker_sizes`, else the
-learned one, the median width of the last 50 distinct poses whose size is not a default size (valid from 3
-such poses). A size is a default size when width and height are both within 0.05 mm of the same whole
+**Second run on the headset (2026-11-23, build 34a0ea96), measured / observed** (log
+`alvr-20261123-2136-34a0ea96.log`, the lines with `marker`). The size gate worked: the baseline of `SCR1`
+on the monitor was learned as 150.9 mm, the user measured 151 mm with a ruler; the code dragged to a
+laptop screen with smaller pixels was 98.3 mm by the screen's data, and the headset reported 98.3 mm
+(measured). The box placed from `SCR1` works, and stays fixed to the room after the code is hidden
+(observed by the user). The code is shown only for the measurement and then hidden (the user's choice),
+so everything must work with the code out of view. While the code was measured the box moved by 1-4 cm
+several times (`marker box: moved by ...`): the heading of the code read mostly 204-206 deg, single poses
+197.8 to 213.8 deg; the pose refreshes about twice a second, so the 1 s average of that build held 2
+distinct poses; `N outliers left out` grew to 48 in 30 s (measured). The user recentered:
+`ReferenceSpaceChangePending type: STAGE, ... pose valid: true, pose in previous space (0.000, -0.003,
+0.000) m, yaw -0.0 deg`, with LOCAL and LOCAL_FLOOR changed by a yaw of 237.9 deg at the same moment. The
+box was dropped (`marker box: stage space changed, waiting for the marker`) and came back only because
+the code was still on screen. At the start of the session there was a STAGE change with the pose
+(0.286, -0.166, -0.523) m, yaw -76.7 deg (measured). The user: "while my arm disappears when outside the
+playzone, my hands don't" (observed; the keyed hands ignored the region, see below). VrApi showed GPU
+95 % and 65 C at 72 fps with the box (measured; the cause was not looked into).
+What changed after it (2026-11-24, not tested: everything in this paragraph compiles and passes the unit
+tests only): the pose is a measured baseline (a robust estimate over up to 60 s, frozen once measured)
+instead of a 1 s average; the box is carried through a STAGE change with a valid pose; the keyed hands
+show only inside a marker box (`marker_hands`); a given size below 10 mm is malformed, the tolerance of
+the size gate is logged and shown in the summary, and a resized code is learned again after 6 sizes.
+
+**Size gate** (it worked in the second run, measured; the resize rule is not tested). Each code has a
+baseline size: the one given with `marker_sizes`, else the learned one, the median width of the last 50
+distinct poses whose size is not a default size (valid from 3 such poses). A resized code: after each new
+distinct size that is not a default size, if the last 6 agree with each other (all within
+`marker_size_tol` of their median) and all lie outside the band of the learned size, the history starts
+again from those 6, so the learned size follows after 6 distinct poses (about 3 s) instead of 26 (about
+13 s); with `marker_size_tol 0` this never happens. A size is a default size when width and height are both within 0.05 mm of the same whole
 multiple of 50 mm. A pose is trusted when its width is within `marker_size_tol` (3 %) of the baseline; a
 default size is never trusted, unless the given size is itself a multiple of 50 mm. Until a code has a
 baseline none of its poses is trusted. Only trusted poses place the box, and the statistics of the summary
@@ -808,12 +837,15 @@ shows the pose as last reported, with ` (size not trusted)` when it is not trust
 | `marker_rate` | 10 Hz | Update snapshots (fresh poses of the known codes, stage space, at the display time of the frame). 0: none |
 | `marker_static` | 0 | 1: tell the runtime the codes don't move, only if it lists that feature (Quest doesn't, measured; read when the tracker starts, see `marker`) |
 | `marker_size` | unset (0) | Does nothing on Quest: it lists no fixed size feature (measured); for the baseline size use `marker_sizes`. Side length in mm, decimals allowed (e.g. `95.6`), 0 to 2000: black edge to black edge, without the white margin. The runtime takes EVERY code as this size, so set it only while codes of one size are in view; with it set the size in the `new ...` line is this value, not a measurement. Only if the runtime lists that feature. Read when the tracker starts (see `marker`): check the `creating the spatial context (...)` line. A value that is not a number is logged and ignored |
-| `marker_sizes` | unset | The baseline size of the codes (see "Size gate"), mm with decimals, black edge to black edge: `144.2` for every code, or payload:mm pairs separated by commas, `RIG1:144.2,SCR1:150` (payloads case sensitive; a number without payload is the size of the other codes; at most 91 characters, an Android limit). Unset: learned from the sizes the runtime reports. A malformed entry is logged once and ignored. Polled, applies at once |
-| `marker_size_tol` | 3 % | A pose is trusted when its width is within this of the baseline, 0 to 50. 0 turns the size gate off: every pose is trusted, as before. Polled, applies to the next pose |
+| `marker_sizes` | unset | The baseline size of the codes (see "Size gate"), mm with decimals, black edge to black edge: `144.2` for every code, or payload:mm pairs separated by commas, `RIG1:144.2,SCR1:150` (payloads case sensitive; a number without payload is the size of the other codes; at most 91 characters, an Android limit). 10 to 2000 mm: a smaller size is malformed (`144,2` gives 144 mm and the malformed entry `2`). Unset: learned from the sizes the runtime reports. A malformed entry is logged once and ignored. Polled, applies at once |
+| `marker_size_tol` | 3 % | A pose is trusted when its width is within this of the baseline, 0 to 50. 0 turns the size gate off: every pose is trusted, as before. Polled, applies to the next pose; a change is logged |
 | `marker_box` | 0 | 1: while a code is known, the depth mask uses a box placed from it instead of the region of the settings (also instead of "Distance") |
 | `marker_id` | unset | Use the code with this payload (text, case sensitive: `RIG1`). A change is logged and the box is forgotten at once. Unset: the box stays with codes that carry the payload of the code used first, until `marker_box 0`, `marker 0`, or `marker_id` changes |
-| `marker_window` | 1000 ms | Length of the average of the pose of the code, 100 to 60000. A change is logged and applies at once (a shorter window drops older poses at once) |
-| `marker_move_ms` | 1000 ms | Poses away from the average must agree for this long (and be at least 3) to be a move, 0 to 60000. Longer: fewer false moves from a pose error that lasts a moment (a standing code's heading), a real move is followed later. A change is logged and applies at once |
+| `marker_window` | 60000 ms | Time window of the distinct poses of the estimate of the pose of the code, 100 to 600000 (at most 240 poses, about 2 minutes at 2 Hz). Was 1000 ms. A change is logged and applies at once (a shorter window drops older poses at once; a measured estimate stays) |
+| `marker_move_ms` | 1000 ms | Poses away from the estimate must agree for this long (and be at least 3) to be a move, 0 to 60000. Longer: fewer false moves from a pose error that lasts a moment (a standing code's heading), a real move is followed later. A move also ends a measurement and starts a new one. A change is logged and applies at once |
+| `marker_scan_poses` | 20 | Distinct poses that measure the pose of the code, 3 to 240; they must also span at least 8 s. A change is logged and applies to the next pose |
+| `marker_scan` | unset | Another positive value measures the pose again from the next pose (the box stays where it is until then). The value at the start of the app is not a request (like `playzone`) |
+| `marker_hands` | 1 | 1: with the color key and a marker box, the keyed hands show only inside the box, faded over 2 cm on each side of its surface. 0: everywhere, as before. The region of the settings (Distance, Cockpit volume) never limits the hands. A change is logged and applies at once |
 | `marker_box_x` / `_y` / `_z` | 0 / 150 / 0 mm | Center of the box from the code: to the right of the heading, up, along the heading. A flat code with its top away from you: +x is your right, +z away from you. A standing code facing you: +x is your LEFT, +z comes TOWARDS you (moving a code from flat to standing needs new values; the defaults fit a flat code, for a standing one start from z 400, y -150, see Testing) |
 | `marker_box_w` / `_h` / `_d` | 1200 / 900 / 1000 mm | Width (across the heading), height, depth (along the heading) |
 | `marker_box_yaw` | 0 deg | Added to the heading, counter-clockwise from above; turns the box about the code |
@@ -827,24 +859,47 @@ switches between the top of the code and its normal, which are opposite for a co
 the slope, so the box turns by 180 degrees and x / z are mirrored. (There is no hysteresis; it is a
 possible change after the first measurements.)
 
-The pose is the average of the poses of the last `marker_window` (1 s) while the code is still. A pose
-that is repeated is counted once. A single pose away from the average (more than 2 cm or 3 degrees) is
-left out and counted as an outlier; 3 or more poses in a row away from the average that agree with each
-other and span `marker_move_ms` (1 s) are a move, and the average starts again from them; a pose away from
-the average that the runtime reports unchanged without a gap for 2 s is also taken as a move (a gap: no
-pose for more than 0.5 s, e.g. the code was out of view; with `marker_rate` below 2 Hz or poses from the
-discoveries only this rule never applies). The pose is kept while the code is not seen, and also while
-there is no tracker (it failed, or the session stopped and started again); only `marker_box 0`,
-`marker 0` or a new `marker_id` forget it. A change of the
-STAGE space (`ReferenceSpaceChangePending` for STAGE; events for LOCAL or VIEW are ignored here) keeps the
-box up to the change time of the event and drops it from then until the code is seen again; the average
-starts again with the first pose in the new space. Quest announced STAGE changes three times at a
-recenter without moving the frame (Evening session), so a recenter may still show the region of the
-settings for about one update (~100 ms) with the code in view, and until the code is seen again otherwise.
-The box applies with Passthrough = Depth only, and live; the settings stay as they are.
+The pose is a measured baseline (not tested; it replaced the 1 s average after the second run). The code
+never moves, so the estimate takes the distinct poses of the last `marker_window` (60 s, at most 240): the
+median of the positions per axis, and for the heading the circular mean of the headings within 1.5
+degrees of their circular median (the plain circular mean with fewer than 5 poses). A pose that is
+repeated is counted once. Once `marker_scan_poses` (20) distinct poses spanning at least 8 s are in the
+estimate, it is measured: logged once (`marker box: measured: ...`) and frozen, later poses near it are
+counted but no longer change it; the code can then be hidden. Before that the box follows the running
+estimate, and `moved by` is logged at most once a second. A single pose away from the estimate (more than
+2 cm or 3 degrees) is left out and counted as an outlier; 3 or more poses in a row away from the estimate
+that agree with each other and span `marker_move_ms` (1 s) are a move: a new measurement starts from them;
+a pose away from the estimate that the runtime reports unchanged without a gap for 2 s is also taken as a
+move (a gap: no pose for more than 0.5 s, e.g. the code was out of view; with `marker_rate` below 2 Hz or
+poses from the discoveries only this rule never applies). `marker_scan` measures again on request. The
+pose is kept while the code is not seen, and also while there is no tracker (it failed, or the session
+stopped and started again); only `marker_box 0`, `marker 0` or a new `marker_id` forget it. A change of
+the STAGE space (`ReferenceSpaceChangePending` for STAGE; events for LOCAL or VIEW are ignored here) with
+a valid pose carries the box into the new space at the change time of the event (not tested): the kept
+pose and the poses of the estimate become p_new = inverse(pose_in_previous_space) * p_old, the heading
+changes by minus the yaw of that pose, a measured estimate stays measured (`marker box: stage space
+changed, box carried over (...)`). If the pose in the new space disagrees, three poses there are a move
+and measure again. Without a valid pose the box is kept up to the change time and dropped from then
+until the code is seen again, as before. The tracker itself still drops its poses at a STAGE change until
+the codes are seen again (`marker: stage space changed, ...`); the box does not need them. The box applies
+with Passthrough = Depth only, and live; the settings stay as they are.
 
-With the color key on, the hand zones do not use the region (`stream.wgsl`: `max(mask, hand.g)` and
-`focus`): keyed hands show everywhere, while forearms, wheel and body show only inside the box. A hand
+With the color key on, the keyed hand zones (the capsules around the hand joints, drawn by
+`focus_area.wgsl`) did not use the region (`stream.wgsl`: `max(mask, hand.g)` and `focus`): keyed hands
+showed everywhere, while forearms, wheel and body show only inside the box (second run, observed). Now
+(not tested), with a marker box and `marker_hands` 1, the CPU limits the hands before they go to the GPU
+(`limit_hand_to_region` in `depth_mask.rs`): each capsule end gets a weight from its distance to the
+surface of the box (1 inside, 0 outside, smooth from 2 cm inside to 2 cm outside, like the region of the
+depth mask), and its radius goes from the joint radius (weight 1) down to minus the reach of the zones
+(weight 0: neither the rim nor the solid fill shows). The radius is linear along a capsule, so a capsule
+that crosses the surface tapers off; one that reaches past 2 cm outside is cut there. A hand half inside
+the box: the part inside looks as before, at the surface the fingers or the palm get thinner over a few
+centimeters (at the surface about half as wide) and vanish about 1-2 cm outside; the part outside shows
+the game, like the forearm. A long capsule (palm, up to about 6 cm) tapers over its whole length inside
+the box when it crosses the surface, so a palm at the surface may look thinner a few cm early. The
+bridge from the wrist (`key_wrist_len`) is limited the same way (its end radius is now its own uniform).
+No new pass, no new texture, no per-pixel cost (only the capsule ends change, about 120 points per frame
+on the CPU). The region of the settings never limits the hands. A hand
 without its forearm means the box ends there, not a wrong heading. The default box is centred on the
 code: 0.5 m either way along the heading, 0.6 m to each side, 0.30 m below to 0.60 m above. For a code
 standing on a monitor that is 0.5 m behind the screen and only 0.5 m towards the driver, with the monitor
@@ -885,6 +940,11 @@ Log lines (`ALVR_CAM`, all start with `marker`):
   baseline, when it changes between given and learned, when the given size changes, and when the learned
   one changes by more than 0.5 mm. With a given size, once the runtime has measured 3 poses that are not a
   default size: `"<payload>" #<id>: given <mm> mm, the runtime measures <mm> mm (<+-%> %)` (its median).
+- `marker: size tolerance <n> %` when `marker_size_tol` changes (also at the start when it is set to other
+  than 3).
+- `marker: "<payload>" #<id>: the last 6 sizes agree at <mm> mm, outside the baseline <mm> mm +-<n> %:
+  size history restarted (a resized code)` (the size is their median, the baseline the learned one); a
+  `size baseline ... (learned from 6 poses)` line follows.
 - `discovery: <n> markers (<n> tracking), <ms> after the request, ...` when the number changes.
 - A code is described everywhere as `"<payload>" #<id> <state> at (x, y, z) m, normal <deg> deg from
   vertical (lying|standing), heading <deg> deg, <w> x <h> mm{ (size not trusted)}` (stage space; position
@@ -908,9 +968,10 @@ Log lines (`ALVR_CAM`, all start with `marker`):
   each` (or `none`, or `failed (poses from the discoveries)`), and per code `  <description><head>, pose
   changes every <ms> (<n> > 0.1 mm / 0.01 deg, <n> bit-exact in 2 s), scatter x/y/z <mm> over <k>
   distinct poses in 10 s, heading scatter <deg> deg (range <deg>), seen <s> ago, <n> poses of another
-  size left out in 2 s{ (last <w> mm)}, baseline <mm> mm (given|learned)`; without a baseline the end is
-  `, <n> poses left out in 2 s{ (last <w> mm)}, no size baseline yet`, with `marker_size_tol 0` it is
-  `, size gate off (marker_size_tol 0), baseline ... | no size baseline yet`. The poses left out are
+  size left out in 2 s{ (last <w> mm)}, baseline <mm> mm +-<n> % (given|learned)` (the band of the
+  trusted sizes, e.g. `baseline 145.6 mm +-3 % (learned)`); without a baseline the end is `, <n> poses
+  left out in 2 s{ (last <w> mm)}, no size baseline yet`, with `marker_size_tol 0` it is `, size gate off
+  (marker_size_tol 0), baseline <mm> mm (given|learned) | no size baseline yet`. The poses left out are
   distinct poses (a repeat of the pose before is not counted again), the size is the width. "pose
   changes", the scatter and the heading scatter count trusted poses only, "seen" is the last pose
   reported. "pose changes" counts
@@ -927,7 +988,16 @@ Log lines (`ALVR_CAM`, all start with `marker`):
   off: one line `update snapshots can't be created: none from now on, poses come from the discoveries
   only (debug.alvr.marker 0, then 1 tries again)` and the poses then come from the discoveries only.
 - `marker box: marker_id is now "<text>" | unset`, `marker box: averaging window <s> s`, `marker box: a
-  move must hold <s> s` (when `marker_window` / `marker_move_ms` are set to other than the defaults).
+  move must hold <s> s`, `marker box: a measurement takes <n> poses over 8 s` (when `marker_window` /
+  `marker_move_ms` / `marker_scan_poses` are set to other than the defaults).
+- `marker box: measuring again (marker_scan <n>)` for a new positive `marker_scan`.
+- `marker box: the hands show inside the box only (marker_hands 1)` or `marker box: the hands show also
+  outside the box (marker_hands 0)` when `marker_hands` changes.
+- `marker box: measured: position (x, y, z) m, heading <deg> deg from <n> poses over <s> s, scatter x/y/z
+  <mm>/<mm>/<mm> mm, heading scatter <deg> deg`, once per measurement: the frozen estimate, the distinct
+  poses in it, the time they span, and the standard deviation of their positions and headings (the heading
+  scatter about their circular mean, before the 1.5 degree trim). `marker box: the marker moved, measuring
+  its pose again` when a move ends a measurement.
 - `marker box: {keeping the last pose, }waiting for <the marker "<id>" | a marker with a pose>{, none has
   a trusted pose yet (size gate)} (known: ...)` every 10 s while no code fits (also while a pose is kept).
   The middle part comes when codes that fit have poses but none of them a trusted one; the descriptions
@@ -935,7 +1005,8 @@ Log lines (`ALVR_CAM`, all start with `marker`):
 - `marker box: <n> poses away from the average left out so far`, at most every 2 s when the count grew.
 - `marker box: placed at (x, y, z) m, heading <deg> deg, size ..., marker #<id> at (...), <n> samples
   over <s> s (window <s> s), <n> outliers left out`, again as `moved by <cm> cm, at ...` when a corner of
-  the box moved by more than 1 cm. The samples are distinct poses only; `over <s> s` is the time from the
+  the box moved by more than 1 cm since the last line (before the pose is measured at most once a
+  second; once measured it moves only with a move or `marker_scan`). The samples are distinct poses only; `over <s> s` is the time from the
   oldest to the newest of them (it can be longer than the window when the runtime stops refreshing the
   pose, and is 0 with one sample).
 - `marker box: used by the depth mask` or `marker box: placed but not used (no stream, or Passthrough is
@@ -947,7 +1018,11 @@ Log lines (`ALVR_CAM`, all start with `marker`):
   the session stopped) while a box is placed: the box stays.
 - `ReferenceSpaceChangePending type: <type>, change time <ns> ns, pose valid: <bool>, pose in previous
   space (x, y, z) m, yaw <deg> deg` (now in `ALVR_CAM`, for every reference space type; only STAGE ones
-  give `marker: stage space changed` and `marker box: stage space changed, waiting for the marker`).
+  give `marker: stage space changed, poses dropped until the markers are seen again` and, at the change
+  time while a box is kept, `marker box: stage space changed, box carried over (moved by (x, y, z) m, yaw
+  <deg> deg in the new space)` with a valid pose (the change of the coordinates of the box centre and of
+  its heading, the box itself stays in the room) or `marker box: stage space changed, waiting for the
+  marker` without one).
 
 Testing (`adb logcat -s ALVR_CAM` running):
 - [ ] The printed codes `RIG1`, `RIG2`, `RIG3` (black edge 144.2, 95.6, 67.4 mm; the payload is case
@@ -977,11 +1052,20 @@ Testing (`adb logcat -s ALVR_CAM` running):
       `marker box: used by the depth mask`. The depth mask shows the box: the real desk and what stands
       on it inside the box, the game outside. The debug view "Tint mask" marks it green only without the
       color key (`setprop debug.alvr.color_key 0`, and `auto_key 0`, live; hands are then limited by the
-      box too); with the key loaded the box is plain passthrough, not green, and the keyed hands are
-      never limited by it. Move the code by 5 cm: the box follows after about 1 s (`marker_move_ms`;
-      at least 3 poses at the new place), then `moved by`. With the code on the monitor, switch the
-      monitor to the game: the box stays. Count the `moved by` lines while racing with the code fixed:
-      each one is a false move; if there are any, try `marker_move_ms 3000`.
+      box too); with the key loaded the box is plain passthrough, not green. Move the code by 5 cm: the
+      box follows after about 1 s (`marker_move_ms`; at least 3 poses at the new place), then `the marker
+      moved, measuring its pose again` and `moved by`. With the code on the monitor, switch the monitor to
+      the game: the box stays. Count the `moved by` lines while racing with the code fixed: each one is a
+      false move; if there are any, try `marker_move_ms 3000`.
+- [ ] Measured baseline: show the code for about 15 s. `marker box: measured: ...` must come after about
+      10 s (20 poses at 2 Hz); note its scatter and heading scatter. Before it at most one `moved by` per
+      second, after it none while the code stays (also with single poses at 198 or 214 deg). Hide the
+      code: the box stays. `setprop debug.alvr.marker_scan 1` with the code shown: `measuring again`, a
+      new `measured:` line; compare the two positions and headings (how repeatable is a measurement?).
+- [ ] Hands (`marker_hands`, color key on): reach out of the box with one hand. The hand must vanish
+      at the box surface like the forearm, thinning over a few cm, not popping. Then `setprop
+      debug.alvr.marker_hands 0`: the hand shows outside again (as in the second run). Look at the palm at
+      the surface: does it thin out too early? Note the GPU load (VrApi) with 1 and 0.
 - [ ] Origin: with the code flat, set `marker_box_y 0`, `marker_box_h 100`, `marker_box_w 150`,
       `marker_box_d 150`. The tinted patch must sit centred on the code, not on a corner. A shift of half
       the code size means the runtime's origin is not the centre; note the direction.
@@ -992,8 +1076,7 @@ Testing (`adb logcat -s ALVR_CAM` running):
       300`: it must move to the right of the code as read. Turn the paper by 90 degrees: the `heading` in
       the `marker box:` line changes by 90 degrees and the box turns with it. If a direction is wrong,
       note which one and try `marker_box_yaw 180` / `90`. Reset x / z to 0 afterwards.
-- [ ] Change `marker_box_y` / `_w` live. Try `marker_window` 300 and 3000: the box is steadier with the
-      longer window and follows a move later.
+- [ ] Change `marker_box_y` / `_w` live.
 - [ ] Standing code (paper upright, or the code shown on the monitor facing you, see "A code on the
       monitor"): `new ...` must say `standing` and a normal of about 90 deg (a monitor leaning back:
       60-90). `marker_box_z 300` must bring the box TOWARDS you, out of the screen. `marker_box_x 300`
@@ -1003,11 +1086,13 @@ Testing (`adb logcat -s ALVR_CAM` running):
       make it your distance to the screen minus 300 or so) and `marker_box_y -150` (0.60 m below to 0.30
       m above the code with `_h` 900, for the wheel and the hands). Compare the `marker box: placed at
       ...` centre with the `marker #.. at ...` position in the same line to check the offset.
-- [ ] Recenter: note the `ReferenceSpaceChangePending type:` lines (only STAGE ones give `marker: stage
-      space changed`); after them the box is gone (`marker box: stage space changed, waiting for the
-      marker`) until the code is seen again, then back at the same place. With the code out of view
-      during a recenter the region of the settings stays: if that happens in practice, keeping the box
-      through STAGE changes is the next step.
+- [ ] Recenter with the code hidden after `measured:`: note the `ReferenceSpaceChangePending type:`
+      lines; a STAGE one with `pose valid: true` must give `marker box: stage space changed, box carried
+      over (...)` and the box must stay at the same place in the room (judge it against the rig). With a
+      STAGE pose of 0 and yaw 0 (as in the second run) the box doesn't move at all. Then show the code
+      again: no `the marker moved, measuring its pose again` line (the new poses fit the carried
+      estimate). A `pose valid: false`
+      change still drops the box until the code is seen again.
 
 ## Open problems, in order
 

@@ -58,6 +58,9 @@ struct DepthUniforms {
     // ahead. xyz: direction of the motion (unit vector), w: how far ahead (0 with hand_zones.w: no sweep)
     hand_sweep: array<vec4f, 2>,
     // One more capsule of each hand, from the wrist towards the forearm, 2 vectors per hand. First:
-    // xyz: the wrist, w: radius (0: none). Second: xyz: the end, w: how solid its core is (0..1)
+    // xyz: the wrist, w: radius at the wrist. Second: xyz: the end, w: how solid its core is (0..1)
     hand_bridge: array<vec4f, 4>,
+    // Radius at the end of each bridge, x: left hand, y: right hand (both radii 0: no bridge). It
+    // differs from the one at the wrist where a hand limited to a marker box tapers off
+    hand_bridge_end: vec4f,
 }

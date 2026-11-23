@@ -204,18 +204,20 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         // The bridge from the wrist to the forearm: one more capsule of the hand, with its own test of
         // the distance because it may reach far out of the bounding sphere
         let bridge_start = depth_u.hand_bridge[hand * 2u];
-        if bridge_start.w > 0.0 {
+        let bridge_end_radius = depth_u.hand_bridge_end[hand];
+        let bridge_radius = max(bridge_start.w, bridge_end_radius);
+        if bridge_radius > 0.0 {
             let bridge_end = depth_u.hand_bridge[hand * 2u + 1u];
             let to_middle = 0.5 * (bridge_start.xyz + bridge_end.xyz) - origin;
             let middle_t = max(dot(to_middle, dir), 0.0);
-            let reach = 0.5 * length(bridge_end.xyz - bridge_start.xyz) + bridge_start.w;
+            let reach = 0.5 * length(bridge_end.xyz - bridge_start.xyz) + bridge_radius;
             if length(to_middle - dir * middle_t)
                 < reach + max(zones.x, 0.0) + max(sweep.x, sweep.y) + SOFTNESS {
                 let capsule = capsule_zones(
                     origin,
                     dir,
                     bridge_start,
-                    vec4f(bridge_end.xyz, bridge_start.w),
+                    vec4f(bridge_end.xyz, bridge_end_radius),
                     bridge_end.w,
                     zones,
                     sweeps,

@@ -318,7 +318,9 @@ pub struct WristBridge {
     /// The wrist joint
     pub start: Vec3,
     pub end: Vec3,
+    /// At the wrist, and at the end (the same, unless the hand is limited to a marker box)
     pub radius: f32,
+    pub end_radius: f32,
     /// How solid its core is (0..1)
     pub solid: f32,
 }
@@ -330,6 +332,7 @@ impl WristBridge {
             start: wrist,
             end: wrist + direction * length,
             radius,
+            end_radius: radius,
             solid: solid.clamp(0.0, 1.0),
         })
     }
@@ -346,8 +349,92 @@ impl WristBridge {
 
     /// Start and end, xyz: position, w: radius
     pub fn capsule(&self) -> [Vec4; 2] {
-        [self.start.extend(self.radius), self.end.extend(self.radius)]
+        [
+            self.start.extend(self.radius),
+            self.end.extend(self.end_radius),
+        ]
     }
+}
+
+/// The hands fade out over this on each side of the surface of a marker box (meters)
+pub const HAND_REGION_FEATHER: f32 = 0.02;
+// A capsule end that is outside gets a radius this much below minus the reach of the zones: more than
+// the soft edge of the rim in focus_area.wgsl (3 mm)
+const HAND_FADE_MARGIN: f32 = 0.005;
+
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// A hand limited to a marker box (`debug.alvr.marker_hands`). Each capsule end gets a weight, 1
+/// inside the box and 0 outside, smooth over `feather` on each side of its surface (like the region
+/// of the depth mask), and its radius goes from the radius (weight 1) down to minus the reach of the
+/// zones (weight 0), where neither the rim nor the solid fill shows. The radius is linear along a
+/// capsule, so a capsule that crosses the surface tapers off towards the outside; one that reaches
+/// past `feather` outside ends there (nothing beyond shows anyway), so that a long capsule doesn't
+/// taper over its whole length out of the box. The bridge from the wrist is one more capsule. Nothing
+/// changes on the GPU: only the capsule ends
+pub fn limit_hand_to_region(
+    shape: &HandShape,
+    zones: &HandZones,
+    bridge: Option<WristBridge>,
+    region: &RegionOverride,
+    feather: f32,
+) -> (HandShape, Option<WristBridge>) {
+    let world_to_volume = region.volume_to_world.inverse();
+    let feather = feather.max(0.0005);
+    let reach = zones.rim.max(zones.core + zones.falloff).max(0.0) + HAND_FADE_MARGIN;
+    let distance = |point: Vec3| box_signed_distance(&world_to_volume, region.half_extents, point);
+    let limit = |[start, end]: [Vec4; 2]| {
+        let mut ends = [start, end];
+        let distances = ends.map(|point| distance(point.truncate()));
+        // Of a capsule that crosses the end of the fade, the outer part shows nothing: cut it off
+        for (inner, outer) in [(0, 1), (1, 0)] {
+            if distances[inner] < feather && distances[outer] > feather {
+                let (mut a, mut b) = (ends[inner].truncate(), ends[outer].truncate());
+                // The box is convex: the capsule crosses that distance once
+                for _ in 0..12 {
+                    let middle = (a + b) * 0.5;
+                    if distance(middle) > feather {
+                        b = middle;
+                    } else {
+                        a = middle;
+                    }
+                }
+                ends[outer] = b.extend(ends[outer].w);
+            }
+        }
+        ends.map(|point| {
+            let weight = 1.0 - smoothstep(-feather, feather, distance(point.truncate()));
+            point
+                .truncate()
+                .extend(weight * point.w - (1.0 - weight) * reach)
+        })
+    };
+
+    let mut limited = *shape;
+    for segment in &mut limited.segments {
+        *segment = limit(*segment);
+    }
+    let bridge = bridge.map(|bridge| {
+        let [start, end] = limit(bridge.capsule());
+        WristBridge {
+            start: start.truncate(),
+            end: end.truncate(),
+            radius: start.w,
+            end_radius: end.w,
+            ..bridge
+        }
+    });
+
+    (limited, bridge)
+}
+
+// Distance from the surface of a box, negative inside. Same as `region_mask` in depth_mask.wgsl
+fn box_signed_distance(world_to_volume: &Mat4, half_extents: Vec3, point: Vec3) -> f32 {
+    let e = world_to_volume.transform_point3(point).abs() - half_extents;
+    e.max(Vec3::ZERO).length() + e.max_element().min(0.0)
 }
 
 /// The hands are passthrough, the color key decides where the hand tracking is not certain
@@ -487,7 +574,17 @@ const EYE_FLOAT_COUNT: usize = 16 + 4 + 16 + 16 + 4;
 pub const DEPTH_UNIFORMS_FLOAT_COUNT: usize = 2 * EYE_FLOAT_COUNT
     + 16
     + 4 * 5
-    + 4 * (2 + 2 * HAND_SEGMENTS / 4 + 2 + 2 * 2 * HAND_SEGMENTS + 6 + 2 * 9 + 1 + 2 + 2 + 2 * 2);
+    + 4 * (2
+        + 2 * HAND_SEGMENTS / 4
+        + 2
+        + 2 * 2 * HAND_SEGMENTS
+        + 6
+        + 2 * 9
+        + 1
+        + 2
+        + 2
+        + 2 * 2
+        + 1);
 pub const DEPTH_UNIFORMS_SIZE: usize = DEPTH_UNIFORMS_FLOAT_COUNT * size_of::<f32>();
 
 pub(crate) fn pose_to_mat4(pose: Pose) -> Mat4 {
@@ -668,20 +765,21 @@ pub fn depth_uniforms(
             zones.sweep.direction.extend(zones.sweep.forward).to_array()
         }));
     }
-    // Radius 0: no bridge
+    // Both radii 0: no bridge
     let bridges = input.color_key.map_or([None; 2], |key| key.bridges);
-    for (hand, bridge) in hands.iter().zip(bridges) {
-        let [start, end] = bridge
-            .filter(|_| hand.is_some())
-            .map_or([Vec4::ZERO; 2], |bridge| {
-                [
-                    bridge.start.extend(bridge.radius),
-                    bridge.end.extend(bridge.solid),
-                ]
-            });
+    let bridges = [0, 1].map(|i| bridges[i].filter(|_| hands[i].is_some()));
+    for bridge in bridges {
+        let [start, end] = bridge.map_or([Vec4::ZERO; 2], |bridge| {
+            [
+                bridge.start.extend(bridge.radius),
+                bridge.end.extend(bridge.solid),
+            ]
+        });
         data.extend(start.to_array());
         data.extend(end.to_array());
     }
+    let end_radius = bridges.map(|bridge| bridge.map_or(0.0, |bridge| bridge.end_radius));
+    data.extend([end_radius[0], end_radius[1], 0.0, 0.0]);
 
     data.try_into().unwrap()
 }
@@ -1011,11 +1109,91 @@ mod tests {
             DEPTH_UNIFORMS_SIZE,
             592 + 16
                 * (2 + 2 * HAND_SEGMENTS / 4 + 2 + 2 * 2 * HAND_SEGMENTS + 6 + 2 * 9 + 1 + 2 + 2)
-                // The bridges
+                // The bridges, and the radii at their ends
                 + 16 * 4
+                + 16
         );
         // 28 capsules per hand, and the bridges from the wrists
-        assert_eq!(DEPTH_UNIFORMS_SIZE, 3200);
+        assert_eq!(DEPTH_UNIFORMS_SIZE, 3216);
+    }
+
+    // A hand reaching out of a marker box: inside unchanged, outside nothing reaches even the rim,
+    // tapering in between
+    #[test]
+    fn hand_limited_to_the_box() {
+        // A box of 1 m around the origin, turned; its +X face is at x = 0.5 in the box frame
+        let rotation = Quat::from_rotation_y(0.4);
+        let region = RegionOverride {
+            volume_to_world: Mat4::from_rotation_translation(rotation, Vec3::new(0.2, 1.0, -0.5)),
+            half_extents: Vec3::splat(0.5),
+        };
+        let at = |x: f32| {
+            region
+                .volume_to_world
+                .transform_point3(Vec3::new(x, 0.1, 0.0))
+        };
+        let zones = HandZones {
+            core: -0.004,
+            falloff: 0.004,
+            rim: 0.012,
+            solid: [1.0; HAND_SEGMENTS],
+            sweep: HandSweep::NONE,
+        };
+        // Capsules along box +X, 2 cm apart, from 10 cm inside to 10 cm outside the face
+        let segments = std::array::from_fn(|i| {
+            let x = 0.4 + (i % 10) as f32 * 0.02;
+            [at(x).extend(0.01), at(x + 0.02).extend(0.01)]
+        });
+        let shape = HandShape { segments };
+        let bridge = WristBridge::new(at(0.45), rotation * Vec3::X, 0.1, 0.02, 1.0);
+        let (limited, bridge) =
+            limit_hand_to_region(&shape, &zones, bridge, &region, HAND_REGION_FEATHER);
+
+        // The reach of the zones: the rim (12 mm) and the margin
+        let gone = -(0.012 + HAND_FADE_MARGIN);
+        for ([start, end], [old_start, _]) in limited.segments.iter().zip(shape.segments) {
+            let x = 0.4 + (old_start.truncate() - at(0.4)).length();
+            // Same positions
+            assert_eq!(start.truncate(), old_start.truncate());
+            for (point, x) in [(start, x), (end, x + 0.02)] {
+                if x <= 0.48 + 1e-4 {
+                    assert!((point.w - 0.01).abs() < 1e-4, "{x} {}", point.w);
+                } else if x >= 0.52 - 1e-4 {
+                    assert!((point.w - gone).abs() < 1e-4, "{x} {}", point.w);
+                } else {
+                    assert!(point.w < 0.01 && point.w > gone, "{x} {}", point.w);
+                }
+            }
+        }
+        // At the face: half the radius, minus half the reach
+        let face = limited.segments[5][0];
+        assert!((face.w - (0.005 + gone * 0.5)).abs() < 1e-4, "{}", face.w);
+        // Outside nothing of the capsule shows, not even its rim or solid fill
+        let eye = at(0.6) + rotation * Vec3::Z * 0.5;
+        let [start, end] = limited.segments[9];
+        let distance = ray_capsule_distance(eye, (start.truncate() - eye).normalize(), start, end);
+        assert!(distance > zones.rim + 0.003, "{distance}");
+
+        // The bridge from 5 cm inside to 5 cm outside: full at the wrist, gone at its end
+        let bridge = bridge.unwrap();
+        assert!((bridge.radius - 0.02).abs() < 1e-4);
+        assert!((bridge.end_radius - gone).abs() < 1e-4);
+        assert_eq!(bridge.capsule()[1].w, bridge.end_radius);
+        // It ends where the fade ends, 2 cm outside
+        assert!((bridge.end - at(0.52)).length() < 1e-3, "{}", bridge.end);
+
+        // A long capsule from 10 cm inside to 10 cm outside: cut off 2 cm outside, so that it shows
+        // up to about 1 cm outside, not 7 cm
+        let long = HandShape {
+            segments: [[at(0.4).extend(0.01), at(0.6).extend(0.01)]; HAND_SEGMENTS],
+        };
+        let (limited, _) = limit_hand_to_region(&long, &zones, None, &region, HAND_REGION_FEATHER);
+        let [start, end] = limited.segments[0];
+        assert!((start.w - 0.01).abs() < 1e-4);
+        assert!((end.truncate() - at(0.52)).length() < 1e-3, "{end}");
+        assert!((end.w - gone).abs() < 1e-4);
+        let zero = 0.4 + 0.12 * 0.01 / (0.01 - gone);
+        assert!(zero < 0.51, "{zero}");
     }
 
     #[test]

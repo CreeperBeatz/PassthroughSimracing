@@ -25,9 +25,11 @@
 //! - `debug.alvr.marker_size <mm>`: side length of every code, decimals allowed (e.g. 95.6; only if
 //!   the runtime lists the feature, Quest doesn't)
 //! - `debug.alvr.marker_sizes <text>`: the baseline size of the codes, "144.2" for every code or
-//!   "RIG1:144.2,SCR1:150" by payload (polled). Unset: learned from the sizes the runtime reports
+//!   "RIG1:144.2,SCR1:150" by payload, 10 to 2000 mm (polled). Unset: learned from the sizes the
+//!   runtime reports; when the last 6 agree outside the band of the learned size (a resized code),
+//!   it is learned again from them
 //! - `debug.alvr.marker_size_tol <%>`: a pose is trusted when its size is within this of the baseline
-//!   (0..50, default 3, polled; 0: every pose is trusted)
+//!   (0..50, default 3, polled, a change is logged; 0: every pose is trusted)
 //!
 //! Size gate: the runtime reports a code whose size it has not measured as 50.0 or 100.0 mm, and its
 //! pose is then wrong (placed along the line of sight as if the code had that size, measured on
@@ -537,9 +539,13 @@ impl SpatialMarkerTracker {
             .clamp(0, 90);
         self.update_interval = (rate > 0).then(|| Duration::from_secs_f32(1.0 / rate as f32));
 
-        self.size_tolerance = debug_property("debug.alvr.marker_size_tol")
+        let tolerance = debug_property("debug.alvr.marker_size_tol")
             .unwrap_or(DEFAULT_SIZE_TOLERANCE)
             .clamp(0, 50) as u32;
+        if tolerance != self.size_tolerance {
+            log(&format!("size tolerance {tolerance} %"));
+            self.size_tolerance = tolerance;
+        }
         let text = debug_property_string("debug.alvr.marker_sizes");
         if text != self.sizes_text {
             let (sizes, malformed) = text
@@ -1495,6 +1501,35 @@ impl SpatialMarkerTracker {
                 tracked.sizes.pop_front();
             }
             tracked.sizes.push_back(extents);
+            // A resized code: the last sizes agree at a size outside the band of the learned one.
+            // Else the median would follow only after half of `LEARNED_SIZES` poses
+            if let Some(learned) = tracked.learned
+                && tracked.sizes.len() > alvr_graphics::RESIZE_SIZES
+            {
+                let tolerance = self.size_tolerance as f32 / 100.0;
+                let recent = tracked
+                    .sizes
+                    .range(tracked.sizes.len() - alvr_graphics::RESIZE_SIZES..)
+                    .copied()
+                    .collect::<Vec<_>>();
+                if alvr_graphics::marker_resized(&recent, learned, tolerance) {
+                    let mut widths = recent.iter().map(|size| size.x).collect::<Vec<_>>();
+                    widths.sort_by(f32::total_cmp);
+                    log(&format!(
+                        "{} #{}: the last {} sizes agree at {:.1} mm, outside the baseline {:.1} \
+                         mm +-{} %: size history restarted (a resized code)",
+                        payload_text(tracked.marker.payload.as_deref()),
+                        tracked.marker.id,
+                        alvr_graphics::RESIZE_SIZES,
+                        widths[widths.len() / 2] * 1000.0,
+                        learned * 1000.0,
+                        self.size_tolerance,
+                    ));
+                    tracked
+                        .sizes
+                        .drain(..tracked.sizes.len() - alvr_graphics::RESIZE_SIZES);
+                }
+            }
             tracked.learned = alvr_graphics::learned_marker_size(tracked.sizes.iter().copied());
         }
         let trusted = self.size_tolerance == 0
@@ -1544,10 +1579,18 @@ impl SpatialMarkerTracker {
     // The size gate part of a summary line
     fn size_text(&self, tracked: &TrackedMarker) -> String {
         let baseline = tracked.baseline(&self.given_sizes);
+        // The band of the trusted sizes
+        let band = if self.size_tolerance > 0 {
+            format!(" +-{} %", self.size_tolerance)
+        } else {
+            String::new()
+        };
         let baseline_text = match baseline {
-            Some(SizeBaseline::Given(size)) => format!("baseline {:.1} mm (given)", size * 1000.0),
+            Some(SizeBaseline::Given(size)) => {
+                format!("baseline {:.1} mm{band} (given)", size * 1000.0)
+            }
             Some(SizeBaseline::Learned(size)) => {
-                format!("baseline {:.1} mm (learned)", size * 1000.0)
+                format!("baseline {:.1} mm{band} (learned)", size * 1000.0)
             }
             None => "no size baseline yet".into(),
         };

@@ -588,12 +588,17 @@ pub fn entry_point() {
                         }
 
                         // The markers are located in STAGE: a change of LOCAL (a recenter) or VIEW
-                        // doesn't move them
+                        // doesn't move them. The box is carried into the new space if the pose is
+                        // valid; the tracker drops its poses until the markers are seen again
                         if event.reference_space_type() == xr::ReferenceSpaceType::STAGE {
                             if let Some(tracker) = &mut marker_tracker {
                                 tracker.on_reference_space_change(event.change_time());
                             }
-                            marker_region.on_reference_space_change(event.change_time());
+                            let change = event.pose_valid().then(|| alvr_graphics::StageChange {
+                                position,
+                                orientation: from_xr_quat(pose.orientation).normalize(),
+                            });
+                            marker_region.on_reference_space_change(event.change_time(), change);
                         }
                     }
                     xr::Event::SpatialDiscoveryRecommendedEXT(event) => {
@@ -795,7 +800,7 @@ pub fn entry_point() {
             let region_override =
                 marker_region.update(marker_tracker.as_ref(), frame_state.predicted_display_time);
             if let Some(stream) = &mut stream_context {
-                stream.set_region_override(region_override);
+                stream.set_region_override(region_override, marker_region.limits_hands());
             }
             // The box applies only to a stream with Passthrough = Depth
             let used = region_override.map(|_| {

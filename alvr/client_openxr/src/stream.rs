@@ -194,8 +194,10 @@ pub struct StreamContext {
     // Log of the leak map: last time, and the lookup time since then
     last_leak_log: Cell<Instant>,
     leak_lookup_time: Cell<(Duration, u32)>,
-    // Box placed from a marker, used instead of the region of the settings
+    // Box placed from a marker, used instead of the region of the settings, and whether the hands of
+    // the color key show only inside it
     region_override: Option<RegionOverride>,
+    hands_in_region: bool,
 }
 
 impl StreamContext {
@@ -370,6 +372,7 @@ impl StreamContext {
             last_leak_log: Cell::new(Instant::now()),
             leak_lookup_time: Cell::new((Duration::ZERO, 0)),
             region_override: None,
+            hands_in_region: false,
         };
 
         this.update_reference_space(None);
@@ -404,9 +407,11 @@ impl StreamContext {
     }
 
     /// A box placed from a marker on the rig, used for the depth mask instead of the region of the
-    /// settings. None: the settings
-    pub fn set_region_override(&mut self, region: Option<RegionOverride>) {
+    /// settings. None: the settings. `hands_in_region`: the hands of the color key show only inside
+    /// the box (`debug.alvr.marker_hands`); the region of the settings never limits them
+    pub fn set_region_override(&mut self, region: Option<RegionOverride>, hands_in_region: bool) {
         self.region_override = region;
+        self.hands_in_region = hands_in_region;
     }
 
     /// New colors for the key, learned from the camera
@@ -845,6 +850,23 @@ impl StreamContext {
 
         self.hand_bounds
             .set(hands.map(|hand| hand.map(|(shape, _)| shape.bounds())));
+
+        // With a box placed from a marker only the part of the hands inside it shows, faded at its
+        // surface. After the bounds: the playzone still knows about the whole hands
+        let mut hands = hands;
+        if let Some(region) = self.region_override.filter(|_| self.hands_in_region) {
+            for (hand, bridge) in hands.iter_mut().zip(&mut bridges) {
+                if let Some((shape, zones)) = hand {
+                    (*shape, *bridge) = alvr_graphics::limit_hand_to_region(
+                        shape,
+                        zones,
+                        *bridge,
+                        &region,
+                        alvr_graphics::HAND_REGION_FEATHER,
+                    );
+                }
+            }
+        }
 
         // To measure the cost of the hands on the GPU. The playzone still knows about them.
         let (mut hands, mut bridges) = if params.hands {

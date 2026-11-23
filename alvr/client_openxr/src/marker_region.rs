@@ -8,10 +8,16 @@
 //! - `debug.alvr.marker_box_w` / `_h` / `_d <mm>`: width (across the heading), height, depth (along the
 //!   heading) (1200, 900, 1000)
 //! - `debug.alvr.marker_box_yaw <deg>`: added to the heading, turns the box about the marker (0)
-//! - `debug.alvr.marker_window <ms>`: length of the average of the pose (1000, 100 to 60000). The
-//!   rig never moves, so a long average gives a more precise pose
-//! - `debug.alvr.marker_move_ms <ms>`: poses away from the average must agree for this long to be a
+//! - `debug.alvr.marker_window <ms>`: time window of the poses of the estimate (60000, 100 to 600000,
+//!   at most 240 distinct poses). The rig never moves, so a long window gives a more precise pose
+//! - `debug.alvr.marker_move_ms <ms>`: poses away from the estimate must agree for this long to be a
 //!   move (1000, 0 to 60000)
+//! - `debug.alvr.marker_scan_poses <n>`: distinct poses (over at least 8 s) that measure the pose of
+//!   the marker (20, 3 to 240)
+//! - `debug.alvr.marker_scan <n>`: another positive value measures the pose again (the value at the
+//!   start of the app is not a request)
+//! - `debug.alvr.marker_hands 0`: the hands of the color key show also outside the box (1: only
+//!   inside it, faded at its surface)
 //!
 //! The frame of the box is level (stage +Y up). Its heading: for a code lying flat (normal within 45
 //! degrees of vertical) the direction of the top of the code, for a standing code the direction out of
@@ -19,31 +25,39 @@
 //! driver; for a flat code whose top points away from the driver +x is the driver's right and +z away.
 //! Only trusted poses place the box (the size gate of the tracker, `debug.alvr.marker_sizes`): a pose
 //! of another size than the baseline of the code is wrong by up to a meter.
-//! The pose is averaged over the window while the marker is still, and kept while the marker is not
-//! seen, also without a tracker (the tracker failed or the session stopped; `debug.alvr.marker 0`
-//! forgets it). Single poses away from the average are left out; three in a row at the same new place
-//! over `marker_move_ms` are a move and start the average again. A change of the STAGE space (only
-//! that one, not LOCAL) keeps the box up to the change time (poses before it are valid in the old
-//! space), then drops it until the marker is seen again.
+//! The pose is a robust estimate of the distinct poses of the window (`PoseSmoother`): the median of
+//! the positions, the circular mean of the headings near their median. Once it has `marker_scan_poses`
+//! poses over 8 s it is measured and frozen (logged once): the code can then be hidden. It is kept
+//! while the marker is not seen, also without a tracker (the tracker failed or the session stopped;
+//! `debug.alvr.marker 0` forgets it). Single poses away from the estimate are left out; three in a row
+//! at the same new place over `marker_move_ms` are a move and start a new measurement. A change of the
+//! STAGE space (only that one, not LOCAL) with a valid pose carries the box into the new space at the
+//! change time (poses before it are in the old space); without a valid pose the box is kept up to the
+//! change time, then dropped until the marker is seen again.
 
 use crate::{
     extra_extensions::{Marker, MarkerState, SpatialMarkerTracker},
     passthrough::{debug_property, debug_property_string},
 };
 use alvr_common::glam::Vec3;
-use alvr_graphics::{MarkerBoxParams, PoseSmoother, RegionOverride};
+use alvr_graphics::{MarkerBoxParams, PoseSmoother, RegionOverride, StageChange};
 use openxr as xr;
 use std::time::{Duration, Instant};
 
 const PROPERTY_POLL_INTERVAL: Duration = Duration::from_millis(500);
-// The average of a still marker, and the move that starts it again
-const DEFAULT_WINDOW_MS: i64 = 1000;
+// The window of the estimate of a still marker, the poses that measure it, and the move that starts
+// it again
+const DEFAULT_WINDOW_MS: i64 = 60000;
+const MAX_WINDOW_MS: i64 = 600000;
+const DEFAULT_SCAN_POSES: i64 = alvr_graphics::DEFAULT_MEASURE_POSES as i64;
 const DEFAULT_MOVE_HOLD_MS: i64 = 1000;
 const RESET_DISTANCE: f32 = 0.02;
 const RESET_ANGLE_DEG: f32 = 3.0;
 const RESET_COUNT: usize = 3;
-// The placement is logged when a corner of the box moved by more than this
+// The placement is logged when a corner of the box moved by more than this, before the pose is
+// measured at most this often
 const LOG_SHIFT: f32 = 0.01;
+const MOVE_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const WAIT_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const REJECTED_LOG_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -63,12 +77,17 @@ pub struct MarkerRegion {
     // Payload of the marker used: without `marker_id` the box stays with codes of this payload
     selected_payload: Option<String>,
     start: Instant,
-    // Smoothed position and yaw, kept while the marker is not seen
+    // Estimated position and yaw, kept while the marker is not seen
     kept: Option<(Vec3, f32)>,
-    // The stage space changes at this time: the kept pose is dropped then, unless a pose in the new
-    // space came first
-    drop_at: Option<xr::Time>,
+    // Changes of the stage space at their change time, in order: the kept pose is carried into the
+    // new space then (or dropped without a valid pose)
+    stage_changes: Vec<(xr::Time, Option<StageChange>)>,
+    // `debug.alvr.marker_scan` as last read
+    last_scan_request: i64,
+    // `debug.alvr.marker_hands`
+    hands_limited: bool,
     last_logged: Option<RegionOverride>,
+    last_move_log: Option<Instant>,
     last_wait_log: Option<Instant>,
     // Outliers logged so far, and when
     logged_rejected: usize,
@@ -96,6 +115,7 @@ impl MarkerRegion {
                     RESET_COUNT,
                 );
                 smoother.set_move_hold(DEFAULT_MOVE_HOLD_MS as f64 / 1000.0);
+                smoother.set_measure_poses(DEFAULT_SCAN_POSES as usize);
                 smoother
             },
             selected: None,
@@ -103,8 +123,12 @@ impl MarkerRegion {
             selected_payload: None,
             start: Instant::now(),
             kept: None,
-            drop_at: None,
+            stage_changes: Vec::new(),
+            // A value left from before is not a request
+            last_scan_request: debug_property("debug.alvr.marker_scan").unwrap_or(0),
+            hands_limited: true,
             last_logged: None,
+            last_move_log: None,
             last_wait_log: None,
             logged_rejected: 0,
             last_rejected_log: None,
@@ -138,7 +162,7 @@ impl MarkerRegion {
 
         let window_s = debug_property("debug.alvr.marker_window")
             .unwrap_or(DEFAULT_WINDOW_MS)
-            .clamp(100, 60000) as f64
+            .clamp(100, MAX_WINDOW_MS) as f64
             / 1000.0;
         if window_s != self.smoother.window() {
             crate::stream_log(&format!("marker box: averaging window {window_s:.1} s"));
@@ -151,6 +175,35 @@ impl MarkerRegion {
         if hold_s != self.smoother.move_hold() {
             crate::stream_log(&format!("marker box: a move must hold {hold_s:.1} s"));
             self.smoother.set_move_hold(hold_s);
+        }
+        let scan_poses = debug_property("debug.alvr.marker_scan_poses")
+            .unwrap_or(DEFAULT_SCAN_POSES)
+            .clamp(3, alvr_graphics::MAX_POSES as i64) as usize;
+        if scan_poses != self.smoother.measure_poses() {
+            crate::stream_log(&format!(
+                "marker box: a measurement takes {scan_poses} poses over {:.0} s",
+                alvr_graphics::MEASURE_MIN_SPAN_S
+            ));
+            self.smoother.set_measure_poses(scan_poses);
+        }
+        let scan = debug_property("debug.alvr.marker_scan").unwrap_or(0);
+        if scan != self.last_scan_request {
+            self.last_scan_request = scan;
+            if scan > 0 {
+                // The box stays where it is until the next pose
+                crate::stream_log(&format!("marker box: measuring again (marker_scan {scan})"));
+                self.smoother.reset();
+                self.last_sample = None;
+            }
+        }
+        let hands_limited = debug_property("debug.alvr.marker_hands").unwrap_or(1) != 0;
+        if hands_limited != self.hands_limited {
+            crate::stream_log(if hands_limited {
+                "marker box: the hands show inside the box only (marker_hands 1)"
+            } else {
+                "marker box: the hands show also outside the box (marker_hands 0)"
+            });
+            self.hands_limited = hands_limited;
         }
 
         self.params = MarkerBoxParams {
@@ -171,14 +224,20 @@ impl MarkerRegion {
         };
     }
 
+    /// Whether the hands of the color key show only inside the box (`debug.alvr.marker_hands`)
+    pub fn limits_hands(&self) -> bool {
+        self.hands_limited
+    }
+
     fn forget(&mut self) {
         self.smoother.reset();
         self.selected = None;
         self.last_sample = None;
         self.selected_payload = None;
         self.kept = None;
-        self.drop_at = None;
+        self.stage_changes.clear();
         self.last_logged = None;
+        self.last_move_log = None;
         // The waiting line comes at once
         self.last_wait_log = None;
         self.no_tracker_logged = false;
@@ -195,16 +254,58 @@ impl MarkerRegion {
     }
 
     /// The STAGE space changes at `change_time`: the kept pose is valid until then, in the old space.
-    /// The samples are not averaged with the poses in the new space (the tracker reports none before
-    /// `change_time`)
-    pub fn on_reference_space_change(&mut self, change_time: xr::Time) {
-        self.smoother.reset();
+    /// With the pose of the new space in the old one (`change`) the box and the poses of its estimate
+    /// are carried into the new space then; without it the estimate starts again (the tracker reports
+    /// no pose before `change_time`) and the box is dropped then
+    pub fn on_reference_space_change(
+        &mut self,
+        change_time: xr::Time,
+        change: Option<StageChange>,
+    ) {
         self.last_sample = None;
-        if self.kept.is_some() {
-            let time = self.drop_at.map_or(change_time.as_nanos(), |pending| {
-                pending.as_nanos().max(change_time.as_nanos())
-            });
-            self.drop_at = Some(xr::Time::from_nanos(time));
+        if change.is_none() {
+            self.smoother.reset();
+        }
+        if self.kept.is_some() || !self.smoother.is_empty() {
+            self.stage_changes.push((change_time, change));
+        }
+    }
+
+    // The changes of the stage space that are due at `now`, in order
+    fn apply_stage_changes(&mut self, now: xr::Time) {
+        while let Some(&(time, change)) = self.stage_changes.first()
+            && now.as_nanos() >= time.as_nanos()
+        {
+            self.stage_changes.remove(0);
+            let Some(change) = change else {
+                if self.kept.is_some() {
+                    crate::stream_log("marker box: stage space changed, waiting for the marker");
+                }
+                // Changes after this one have nothing to carry
+                self.smoother.reset();
+                self.kept = None;
+                self.last_logged = None;
+                continue;
+            };
+            self.smoother.transform(&change);
+            let Some((position, yaw)) = self.kept else {
+                continue;
+            };
+            let old = alvr_graphics::marker_box(position, yaw, &self.params);
+            let (position, yaw) = change.apply(position, yaw);
+            self.kept = Some((position, yaw));
+            let new = alvr_graphics::marker_box(position, yaw, &self.params);
+            // The same place in the room: no "moved by" line for it
+            self.last_logged = Some(new);
+            let moved = new.center() - old.center();
+            crate::stream_log(&format!(
+                "marker box: stage space changed, box carried over (moved by ({:.3}, {:.3}, {:.3}) \
+                 m, yaw {:.1} deg in the new space)",
+                moved.x,
+                moved.y,
+                moved.z,
+                alvr_graphics::yaw_difference(new.yaw(), old.yaw()).to_degrees()
+            ));
         }
     }
 
@@ -261,6 +362,10 @@ impl MarkerRegion {
             return None;
         }
 
+        // Before the poses of this frame: the tracker takes poses in the new space from the change
+        // time on
+        self.apply_stage_changes(now);
+
         if let Some(tracker) = tracker {
             self.no_tracker_logged = false;
             self.follow(tracker);
@@ -283,21 +388,17 @@ impl MarkerRegion {
             ));
         }
 
-        if self
-            .drop_at
-            .is_some_and(|time| now.as_nanos() >= time.as_nanos())
-        {
-            crate::stream_log("marker box: stage space changed, waiting for the marker");
-            self.drop_at = None;
-            self.kept = None;
-            self.last_logged = None;
-        }
-
         let (position, yaw) = self.kept?;
         let region = alvr_graphics::marker_box(position, yaw, &self.params);
         let shift = self.last_logged.map(|last| last.max_corner_shift(&region));
-        if shift.is_none_or(|shift| shift > LOG_SHIFT) {
+        // Before it is measured the box follows the estimate: "moved by" at most once a second
+        let move_logged_lately = !self.smoother.is_measured()
+            && self
+                .last_move_log
+                .is_some_and(|time| time.elapsed() < MOVE_LOG_INTERVAL);
+        if shift.is_none_or(|shift| shift > LOG_SHIFT && !move_logged_lately) {
             self.last_logged = Some(region);
+            self.last_move_log = Some(Instant::now());
             let center = region.center();
             let size = region.size();
             crate::stream_log(&format!(
@@ -329,6 +430,31 @@ impl MarkerRegion {
         Some(region)
     }
 
+    // The pose is measured: logged once per measurement
+    fn log_measured(&self) {
+        let Some((position, yaw)) = self.smoother.value() else {
+            return;
+        };
+        let scatter = alvr_graphics::scatter(self.smoother.samples().map(|(p, _)| p))
+            .map_or(Vec3::ZERO, |(deviation, _)| deviation * 1000.0);
+        let heading_scatter = alvr_graphics::yaw_scatter(self.smoother.samples().map(|(_, y)| y))
+            .map_or(0.0, |(deviation, _)| deviation.to_degrees());
+        crate::stream_log(&format!(
+            "marker box: measured: position ({:.4}, {:.4}, {:.4}) m, heading {:.2} deg from {} poses \
+             over {:.1} s, scatter x/y/z {:.1}/{:.1}/{:.1} mm, heading scatter {:.2} deg",
+            position.x,
+            position.y,
+            position.z,
+            alvr_graphics::yaw_log_deg(yaw),
+            self.smoother.len(),
+            self.smoother.span(),
+            scatter.x,
+            scatter.y,
+            scatter.z,
+            heading_scatter
+        ));
+    }
+
     // Takes the pose of the marker chosen, or logs what it waits for
     fn follow(&mut self, tracker: &SpatialMarkerTracker) {
         if let Some(marker) = self.choose(tracker) {
@@ -345,16 +471,22 @@ impl MarkerRegion {
                 && let Some(updated) = marker.trusted_updated
             {
                 self.last_sample = Some(updated);
-                // A pose in the current stage space
-                self.drop_at = None;
                 let heading = alvr_graphics::marker_heading(marker.trusted_orientation);
                 let time = updated.saturating_duration_since(self.start).as_secs_f64();
+                let was_measured = self.smoother.is_measured();
                 // The smoother counts a repeated pose once
                 self.kept = Some(self.smoother.push(
                     time,
                     marker.trusted_position,
                     alvr_graphics::heading_yaw(heading.direction),
                 ));
+                match (was_measured, self.smoother.is_measured()) {
+                    (false, true) => self.log_measured(),
+                    (true, false) => {
+                        crate::stream_log("marker box: the marker moved, measuring its pose again")
+                    }
+                    _ => (),
+                }
             }
         } else if self
             .last_wait_log
