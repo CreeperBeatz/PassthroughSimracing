@@ -315,6 +315,13 @@ pub fn marker_box(position: Vec3, yaw: f32, params: &MarkerBoxParams) -> RegionO
 /// discoveries only) never make up this time: a move then needs `reset_count` distinct poses
 const UNCHANGED_MOVE_S: f64 = 2.0;
 const MAX_REPEAT_GAP_S: f64 = 0.5;
+/// A measured estimate is frozen and the code never moves once placed: a move away from it takes this
+/// many more distinct poses than `reset_count`, spanning at least `MEASURED_MOVE_HOLD_S` (or the move
+/// hold if longer), and the estimate of those poses must itself be away. A pose held unchanged is no
+/// move then. One heading of a standing code is off by more than 3 degrees about every tenth pose
+/// (2.2 degrees of scatter on the monitor): three in a row on one side come about once in 1000 poses
+pub const MEASURED_EXTRA_POSES: usize = 2;
+pub const MEASURED_MOVE_HOLD_S: f64 = 3.0;
 /// Most distinct poses in the estimate (2 minutes at the 2 Hz of Quest)
 pub const MAX_POSES: usize = 240;
 /// A measurement takes this many distinct poses by default, see `PoseSmoother::set_measure_poses`
@@ -394,7 +401,8 @@ impl StageChange {
 /// `UNCHANGED_MOVE_S`): that is a move, and the estimate starts again from them. A pose equal to the
 /// one before it is not counted again (the runtime may report the same pose several times).
 /// Measured: once the estimate has `measure_poses` distinct poses over `MEASURE_MIN_SPAN_S`, it is
-/// frozen; later poses near it are still counted but no longer change it, until a move or a reset
+/// frozen; later poses near it are still counted but no longer change it, until a move or a reset. A
+/// move away from a measured estimate needs more, see `MEASURED_EXTRA_POSES`
 pub struct PoseSmoother {
     window_s: f64,
     reset_distance: f32,
@@ -564,8 +572,11 @@ impl PoseSmoother {
                 self.samples.push_back((time_s, position, yaw));
             }
         } else if repeat && let Some(&(first, _, _)) = self.pending.first() {
-            // The same pose again: it counts once, unless it stays
-            if time_s - self.unchanged_since < UNCHANGED_MOVE_S || time_s - first < self.move_hold_s
+            // The same pose again: it counts once, unless it stays (not against a measured estimate:
+            // one pose the runtime holds is no proof of a move)
+            if self.measured
+                || time_s - self.unchanged_since < UNCHANGED_MOVE_S
+                || time_s - first < self.move_hold_s
             {
                 return (mean_position, mean_yaw);
             }
@@ -577,10 +588,30 @@ impl PoseSmoother {
                 .retain(|(_, other_position, other_yaw)| near(*other_position, *other_yaw));
             self.rejected += count - self.pending.len();
             self.pending.push((time_s, position, yaw));
-            if self.pending.len() < self.reset_count
-                || time_s - self.pending[0].0 < self.move_hold_s
-            {
+            let (needed, hold) = if self.measured {
+                (
+                    self.reset_count + MEASURED_EXTRA_POSES,
+                    self.move_hold_s.max(MEASURED_MOVE_HOLD_S),
+                )
+            } else {
+                (self.reset_count, self.move_hold_s)
+            };
+            if self.pending.len() < needed || time_s - self.pending[0].0 < hold {
                 return (mean_position, mean_yaw);
+            }
+            if self.measured {
+                let poses = self
+                    .pending
+                    .iter()
+                    .map(|(_, position, yaw)| (*position, *yaw))
+                    .collect::<Vec<_>>();
+                let away = robust_pose(&poses).is_some_and(|(position, yaw)| {
+                    position.distance(mean_position) > reset_distance
+                        || yaw_difference(yaw, mean_yaw).abs() > reset_angle
+                });
+                if !away {
+                    return (mean_position, mean_yaw);
+                }
             }
             self.take_pending();
         }
@@ -1263,6 +1294,47 @@ mod tests {
         assert!(smoother.is_measured());
     }
 
+    // Single headings of 198 and 214 degrees came next to the true 205 (the code on the monitor). A
+    // measured estimate keeps its value through such a pose held by the runtime (10 Hz snapshots), and
+    // through three or four of them in a row
+    #[test]
+    fn measured_smoother_keeps_its_value_through_outliers() {
+        let mut smoother = PoseSmoother::new(60.0, 0.02, 3_f32.to_radians(), 3);
+        smoother.set_move_hold(1.0);
+        let center = Vec3::new(0.3, 1.1, -0.7);
+        let mut time = 0.0;
+        for i in 0..20 {
+            time += 0.5;
+            smoother.push(time, still(center, i), 205_f32.to_radians());
+        }
+        assert!(smoother.is_measured());
+        let frozen = smoother.value().unwrap();
+
+        // One 214 degree pose reported unchanged for 3 s
+        for _ in 0..30 {
+            time += 0.1;
+            let value = smoother.push(time, center, 214_f32.to_radians());
+            assert_eq!(value, frozen);
+        }
+        time += 0.5;
+        smoother.push(time, still(center, 20), 205_f32.to_radians());
+
+        // Three, then four distinct poses in a row at about 209 degrees, over more than the move hold
+        for run in [3, 4] {
+            for i in 0..run {
+                time += 0.5;
+                let yaw_deg = 209.0 + 0.2 * i as f32;
+                let value = smoother.push(time, still(center, i), yaw_deg.to_radians());
+                assert_eq!(value, frozen, "{run} {i}");
+            }
+            time += 0.5;
+            smoother.push(time, still(center, 21), 205_f32.to_radians());
+        }
+        assert!(smoother.is_measured());
+        assert_eq!(smoother.value(), Some(frozen));
+        assert_eq!(smoother.rejected(), 8);
+    }
+
     #[test]
     fn smoother_restarts_a_measurement_after_a_move() {
         let mut smoother = PoseSmoother::new(60.0, 0.02, 3_f32.to_radians(), 3);
@@ -1274,21 +1346,22 @@ mod tests {
         assert!(smoother.is_measured());
         let frozen = smoother.value().unwrap();
 
-        // Three agreeing poses 10 cm away: held back until they span the move hold
+        // Agreeing poses 10 cm away: against a measured estimate held back until there are 5 of them
+        // over 3 s (the move hold is 1 s)
         let moved = center + Vec3::Z * 0.1;
-        for i in 0..2 {
+        for i in 0..6 {
             let value = smoother.push(10.0 + i as f64 * 0.5, still(moved, i), 0.0);
-            assert_eq!(value, frozen);
+            assert_eq!(value, frozen, "{i}");
         }
-        let (position, _) = smoother.push(11.0, still(moved, 2), 0.0);
+        let (position, _) = smoother.push(13.0, still(moved, 6), 0.0);
         assert!((position - moved).length() < 0.003, "{position}");
         assert!(!smoother.is_measured());
-        assert_eq!(smoother.len(), 3);
+        assert_eq!(smoother.len(), 7);
         assert_eq!(smoother.rejected(), 0);
 
         // The new measurement follows the poses until it is measured again
-        for i in 3..20 {
-            smoother.push(11.0 + (i - 2) as f64 * 0.5, still(moved, i), 0.0);
+        for i in 7..24 {
+            smoother.push(13.0 + (i - 6) as f64 * 0.5, still(moved, i), 0.0);
         }
         assert!(smoother.is_measured());
         let (position, _) = smoother.value().unwrap();

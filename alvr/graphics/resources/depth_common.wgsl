@@ -60,7 +60,8 @@ struct DepthUniforms {
     // One more capsule of each hand, from the wrist towards the forearm, 2 vectors per hand. First:
     // xyz: the wrist, w: radius at the wrist. Second: xyz: the end, w: how solid its core is (0..1)
     hand_bridge: array<vec4f, 4>,
-    // Radius at the end of each bridge, x: left hand, y: right hand (both radii 0: no bridge). It
-    // differs from the one at the wrist where a hand limited to a marker box tapers off
+    // Radius at the end of each bridge, x: left hand, y: right hand. It differs from the one at the
+    // wrist where a hand limited to a marker box tapers off (both may be negative, the rim still
+    // shows down to minus the rim). z, w: 1 when the left / right hand has a bridge
     hand_bridge_end: vec4f,
 }

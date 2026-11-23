@@ -2,6 +2,7 @@ use super::{GraphicsContext, MAX_IMMEDIATE_SIZE, staging::StagingRenderer};
 use crate::{
     depth_dump::{self, DEPTH_DUMP_TIMEOUT, DepthDumpFiles, DepthDumpRequest, DumpReadback},
     depth_mask::{self, DEPTH_UNIFORMS_SIZE, DepthRenderInput},
+    overlay::{self, OVERLAY_UNIFORMS_SIZE, OverlayEye, OverlaySegment, SEGMENT_FLOAT_COUNT},
 };
 use alvr_common::{
     AlvrFoveatedEncodingParams, ViewParams,
@@ -43,12 +44,21 @@ const CK_CHANNEL1_CONST_OFFSET: u32 = CK_CHANNEL0_CONST_OFFSET + VEC4_SIZE;
 const CK_CHANNEL2_CONST_OFFSET: u32 = CK_CHANNEL1_CONST_OFFSET + VEC4_SIZE;
 const IMMEDIATE_SIZE: u32 = CK_CHANNEL2_CONST_OFFSET + VEC4_SIZE;
 const VIEW_IDX_IMMEDIATE_SIZE: u32 = U32_SIZE;
+// overlay.wgsl: view_proj, viewport, pixels_per_radian, first
+const OVERLAY_VIEWPORT_OFFSET: u32 = TRANSFORM_SIZE;
+const OVERLAY_PIXELS_PER_RADIAN_OFFSET: u32 = OVERLAY_VIEWPORT_OFFSET + 2 * FLOAT_SIZE;
+const OVERLAY_FIRST_OFFSET: u32 = OVERLAY_PIXELS_PER_RADIAN_OFFSET + FLOAT_SIZE;
+const OVERLAY_IMMEDIATE_SIZE: u32 = OVERLAY_FIRST_OFFSET + U32_SIZE;
 const FOVEATION_EYE_UNIFORM_VEC4_COUNT: usize = 5;
 const FOVEATION_UNIFORM_VEC4_COUNT: usize = 1 + FOVEATION_EYE_UNIFORM_VEC4_COUNT * 2;
 pub(crate) const FOVEATION_UNIFORM_SIZE: usize =
     FOVEATION_UNIFORM_VEC4_COUNT * mem::size_of::<Vec4>();
 const _: () = assert!(
     IMMEDIATE_SIZE <= MAX_IMMEDIATE_SIZE,
+    "Immediate size exceeds the maximum size"
+);
+const _: () = assert!(
+    OVERLAY_IMMEDIATE_SIZE <= MAX_IMMEDIATE_SIZE,
     "Immediate size exceeds the maximum size"
 );
 
@@ -75,6 +85,7 @@ const DEPTH_DUMP_WGSL: &str = include_str!("../resources/depth_dump.wgsl");
 const STREAM_WGSL: &str = include_str!("../resources/stream.wgsl");
 const LIGHT_PROBE_LOCAL_WGSL: &str = include_str!("../resources/light_probe_local.wgsl");
 const LIGHT_PROBE_GLOBAL_WGSL: &str = include_str!("../resources/light_probe_global.wgsl");
+pub(crate) const OVERLAY_WGSL: &str = include_str!("../resources/overlay.wgsl");
 
 // The common code must come last: wgpu-hal (GLES) resolves the types of the immediates using indices
 // that are only correct if those types are the first ones in the shader.
@@ -104,6 +115,10 @@ pub(crate) fn light_probe_local_shader_source() -> String {
 
 pub(crate) fn light_probe_global_shader_source() -> String {
     LIGHT_PROBE_GLOBAL_WGSL.to_owned()
+}
+
+pub(crate) fn overlay_shader_source() -> String {
+    OVERLAY_WGSL.to_owned()
 }
 
 fn shader_module(device: &Device, label: &str, source: String) -> ShaderModule {
@@ -176,6 +191,10 @@ pub(crate) struct StreamPipelines {
     /// local light probe
     pub probe_global_layout: BindGroupLayout,
     pub probe_global: RenderPipeline,
+    /// overlay segments
+    pub overlay_layout: BindGroupLayout,
+    /// Drawn in the main pass, after the stream
+    pub overlay: RenderPipeline,
 }
 
 impl StreamPipelines {
@@ -452,6 +471,66 @@ impl StreamPipelines {
             cache: None,
         });
 
+        let overlay_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("overlay"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let overlay_module = shader_module(device, "overlay", overlay_shader_source());
+        // The colors are corrected like the stream
+        let overlay_constants = [(
+            "ENABLE_SRGB_CORRECTION",
+            constants
+                .iter()
+                .find(|(name, _)| *name == "ENABLE_SRGB_CORRECTION")
+                .map_or(0.0, |(_, value)| *value),
+        )];
+        let overlay_compilation_options = PipelineCompilationOptions {
+            constants: &overlay_constants,
+            zero_initialize_workgroup_memory: false,
+        };
+        let overlay = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("overlay"),
+            layout: Some(&device.create_pipeline_layout(&PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[Some(&overlay_layout)],
+                immediate_size: OVERLAY_IMMEDIATE_SIZE,
+            })),
+            vertex: VertexState {
+                module: &overlay_module,
+                entry_point: None,
+                compilation_options: overlay_compilation_options.clone(),
+                buffers: &[],
+            },
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(FragmentState {
+                module: &overlay_module,
+                entry_point: None,
+                compilation_options: overlay_compilation_options,
+                // Opaque, see overlay.wgsl
+                targets: &[Some(ColorTargetState {
+                    format: target_format,
+                    blend: None,
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
         Self {
             view_layout,
             depth_layout,
@@ -465,6 +544,8 @@ impl StreamPipelines {
             probe_local,
             probe_global_layout,
             probe_global,
+            overlay_layout,
+            overlay,
         }
     }
 }
@@ -676,6 +757,31 @@ pub(crate) fn create_depth_uniform_buffer(device: &Device) -> Buffer {
     })
 }
 
+/// The segments of both eyes, see overlay.wgsl
+pub(crate) fn create_overlay_buffer(device: &Device) -> Buffer {
+    device.create_buffer(&BufferDescriptor {
+        label: Some("overlay segments"),
+        size: OVERLAY_UNIFORMS_SIZE as u64,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+pub(crate) fn create_overlay_bind_group(
+    device: &Device,
+    pipelines: &StreamPipelines,
+    buffer: &Buffer,
+) -> BindGroup {
+    device.create_bind_group(&BindGroupDescriptor {
+        label: Some("overlay"),
+        layout: &pipelines.overlay_layout,
+        entries: &[BindGroupEntry {
+            binding: 0,
+            resource: buffer.as_entire_binding(),
+        }],
+    })
+}
+
 pub(crate) fn floats_to_bytes(values: &[f32]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
@@ -729,6 +835,10 @@ pub struct StreamRenderer {
     dump_request: Cell<Option<(DepthDumpRequest, Instant)>>,
     dump_pipeline: OnceCell<RenderPipeline>,
     dump_readback: RefCell<Option<DumpReadback>>,
+    // Outline overlay: segments of both eyes
+    overlay_buffer: Buffer,
+    overlay_bind_group: BindGroup,
+    target_view_resolution: UVec2,
 }
 
 impl StreamRenderer {
@@ -899,6 +1009,8 @@ impl StreamRenderer {
             view_objects.try_into().unwrap_or_else(|_| unreachable!());
         let (playzone_textures, playzone_bind_groups) =
             create_playzone(device, &pipelines, &views_objects, &sampler, UVec2::ONE);
+        let overlay_buffer = create_overlay_buffer(device);
+        let overlay_bind_group = create_overlay_bind_group(device, &pipelines, &overlay_buffer);
 
         Self {
             context,
@@ -923,6 +1035,9 @@ impl StreamRenderer {
             dump_request: Cell::new(None),
             dump_pipeline: OnceCell::new(),
             dump_readback: RefCell::new(None),
+            overlay_buffer,
+            overlay_bind_group,
+            target_view_resolution,
         }
     }
 
@@ -1010,7 +1125,9 @@ impl StreamRenderer {
     }
 
     /// Runtime foveation centers must already be encoder-aligned. `None` uses the negotiated centers.
-    /// Returns the part of each view with the hands, if the color key is used (see `hands_view_rect`).
+    /// `overlay`: lines in stage space drawn over the stream, only with Passthrough = Depth (empty:
+    /// nothing is uploaded or drawn). Returns the part of each view with the hands, if the color key is
+    /// used (see `hands_view_rect`).
     ///
     /// # Safety
     /// `hardware_buffer` must be a valid pointer to a ANativeWindowBuffer.
@@ -1021,6 +1138,7 @@ impl StreamRenderer {
         passthrough: Option<&PassthroughMode>,
         foveation_center_shifts: Option<[Vec2; 2]>,
         depth: Option<&DepthRenderInput>,
+        overlay: &[OverlaySegment],
     ) -> Option<[Option<(Vec2, Vec2)>; 2]> {
         let new_frame = !hardware_buffer.is_null();
 
@@ -1202,6 +1320,9 @@ impl StreamRenderer {
             self.encode_depth_dump(&mut encoder, depth_bind_group, n, &frame, json)
         });
 
+        let overlay_draws = (depth_config.is_some() && !overlay.is_empty())
+            .then(|| self.write_overlay(&view_params, depth, overlay));
+
         for (view_idx, view_params) in view_params.iter().enumerate() {
             let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: None,
@@ -1228,6 +1349,20 @@ impl StreamRenderer {
             render_pass.set_bind_group(1, depth_bind_group, &[]);
             set_passthrough_immediates(&mut render_pass, passthrough);
             render_pass.draw(0..4, 0..1);
+
+            if let Some(draws) = &overlay_draws
+                && let (eye, first, count) = &draws[view_idx]
+                && *count > 0
+            {
+                encode_overlay(
+                    &mut render_pass,
+                    &self.pipelines,
+                    &self.overlay_bind_group,
+                    eye,
+                    *first,
+                    *count,
+                );
+            }
         }
 
         self.context.queue.submit(iter::once(encoder.finish()));
@@ -1243,6 +1378,46 @@ impl StreamRenderer {
         }
 
         hand_rects
+    }
+
+    // Clips the segments for each eye and uploads them. Per eye: the camera, the first segment and
+    // their number. The camera must be the one of the depth mask, or the outline is offset from the
+    // hole it describes. The mask casts its rays from the eye position located at display time
+    // (`DepthRenderInput::eye_positions`) in the directions of the pixels of the stream view, and that
+    // image is drawn into the output view turned only by the rotation between the two (the quad of
+    // `reprojection_transform` is 1 km away). So a point hit by a ray shows in the output view in its
+    // direction from that eye position: the camera is that position with the orientation and the fov of
+    // the output view (on Quest the same as the stream view)
+    fn write_overlay(
+        &self,
+        view_params: &[StreamViewParams; 2],
+        depth: Option<&DepthRenderInput>,
+        overlay: &[OverlaySegment],
+    ) -> [(OverlayEye, u32, u32); 2] {
+        // No eye positions in the first frame of the environment depth: the position of the view
+        let eye_positions = depth
+            .map(|depth| depth.eye_positions)
+            .filter(|positions| *positions != [Vec3::ZERO; 2]);
+        let mut data = Vec::with_capacity(2 * overlay.len() * SEGMENT_FLOAT_COUNT);
+        let draws = [0, 1].map(|i| {
+            let output = &view_params[i].output_view_params;
+            let eye = OverlayEye::new(
+                eye_positions.map_or(output.pose.position, |positions| positions[i]),
+                output.pose.orientation,
+                output.fov,
+                self.target_view_resolution.as_vec2(),
+            );
+            let first = (data.len() / SEGMENT_FLOAT_COUNT) as u32;
+            let count = overlay::pack_segments(&eye, overlay, &mut data);
+            (eye, first, count)
+        });
+        if !data.is_empty() {
+            self.context
+                .queue
+                .write_buffer(&self.overlay_buffer, 0, &floats_to_bytes(&data));
+        }
+
+        draws
     }
 
     fn encode_depth_dump(
@@ -1439,6 +1614,31 @@ pub(crate) fn encode_depth_mask(
     pass.draw(0..3, 0..1);
 }
 
+/// The segments `first..first + count` of the overlay buffer, in the main pass of an eye after the
+/// stream
+pub(crate) fn encode_overlay(
+    render_pass: &mut RenderPass,
+    pipelines: &StreamPipelines,
+    bind_group: &BindGroup,
+    eye: &OverlayEye,
+    first: u32,
+    count: u32,
+) {
+    render_pass.set_pipeline(&pipelines.overlay);
+    render_pass.set_bind_group(0, bind_group, &[]);
+    render_pass.set_immediates(0, &floats_to_bytes(&eye.view_proj.to_cols_array()));
+    render_pass.set_immediates(
+        OVERLAY_VIEWPORT_OFFSET,
+        &floats_to_bytes(&eye.viewport.to_array()),
+    );
+    render_pass.set_immediates(
+        OVERLAY_PIXELS_PER_RADIAN_OFFSET,
+        &eye.pixels_per_radian.to_le_bytes(),
+    );
+    render_pass.set_immediates(OVERLAY_FIRST_OFFSET, &first.to_le_bytes());
+    render_pass.draw(0..4, 0..count);
+}
+
 pub(crate) fn encode_playzone_copy(
     encoder: &mut wgpu::CommandEncoder,
     pipelines: &StreamPipelines,
@@ -1588,7 +1788,7 @@ fn encode_light_probe_update(
     pass.draw(0..3, 0..1);
 }
 
-fn reprojection_transform(view_params: &StreamViewParams) -> Mat4 {
+pub(crate) fn reprojection_transform(view_params: &StreamViewParams) -> Mat4 {
     let input_fov = view_params.input_view_params.fov;
 
     let tanl = f32::tan(input_fov.left);

@@ -744,8 +744,9 @@ dumps: `pose` and `fx`, `fy`, `cx`, `cy` there, at its `image_ns`.
 
 **QR code markers and the box placed from them** (the tracker, the size gate and the box ran on the
 headset, see "First run on the headset" and "Second run on the headset" below; the measured baseline of
-the pose, the box carried through a stage change, the hands limited by the box and the changes of the
-size gate of 2026-11-24 are not tested: they compile and pass the unit tests only).
+the pose, the box carried through a stage change, the hands limited by the box, the changes of the
+size gate of 2026-11-24 and the outline of the anchor and the box are not tested: they compile and pass
+the unit tests only).
 Step one of way B: does the runtime give this
 app QR code poses (`XR_EXT_spatial_entity` and `XR_EXT_spatial_marker_tracking`), how good are they, and
 the box region placed from one. The manifest now declares `com.oculus.permission.USE_ANCHOR_API` and
@@ -813,7 +814,8 @@ playzone, my hands don't" (observed; the keyed hands ignored the region, see bel
 95 % and 65 C at 72 fps with the box (measured; the cause was not looked into).
 What changed after it (2026-11-24, not tested: everything in this paragraph compiles and passes the unit
 tests only): the pose is a measured baseline (a robust estimate over up to 60 s, frozen once measured)
-instead of a 1 s average; the box is carried through a STAGE change with a valid pose; the keyed hands
+instead of a 1 s average (a move away from a measured pose needs 5 poses over 3 s, and the same code
+found again under a new entity id keeps it); the box is carried through a STAGE change with a valid pose; the keyed hands
 show only inside a marker box (`marker_hands`); a given size below 10 mm is malformed, the tolerance of
 the size gate is logged and shown in the summary, and a resized code is learned again after 6 sizes.
 
@@ -841,14 +843,16 @@ shows the pose as last reported, with ` (size not trusted)` when it is not trust
 | `marker_size_tol` | 3 % | A pose is trusted when its width is within this of the baseline, 0 to 50. 0 turns the size gate off: every pose is trusted, as before. Polled, applies to the next pose; a change is logged |
 | `marker_box` | 0 | 1: while a code is known, the depth mask uses a box placed from it instead of the region of the settings (also instead of "Distance") |
 | `marker_id` | unset | Use the code with this payload (text, case sensitive: `RIG1`). A change is logged and the box is forgotten at once. Unset: the box stays with codes that carry the payload of the code used first, until `marker_box 0`, `marker 0`, or `marker_id` changes |
-| `marker_window` | 60000 ms | Time window of the distinct poses of the estimate of the pose of the code, 100 to 600000 (at most 240 poses, about 2 minutes at 2 Hz). Was 1000 ms. A change is logged and applies at once (a shorter window drops older poses at once; a measured estimate stays) |
-| `marker_move_ms` | 1000 ms | Poses away from the estimate must agree for this long (and be at least 3) to be a move, 0 to 60000. Longer: fewer false moves from a pose error that lasts a moment (a standing code's heading), a real move is followed later. A move also ends a measurement and starts a new one. A change is logged and applies at once |
+| `marker_window` | 60000 ms | Time window of the distinct poses of the estimate of the pose of the code, 100 to 600000 (at most 240 poses, about 2 minutes at 2 Hz). Was 1000 ms: a value below 8000 left over from before (setprop lasts until a reboot) means the pose is never measured, the log line says so. A change is logged and applies at once (a shorter window drops older poses at once; a measured estimate stays) |
+| `marker_move_ms` | 1000 ms | Poses away from the estimate must agree for this long (and be at least 3) to be a move, 0 to 60000. Against a measured estimate a move needs at least 5 poses over at least 3 s (or `marker_move_ms` if longer). Longer: fewer false moves from a pose error that lasts a moment (a standing code's heading), a real move is followed later. A move also ends a measurement and starts a new one. A change is logged and applies at once |
 | `marker_scan_poses` | 20 | Distinct poses that measure the pose of the code, 3 to 240; they must also span at least 8 s. A change is logged and applies to the next pose |
-| `marker_scan` | unset | Another positive value measures the pose again from the next pose (the box stays where it is until then). The value at the start of the app is not a request (like `playzone`) |
+| `marker_scan` | unset | Another positive value measures the pose again from the next pose the runtime reports after the request (the box stays where it is until then; with the code hidden, until the code is seen again). The value at the start of the app is not a request (like `playzone`) |
 | `marker_hands` | 1 | 1: with the color key and a marker box, the keyed hands show only inside the box, faded over 2 cm on each side of its surface. 0: everywhere, as before. The region of the settings (Distance, Cockpit volume) never limits the hands. A change is logged and applies at once |
 | `marker_box_x` / `_y` / `_z` | 0 / 150 / 0 mm | Center of the box from the code: to the right of the heading, up, along the heading. A flat code with its top away from you: +x is your right, +z away from you. A standing code facing you: +x is your LEFT, +z comes TOWARDS you (moving a code from flat to standing needs new values; the defaults fit a flat code, for a standing one start from z 400, y -150, see Testing) |
 | `marker_box_w` / `_h` / `_d` | 1200 / 900 / 1000 mm | Width (across the heading), height, depth (along the heading) |
 | `marker_box_yaw` | 0 deg | Added to the heading, counter-clockwise from above; turns the box about the code |
+| `area_show` | unset | Outline of the code and the box over the stream (see "Outline of the anchor and the box"). Unset: for 8 s each time the pose of the code becomes measured, each time the box is carried over a STAGE change and each time a box is placed after there was none. 1 (any number but 0): always while there is a box. 0: never. Only with a marker box and Passthrough = Depth. Polled, applies at once |
+| `area_line` | 12 | Width of the lines of the outline on screen, hundredths of a degree (12 = 0.12 deg, about 2 px at the center of a view about 2000 px wide), 2 to 100. Polled |
 
 The box frame is level (stage +Y up); only the heading comes from the code, never its tilt (a tilt error of
 a few degrees would move the far end of the box by centimeters). Heading: a code lying flat (normal within
@@ -871,15 +875,22 @@ estimate, and `moved by` is logged at most once a second. A single pose away fro
 that agree with each other and span `marker_move_ms` (1 s) are a move: a new measurement starts from them;
 a pose away from the estimate that the runtime reports unchanged without a gap for 2 s is also taken as a
 move (a gap: no pose for more than 0.5 s, e.g. the code was out of view; with `marker_rate` below 2 Hz or
-poses from the discoveries only this rule never applies). `marker_scan` measures again on request. The
+poses from the discoveries only this rule never applies). Against a measured estimate a move needs more
+(the code never moves once placed): at least 5 such poses spanning at least 3 s (or `marker_move_ms` if
+longer), and the estimate of those poses must itself be more than 2 cm or 3 degrees away; a pose held
+unchanged is no move then. With a heading scatter of 2.2 degrees (the code on the monitor) three poses in
+a row more than 3 degrees off on one side come about once in 1000 poses, five about once in 100000.
+`marker_scan` measures again on request. The
 pose is kept while the code is not seen, and also while there is no tracker (it failed, or the session
-stopped and started again); only `marker_box 0`, `marker 0` or a new `marker_id` forget it. A change of
+stopped and started again); the same code found again under a new entity id (`lost #<id>` and a new
+`new ...` line, or a new tracker) keeps it too, a measured pose included: the move rule decides whether
+its poses differ. Only `marker_box 0`, `marker 0` or a new `marker_id` forget it. A change of
 the STAGE space (`ReferenceSpaceChangePending` for STAGE; events for LOCAL or VIEW are ignored here) with
 a valid pose carries the box into the new space at the change time of the event (not tested): the kept
 pose and the poses of the estimate become p_new = inverse(pose_in_previous_space) * p_old, the heading
 changes by minus the yaw of that pose, a measured estimate stays measured (`marker box: stage space
-changed, box carried over (...)`). If the pose in the new space disagrees, three poses there are a move
-and measure again. Without a valid pose the box is kept up to the change time and dropped from then
+changed, box carried over (...)`). If the pose in the new space disagrees, five poses there over 3 s are
+a move and measure again. Without a valid pose the box is kept up to the change time and dropped from then
 until the code is seen again, as before. The tracker itself still drops its poses at a STAGE change until
 the codes are seen again (`marker: stage space changed, ...`); the box does not need them. The box applies
 with Passthrough = Depth only, and live; the settings stay as they are.
@@ -897,7 +908,9 @@ the box: the part inside looks as before, at the surface the fingers or the palm
 centimeters (at the surface about half as wide) and vanish about 1-2 cm outside; the part outside shows
 the game, like the forearm. A long capsule (palm, up to about 6 cm) tapers over its whole length inside
 the box when it crosses the surface, so a palm at the surface may look thinner a few cm early. The
-bridge from the wrist (`key_wrist_len`) is limited the same way (its end radius is now its own uniform).
+bridge from the wrist (`key_wrist_len`) is limited the same way (its end radius is now its own uniform,
+and a flag per hand says whether it has a bridge, so that a fading bridge with negative radii still shows
+its rim, like the capsules of the hand).
 No new pass, no new texture, no per-pixel cost (only the capsule ends change, about 120 points per frame
 on the CPU). The region of the settings never limits the hands. A hand
 without its forearm means the box ends there, not a wrong heading. The default box is centred on the
@@ -908,6 +921,40 @@ screen to 1.15 m towards the driver), `marker_box_y -100`, `marker_box_h 1400` (
 the code, lap included). Not tried.
 The debug view "Tint mask" paints the box green only without the color key (`color_key 0`); with the key
 loaded the box is plain passthrough.
+
+**Outline of the anchor and the box (not tested).** After the code is scanned the headset shows where
+the anchor and the play area are: thin opaque lines drawn into the game image, over the stream and over
+the passthrough hole alike (`area_show`, `area_line`). Drawn in stage space: the outline of the code, a
+square of the size the runtime reports, at the estimated position, turned to the estimated heading with
+the tilt of the last pose used (amber while the pose is being measured, green once it is measured and
+frozen); at its centre the axes of the box frame: the heading the box uses (with `marker_box_yaw`, 20 cm,
+blue), up (10 cm, magenta) and to the right of the heading (10 cm, red); and the 12 edges of the box the
+mask uses (white). A box kept without a tracker or carried over a stage change is drawn the same way.
+How: one more pipeline in the existing main pass of each eye, right after the stream draw (no new pass,
+swapchain or composition layer). The segments of the frame (19) go into one 12 KB uniform buffer, each
+clipped on the CPU against the near plane of the eye (0.1 m + 5 mm; edges that pass behind the head are
+cut there, segments wholly behind are dropped), and are drawn with one instanced draw per eye as quads
+facing the screen, a constant width in pixels. Alpha 1 without blending: in the premultiplied depth mode
+that is opaque, and with the color key alpha 1 is the packed value for "both game layers opaque" (lower
+2a, upper 2a - 1, also after the rewrite outside the lower rect), so a line shows over game, passthrough
+and keyed hands; the colors get the sRGB correction of the stream. The camera is the one of the depth
+mask: the eye position located at display time (the one `depth_uniforms` gets) with the orientation and
+fov of the view the stream is drawn into (on Quest the PC's view, as the mask), so the white lines lie on
+the border of the hole (an outline from the PC's eye position would be offset from it by the prediction
+error and swim with head motion). Nothing is uploaded or drawn while it is hidden (the CPU checks a few
+flags per frame). The GPU test `overlay_draws_the_box_outline_over_the_stream` draws a box over the
+stream on the PC: line color along an edge, every pixel away from the lines unchanged. The test
+`overlay_camera_matches_the_rays_of_the_mask` checks the camera: a point on the ray of a stream pixel
+(from the eye position of the depth input, in the direction `depth_uniforms` uses) lands on the place
+where `reprojection_transform` draws that pixel, also with input and output views that differ in
+orientation, position and fov.
+Test on the headset (box on, Passthrough = Depth, `setprop debug.alvr.area_show 1` or wait for
+`marker box: measured:`): the square sits on the real code and is turned like it (the heading line
+points to the top of a flat code, out of the face of a standing one); the white outline runs along the
+border where the real world ends and the game begins; with the head moved sideways by 10 cm the lines
+stay glued to the desk and do not swim; both eyes fuse the lines into one (no double image); the frame
+rate and the GPU load (VrApi) with and without `area_show 1`. If the lines are too thin or too thick:
+`area_line`.
 
 **The printed codes** (2026-11-23). Three codes with the payloads `RIG1`, `RIG2` and `RIG3`, black edge on
 the paper 144.2, 95.6 and 67.4 mm. The printer scaled the page to 96 %: the 100 mm check bar measured
@@ -989,7 +1036,8 @@ Log lines (`ALVR_CAM`, all start with `marker`):
   only (debug.alvr.marker 0, then 1 tries again)` and the poses then come from the discoveries only.
 - `marker box: marker_id is now "<text>" | unset`, `marker box: averaging window <s> s`, `marker box: a
   move must hold <s> s`, `marker box: a measurement takes <n> poses over 8 s` (when `marker_window` /
-  `marker_move_ms` / `marker_scan_poses` are set to other than the defaults).
+  `marker_move_ms` / `marker_scan_poses` are set to other than the defaults). A window below 8 s adds
+  ` (shorter than the 8 s a measurement needs: never measured)`.
 - `marker box: measuring again (marker_scan <n>)` for a new positive `marker_scan`.
 - `marker box: the hands show inside the box only (marker_hands 1)` or `marker box: the hands show also
   outside the box (marker_hands 0)` when `marker_hands` changes.
@@ -1016,6 +1064,9 @@ Log lines (`ALVR_CAM`, all start with `marker`):
   (debug.alvr.marker 0), the region of the settings applies`, when a box that was placed is dropped for
   that reason. `marker box: no tracker, keeping the last pose` once when the tracker goes (it failed, or
   the session stopped) while a box is placed: the box stays.
+- `area: outline shown (measured | carried over | placed | area_show 1)` when the outline of the code
+  and the box appears or shows for another reason, `area: outline hidden` when it goes (after 8 s, with
+  `area_show 0`, without a box, or when Passthrough is not Depth).
 - `ReferenceSpaceChangePending type: <type>, change time <ns> ns, pose valid: <bool>, pose in previous
   space (x, y, z) m, yaw <deg> deg` (now in `ALVR_CAM`, for every reference space type; only STAGE ones
   give `marker: stage space changed, poses dropped until the markers are seen again` and, at the change
@@ -1053,15 +1104,18 @@ Testing (`adb logcat -s ALVR_CAM` running):
       on it inside the box, the game outside. The debug view "Tint mask" marks it green only without the
       color key (`setprop debug.alvr.color_key 0`, and `auto_key 0`, live; hands are then limited by the
       box too); with the key loaded the box is plain passthrough, not green. Move the code by 5 cm: the
-      box follows after about 1 s (`marker_move_ms`; at least 3 poses at the new place), then `the marker
-      moved, measuring its pose again` and `moved by`. With the code on the monitor, switch the monitor to
-      the game: the box stays. Count the `moved by` lines while racing with the code fixed: each one is a
-      false move; if there are any, try `marker_move_ms 3000`.
+      box follows after about 1 s (`marker_move_ms`; at least 3 poses at the new place) while the pose is
+      not yet measured, after about 3 s (at least 5 poses) once it is measured, then `the marker moved,
+      measuring its pose again` and `moved by`. With the code on the monitor, switch the monitor to the
+      game: the box stays. Count the `moved by` lines while racing with the code fixed: each one is a
+      false move; if there are any, try `marker_move_ms 6000`.
 - [ ] Measured baseline: show the code for about 15 s. `marker box: measured: ...` must come after about
       10 s (20 poses at 2 Hz); note its scatter and heading scatter. Before it at most one `moved by` per
       second, after it none while the code stays (also with single poses at 198 or 214 deg). Hide the
-      code: the box stays. `setprop debug.alvr.marker_scan 1` with the code shown: `measuring again`, a
-      new `measured:` line; compare the two positions and headings (how repeatable is a measurement?).
+      code: the box stays, also after `setprop debug.alvr.marker_scan 1` while it is hidden (no
+      `moved by` until the code is shown again). `setprop debug.alvr.marker_scan 2` with the code shown:
+      `measuring again`, a new `measured:` line; compare the two positions and headings (how repeatable
+      is a measurement?).
 - [ ] Hands (`marker_hands`, color key on): reach out of the box with one hand. The hand must vanish
       at the box surface like the forearm, thinning over a few cm, not popping. Then `setprop
       debug.alvr.marker_hands 0`: the hand shows outside again (as in the second run). Look at the palm at
@@ -1093,6 +1147,12 @@ Testing (`adb logcat -s ALVR_CAM` running):
       again: no `the marker moved, measuring its pose again` line (the new poses fit the carried
       estimate). A `pose valid: false`
       change still drops the box until the code is seen again.
+- [ ] Outline (`area_show` unset, box on, code shown): `area: outline shown (placed)`, amber square on
+      the code, then after `marker box: measured:` `area: outline shown (measured)`, green, and `area:
+      outline hidden` 8 s later. `setprop debug.alvr.area_show 1`: the square on the real code and
+      turned like it; the white lines along the border of the passthrough; move the head 10 cm sideways:
+      the lines stay on the desk; both eyes fuse them. Note fps and GPU load (VrApi) with `area_show 1`
+      and `0`. Recenter: `area: outline shown (carried over)` and the outline stays on the rig.
 
 ## Open problems, in order
 

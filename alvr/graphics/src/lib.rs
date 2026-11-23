@@ -5,6 +5,7 @@ mod key_dump;
 mod leak_map;
 mod lobby;
 mod marker_box;
+mod overlay;
 mod staging;
 mod stream;
 
@@ -18,6 +19,7 @@ pub use key_dump::*;
 pub use leak_map::*;
 pub use lobby::*;
 pub use marker_box::*;
+pub use overlay::*;
 pub use stream::*;
 
 use alvr_common::{
@@ -36,6 +38,8 @@ pub const SDR_FORMAT: TextureFormat = TextureFormat::Rgba8Unorm;
 pub const SDR_FORMAT_GL: u32 = gl::RGBA8;
 pub const GL_TEXTURE_EXTERNAL_OES: u32 = 0x8D65;
 pub const MAX_IMMEDIATE_SIZE: u32 = 128;
+/// Near plane of `projection_from_fov` (meters)
+const PROJECTION_NEAR: f32 = 0.1;
 
 type CreateImageFn = unsafe extern "C" fn(
     egl::EGLDisplay,
@@ -75,8 +79,6 @@ macro_rules! ck {
 pub(crate) use ck;
 
 fn projection_from_fov(fov: Fov) -> Mat4 {
-    const NEAR: f32 = 0.1;
-
     let tanl = f32::tan(fov.left);
     let tanr = f32::tan(fov.right);
     let tanu = f32::tan(fov.up);
@@ -91,7 +93,7 @@ fn projection_from_fov(fov: Fov) -> Mat4 {
     Mat4::from_cols(
         Vec4::new(a, 0.0, c, 0.0),
         Vec4::new(0.0, -b, -d, 0.0),
-        Vec4::new(0.0, 0.0, -1.0, -NEAR),
+        Vec4::new(0.0, 0.0, -1.0, -PROJECTION_NEAR),
         Vec4::new(0.0, 0.0, -1.0, 0.0),
     )
     .transpose()

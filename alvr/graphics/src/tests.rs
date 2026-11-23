@@ -6,13 +6,14 @@ use crate::{
     depth_dump::{DumpReadback, DumpSource},
     depth_mask::{
         self, ArmMotion, ColorKeyInput, DepthFrame, DepthRenderInput, HAND_SEGMENTS, HandShape,
-        HandSweep, HandZones, SweepParams, WristBridge,
+        HandSweep, HandZones, RegionOverride, SweepParams, WristBridge,
     },
+    overlay::{self, OVERLAY_AMBER, OVERLAY_SLOTS, OverlayEye, OverlaySegment},
     stream::{self, FOVEATION_UNIFORM_SIZE, LIGHT_PROBE_SIZE, StreamPipelines, floats_to_bytes},
 };
 use alvr_common::{
     Fov, Pose, ViewParams,
-    glam::{Mat4, UVec2, Vec2, Vec3, Vec4},
+    glam::{Mat4, Quat, UVec2, Vec2, Vec3, Vec4},
 };
 use alvr_session::{
     CockpitVolumeConfig, DepthMaskRegion, DepthPassthroughConfig, DepthPassthroughDebugView,
@@ -151,6 +152,93 @@ fn light_probe_shaders_translate_to_gles() {
         &stream::light_probe_global_shader_source(),
         &[],
     );
+}
+
+#[test]
+fn overlay_shader_translates_to_gles() {
+    for srgb in [false, true] {
+        translate_to_gles(
+            "overlay",
+            &stream::overlay_shader_source(),
+            &[("ENABLE_SRGB_CORRECTION", f64::from(u8::from(srgb)))],
+        );
+    }
+    // The uniform buffer holds the segments of both eyes
+    assert!(stream::OVERLAY_WGSL.contains(&format!("const MAX_SEGMENTS: u32 = {OVERLAY_SLOTS}u;")));
+}
+
+// The camera of the overlay (as `StreamRenderer::write_overlay` builds it) puts a point where the
+// stream shows the ray of the depth mask that hit it: the mask casts the ray of a pixel of the stream
+// view from the eye position of the depth input in the direction of `uv_to_world_dir` (input view),
+// and the main pass draws that pixel into the output view with `reprojection_transform`. Input and
+// output views differ here in orientation, position and fov (as with the custom reprojection), and the
+// eye is away from both
+#[test]
+fn overlay_camera_matches_the_rays_of_the_mask() {
+    let input = ViewParams {
+        pose: Pose {
+            orientation: Quat::from_euler(alvr_common::glam::EulerRot::YXZ, 0.3, -0.2, 0.05),
+            position: Vec3::new(0.02, 1.2, 0.1),
+        },
+        fov: Fov {
+            left: -0.9,
+            right: 0.7,
+            up: 0.8,
+            down: -0.95,
+        },
+    };
+    let output = ViewParams {
+        pose: Pose {
+            orientation: input.pose.orientation
+                * Quat::from_rotation_y(0.04)
+                * Quat::from_rotation_x(-0.02),
+            position: input.pose.position + Vec3::new(0.01, 0.0, -0.005),
+        },
+        fov: Fov {
+            left: -0.85,
+            right: 0.75,
+            up: 0.82,
+            down: -0.9,
+        },
+    };
+    let eye_position = Vec3::new(0.035, 1.21, 0.09);
+    let transform = stream::reprojection_transform(&stream::StreamViewParams {
+        swapchain_index: 0,
+        input_view_params: input,
+        output_view_params: output,
+    });
+    let uv_to_dir = depth_mask::uv_to_world_dir(&input);
+    let eye = OverlayEye::new(
+        eye_position,
+        output.pose.orientation,
+        output.fov,
+        Vec2::splat(TARGET_SIZE as f32),
+    );
+
+    for (u, v) in [
+        (0.5, 0.5),
+        (0.1, 0.2),
+        (0.9, 0.8),
+        (0.3, 0.95),
+        (0.75, 0.05),
+    ] {
+        let direction = (uv_to_dir * Vec4::new(u, v, 1.0, 0.0))
+            .truncate()
+            .normalize();
+        for distance in [0.3, 0.8, 2.5] {
+            let point = eye_position + direction * distance;
+            // As in stream.wgsl vertex_main
+            let stream = transform * Vec4::new(u - 0.5, 0.5 - v, 0.0, 1.0);
+            let overlay = eye.view_proj * point.extend(1.0);
+            let stream = Vec2::new(stream.x, stream.y) / stream.w;
+            let overlay = Vec2::new(overlay.x, overlay.y) / overlay.w;
+            // The quad of the stream is 1 km away: the offset of the views moves it by 1e-5 rad
+            assert!(
+                stream.distance(overlay) < 1e-4,
+                "{u} {v} {distance}: {stream} {overlay}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -344,6 +432,7 @@ fn render_with_key(
         None,
         None,
         false,
+        &[],
     )
 }
 
@@ -361,6 +450,7 @@ fn render_full(
     playzone: Option<&Scene>,
     key_lower_rects: Option<[(Vec2, Vec2); 2]>,
     playzone_view: bool,
+    overlay: &[OverlaySegment],
 ) -> Output {
     let target_format = TextureFormat::Rgba8Unorm;
     let constants = [
@@ -559,6 +649,21 @@ fn render_full(
     });
     let target_view = target.create_view(&TextureViewDescriptor::default());
 
+    // Drawn after the stream in the same pass, with the camera of the eye
+    let overlay_eye = OverlayEye::new(
+        eye_position,
+        Quat::IDENTITY,
+        fov(),
+        Vec2::splat(TARGET_SIZE as f32),
+    );
+    let overlay_buffer = stream::create_overlay_buffer(device);
+    let overlay_bind_group = stream::create_overlay_bind_group(device, &pipelines, &overlay_buffer);
+    let mut overlay_data = vec![];
+    let overlay_count = overlay::pack_segments(&overlay_eye, overlay, &mut overlay_data);
+    if overlay_count > 0 {
+        queue.write_buffer(&overlay_buffer, 0, &floats_to_bytes(&overlay_data));
+    }
+
     let mut encoder = device.create_command_encoder(&Default::default());
 
     if lighting_enabled {
@@ -669,6 +774,17 @@ fn render_full(
         pass.set_bind_group(0, &view_bind_group, &[]);
         pass.set_bind_group(1, &depth_bind_group, &[]);
         pass.draw(0..4, 0..1);
+
+        if overlay_count > 0 {
+            stream::encode_overlay(
+                &mut pass,
+                &pipelines,
+                &overlay_bind_group,
+                &overlay_eye,
+                0,
+                overlay_count,
+            );
+        }
     }
 
     let readback = device.create_buffer(&BufferDescriptor {
@@ -832,6 +948,7 @@ fn color_key_upper_layer_alone_matches_both() {
             None,
             rects,
             false,
+            &[],
         )
     };
     let whole = render_rects(None);
@@ -1460,6 +1577,7 @@ fn late_arms_are_moved() {
             None,
             None,
             false,
+            &[],
         )
     };
     let motion = |displacement| ArmMotion {
@@ -1502,6 +1620,7 @@ fn late_arms_are_moved() {
         None,
         None,
         false,
+        &[],
     );
     assert_eq!(keyed.alpha(0.45, 0.37), 0.0);
     assert!(keyed.alpha(0.55, 0.48) < 0.1, "{}", keyed.alpha(0.55, 0.48));
@@ -1752,6 +1871,7 @@ fn playzone_fills_objects_removed_near_the_hand() {
             playzone,
             None,
             playzone_view,
+            &[],
         )
     };
     let render_playzone = |playzone| render_view(&config, playzone, false);
@@ -2258,4 +2378,99 @@ fn tint_debug_view_marks_the_mask() {
     let hand = out.at(0.5, 0.25);
     assert_eq!(hand[3], 0);
     assert!(hand[1] > 50 && hand[0] == 0);
+}
+
+// Distance of a point from a segment (pixels)
+fn distance_to_segment(point: Vec2, a: Vec2, b: Vec2) -> f32 {
+    let t = ((point - a).dot(b - a) / (b - a).length_squared().max(1e-6)).clamp(0.0, 1.0);
+    point.distance(a + (b - a) * t)
+}
+
+#[test]
+fn overlay_draws_the_box_outline_over_the_stream() {
+    let (device, queue) = gpu_or_skip!();
+    let config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
+
+    // Below the eye: front face 1 m away, back face 2 m
+    let region = RegionOverride {
+        volume_to_world: Mat4::from_translation(Vec3::new(0.0, -0.5, -1.5)),
+        half_extents: Vec3::new(0.3, 0.1, 0.5),
+    };
+    // 3 pixels: 90 degrees over 64 pixels
+    let eye = OverlayEye::new(
+        Vec3::ZERO,
+        Quat::IDENTITY,
+        fov(),
+        Vec2::splat(TARGET_SIZE as f32),
+    );
+    let half_width = 1.5;
+    let edges = overlay::box_edges(
+        &region,
+        OVERLAY_AMBER,
+        2.0 * half_width / eye.pixels_per_radian,
+    );
+
+    let draw = |overlay: &[OverlaySegment]| {
+        render_full(
+            &device,
+            &queue,
+            &config,
+            &hand_scene(),
+            Vec3::ZERO,
+            Vec3::ZERO,
+            true,
+            None,
+            [None; 2],
+            None,
+            None,
+            false,
+            overlay,
+        )
+    };
+    let plain = draw(&[]);
+    let outlined = draw(&edges);
+
+    // Where the edges are in the target (row 0 at the top). The projection of the stream flips y, so
+    // the box below the eye is in the upper half here; on the headset the stream is flipped the same way
+    let to_pixels = |point: Vec3| {
+        let clip = eye.view_proj * point.extend(1.0);
+        Vec2::new(clip.x / clip.w + 1.0, 1.0 - clip.y / clip.w) * 0.5 * TARGET_SIZE as f32
+    };
+    let projected = edges.map(|edge| (to_pixels(edge.start), to_pixels(edge.end)));
+
+    // The upper front edge crosses the hole of the hand: opaque in the line color there
+    let row = to_pixels(Vec3::new(0.0, -0.4, -1.0)).y;
+    assert!((row - 19.2).abs() < 1e-3, "{row}");
+    let row = row as u32;
+    let pixel = |out: &Output, x: u32, y: u32| out.pixels[(y * TARGET_SIZE + x) as usize];
+    for x in 26..=38 {
+        assert_eq!(pixel(&plain, x, row)[3], 0, "not in the hole at {x}");
+        let [r, g, b, a] = pixel(&outlined, x, row);
+        let expected = OVERLAY_AMBER * 255.0;
+        assert!(
+            (f32::from(r) - expected.x).abs() <= 1.0
+                && (f32::from(g) - expected.y).abs() <= 1.0
+                && (f32::from(b) - expected.z).abs() <= 1.0
+                && a == 255,
+            "{x}: {:?}",
+            [r, g, b, a]
+        );
+    }
+
+    // Away from every line nothing changes
+    let mut away = 0;
+    for y in 0..TARGET_SIZE {
+        for x in 0..TARGET_SIZE {
+            let center = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
+            let distance = projected
+                .iter()
+                .map(|(a, b)| distance_to_segment(center, *a, *b))
+                .fold(f32::INFINITY, f32::min);
+            if distance > half_width + 1.5 {
+                away += 1;
+                assert_eq!(pixel(&outlined, x, y), pixel(&plain, x, y), "at {x}, {y}");
+            }
+        }
+    }
+    assert!(away > TARGET_SIZE * TARGET_SIZE / 2, "{away}");
 }

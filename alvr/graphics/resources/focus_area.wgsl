@@ -205,12 +205,14 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         // the distance because it may reach far out of the bounding sphere
         let bridge_start = depth_u.hand_bridge[hand * 2u];
         let bridge_end_radius = depth_u.hand_bridge_end[hand];
+        // A bridge faded at the surface of a marker box has negative radii, its rim may still show
         let bridge_radius = max(bridge_start.w, bridge_end_radius);
-        if bridge_radius > 0.0 {
+        if depth_u.hand_bridge_end[2u + hand] > 0.5
+            && bridge_radius + max(zones.x, 0.0) + SOFTNESS > 0.0 {
             let bridge_end = depth_u.hand_bridge[hand * 2u + 1u];
             let to_middle = 0.5 * (bridge_start.xyz + bridge_end.xyz) - origin;
             let middle_t = max(dot(to_middle, dir), 0.0);
-            let reach = 0.5 * length(bridge_end.xyz - bridge_start.xyz) + bridge_radius;
+            let reach = 0.5 * length(bridge_end.xyz - bridge_start.xyz) + max(bridge_radius, 0.0);
             if length(to_middle - dir * middle_t)
                 < reach + max(zones.x, 0.0) + max(sweep.x, sweep.y) + SOFTNESS {
                 let capsule = capsule_zones(

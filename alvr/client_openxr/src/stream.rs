@@ -22,7 +22,7 @@ use alvr_common::{
 use alvr_graphics::{
     ArmMotion, BridgeChoice, ColorKeyInput, DepthDumpFiles, DepthDumpRequest, DepthFrame,
     DepthRenderInput, GraphicsContext, HAND_SEGMENTS, HandShape, HandZones, LeakGains,
-    RegionOverride, SEGMENT_JOINTS, StreamRenderer, StreamViewParams, WristBridge,
+    OverlaySegment, RegionOverride, SEGMENT_JOINTS, StreamRenderer, StreamViewParams, WristBridge,
 };
 use alvr_packets::{ClientStreamConfig, RealTimeConfig, TrackingData};
 use alvr_session::{
@@ -198,6 +198,8 @@ pub struct StreamContext {
     // the color key show only inside it
     region_override: Option<RegionOverride>,
     hands_in_region: bool,
+    // Outline of the anchor and the box, drawn over the stream (stage space). Empty: none
+    area_overlay: Vec<OverlaySegment>,
 }
 
 impl StreamContext {
@@ -373,6 +375,7 @@ impl StreamContext {
             leak_lookup_time: Cell::new((Duration::ZERO, 0)),
             region_override: None,
             hands_in_region: false,
+            area_overlay: Vec::new(),
         };
 
         this.update_reference_space(None);
@@ -412,6 +415,13 @@ impl StreamContext {
     pub fn set_region_override(&mut self, region: Option<RegionOverride>, hands_in_region: bool) {
         self.region_override = region;
         self.hands_in_region = hands_in_region;
+    }
+
+    /// Lines drawn over the stream in this and the next frames, stage space. Empty: none (nothing is
+    /// uploaded or drawn). Only with Passthrough = Depth
+    pub fn set_area_overlay(&mut self, segments: &[OverlaySegment]) {
+        self.area_overlay.clear();
+        self.area_overlay.extend_from_slice(segments);
     }
 
     /// New colors for the key, learned from the camera
@@ -1333,6 +1343,7 @@ impl StreamContext {
                 .foveation_center_shifts
                 .map(|centers| centers.map(Vec2::from_array)),
             depth_input.as_ref(),
+            &self.area_overlay,
         );
 
         if let Some((n, result)) = self.renderer.poll_depth_dump() {

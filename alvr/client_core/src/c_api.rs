@@ -834,6 +834,7 @@ pub extern "C" fn alvr_render_stream_opengl(
                     .map(|centers| centers.map(Vec2::from_array)),
                 // Depth passthrough is only supported by the OpenXR client
                 None,
+                &[],
             );
         }
     });

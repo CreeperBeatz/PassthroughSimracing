@@ -1,3 +1,4 @@
+mod area_overlay;
 #[cfg(target_os = "android")]
 mod auto_color_key;
 mod c_api;
@@ -22,6 +23,7 @@ use alvr_common::{
 use alvr_graphics::GraphicsContext;
 use alvr_session::{BodyTrackingBDConfig, BodyTrackingSourcesConfig, PerformanceLevel};
 use alvr_system_info::Platform;
+use area_overlay::AreaOverlay;
 use extra_extensions::{
     BD_MOTION_TRACKING_EXTENSION_NAME, META_BODY_TRACKING_FIDELITY_EXTENSION_NAME,
     PICO_CONFIGURATION_EXTENSION_NAME, SPATIAL_MARKER_EXTENSION_NAMES, SpatialMarkerFns,
@@ -519,6 +521,8 @@ pub fn entry_point() {
         let mut marker_region = MarkerRegion::new();
         // Whether the depth mask uses the box, last logged. None: no box
         let mut marker_box_used = None::<bool>;
+        // Outline of the code and the box over the stream (`debug.alvr.area_show`)
+        let mut area_overlay = AreaOverlay::new();
 
         let mut event_storage = xr::EventDataBuffer::new();
         let mut headset_is_worn = true;
@@ -817,6 +821,13 @@ pub fn entry_point() {
                     ),
                     None => (),
                 }
+            }
+            let depth_passthrough = stream_context
+                .as_ref()
+                .is_some_and(|stream| stream.uses_depth_passthrough());
+            let outline = area_overlay.update(&marker_region, region_override, depth_passthrough);
+            if let Some(stream) = &mut stream_context {
+                stream.set_area_overlay(outline);
             }
 
             // The color key needs the focus area, which comes from the depth passthrough

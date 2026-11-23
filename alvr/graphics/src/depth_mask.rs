@@ -765,7 +765,7 @@ pub fn depth_uniforms(
             zones.sweep.direction.extend(zones.sweep.forward).to_array()
         }));
     }
-    // Both radii 0: no bridge
+    // No bridge: zeros
     let bridges = input.color_key.map_or([None; 2], |key| key.bridges);
     let bridges = [0, 1].map(|i| bridges[i].filter(|_| hands[i].is_some()));
     for bridge in bridges {
@@ -778,8 +778,11 @@ pub fn depth_uniforms(
         data.extend(start.to_array());
         data.extend(end.to_array());
     }
+    // The radii at the ends, and whether each hand has a bridge (limited to a box, both radii may be
+    // negative while its rim still shows)
     let end_radius = bridges.map(|bridge| bridge.map_or(0.0, |bridge| bridge.end_radius));
-    data.extend([end_radius[0], end_radius[1], 0.0, 0.0]);
+    let has_bridge = bridges.map(|bridge| if bridge.is_some() { 1.0 } else { 0.0 });
+    data.extend([end_radius[0], end_radius[1], has_bridge[0], has_bridge[1]]);
 
     data.try_into().unwrap()
 }
