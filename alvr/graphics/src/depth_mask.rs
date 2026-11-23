@@ -388,6 +388,99 @@ pub struct DepthRenderInput {
     /// With the color key: the part of each view (min and max view uv) where the lower game layer is
     /// shown. Outside of it the upper layer shows what both would. None: the whole view
     pub key_lower_rects: Option<[(Vec2, Vec2); 2]>,
+    /// A box that replaces the region of the settings (placed from a marker on the rig). None: the
+    /// region of the settings
+    pub region_override: Option<RegionOverride>,
+}
+
+/// An oriented box in stage space, used for the depth mask instead of `DepthPassthroughConfig::region`
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RegionOverride {
+    /// Rigid transform (rotation and translation only) from the box frame to stage space
+    pub volume_to_world: Mat4,
+    /// Half of the width (local X), height (local Y) and depth (local Z)
+    pub half_extents: Vec3,
+}
+
+impl RegionOverride {
+    pub fn center(&self) -> Vec3 {
+        self.volume_to_world.w_axis.truncate()
+    }
+
+    /// Full size: local X, Y, Z
+    pub fn size(&self) -> Vec3 {
+        self.half_extents * 2.0
+    }
+
+    /// Direction of local -Z projected on the floor, as a yaw about stage +Y (radians, 0: towards -Z,
+    /// counter-clockwise seen from above), like `CockpitVolumeConfig::yaw_deg`
+    pub fn yaw(&self) -> f32 {
+        let forward = self.volume_to_world.transform_vector3(Vec3::NEG_Z);
+        f32::atan2(-forward.x, -forward.z)
+    }
+
+    /// The 8 corners in stage space
+    pub fn corners(&self) -> [Vec3; 8] {
+        std::array::from_fn(|i| {
+            let sign = Vec3::new(
+                if i & 1 == 0 { -1.0 } else { 1.0 },
+                if i & 2 == 0 { -1.0 } else { 1.0 },
+                if i & 4 == 0 { -1.0 } else { 1.0 },
+            );
+            self.volume_to_world
+                .transform_point3(sign * self.half_extents)
+        })
+    }
+
+    /// How far the box moved: the largest distance between corresponding corners (meters)
+    pub fn max_corner_shift(&self, other: &Self) -> f32 {
+        self.corners()
+            .iter()
+            .zip(other.corners())
+            .map(|(a, b)| a.distance(b))
+            .fold(0.0, f32::max)
+    }
+}
+
+/// The region the depth mask uses in a frame: the override if there is one, else the settings
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum EffectiveRegion {
+    Distance {
+        max_distance: f32,
+    },
+    Volume {
+        volume_to_world: Mat4,
+        half_extents: Vec3,
+        /// From `DepthRenderInput::region_override`
+        from_override: bool,
+    },
+}
+
+pub(crate) fn effective_region(
+    config: &DepthPassthroughConfig,
+    input: &DepthRenderInput,
+) -> EffectiveRegion {
+    if let Some(region) = input.region_override {
+        return EffectiveRegion::Volume {
+            volume_to_world: region.volume_to_world,
+            half_extents: region.half_extents,
+            from_override: true,
+        };
+    }
+
+    match &config.region {
+        DepthMaskRegion::Distance { max_distance } => EffectiveRegion::Distance {
+            max_distance: *max_distance,
+        },
+        DepthMaskRegion::Volume(volume) => EffectiveRegion::Volume {
+            volume_to_world: Mat4::from_rotation_translation(
+                Quat::from_rotation_y(volume.yaw_deg.to_radians()),
+                Vec3::new(volume.center_x, volume.center_y, volume.center_z),
+            ),
+            half_extents: Vec3::new(volume.width, volume.height, volume.depth) * 0.5,
+            from_override: false,
+        },
+    }
 }
 
 const EYE_FLOAT_COUNT: usize = 16 + 4 + 16 + 16 + 4;
@@ -459,23 +552,17 @@ pub fn depth_uniforms(
         }
     }
 
-    let (region_mode, max_distance, world_to_volume, half_extents) = match &config.region {
-        DepthMaskRegion::Distance { max_distance } => {
-            (0.0, *max_distance, Mat4::IDENTITY, Vec3::ZERO)
-        }
-        DepthMaskRegion::Volume(volume) => {
-            let volume_to_world = Mat4::from_rotation_translation(
-                Quat::from_rotation_y(volume.yaw_deg.to_radians()),
-                Vec3::new(volume.center_x, volume.center_y, volume.center_z),
-            );
-            (
-                1.0,
-                0.0,
-                volume_to_world.inverse(),
-                Vec3::new(volume.width, volume.height, volume.depth) * 0.5,
-            )
-        }
-    };
+    let (region_mode, max_distance, world_to_volume, half_extents) =
+        match effective_region(config, input) {
+            EffectiveRegion::Distance { max_distance } => {
+                (0.0, max_distance, Mat4::IDENTITY, Vec3::ZERO)
+            }
+            EffectiveRegion::Volume {
+                volume_to_world,
+                half_extents,
+                ..
+            } => (1.0, 0.0, volume_to_world.inverse(), half_extents),
+        };
     data.extend(world_to_volume.to_cols_array());
     data.extend(half_extents.extend(0.0).to_array());
 
@@ -1024,6 +1111,7 @@ mod tests {
             capture_playzone: false,
             playzone_view: false,
             key_lower_rects: None,
+            region_override: None,
         };
         let data = depth_uniforms(&cfg, &[view(), view()], &input, None, false);
 
@@ -1047,6 +1135,97 @@ mod tests {
         assert_eq!(data[base + 26], 0.0);
     }
 
+    // The override replaces the region of the settings, also a distance region
+    #[test]
+    fn region_override_replaces_settings() {
+        let volume_to_world = Mat4::from_rotation_translation(
+            Quat::from_rotation_y(0.3) * Quat::from_rotation_x(0.05),
+            Vec3::new(0.2, 0.9, -0.6),
+        );
+        let region = RegionOverride {
+            volume_to_world,
+            half_extents: Vec3::new(0.6, 0.45, 0.5),
+        };
+        let base = 2 * EYE_FLOAT_COUNT;
+        for settings in [
+            DepthMaskRegion::Distance { max_distance: 0.9 },
+            DepthMaskRegion::Volume(CockpitVolumeConfig {
+                center_x: 1.0,
+                center_y: 0.8,
+                center_z: -2.0,
+                yaw_deg: 90.0,
+                width: 1.0,
+                height: 1.0,
+                depth: 2.0,
+            }),
+        ] {
+            let cfg = config(settings);
+            let mut input = DepthRenderInput {
+                frame: None,
+                eye_positions: [Vec3::ZERO; 2],
+                color_key: None,
+                arms: [None; 2],
+                capture_playzone: false,
+                playzone_view: false,
+                key_lower_rects: None,
+                region_override: Some(region),
+            };
+            let data = depth_uniforms(&cfg, &[view(), view()], &input, None, false);
+            let world_to_volume = Mat4::from_cols_slice(&data[base..base + 16]);
+            assert!(
+                world_to_volume.abs_diff_eq(volume_to_world.inverse(), 1e-6),
+                "{world_to_volume}"
+            );
+            assert_eq!(&data[base + 16..base + 19], &[0.6, 0.45, 0.5]);
+            assert_eq!(data[base + 20], 1.0);
+            assert_eq!(data[base + 21], 0.0);
+            // Feathering and debug view still from the settings
+            assert_eq!(data[base + 22], 0.02);
+
+            // Without the override: as before
+            input.region_override = None;
+            let plain = depth_uniforms(&cfg, &[view(), view()], &input, None, false);
+            let expected = match &cfg.region {
+                DepthMaskRegion::Distance { .. } => 0.0,
+                DepthMaskRegion::Volume(_) => 1.0,
+            };
+            assert_eq!(plain[base + 20], expected);
+        }
+    }
+
+    #[test]
+    fn region_override_geometry() {
+        let region = RegionOverride {
+            volume_to_world: Mat4::from_rotation_translation(
+                Quat::from_rotation_y(90_f32.to_radians()),
+                Vec3::new(1.0, 0.8, -2.0),
+            ),
+            half_extents: Vec3::new(0.5, 0.25, 1.0),
+        };
+        assert!((region.center() - Vec3::new(1.0, 0.8, -2.0)).length() < 1e-6);
+        assert!((region.yaw().to_degrees() - 90.0).abs() < 1e-4);
+        assert_eq!(region.size(), Vec3::new(1.0, 0.5, 2.0));
+        // Every corner is on the surface of the box
+        for corner in region.corners() {
+            let local = region.volume_to_world.inverse().transform_point3(corner);
+            assert!((local.abs() - region.half_extents).abs().max_element() < 1e-5);
+        }
+
+        let moved = RegionOverride {
+            volume_to_world: Mat4::from_translation(Vec3::new(0.0, 0.0, 0.01))
+                * region.volume_to_world,
+            ..region
+        };
+        assert!((region.max_corner_shift(&moved) - 0.01).abs() < 1e-5);
+        // Turning by 1 degree moves the far corners by about the half diagonal times the angle
+        let turned = RegionOverride {
+            volume_to_world: region.volume_to_world * Mat4::from_rotation_y(1_f32.to_radians()),
+            ..region
+        };
+        let expected = Vec2::new(0.5, 1.0).length() * 1_f32.to_radians();
+        assert!((region.max_corner_shift(&turned) - expected).abs() < 1e-4);
+    }
+
     #[test]
     fn lighting_disabled_when_not_rendered() {
         let mut cfg = config(DepthMaskRegion::Distance { max_distance: 0.9 });
@@ -1066,6 +1245,7 @@ mod tests {
             capture_playzone: false,
             playzone_view: false,
             key_lower_rects: None,
+            region_override: None,
         };
         let base = 2 * EYE_FLOAT_COUNT + 16 + 4 * 3;
 

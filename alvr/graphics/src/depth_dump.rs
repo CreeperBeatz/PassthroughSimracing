@@ -376,12 +376,24 @@ impl DumpFrame<'_> {
     pub fn to_json(&self) -> String {
         let n = self.request.n;
         let config = self.config;
-        let mut region = match &config.region {
-            DepthMaskRegion::Distance { max_distance } => vec![
+        // The region the mask used: a box placed from a marker replaces the one of the settings
+        let mut region = match (&self.input.region_override, &config.region) {
+            (Some(volume), _) => vec![
+                ("mode", string("volume")),
+                ("source", string("marker")),
+                ("center", numbers(&volume.center().to_array())),
+                ("yaw_deg", number(volume.yaw().to_degrees())),
+                ("size", numbers(&volume.size().to_array())),
+                (
+                    "volume_to_world",
+                    numbers(&volume.volume_to_world.to_cols_array()),
+                ),
+            ],
+            (None, DepthMaskRegion::Distance { max_distance }) => vec![
                 ("mode", string("distance")),
                 ("max_distance", number(*max_distance)),
             ],
-            DepthMaskRegion::Volume(volume) => vec![
+            (None, DepthMaskRegion::Volume(volume)) => vec![
                 ("mode", string("volume")),
                 (
                     "center",
@@ -607,6 +619,7 @@ mod tests {
             capture_playzone: false,
             playzone_view: false,
             key_lower_rects: None,
+            region_override: None,
         };
 
         for playzone in [None, Some(([view; 2], 2.5))] {
@@ -639,5 +652,43 @@ mod tests {
             assert_eq!(json.contains(r#""playzone":null"#), playzone.is_none());
             assert!(json.contains(r#""hands":[null,{"bounds":"#), "{json}");
         }
+
+        // A box placed from a marker is written instead of the region of the settings
+        let input = DepthRenderInput {
+            region_override: Some(depth_mask::RegionOverride {
+                volume_to_world: alvr_common::glam::Mat4::from_rotation_translation(
+                    alvr_common::glam::Quat::from_rotation_y(90_f32.to_radians()),
+                    Vec3::new(0.25, 0.9, -0.5),
+                ),
+                half_extents: Vec3::new(0.6, 0.45, 0.5),
+            }),
+            ..input
+        };
+        let json = DumpFrame {
+            request: DepthDumpRequest {
+                n: 8,
+                display_ns: 1,
+                depth_capture_ns: None,
+                now_ns: None,
+            },
+            config: &config,
+            stream_views: &[view; 2],
+            input: &input,
+            frame: &frame,
+            playzone: None,
+            depth_size: UVec2::new(320, 320),
+            mask_size: UVec2::new(412, 441),
+            focus_size: UVec2::new(412, 441),
+        }
+        .to_json();
+        assert!(is_valid_json(&json), "{json}");
+        assert!(
+            json.contains(
+                r#""region":{"mode":"volume","source":"marker","center":[0.25,0.9,-0.5]"#
+            ),
+            "{json}"
+        );
+        assert!(!json.contains("max_distance"), "{json}");
+        assert!(json.contains(r#""size":[1.2,0.9,1]"#), "{json}");
     }
 }

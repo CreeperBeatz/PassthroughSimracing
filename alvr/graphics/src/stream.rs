@@ -1073,6 +1073,7 @@ impl StreamRenderer {
                 capture_playzone: false,
                 playzone_view: false,
                 key_lower_rects: None,
+                region_override: None,
             });
 
             // Fall back to "no depth" if the swapchain image is unknown

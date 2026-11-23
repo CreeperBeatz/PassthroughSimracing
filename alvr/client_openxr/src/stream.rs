@@ -22,7 +22,7 @@ use alvr_common::{
 use alvr_graphics::{
     ArmMotion, BridgeChoice, ColorKeyInput, DepthDumpFiles, DepthDumpRequest, DepthFrame,
     DepthRenderInput, GraphicsContext, HAND_SEGMENTS, HandShape, HandZones, LeakGains,
-    SEGMENT_JOINTS, StreamRenderer, StreamViewParams, WristBridge,
+    RegionOverride, SEGMENT_JOINTS, StreamRenderer, StreamViewParams, WristBridge,
 };
 use alvr_packets::{ClientStreamConfig, RealTimeConfig, TrackingData};
 use alvr_session::{
@@ -194,6 +194,8 @@ pub struct StreamContext {
     // Log of the leak map: last time, and the lookup time since then
     last_leak_log: Cell<Instant>,
     leak_lookup_time: Cell<(Duration, u32)>,
+    // Box placed from a marker, used instead of the region of the settings
+    region_override: Option<RegionOverride>,
 }
 
 impl StreamContext {
@@ -367,6 +369,7 @@ impl StreamContext {
             hand_leak: [const { Cell::new(0.0) }; 2],
             last_leak_log: Cell::new(Instant::now()),
             leak_lookup_time: Cell::new((Duration::ZERO, 0)),
+            region_override: None,
         };
 
         this.update_reference_space(None);
@@ -398,6 +401,12 @@ impl StreamContext {
                 Arc::clone(&self.interaction_context),
             ));
         }
+    }
+
+    /// A box placed from a marker on the rig, used for the depth mask instead of the region of the
+    /// settings. None: the settings
+    pub fn set_region_override(&mut self, region: Option<RegionOverride>) {
+        self.region_override = region;
     }
 
     /// New colors for the key, learned from the camera
@@ -1055,6 +1064,7 @@ impl StreamContext {
                         capture_playzone: false,
                         playzone_view: false,
                         key_lower_rects: None,
+                        region_override: self.region_override,
                     });
                 }
                 Err(e) => {
@@ -1096,6 +1106,7 @@ impl StreamContext {
             capture_playzone,
             playzone_view: self.color_key.is_some_and(|params| params.playzone_view),
             key_lower_rects: None,
+            region_override: self.region_override,
         })
     }
 

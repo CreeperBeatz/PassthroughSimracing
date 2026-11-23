@@ -129,6 +129,12 @@ name = "com.oculus.permission.HAND_TRACKING"
 name = "com.oculus.permission.WIFI_LOCK"
 [[package.metadata.android.uses_permission]]
 name = "com.oculus.permission.USE_SCENE"
+# QR code markers: without it the runtime hides XR_EXT_spatial_entity (the headset asks for the horizonos
+# name, Meta's documents name the com.oculus one)
+[[package.metadata.android.uses_permission]]
+name = "com.oculus.permission.USE_ANCHOR_API"
+[[package.metadata.android.uses_permission]]
+name = "horizonos.permission.USE_ANCHOR_API"
 # Only requested if the colors of the color key are learned automatically
 [[package.metadata.android.uses_permission]]
 name = "android.permission.CAMERA"

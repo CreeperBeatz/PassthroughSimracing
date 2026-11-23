@@ -7,6 +7,7 @@ mod extra_extensions;
 mod graphics;
 mod interaction;
 mod lobby;
+mod marker_region;
 mod passthrough;
 mod stream;
 
@@ -23,10 +24,12 @@ use alvr_session::{BodyTrackingBDConfig, BodyTrackingSourcesConfig, PerformanceL
 use alvr_system_info::Platform;
 use extra_extensions::{
     BD_MOTION_TRACKING_EXTENSION_NAME, META_BODY_TRACKING_FIDELITY_EXTENSION_NAME,
-    PICO_CONFIGURATION_EXTENSION_NAME,
+    PICO_CONFIGURATION_EXTENSION_NAME, SPATIAL_MARKER_EXTENSION_NAMES, SpatialMarkerFns,
+    SpatialMarkerTracker,
 };
 use interaction::{InteractionContext, InteractionSourcesConfig};
 use lobby::Lobby;
+use marker_region::MarkerRegion;
 use openxr as xr;
 use passthrough::{ColorKeyLoader, PassthroughLayer};
 use std::{
@@ -263,6 +266,47 @@ pub fn entry_point() {
 
     selected_exts = selected_exts.intersection(&available_exts);
 
+    // QR code markers (`debug.alvr.marker`, read at the start of the app, see `SpatialMarkerTracker`).
+    // Enabled by name, so that the `openxr` crate doesn't load their functions in `create_instance`,
+    // and only all three together: each depends on the one before
+    let marker_listed = [
+        ("XR_EXT_future", available_exts.ext_future),
+        ("XR_EXT_spatial_entity", available_exts.ext_spatial_entity),
+        (
+            "XR_EXT_spatial_marker_tracking",
+            available_exts.ext_spatial_marker_tracking,
+        ),
+        ("XR_EXT_spatial_anchor", available_exts.ext_spatial_anchor),
+        (
+            "XR_EXT_spatial_persistence",
+            available_exts.ext_spatial_persistence,
+        ),
+    ];
+    let marker_wanted = passthrough::debug_property("debug.alvr.marker").unwrap_or(1) != 0;
+    let marker_exts_listed = marker_listed[..3].iter().all(|(_, listed)| *listed);
+    let mut enable_marker_exts = marker_wanted && marker_exts_listed;
+    stream_log(&format!(
+        "marker: the runtime lists {}; enabled: {}",
+        marker_listed
+            .iter()
+            .map(|(name, listed)| format!("{name} {}", if *listed { "yes" } else { "no" }))
+            .collect::<Vec<_>>()
+            .join(", "),
+        if enable_marker_exts {
+            "the first three (anchor and persistence are not used)"
+        } else if !marker_wanted {
+            "none (debug.alvr.marker 0)"
+        } else {
+            "none (the first three are needed together)"
+        }
+    ));
+    let mut instance_exts = selected_exts.clone();
+    if enable_marker_exts {
+        instance_exts
+            .other
+            .extend(SPATIAL_MARKER_EXTENSION_NAMES.map(|name| name.to_vec()));
+    }
+
     let available_layers = xr_entry.enumerate_layers().unwrap();
     info!("OpenXR available layers: {available_layers:#?}");
 
@@ -278,19 +322,35 @@ pub fn entry_point() {
         })
         .collect::<Vec<_>>();
 
-    let xr_instance = xr_entry
-        .create_instance(
-            &xr::ApplicationInfo {
-                application_name: "ALVR Client",
-                application_version: 0,
-                engine_name: "ALVR",
-                engine_version: 0,
-                api_version: openxr_version,
-            },
-            &selected_exts,
-            &[],
-        )
-        .unwrap();
+    let app_info = xr::ApplicationInfo {
+        application_name: "ALVR Client",
+        application_version: 0,
+        engine_name: "ALVR",
+        engine_version: 0,
+        api_version: openxr_version,
+    };
+    // A runtime that lists the marker extensions may still refuse them: start without them
+    let xr_instance = match xr_entry.create_instance(&app_info, &instance_exts, &[]) {
+        Ok(instance) => instance,
+        Err(e) if enable_marker_exts => {
+            stream_log(&format!(
+                "marker: off, the instance can't be created with the extensions: {e:?}"
+            ));
+            enable_marker_exts = false;
+            xr_entry
+                .create_instance(&app_info, &selected_exts, &[])
+                .unwrap()
+        }
+        Err(e) => panic!("{e:?}"),
+    };
+
+    let marker_fns = enable_marker_exts
+        .then(|| {
+            SpatialMarkerFns::load(&xr_instance)
+                .inspect_err(|e| stream_log(&format!("marker: off, functions not found: {e:?}")))
+                .ok()
+        })
+        .flatten();
 
     let platform = alvr_system_info::platform(
         xr_instance
@@ -449,6 +509,17 @@ pub fn entry_point() {
         let mut stream_context = None::<StreamContext>;
         let mut passthrough_layer = None;
 
+        // QR code markers, while the session runs and `debug.alvr.marker` is 1 (unset: while
+        // `debug.alvr.marker_box` is 1)
+        let mut marker_tracker = None::<SpatialMarkerTracker>;
+        // Gave up until `debug.alvr.marker` is set to 0 and back
+        let mut marker_failed = false;
+        let mut marker_restart_logged = false;
+        let mut last_marker_poll = None::<Instant>;
+        let mut marker_region = MarkerRegion::new();
+        // Whether the depth mask uses the box, last logged. None: no box
+        let mut marker_box_used = None::<bool>;
+
         let mut event_storage = xr::EventDataBuffer::new();
         let mut headset_is_worn = true;
         let mut color_key_loader = ColorKeyLoader::new();
@@ -476,26 +547,58 @@ pub fn entry_point() {
                             session_running = false;
 
                             passthrough_layer = None;
+                            // Its handles must go before the session ends
+                            marker_tracker = None;
 
                             core_context.pause();
 
                             xr_session.end().ok();
                         }
                         xr::SessionState::EXITING | xr::SessionState::LOSS_PENDING => {
+                            // Its handles must go before the session
+                            drop(marker_tracker.take());
+
                             break 'render_loop;
                         }
                         _ => (),
                     },
                     xr::Event::ReferenceSpaceChangePending(event) => {
-                        info!(
-                            "ReferenceSpaceChangePending type: {:?}",
-                            event.reference_space_type()
-                        );
+                        // With stream_log: the client logger drops info while streaming, and the
+                        // marker checklist reads ALVR_CAM
+                        let pose = event.pose_in_previous_space();
+                        let position = from_xr_vec3(pose.position);
+                        stream_log(&format!(
+                            "ReferenceSpaceChangePending type: {:?}, change time {} ns, pose valid: {}, \
+                             pose in previous space ({:.3}, {:.3}, {:.3}) m, yaw {:.1} deg",
+                            event.reference_space_type(),
+                            event.change_time().as_nanos(),
+                            event.pose_valid(),
+                            position.x,
+                            position.y,
+                            position.z,
+                            alvr_graphics::yaw_log_deg(alvr_graphics::heading_yaw(
+                                from_xr_quat(pose.orientation) * Vec3::NEG_Z
+                            )),
+                        ));
 
                         lobby.update_reference_space();
 
                         if let Some(stream) = &mut stream_context {
                             stream.update_reference_space(Some(event.change_time()));
+                        }
+
+                        // The markers are located in STAGE: a change of LOCAL (a recenter) or VIEW
+                        // doesn't move them
+                        if event.reference_space_type() == xr::ReferenceSpaceType::STAGE {
+                            if let Some(tracker) = &mut marker_tracker {
+                                tracker.on_reference_space_change(event.change_time());
+                            }
+                            marker_region.on_reference_space_change(event.change_time());
+                        }
+                    }
+                    xr::Event::SpatialDiscoveryRecommendedEXT(event) => {
+                        if let Some(tracker) = &mut marker_tracker {
+                            tracker.on_discovery_recommended(event.spatial_context());
                         }
                     }
                     xr::Event::PerfSettingsEXT(event) => {
@@ -647,6 +750,69 @@ pub fn entry_point() {
                 Duration::from_nanos(frame_state.predicted_display_period.as_nanos() as _);
             let vsync_time =
                 Duration::from_nanos(frame_state.predicted_display_time.as_nanos() as _);
+
+            // QR code markers: `debug.alvr.marker` (polled), and the box placed from one
+            if last_marker_poll.is_none_or(|time| time.elapsed() > Duration::from_millis(500)) {
+                last_marker_poll = Some(Instant::now());
+                let marker_property = passthrough::debug_property("debug.alvr.marker");
+                // Unset: only while the box is on
+                let wanted = marker_property.map_or_else(
+                    || passthrough::debug_property("debug.alvr.marker_box").unwrap_or(0) != 0,
+                    |value| value != 0,
+                );
+                if !wanted {
+                    if marker_tracker.take().is_some() {
+                        stream_log(if marker_property.is_some() {
+                            "marker: stopped (debug.alvr.marker 0)"
+                        } else {
+                            "marker: stopped (marker_box 0 and debug.alvr.marker unset)"
+                        });
+                    }
+                    // 0 turns the box off too. Without a tracker for other reasons it is kept
+                    if marker_property.is_some() {
+                        marker_region.stop();
+                    }
+                    marker_failed = false;
+                } else if marker_tracker.is_none() && !marker_failed {
+                    if let Some(fns) = marker_fns {
+                        marker_tracker = SpatialMarkerTracker::new(&xr_session, xr_system, fns);
+                        marker_failed = marker_tracker.is_none();
+                    } else if marker_exts_listed && !marker_wanted && !marker_restart_logged {
+                        marker_restart_logged = true;
+                        stream_log(
+                            "marker: the extensions are only enabled at the start of the app, restart it",
+                        );
+                    }
+                }
+            }
+            if let Some(tracker) = &mut marker_tracker {
+                tracker.update(frame_state.predicted_display_time);
+                if tracker.is_off() {
+                    marker_tracker = None;
+                    marker_failed = true;
+                }
+            }
+            let region_override =
+                marker_region.update(marker_tracker.as_ref(), frame_state.predicted_display_time);
+            if let Some(stream) = &mut stream_context {
+                stream.set_region_override(region_override);
+            }
+            // The box applies only to a stream with Passthrough = Depth
+            let used = region_override.map(|_| {
+                stream_context
+                    .as_ref()
+                    .is_some_and(|stream| stream.uses_depth_passthrough())
+            });
+            if used != marker_box_used {
+                marker_box_used = used;
+                match used {
+                    Some(true) => stream_log("marker box: used by the depth mask"),
+                    Some(false) => stream_log(
+                        "marker box: placed but not used (no stream, or Passthrough is not Depth)",
+                    ),
+                    None => (),
+                }
+            }
 
             // The color key needs the focus area, which comes from the depth passthrough
             let color_key = color_key_loader.poll().filter(|_| {

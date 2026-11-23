@@ -530,6 +530,7 @@ fn render_full(
         capture_playzone: false,
         playzone_view,
         key_lower_rects,
+        region_override: None,
     };
     let lighting_enabled = config.lighting.as_option().is_some();
     let playzone_views = [view(depth_camera_position); 2];
@@ -1781,6 +1782,7 @@ fn depth_dump_reads_back_meters_and_masks() {
         capture_playzone: false,
         playzone_view: false,
         key_lower_rects: None,
+        region_override: None,
     };
     let uniforms = depth_mask::depth_uniforms(
         &config,

@@ -67,11 +67,18 @@ new value other than 0 at any time. Everything else is a default.
   similar to Virtual Desktop"; QR codes can be printed. "We still need better edge precision on arms and
   wheel".
 
-**Open for the user.** Way A or way B first (below)? Is the rig a motion rig? Where will the QR codes be
-(in the camera's view when looking ahead: wheel deck or monitor stand, not the base behind the legs), how
-many, what size? Does "no arm extension" also mean `arm_shift 0` (the depth is shifted along a 45 cm arm
-from the wrist) and dropping the 50 cm forearm that the learner excludes from its samples? When can
+**Open for the user.** Way A or way B first (below)? Does "no arm extension" also mean `arm_shift 0` (the
+depth is shifted along a 45 cm arm from the wrist) and dropping the 50 cm forearm that the learner
+excludes from its samples? How many QR codes, and the size to keep after the first measurement? When can
 captures be taken with a real wheel?
+
+**Answered by the user, 2026-11-23 (evening).**
+- Motion rigs are out of scope: a code never moves once placed.
+- The codes are mounted on the rig (flat or standing) or shown on the monitor, facing the driver (a
+  standing code), as the anchor. Where they sit still has to be in the camera's view when looking ahead
+  (wheel deck or monitor stand, not the base behind the legs).
+- Rule: a code is used as it is and measured precisely, and that measurement is the baseline. Its size
+  can be changed after the first accurate measurement.
 
 **What the day established** (from captures unless noted; points 1-4 and 6 were re-measured by a second,
 independent analysis, which changed several first results; 5 is from the logs, 7 was measured with the
@@ -171,6 +178,35 @@ a search of public sources; not yet re-measured by a second analysis, so read th
     redone. The box of the region takes any pose in the shader; the settings only offer a yaw, and they come
     from the PC, so a calibration on the headset needs its own path.
 
+    *Web search of 2026-11-23 on the QR route* (reported = forum, blog or sample code; documented = Meta or
+    Khronos pages; nothing of it checked on the headset).
+    - Documented (the spec, with Meta as author): `XR_EXT_spatial_marker_tracking` is ratified (OpenXR
+      1.1.49) and needs `XR_EXT_spatial_entity` and `XR_EXT_future`. Reported by a Meta engineer in Meta's
+      sample repository: both extensions are advertised on v205 and QR works from v83; a Godot post says
+      v79 answered "QR not supported". v210 should list them, `capabilities ...` in the log says for sure.
+    - Only QR codes are expected on Quest: Unity's package lists "QR Codes only" for Horizon OS, and the
+      Godot post saw no ArUco or AprilTag. Documented: versions up to 10, no logo, no Micro QR; the payload
+      is text or bytes; codes "relatively large and close", best in good light.
+    - Documented: the spatial data permission is a runtime permission (`com.oculus.permission.USE_SCENE`,
+      the user is asked once). Reported (Godot issue): a context created before the user accepted failed
+      with `XR_ERROR_PERMISSION_INSUFFICIENT` and nothing worked until the app was restarted, so the
+      context must be created after the grant. `USE_ANCHOR_API` is documented as a manifest entry; no
+      Meta page names the `horizonos.` variant.
+    - Documented: poses update at a lower rate than the frame rate, "not frame-perfect", not for moving
+      codes; the pose of a moved code does update in the end. Reported (Meta forum, 2026-11, no reply):
+      severe position jitter on a still printed code on a table. No numbers for size, distance, rate or
+      accuracy are published; start from 10 cm and measure.
+    - Documented: Meta's own QR sample suggests showing a code on a computer screen. Nothing is published
+      about glare, flicker or light-on-dark codes on Quest; the general knowledge (moire between the pixel
+      grid and the sensor, banding of a rolling shutter) says to use whole pixels per module, dark on
+      light, a white margin of 4 modules, full brightness.
+    - Documented (the spec): the options "static markers" (more accurate pose and size) and "fixed size
+      for every code" exist only if the runtime lists their features. No source says whether Meta's does:
+      the `capabilities ...` line answers it.
+    - Documented (the spec): the pose is the centre of the code, +X to the right looking at its face, +Y to
+      the top, +Z out of the front; the extents are the full width and height. QR codes have no id, only
+      the payload.
+
 **Method: what cost time today.**
 - Offline tests on screenshots of the display with a skeleton placed by hand were wrong twice (no leak
   predicted for `key_smooth` 70; gains of a shape detector against a baseline the headset doesn't have).
@@ -248,7 +284,11 @@ shifter and held things have to be decided live.
    it works at all for a native app; Meta documents QR tracking for its own SDKs, as experimental and not
    for moving objects. Otherwise: find the codes in the passthrough camera image (it must be larger than
    320x240 for that; 22 ms late is fine for something that doesn't move), or touch points of the rig with
-   a controller once and keep them as a spatial anchor. A world-anchored box breaks on a motion rig.
+   a controller once and keep them as a spatial anchor. A world-anchored box breaks on a motion rig; the
+   user ruled motion rigs out (2026-11-23, evening), so a code that never moves once placed is the case to
+   build for. The codes sit on the rig (flat or standing) or are shown on the monitor facing the driver.
+   A code is used as it is, measured precisely, and that is the baseline; its size can change after the
+   first measurement.
 3. From the anchors to the box: its pose every time the anchors are seen, its size once (settings), then
    `world_to_volume` as now. Test: the border stays on the rig when the head moves and after a recenter.
 4. The map in the rig's frame, built while the hands are away (the user accepts a short moment for that):
@@ -677,7 +717,8 @@ another thread):
   (null: not reported), `now_ns` (when it was rendered), all XrTime, which is CLOCK_MONOTONIC on Quest like
   `image_ns` of the camera dumps; `depth` (`width`, `height`, `near`, `far`, `flip_y`), `mask`, `focus`
   (sizes); `playzone` (`age_s`, null: none); `region` (`mode` distance: `max_distance`, volume: `center`,
-  `yaw_deg`, `size`; `feathering`); `debug_view`; `color_key`; `eyes` (left, right): `eye_position`, `view`
+  `yaw_deg`, `size`; `feathering`; the region the mask used: a box placed from a marker has `source`
+  "marker" and its `volume_to_world`, column major); `debug_view`; `color_key`; `eyes` (left, right): `eye_position`, `view`
   (`pose` and `tangents` left, right, down, up of the streamed view), `uv_to_world_dir` (column major 4x4:
   `dir = M * (u, v, 1, 0)`, uv from the top left), `depth_camera` and `playzone_camera` (`pose`, `tangents`,
   `world_to_view`, `view_to_world`), `files`; `hands` (`bounds` xyz r, `capsules` like the camera dumps,
@@ -700,6 +741,216 @@ dumps: `pose` and `fx`, `fy`, `cx`, `cy` there, at its `image_ns`.
 - [ ] Fast arrival onto wood with `key_leak_map` 0 against 100: the rim is narrow from the start with 100.
 - [ ] The `leak map ... ms` part of the `auto key` line and the `lookup ... us` of the render thread.
 - [ ] `key_lut_dump 1`, then `adb pull` the file for offline tests.
+
+**QR code markers and the box placed from them** (not tested on the headset: compiles and passes the unit
+tests only; nothing in this section ran on the headset yet). Step one of way B: does the runtime give this
+app QR code poses (`XR_EXT_spatial_entity` and `XR_EXT_spatial_marker_tracking`), how good are they, and
+the box region placed from one. The manifest now declares `com.oculus.permission.USE_ANCHOR_API` and
+`horizonos.permission.USE_ANCHOR_API`. The extensions are enabled at the start of the app if
+`debug.alvr.marker` is not 0 (unset counts as on here) and the runtime lists `XR_EXT_future`,
+`XR_EXT_spatial_entity` and `XR_EXT_spatial_marker_tracking` (all three or none; by name, so a missing
+function turns the feature off instead of ending the app; if the runtime refuses them when the instance is
+created, the app starts again without them). Without them, or with `marker 0` at the start, nothing
+changes. Enabled extensions cost nothing by themselves: the tracker (QR detection and the snapshot calls)
+runs only while `marker` is 1, or while it is unset and `marker_box` is 1.
+`XR_EXT_spatial_anchor` and `XR_EXT_spatial_persistence` are only reported, not enabled.
+Code: `extra_extensions/spatial_marker_ext.rs` (OpenXR), `marker_region.rs` (the box), geometry with tests
+in `alvr_graphics` `marker_box.rs`.
+
+Scope (the user, 2026-11-23, evening): no motion rigs, a code never moves once placed. The codes are
+mounted on the rig (flat or standing) or shown on the monitor facing the driver (a standing code). A code
+is used as it is and measured precisely; that measurement is the baseline, and its size may be changed
+after the first measurement.
+
+| Property (`debug.alvr.`) | Default | Meaning |
+|---|---|---|
+| `marker` | unset | 1: look for QR codes while the session runs. Unset: only while `marker_box` is 1 (so a normal race pays nothing). 0: the tracker is stopped and a placed box is forgotten. The extensions are chosen at the start of the app: 0 at the start needs a restart for 1 to work. To restart the tracker (to apply `marker_static` / `marker_size`, or after a line starting `marker: off, ...`): `setprop debug.alvr.marker 0`, wait a second, then `1` |
+| `marker_discovery` | 2 s | A discovery snapshot (finds new codes) this often without the runtime's discovery-recommended event; also right after the context is ready, after an event and after a stage change, but then at most every 250 ms |
+| `marker_rate` | 10 Hz | Update snapshots (fresh poses of the known codes, stage space, at the display time of the frame). 0: none |
+| `marker_static` | 0 | 1: tell the runtime the codes don't move, only if it lists that feature (read when the tracker starts, see `marker`) |
+| `marker_size` | unset (0) | Side length in mm, decimals allowed (e.g. `95.6`), 0 to 2000: black edge to black edge, without the white margin. The runtime takes EVERY code as this size, so set it only while codes of one size are in view; with it set the size in the `new ...` line is this value, not a measurement. Only if the runtime lists that feature. Read when the tracker starts (see `marker`): check the `creating the spatial context (...)` line. A value that is not a number is logged and ignored |
+| `marker_box` | 0 | 1: while a code is known, the depth mask uses a box placed from it instead of the region of the settings (also instead of "Distance") |
+| `marker_id` | unset | Use the code with this payload (text, case sensitive: `RIG1`). A change is logged and the box is forgotten at once. Unset: the box stays with codes that carry the payload of the code used first, until `marker_box 0`, `marker 0`, or `marker_id` changes |
+| `marker_window` | 1000 ms | Length of the average of the pose of the code, 100 to 60000. A change is logged and applies at once (a shorter window drops older poses at once) |
+| `marker_move_ms` | 1000 ms | Poses away from the average must agree for this long (and be at least 3) to be a move, 0 to 60000. Longer: fewer false moves from a pose error that lasts a moment (a standing code's heading), a real move is followed later. A change is logged and applies at once |
+| `marker_box_x` / `_y` / `_z` | 0 / 150 / 0 mm | Center of the box from the code: to the right of the heading, up, along the heading. A flat code with its top away from you: +x is your right, +z away from you. A standing code facing you: +x is your LEFT, +z comes TOWARDS you (moving a code from flat to standing needs new values; the defaults fit a flat code, for a standing one start from z 400, y -150, see Testing) |
+| `marker_box_w` / `_h` / `_d` | 1200 / 900 / 1000 mm | Width (across the heading), height, depth (along the heading) |
+| `marker_box_yaw` | 0 deg | Added to the heading, counter-clockwise from above; turns the box about the code |
+
+The box frame is level (stage +Y up); only the heading comes from the code, never its tilt (a tilt error of
+a few degrees would move the far end of the box by centimeters). Heading: a code lying flat (normal within
+45 degrees of vertical) points to its top (the reading direction: the side with the two upper finder
+squares); a standing code points out of its printed face. Do not mount a code with its normal between
+about 35 and 55 degrees from vertical (read the angle in the `new ...` line): at 45 degrees the heading
+switches between the top of the code and its normal, which are opposite for a code whose top points up
+the slope, so the box turns by 180 degrees and x / z are mirrored. (There is no hysteresis; it is a
+possible change after the first measurements.)
+
+The pose is the average of the poses of the last `marker_window` (1 s) while the code is still. A pose
+that is repeated is counted once. A single pose away from the average (more than 2 cm or 3 degrees) is
+left out and counted as an outlier; 3 or more poses in a row away from the average that agree with each
+other and span `marker_move_ms` (1 s) are a move, and the average starts again from them; a pose away from
+the average that the runtime reports unchanged without a gap for 2 s is also taken as a move (a gap: no
+pose for more than 0.5 s, e.g. the code was out of view; with `marker_rate` below 2 Hz or poses from the
+discoveries only this rule never applies). The pose is kept while the code is not seen, and also while
+there is no tracker (it failed, or the session stopped and started again); only `marker_box 0`,
+`marker 0` or a new `marker_id` forget it. A change of the
+STAGE space (`ReferenceSpaceChangePending` for STAGE; events for LOCAL or VIEW are ignored here) keeps the
+box up to the change time of the event and drops it from then until the code is seen again; the average
+starts again with the first pose in the new space. Quest announced STAGE changes three times at a
+recenter without moving the frame (Evening session), so a recenter may still show the region of the
+settings for about one update (~100 ms) with the code in view, and until the code is seen again otherwise.
+The box applies with Passthrough = Depth only, and live; the settings stay as they are.
+
+With the color key on, the hand zones do not use the region (`stream.wgsl`: `max(mask, hand.g)` and
+`focus`): keyed hands show everywhere, while forearms, wheel and body show only inside the box. A hand
+without its forearm means the box ends there, not a wrong heading. The default box is centred on the
+code: 0.5 m either way along the heading, 0.6 m to each side, 0.30 m below to 0.60 m above. For a code
+standing on a monitor that is 0.5 m behind the screen and only 0.5 m towards the driver, with the monitor
+itself inside. Example for a monitor code: `marker_box_z 600`, `marker_box_d 1100` (5 cm in front of the
+screen to 1.15 m towards the driver), `marker_box_y -100`, `marker_box_h 1400` (0.8 m below to 0.6 m above
+the code, lap included). Not tried.
+The debug view "Tint mask" paints the box green only without the color key (`color_key 0`); with the key
+loaded the box is plain passthrough.
+
+**The printed codes** (2026-11-23). Three codes with the payloads `RIG1`, `RIG2` and `RIG3`, black edge on
+the paper 144.2, 95.6 and 67.4 mm. The printer scaled the page to 96 %: the 100 mm check bar measured
+96 mm, so these are the measured sizes, not the designed ones. `tools/make_qr.py` makes the sheets
+(outside the repository, on the development PC). The size to give to `marker_size` is the black edge
+measured with a ruler, not the designed one.
+
+**A code on the monitor.** `tools/show_qr.py [payload] [--monitor N] [--px N | --mm X] [--pitch X]
+[--white N]` (outside the repository, on the development PC) shows a code on a monitor at a whole number
+of pixels per module; the default payload is `SCR1`. Keys: `+` / `-` size, arrows move, `m` next monitor,
+`b` / `B` dimmer / brighter white, `c` shows a bar of a round number of pixels to measure the monitor's mm
+per pixel with a ruler, Esc ends. It prints the size by the monitor's own data, which is only a first
+guess: measure the black edge with a ruler, that number is the marker size. Not tested on the headset.
+
+Log lines (`ALVR_CAM`, all start with `marker`):
+- At the start: `marker: the runtime lists XR_EXT_future yes, ... XR_EXT_spatial_persistence no; enabled: ...`.
+  Then, rarely: `marker: off, the instance can't be created with the extensions: <error>` (the app runs
+  without them), `marker: off, functions not found: <error>`.
+- `marker: stopped (debug.alvr.marker 0)` or `marker: stopped (marker_box 0 and debug.alvr.marker unset)`
+  when the tracker is dropped; `marker: the extensions are only enabled at the start of the app, restart
+  it` after `marker 1` when the app started with `marker 0`.
+- Once per session: `capabilities [...]; QR code: components [...], features [...]` (does the runtime
+  list the static and the fixed size features?), `creating the spatial context (static markers: <bool>,
+  fixed size: <mm> mm | no)`, `spatial context ready after <ms>`, `first discovery-recommended event after
+  <s>`. `no view space, lines without the head: ...` if the head reference space can't be made.
+- `marker_size "<text>" is not a number, ignored`.
+- `discovery: <n> markers (<n> tracking), <ms> after the request, ...` when the number changes.
+- A code is described everywhere as `"<payload>" #<id> <state> at (x, y, z) m, normal <deg> deg from
+  vertical (lying|standing), heading <deg> deg, <w> x <h> mm` (stage space; position to 0.1 mm, heading to
+  0.01 deg, size as the runtime reports it). The heading is the one the box would use (degrees about
+  vertical, counter-clockwise from above, 0 = stage -Z), printed in -90..270 so that a code facing the
+  driver (about 180) doesn't jump between +180 and -180; the same range in the `marker box:` and
+  `ReferenceSpaceChangePending` lines. Lines using it: `new <description><head>`, `<old state> -> <new state>: <description><head>`
+  (also `tracking -> paused`), `lost #<id>`, `payload changed ...` (seen by discoveries; update snapshots
+  read a payload only while it is unknown). A pose also counts as changed when only its orientation
+  changes.
+- The head part, added when a head sample and a pose exist: `, head <m> m away, <deg> deg off the normal,
+  head up to <m/s> m/s and <deg/s> deg/s in 2 s` (the head pose in the view reference space, sampled at
+  20 Hz; with fewer than 2 head samples `head up to - in 2 s`). It tells at which distance and angle the
+  code was seen, and how fast the head moved: a bad pose with a fast head is not a bad code.
+- `the payload buffer id of #<id> changed from <a> to <b> (logged once) ...`: the runtime gives new buffer
+  ids per snapshot (the payload cache is cleared at 64 entries).
+- `unknown tracking state <n> of #<id> (logged once, taken as paused)`; `invalid pose from the runtime for
+  #<id> (logged once, dropped): center (...), orientation (...), extents <w> x <h>` (a non-finite pose).
+- Every 2 s while codes are known: `<n> known; discoveries <n> (...); update snapshots <rate>/s, <ms>
+  each` (or `none`, or `failed (poses from the discoveries)`), and per code `  <description><head>, pose
+  changes every <ms> (<n> > 0.1 mm / 0.01 deg, <n> bit-exact in 2 s), scatter x/y/z <mm> over <k>
+  distinct poses in 10 s, heading scatter <deg> deg (range <deg>), seen <s> ago`. "pose changes" counts
+  the changes of more than 0.1 mm or 0.01 deg, and how often they come is how often the runtime really
+  updates the pose (update snapshots repeat the last one; the bit-exact count includes smaller changes,
+  which show whether the runtime changes the pose by tiny amounts). The scatter is the standard
+  deviation of the position over the distinct poses of the last 10 s (`scatter x/y/z - (no distinct
+  pose) in 10 s, heading scatter -` with none); the heading scatter is that of the heading, with its
+  peak-to-peak range, about the circular mean. A code without a pose yet: `  <description>, no pose yet`.
+  Every 10 s while none is known: `0 known; ...`.
+- `<OpenXR call> took <ms> ms (...)` when a call takes more than 2 ms (at most every 2 s per call).
+- `<OpenXR call>: <result> (<code>)` once per call and result code. `off, ...` when it gives up: restart
+  with `setprop debug.alvr.marker 0`, a second, `1`. Update snapshots that fail no longer turn the tracker
+  off: one line `update snapshots can't be created: none from now on, poses come from the discoveries
+  only (debug.alvr.marker 0, then 1 tries again)` and the poses then come from the discoveries only.
+- `marker box: marker_id is now "<text>" | unset`, `marker box: averaging window <s> s`, `marker box: a
+  move must hold <s> s` (when `marker_window` / `marker_move_ms` are set to other than the defaults).
+- `marker box: {keeping the last pose, }waiting for <the marker "<id>" | a marker with a pose> (known:
+  ...)` every 10 s while no code fits (also while a pose is kept).
+- `marker box: <n> poses away from the average left out so far`, at most every 2 s when the count grew.
+- `marker box: placed at (x, y, z) m, heading <deg> deg, size ..., marker #<id> at (...), <n> samples
+  over <s> s (window <s> s), <n> outliers left out`, again as `moved by <cm> cm, at ...` when a corner of
+  the box moved by more than 1 cm. The samples are distinct poses only; `over <s> s` is the time from the
+  oldest to the newest of them (it can be longer than the window when the runtime stops refreshing the
+  pose, and is 0 with one sample).
+- `marker box: used by the depth mask` or `marker box: placed but not used (no stream, or Passthrough is
+  not Depth)` when that changes. It says "used" also when the environment depth failed to start (a missing
+  permission); that failure is logged on its own.
+- `marker box: off (marker_box 0), the region of the settings applies` and `marker box: off
+  (debug.alvr.marker 0), the region of the settings applies`, when a box that was placed is dropped for
+  that reason. `marker box: no tracker, keeping the last pose` once when the tracker goes (it failed, or
+  the session stopped) while a box is placed: the box stays.
+- `ReferenceSpaceChangePending type: <type>, change time <ns> ns, pose valid: <bool>, pose in previous
+  space (x, y, z) m, yaw <deg> deg` (now in `ALVR_CAM`, for every reference space type; only STAGE ones
+  give `marker: stage space changed` and `marker box: stage space changed, waiting for the marker`).
+
+Testing (`adb logcat -s ALVR_CAM` running):
+- [ ] The printed codes `RIG1`, `RIG2`, `RIG3` (black edge 144.2, 95.6, 67.4 mm; the payload is case
+      sensitive, `marker_id RIG1`), plain black on white, no logo. Lay one flat on the desk in good light.
+- [ ] `setprop debug.alvr.marker 1` (the measuring steps run without the box; unset, the tracker runs only
+      with `marker_box 1`). Start the app: the first line says which extensions the runtime lists. If `XR_EXT_spatial_entity`
+      is `no`, look for `missing uses-permission` in the full logcat.
+- [ ] `capabilities ...` must list `MARKER_TRACKING_QR_CODE`; a `ERROR_PERMISSION_INSUFFICIENT` line
+      means the spatial data permission (asked at the first depth passthrough) is missing: it retries
+      every 10 s. Note whether the features list the static and the fixed size feature.
+- [ ] After a line starting `marker: off, ...`: `setprop debug.alvr.marker 0`, wait a second,
+      `setprop debug.alvr.marker 1` restarts the tracker.
+- [ ] Accuracy of the size first, with `marker_size` unset: look at each code from 40-80 cm:
+      `new "RIG1" ...`. Compare the size in the line with the measured one (144.2, 95.6, 67.4 mm) for
+      each of the three codes; read the normal angle (about 0 on a level desk), the pose changes interval
+      and the scatter, once with the head still and once while moving it (the head part says how fast).
+      Then from further away and at a flat angle (the head part gives the distance and the angle).
+- [ ] Then one code at a time: `setprop debug.alvr.marker_size 144.2`, restart the tracker (`marker 0`,
+      a second, `1`), check the `creating the spatial context (... fixed size: 144.2 mm)` line (if it
+      says `no`, the runtime does not list the feature: nothing changes), and compare the scatter and
+      the position with the run without it. Only one size in view at a time: the size applies to every
+      code. Change the size (the user may change it after the first measurement) the same way.
+- [ ] Turn the head away for 10 s and back: `paused` / `tracking` lines, and whether the position comes
+      back to the same millimeters.
+- [ ] Passthrough = Depth, then `setprop debug.alvr.marker_box 1`: `marker box: placed ...`, then
+      `marker box: used by the depth mask`. The depth mask shows the box: the real desk and what stands
+      on it inside the box, the game outside. The debug view "Tint mask" marks it green only without the
+      color key (`setprop debug.alvr.color_key 0`, and `auto_key 0`, live; hands are then limited by the
+      box too); with the key loaded the box is plain passthrough, not green, and the keyed hands are
+      never limited by it. Move the code by 5 cm: the box follows after about 1 s (`marker_move_ms`;
+      at least 3 poses at the new place), then `moved by`. With the code on the monitor, switch the
+      monitor to the game: the box stays. Count the `moved by` lines while racing with the code fixed:
+      each one is a false move; if there are any, try `marker_move_ms 3000`.
+- [ ] Origin: with the code flat, set `marker_box_y 0`, `marker_box_h 100`, `marker_box_w 150`,
+      `marker_box_d 150`. The tinted patch must sit centred on the code, not on a corner. A shift of half
+      the code size means the runtime's origin is not the centre; note the direction.
+- [ ] Heading, flat code (default sizes, or `marker_box_w 400` so the long axis is obvious):
+      `marker_box_w 400`: the box must get narrow ACROSS the reading direction of the code (left-right as
+      you read it); if it narrows along it, the heading is off by 90 degrees. `marker_box_z 300`: the box
+      must move 30 cm towards the TOP edge of the code (the side with two finder squares). `marker_box_x
+      300`: it must move to the right of the code as read. Turn the paper by 90 degrees: the `heading` in
+      the `marker box:` line changes by 90 degrees and the box turns with it. If a direction is wrong,
+      note which one and try `marker_box_yaw 180` / `90`. Reset x / z to 0 afterwards.
+- [ ] Change `marker_box_y` / `_w` live. Try `marker_window` 300 and 3000: the box is steadier with the
+      longer window and follows a move later.
+- [ ] Standing code (paper upright, or the code shown on the monitor facing you, see "A code on the
+      monitor"): `new ...` must say `standing` and a normal of about 90 deg (a monitor leaning back:
+      60-90). `marker_box_z 300` must bring the box TOWARDS you, out of the screen. `marker_box_x 300`
+      must move it to your LEFT. The default box is made for a flat code: around a standing code it
+      reaches 0.5 m behind the screen and only 0.5 m in front, from 0.30 m below to 0.60 m above the
+      code. Start from `marker_box_z 400` (0.1 m behind the screen to 0.9 m in front with `_d` 1000;
+      make it your distance to the screen minus 300 or so) and `marker_box_y -150` (0.60 m below to 0.30
+      m above the code with `_h` 900, for the wheel and the hands). Compare the `marker box: placed at
+      ...` centre with the `marker #.. at ...` position in the same line to check the offset.
+- [ ] Recenter: note the `ReferenceSpaceChangePending type:` lines (only STAGE ones give `marker: stage
+      space changed`); after them the box is gone (`marker box: stage space changed, waiting for the
+      marker`) until the code is seen again, then back at the same place. With the code out of view
+      during a recenter the region of the settings stays: if that happens in practice, keeping the box
+      through STAGE changes is the next step.
 
 ## Open problems, in order
 
@@ -735,3 +986,21 @@ sample counts are written to the log of the headset.
 - [Godden et al.: hand tracking accuracy and latency](https://ericg5.github.io/ResearchPortfolio/papers/characterization)
 - [Nokia XR Lab: RGB-D body segmentation](https://www.frontiersin.org/journals/virtual-reality/articles/10.3389/frvir.2026.1757111/full)
 - [PassthroughForge](https://www.passthroughforge.com/)
+- [Meta: QR code detection (MRUK)](https://developers.meta.com/horizon/documentation/unity/unity-mr-utility-kit-qrcode-detection)
+- [Meta: spatial data permission (native)](https://developers.meta.com/horizon/documentation/native/native-spatial-data-perm/)
+- [Meta: spatial anchors API reference (native)](https://developers.meta.com/horizon/documentation/native/android/openxr-spatial-anchors-api-ref)
+- [Meta: experimental features (native)](https://developers.meta.com/horizon/documentation/native/android/mobile-experimental-features/)
+- [Android XR: XR_EXT_spatial_marker_tracking](https://developer.android.com/develop/xr/openxr/extensions/XR_EXT_spatial_marker_tracking)
+- [Android XR: XR_EXT_spatial_entity](https://developer.android.com/develop/xr/openxr/extensions/XR_EXT_spatial_entity)
+- [Khronos: XrSpatialMarkerDataEXT](https://registry.khronos.org/OpenXR/specs/1.1/man/html/XrSpatialMarkerDataEXT.html)
+- [Khronos: OpenXR SDK changelog](https://github.com/KhronosGroup/OpenXR-SDK-Source/blob/main/CHANGELOG.SDK.md)
+- [Meta sample repository: QR on v205, answer of a Meta engineer](https://github.com/oculus-samples/Unity-MRUtilityKitSample/issues/15)
+- [Godot forum: QR tracking on Quest 3 (v79 no, v83 yes)](https://forum.godotengine.org/t/qrcode-tracking-via-openxr-spatial-entities-extension-on-meta-quest-3/123395)
+- [Godot issue: permission before the context](https://github.com/godotengine/godot/issues/123467)
+- [Godot: spatial entities, update snapshots](https://docs.godotengine.org/en/stable/tutorials/xr/openxr_spatial_entities.html)
+- [Unity forum: marker tracking platforms (QR only on Horizon OS)](https://discussions.unity.com/t/when-does-the-ar-marker-tracking-get-more-supported-plattforms/1703253)
+- [UploadVR: QR codes in MRUK v78](https://uploadvr.com/quest-3-mruk-update-decode-track-qr-codes-unity)
+- [Meta forum: QR position jitter on a still code](https://communityforums.atmeta.com/questions-and-discussions-26/quest-3-qr-code-tracking-severe-position-jitter-182318)
+- [Meta forum: QR code detection discussion](https://communityforums.atmeta.com/questions-and-discussions-26/mr-qrcode-detection-173577)
+- [Display-camera channels (moire, rolling shutter)](https://arxiv.org/pdf/1501.02528)
+- [Microsoft: QR code tracking sizes (other platform)](https://learn.microsoft.com/en-us/windows/mixed-reality/qr-code-tracking)

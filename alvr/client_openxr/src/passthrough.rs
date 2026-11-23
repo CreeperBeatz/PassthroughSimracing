@@ -396,6 +396,25 @@ pub fn debug_property(name: &str) -> Option<i64> {
     None
 }
 
+/// Text Android system property, trimmed. None if it is not set or empty
+#[allow(unused_variables)]
+pub fn debug_property_string(name: &str) -> Option<String> {
+    #[cfg(target_os = "android")]
+    {
+        let name = std::ffi::CString::new(name).ok()?;
+        let mut value = [0_u8; libc::PROP_VALUE_MAX as usize];
+        let length =
+            unsafe { libc::__system_property_get(name.as_ptr(), value.as_mut_ptr().cast()) };
+        let text = String::from_utf8_lossy(&value[..length.clamp(0, value.len() as i32) as usize])
+            .trim()
+            .to_owned();
+
+        (!text.is_empty()).then_some(text)
+    }
+    #[cfg(not(target_os = "android"))]
+    None
+}
+
 impl<'a> Deref for PassthroughLayer<'a> {
     type Target = xr::CompositionLayerBase<'a, xr::OpenGlEs>;
 

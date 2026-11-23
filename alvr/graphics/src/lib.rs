@@ -4,6 +4,7 @@ mod depth_mask;
 mod key_dump;
 mod leak_map;
 mod lobby;
+mod marker_box;
 mod staging;
 mod stream;
 
@@ -16,6 +17,7 @@ pub use depth_mask::*;
 pub use key_dump::*;
 pub use leak_map::*;
 pub use lobby::*;
+pub use marker_box::*;
 pub use stream::*;
 
 use alvr_common::{
