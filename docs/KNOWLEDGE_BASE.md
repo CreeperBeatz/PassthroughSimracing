@@ -67,6 +67,116 @@ new value other than 0 at any time. Everything else is a default.
   similar to Virtual Desktop"; QR codes can be printed. "We still need better edge precision on arms and
   wheel".
 
+**Night of 2026-11-23: which way the mask is wrong, measured on 26 captures.** Offline, on captures taken
+the same evening with the box placed from a QR code active (build 34a0ea96). An analysis, then an
+independent re-measurement; where they differ, the numbers of the re-measurement are used here.
+- The principle and the question of the user: "treat the depth map as a ground truth, that is delayed.
+  Think about it as GPS measurements. they come back delayed, but are ground truth. on GPS, accelerometer
+  data is insantaneous. Here, chroma key is instantaneous." And: "you can validate via logs - am I
+  removing something that should be VR or am I displaying something that should be real life as VR".
+- Observed by the user with the box active: hands do not disappear outside the play area, arms do. With
+  the hands on the lap the legs are cut out; the idea: "the chroma keyer should not work on areas that
+  were consistently rendered in-zone". The edges of objects in the zone (desk, its underside, the arm)
+  are rough and "around them, the area should appear as outside the playzone".
+- The captures: `logs/dumps-20261123-box`, n = 600..625, on the development PC, never committed. Groups,
+  sorted by looking at contact sheets (the re-measurement agrees):
+  - 600-603: headset not worn, lying on a desk outside the box. Not used.
+  - 604 and 608-619 ("desk view"): seated, looking at the monitor and the QR code. The hands are at the
+    bottom edge of the eye view (hand texels present), outside the camera image.
+  - 606 and 607 ("arm"): 606 right hand raised (joints up to 1.24 m/s); 607 a phone in the right hand at
+    the desk edge, sleeve across the view. In 606 the right hand straddles a side face of the box: 5 of 56
+    capsule points are outside, by at most 9.1 mm, the capsule surface reaches 15.8 mm outside.
+  - 605, 620-623, 625 ("lap"): looking down, both hands on the yellow trousers. 624: lap, hands not
+    tracked.
+  - Screenshots are 0.4-1.7 s before the "depth dump n" line. The camera pass used for the key colour lies
+    from 512 ms before to 16 ms after display (622).
+- Measured, geometry: a numpy copy of the mask shader (`bx.py`) reproduces the dumped mask r, b and a
+  channels of all 26 captures x 2 eyes (at most 1e-5 of texels differ by more than 2/255; a second copy
+  written from the shader: at most 5.2e-6). With the depth rows flipped 45-82 % of the texels differ. The
+  box is identical in all dumps. Static desk cells (5x5 cm, seen by 10 or more captures, 615 values):
+  deviation from the cell median 3.2 mm (median), 11.4 mm (90 %); the per-capture offsets span 14.1 mm.
+  Between captures, inliers within 5 cm: median residual 5.3 mm (609 to 619) to 19.3 mm (604 to 625), and
+  some pairs carry a constant offset of +11 to +13 mm (604 to 609, 604 to 625). Left eye against right
+  eye 5.5-7.3 mm.
+- Measured, age of the depth at display (26 captures): median 123.8 ms, range 89.3-183.2 ms, IQR
+  112.1-138.1. At render 73.2 ms (47.6-133.0), render to display 50.2 ms (30.4-51.1). Hand speed per
+  capture: median 0.05 m/s, largest joint 1.5 m/s. Speed times age (arithmetic, not a measurement): a hand
+  at 0.05 m/s moves 6 mm in 124 ms, at 0.5 m/s 6 cm, at 1 m/s 12 cm.
+- Measured, the hand is not in the depth image (left eye, render-time capsules). Of the depth texels
+  whose ray passes inside a capsule, the depth lies on the hand (within 3 cm) in 3 % (605), 0 % (606),
+  11 % (607), 1 % (620), 10 % (621), 2 % (622), 0.1 % (623) and 0.1 % (625); in 65-100 % it lies more
+  than 12 cm behind it. Around a resting hand on the lap the runtime also removes the thigh. Trousers
+  texels (by camera colour) with no depth, or depth more than 12 cm behind the hand, pooled over 605,
+  620-623 and 625: 88, 87, 76, 58, 33 and 19 % at 0-1, 1-2, 2-3, 3-4, 4-5 and 5-6 cm from the capsule
+  surface. That is an average over uneven captures: 621 has 17 % at 0-2 cm, 622 and 623 have 93-98 % at
+  2-4 cm and 47-71 % at 5-8 cm; with a colour class that includes shadowed trousers the profile is 90, 88,
+  81, 72, 55, 38 %. The depth image shows a blocky hole filled with far values (the floor under the desk
+  at 1.25-1.37 m) that reaches 8-15 cm on the side towards the knees in some captures. The first reading
+  "3-5 cm, the thigh slopes away beyond" is wrong: the 33-36 % beyond 6 cm is that fill.
+- Measured, direction of the errors by region (left eye, 604-625; "wrong" means against the current depth
+  classified hard against the box; the colour of the key from the 320x240 camera image):
+  - Edges of the box region, away from the hands: 66,825 of 443,637 edge texels (15.1 %) are shown as
+    real that the depth puts outside. Of them 53,542 (80.1 %) come from the feathering of 0.08 m and
+    13,283 (19.9 %) from the 3x3 blend of the depth mask (it grows in-box objects by one texel). Feathering
+    leaks lie median 1.3 cm outside the box (90 %: 2.6 cm). For a flat surface the shader gives a mask of
+    1.0 up to about 1.9 cm outside a face, 0.66 at 3 cm, 0.43 at 3.6 cm and 0 from 5.8 cm; with the key at
+    0 the shown share reaches about 2.9 cm. Surfaces leaked by the blend lie median 1.3 cm outside, 90 %
+    21.7 cm (depth steps; analysis only). Farther from edges, 23,198 of 2,137,056 texels (1.09 %) are
+    shown real beyond the box, all from the feathering. Inside the box nothing is cut. The other way (game
+    where the depth puts it inside), 3,038 texels (0.7 %), only where the depth has no data (analysis only).
+  - Disc around the hands where the remembered copy of the play zone is used, more than 6 cm from the
+    capsules: on the lap (605 and 620-625) 18,627 texels are shown real that the current depth puts
+    outside. Without 605 (492 texels, none from the copy): 18,135 (15-24 % of the disc with depth, per
+    capture), 87 % from the copy (mask channel a). There the current surface is the floor under the desk
+    at 1.25-1.37 m, 9-22 cm outside the box; the copy's surface on the same ray is 54-63 cm nearer. The
+    camera independently sees trousers at those texels in only 2.8-13.6 %, so the current depth is right
+    and the copy is stale. The copy used for 620-625 was taken at 22:11:41.6 while the hands were not
+    tracked, 5-90 s before. On the desk view (608-619) the copy adds coverage in 17-38 % of the disc, its
+    surface 1.6-2.5 cm nearer than the current one; where only the copy makes a texel shown (734-2,014 per
+    capture) the current surface is 4.3-6.0 cm outside the box. For 605-607 the copy (22:06:47, taken
+    looking at the monitor) covers none of the disc. Its registration (94-96 % of the static parts within
+    5 cm of the current depth, +11 to +15 mm; its lap only 16-43 %) was not re-measured.
+  - Lap, trousers near the hands (colour class including shadowed trousers): in 605, with no copy over
+    the lap, 43.9 % (left eye) and 48.0 % (right) of the trousers texels are shown as game (36-48 % over
+    the colour classes tried); they lie median 1.7 cm (90 %: 3.5 cm) from the capsules and every one more
+    than 5 mm from them is outside the key zone, with the depth removed. In 620-625 with a copy over the
+    lap: 4,145 of 43,757 (9.5 %), per capture and eye from 0.4 % (620 left) to 34.8 % (623 right); in the
+    1-6 cm ring 622 and 623 still lose 15-44 % of the trousers, although the copy covers 40-76 % of the
+    ring trousers in 620-625. 624 (no hands): 707 of 14,305 (4.9 %), where the shins leave the box at its
+    bottom face; that is the box, not an error (analysis only).
+  - The key keeps almost none of the trousers colour: 0.1-1.6 % of trousers texels have K of 0.5 or more.
+    K is from the camera image, not from the compositor's own image, so this is a proxy.
+  - The hand itself: 441 of 34,427 known hand texels (1.3 %) are shown as game, 346 of them in 606 (26-32 %
+    of that hand, raised and fast; low confidence, K from an image 387 ms old). Of 605 and 620-625 together,
+    95 texels (analysis only). Hands shown as real that should be game: 0, because no hand is outside
+    the box.
+  - Counting all texels, about 143,000 are shown real that the depth puts outside against about 9,900
+    shown game that it puts inside (14:1). That is a count of mask texels under the truth choices above,
+    not of area, and its edge part is the soft edge against a hard box on the same depth.
+- Measured on the same captures, not re-measured: current depth and the static map of the other captures
+  agree on in/out for 99.7-100 % of interior texels but only 84-93 % of texels within 6 mask texels of an
+  edge. Inside the key zone only 5 % of the texels have usable depth; where it is usable it never says
+  "outside" where the key keeps a colour (0 of 1,780 texels) and says "inside" where the key drops the
+  colour in 747. Thighs inside the box: 85-95 % of the trousers texels in 624 (including shadowed parts);
+  97.9-100 % holds only for the brightly lit parts. In the lap captures with hands 37-88 % (the rest is
+  the far fill near the hands and the shins and knees below and in front of the box). So places that are
+  consistently inside exist and can be measured, but the edges of objects move from capture to capture.
+- What cannot be decided from this data: a hand outside the box (none), a forearm crossing a face (none;
+  606 is a hand at a face), the error of the depth's own edge against the real edge (no camera edges as
+  truth), the band from 5 mm inside to 1 cm outside the capsules, the delay of a moving arm on single
+  frames. Method caveats: the key value comes from a 320x240 camera image 12-512 ms from display; the edge
+  "errors" are measured against a hard box on the same depth, so the feathering share is an error by
+  construction; the 14:1 ratio counts texels.
+- What follows (plan, not result):
+  - (a) The feathering was set to 0.08 live on 2026-11-23 and never judged. Compare 0.02-0.03 on the
+    headset first. It is a live setting.
+  - (b) The whole-frame remembered copy is not a static map: body parts enter it and it goes stale.
+    Replace it by a memory in the box frame of what is consistently inside the play area, updated only
+    away from the tracked hands and arms, and use it where the hands remove the depth. An offline
+    prototype on these captures is in progress (`logs/analysis-20261123-edges/memory`).
+  - (c) The late depth cannot correct the key on the hand itself (it is not in it), only from about 4-5
+    cm away from the hand surface outward.
+
 **Open for the user.** Way A or way B first (below)? Does "no arm extension" also mean `arm_shift 0` (the
 depth is shifted along a 45 cm arm from the wrist) and dropping the 50 cm forearm that the learner
 excludes from its samples? How many QR codes, and the size to keep after the first measurement? When can
@@ -232,6 +342,9 @@ are never committed).
   desk, and a sleeve (offset about 5 %). Screenshots of the display from the same minutes.
 - A viewer that draws the capsules and the key's decision into the camera image, and the scripts and
   results of the analyses above (leak, ring, background model, camera model), each with its re-check.
+- `logs/analysis-20261123-edges` (scripts b1-b7, `check/` for the re-measurement, `views/` and `memory/`)
+  and the 26 captures in `logs/dumps-20261123-box`. `bx.py` reproduces the mask shader in numpy and was
+  verified against all dumped masks.
 
 **To continue, way A: iterate on what is there.** In the order of what it should bring:
 1. Live, no build: is the skeleton tail gone with `key_wrist_len` 0; `arm_shift 0` if the arm still looks
@@ -1158,9 +1271,16 @@ Testing (`adb logcat -s ALVR_CAM` running):
 
 The order of the user on 2026-11-23; how to go on with each is in "Where it stands and how to continue".
 
-1. The forearm and held objects are cut out near the hand. Nothing works yet.
-2. Jagged edges of what the depth mask shows (sleeve, bottle, later the rig).
-3. The room next to the hand: thin lines and patches. Roughly 40-50 % of it from the solid fill.
+1. The forearm and held objects are cut out near the hand. Nothing works yet. Measured on the lap: the
+   runtime removes the depth on the hand and 3-5 cm of thigh around it (uneven, up to 8-15 cm towards
+   the knees), the key zone is mm wide and keeps 0.1-1.6 % of the trousers colour, so the hole comes
+   from the depth removal.
+2. Jagged edges of what the depth mask shows (sleeve, bottle, later the rig). Measured: at the box
+   region's edges 80 % of the surfaces shown real that the depth puts outside come from the 0.08 m
+   feathering (median 1.3 cm outside), 20 % from the 3x3 blend; feathering 0.08 not judged yet.
+3. The room next to the hand: thin lines and patches. Roughly 40-50 % of it from the solid fill. In the
+   box captures on the lap, 87 % of the real shown around the hands beyond 6 cm comes from the stale
+   remembered copy (old legs where the floor under the desk is).
 4. The play area around anchors on the rig (QR codes) instead of around the head: the box region exists,
    the calibration doesn't.
 5. A real drive with a wheel. Hands on a wheel were only approximated with a bottle and a monitor, and
