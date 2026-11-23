@@ -114,7 +114,7 @@ the 28 (two for a moving bridge with solid fill); no texture samples. `key_wrist
 same as before (GPU test). The `auto key` line of `ALVR_CAM` logs `wrist` flexion / deviation (degrees)
 and the confidence of each hand.
 
-**Steadier verification** (`key_steady`, `key_confirm`, `key_smooth`, **not tested**). Aim: fewer holes
+**Steadier verification** (`key_steady`, `key_confirm`, `key_smooth`). Aim: fewer holes
 and less flicker on the hand without showing more of the room. One fast or untracked finger no longer
 stops the verification of the whole hand (`key_steady`); the axis of a segment can be verified with a
 less strict table (`key_confirm`), its sides stay with the key, so a hand tracked beside the real one is
@@ -260,9 +260,9 @@ Measured in the SteamVR home, 72 Hz, with color key on unless noted:
 | `key_error` | 10 ms | How much the fill shrinks with the speed |
 | `key_solid` | 6 | Segments that are always solid: 0 none, 6 wrist, 9 palm, 28 hand |
 | `key_tight` / `key_bias` / `key_unknown` | 30 / 150 / 10 % | Strictness, preference for skin, unknown colors |
-| `key_smooth` | 100 % | Smoothing of the skin colors, of a LUT texel (70..100). `key_tight` is scaled by its cube, so 70 is about a third of the floor: rarer skin colors are kept, not more around the common ones, but the tails of a widely spread skin (varied light) reach further (computed: 36 % more cells at 70). 100: as before. Try 70. Not tested |
-| `key_confirm` | 0 % | `key_tight` of a second table that is never uploaded: the points on the axis of a segment are verified with it (the points beside it with the key), and the reliability comes from the share of the background around the hands that it keeps. Capped at `key_tight`, so it keeps everything the key keeps. 0: off. Try 12. Not tested |
-| `key_steady` | 1 | 1: a hand is verified while its palm (palm, wrist, knuckles) is tracked and slower than 0.5 m/s, each segment while its own two joints are too; its background is then sampled for the reliability only, and a hand with a fast finger is judged by its own background (fewer than 50 colors: no fill). Colors are still learned only from whole hands. 0: the whole hand or nothing, as before. Not tested |
+| `key_smooth` | 100 % | Smoothing of the skin colors, of a LUT texel (70..100). `key_tight` is scaled by its cube, so 70 is about a third of the floor: rarer skin colors are kept, not more around the common ones, but the tails of a widely spread skin (varied light) reach further (computed: 36 % more cells at 70). 100: as before. On the headset 70 leaks: skin kept 0.70 -> 0.84, but the background around the hand 1 -> 4 % (worst tenth 3 -> 16 %) and the scene 1 -> 11 %; user: "leaks a lot more". Values in between not tested |
+| `key_confirm` | 12 % | `key_tight` of a second table that is never uploaded: the points on the axis of a segment are verified with it (the points beside it with the key), and the reliability comes from the share of the background around the hands that it keeps. Capped at `key_tight`, so it keeps everything the key keeps. 0: off. On the headset with 12: of the segments that are voted on 71 % are confirmed (65 % without), verified weight 0.55 (0.44), background unchanged; user: "the best one so far", in some cases the hand is still not full enough |
+| `key_steady` | 1 | 1: a hand is verified while its palm (palm, wrist, knuckles) is tracked and slower than 0.5 m/s, each segment while its own two joints are too; its background is then sampled for the reliability only, and a hand with a fast finger is judged by its own background (fewer than 50 colors: no fill). Colors are still learned only from whole hands. 0: the whole hand or nothing, as before. Runs on the headset, not compared with 0 |
 | `key_delay` / `key_scale` | 0 ms / 100 % | Hand pose offset (negative predicts), thickness |
 | `playzone` / `playzone_auto` | 0 / 1 | New value: remember now, -1 forgets it (not tested). Automatic after 1.5 s without hands |
 | `key_layers` | 4 | 4: extra layers only with hands in view, 2: never, 5: always, 30 / 31: always three (no upper game layer / no keyed passthrough). Not tested |

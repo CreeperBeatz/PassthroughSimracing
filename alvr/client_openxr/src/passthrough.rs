@@ -102,7 +102,7 @@ impl PassthroughLayer<'_> {
 ///   (70..100). `key_tight` is scaled by its cube: 70 keeps rarer skin colors, not more around common ones
 /// - `setprop debug.alvr.key_confirm <percent>`: `key_tight` of a second table (never uploaded) for the points
 ///   on the axis of each segment when hand segments are verified, and for its reliability. At most
-///   `key_tight`. 0: off, the key table
+///   `key_tight`. Default 12, 0: off, the key table
 /// - `setprop debug.alvr.key_steady 0`: a hand is verified only if all its joints are tracked and slow, as
 ///   before. 1: if its palm is, each segment whose two joints are. Its reliability then comes from its own
 ///   background only

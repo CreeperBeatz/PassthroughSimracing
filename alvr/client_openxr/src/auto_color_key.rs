@@ -270,7 +270,7 @@ fn learn_loop(context: &Context) {
             model.skin_bias = percent("debug.alvr.key_bias", 150);
             model.tightness = percent("debug.alvr.key_tight", 30);
             model.skin_smoothing = percent("debug.alvr.key_smooth", 100);
-            model.confirm_tightness = percent("debug.alvr.key_confirm", 0);
+            model.confirm_tightness = percent("debug.alvr.key_confirm", 12);
             model.add_samples(&samples, elapsed);
             let new_lut = if last_lut_update.elapsed() >= LUT_UPDATE_INTERVAL {
                 last_lut_update = Instant::now();
