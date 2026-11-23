@@ -223,7 +223,7 @@ pub struct WristParams {
 impl WristParams {
     /// None if it is off
     pub fn load() -> Option<Self> {
-        let length_m = millimeters("debug.alvr.key_wrist_len", 80);
+        let length_m = millimeters("debug.alvr.key_wrist_len", 0);
 
         (length_m > 0.0).then(|| Self {
             length_m,

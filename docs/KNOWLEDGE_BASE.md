@@ -319,7 +319,7 @@ Measured in the SteamVR home, 72 Hz, with color key on unless noted:
 | `key_leak_probe` | 60 cm | Distance of the spheres of `key_leak_view 2` from the anchor of the map |
 | `key_lut_dump` | 0 | New value: write the learned LUT to `/sdcard/Android/data/alvr.client.dev/files/alvr_learned_key_<time>.lut` |
 | `key_dump` / `key_dump_burst` | 0 / 1 | New value `n` other than 0: write the next `key_dump_burst` (1..30) learning passes to the same folder, `alvr_dump_<n>_<00..>`, also without hands. Each line `dump <n>/<index>: <path>` on `ALVR_CAM`. The render thread also writes the depth of one frame, `alvr_dump_<n>_depth*` (below), also without `auto_key`; `depth dump <n>: ...` on `ALVR_CAM`. Not tested |
-| `key_wrist_len` | 80 mm | Keyed bridge from the wrist towards the forearm, 0: off (as before), up to 300. The direction and the solid fill need `auto_key`, without it: opposite to the fingers, never solid. Not tested |
+| `key_wrist_len` | 0 mm | Keyed bridge from the wrist towards the forearm, 0: off, up to 300. Was 80 until 2026-11-23: the user sees it as a tail of the skeleton that "messes up where the arm continues"; the skeleton is for the hand up to the wrist only, the arm is not to be extended from it. The direction and the solid fill need `auto_key`, without it: opposite to the fingers, never solid |
 | `key_wrist_scale` / `key_wrist_conf` | 100 / 60 % | Its radius (of the wrist joint radius), how sure the camera must be of its direction for the solid fill |
 | `key_wrist_follow` | 30 % | Below this score of the best direction (share of points the key keeps, 0 over skin-like backgrounds) the bridge goes back to the default direction. 0: always the best one. Not tested |
 
