@@ -10,7 +10,8 @@
 // the cockpit box).
 //
 // Output: r: region coverage (0..1), g: proximity for the debug view (1: at the eye, 0: 3 m or
-// more), b: whether there is depth data (0/1)
+// more), b: whether there is depth data (0/1), a: how much of r comes from the remembered playzone
+// (for the debug view)
 
 struct Immediate {
     view_idx: u32,
@@ -55,7 +56,9 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     if depth_u.lighting2.z > 0.5 && depth_u.playzone.x > 0.5 && result.r < 1.0 {
         let near_hand = textureSampleLevel(focus_area, linear_sampler, uv, 0.0).b;
         if near_hand > 0.0 {
-            result.r = max(result.r, near_hand * playzone_coverage(uv));
+            let coverage = max(result.r, near_hand * playzone_coverage(uv));
+            result.a = coverage - result.r;
+            result.r = coverage;
         }
     }
 
@@ -162,7 +165,7 @@ fn current_mask(uv: vec2f) -> vec4f {
         has_depth = 1.0;
     }
 
-    return vec4f(coverage, proximity, has_depth, 1.0);
+    return vec4f(coverage, proximity, has_depth, 0.0);
 }
 
 // Depth values from here on mean "no data"

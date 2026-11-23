@@ -4,7 +4,7 @@ use crate::{
     extra_extensions::EnvironmentDepthMETA,
     graphics::{self, ProjectionLayerAlphaConfig, ProjectionLayerBuilder},
     interaction::{self, InteractionContext, InteractionSourcesConfig},
-    passthrough::ColorKeyParams,
+    passthrough::{self, ColorKeyParams, debug_property},
 };
 use alvr_client_core::{
     ClientCoreContext, VideoFrameMetadata,
@@ -15,13 +15,14 @@ use alvr_common::{
     HAND_LEFT_ID, HAND_RIGHT_ID, HEAD_ID, Pose, RelaxedAtomic, ViewParams,
     anyhow::Result,
     error,
-    glam::{Quat, UVec2, Vec2, Vec3},
+    glam::{Quat, UVec2, Vec2, Vec3, Vec4},
     info,
     parking_lot::RwLock,
 };
 use alvr_graphics::{
-    ArmMotion, BridgeChoice, ColorKeyInput, DepthRenderInput, GraphicsContext, HAND_SEGMENTS,
-    HandShape, HandZones, LeakGains, SEGMENT_JOINTS, StreamRenderer, StreamViewParams, WristBridge,
+    ArmMotion, BridgeChoice, ColorKeyInput, DepthDumpFiles, DepthDumpRequest, DepthFrame,
+    DepthRenderInput, GraphicsContext, HAND_SEGMENTS, HandShape, HandZones, LeakGains,
+    SEGMENT_JOINTS, StreamRenderer, StreamViewParams, WristBridge,
 };
 use alvr_packets::{ClientStreamConfig, RealTimeConfig, TrackingData};
 use alvr_session::{
@@ -32,7 +33,7 @@ use alvr_system_info::Platform;
 use openxr as xr;
 use std::{
     cell::Cell,
-    ptr,
+    fs, ptr,
     rc::Rc,
     sync::Arc,
     thread::{self, JoinHandle},
@@ -50,12 +51,16 @@ const WRIST_JOINT: usize = 1;
 const MIN_FILL_SPEED: f32 = 0.08;
 const MAX_FILL_SPEED: f32 = 0.25;
 
-// How often `debug.alvr.arm_shift` is read
-const ARM_SHIFT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+// How often `debug.alvr.arm_shift`, `debug.alvr.playzone_auto` and `debug.alvr.key_dump` are read
+const PROPERTY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-// The playzone is remembered when no hands were tracked for a while
+// The playzone is remembered when no hand was near the view of the depth camera for a while
 const PLAYZONE_HANDS_TIMEOUT: Duration = Duration::from_millis(1500);
 const PLAYZONE_INTERVAL: Duration = Duration::from_millis(500);
+// Around the bounding sphere of a hand: the runtime removes it from the depth map, and what it holds
+const PLAYZONE_HAND_MARGIN: f32 = 0.1;
+// Why no playzone is remembered, at most this often
+const PLAYZONE_LOG_INTERVAL: Duration = Duration::from_secs(2);
 
 // The layers of the color key stay a moment after the hands left the view, so they don't flicker
 const KEY_LAYERS_HOLD: Duration = Duration::from_millis(300);
@@ -75,6 +80,8 @@ const LEAK_LOG_INTERVAL: Duration = Duration::from_secs(2);
 pub struct ColorKeyFrame {
     /// Hands with a pose
     pub tracked_hands: [bool; 2],
+    /// Age of the remembered playzone, None: there is none
+    pub playzone_age: Option<Duration>,
     /// Part of each view with the hands, see `hands_view_rect`
     pub hand_rects: [Option<(Vec2, Vec2)>; 2],
     /// The hands are in view, or were a moment ago: the layers of the color key are needed
@@ -158,14 +165,25 @@ pub struct StreamContext {
     // The depth of the arms is shifted by the motion of the wrist since the depth image was captured.
     // `setprop debug.alvr.arm_shift 0`: plain depth
     arm_shift: bool,
-    last_arm_shift_poll: Instant,
-    tracked_hands: Cell<[bool; 2]>,
+    // `debug.alvr.playzone_auto`
+    playzone_auto: bool,
+    last_property_poll: Instant,
+    // `debug.alvr.key_dump`: last value, a new one waits for a depth image (since when)
+    last_dump_value: Option<i64>,
+    pending_dump: Option<(i64, Instant)>,
+    // When the depth image of this frame was captured
+    depth_capture_time: Option<xr::Time>,
+    // Bounding spheres of the hands with a pose (xyz, radius), before `key_hands` and `key_leak_view`
+    hand_bounds: Cell<[Option<Vec4>; 2]>,
     // Last part of each view with the hands, and when there was one
     last_hand_rects: [Option<(Vec2, Vec2)>; 2],
     last_hand_rect_time: Option<Instant>,
     last_hands_seen: Instant,
     last_playzone_capture: Instant,
     last_playzone_request: i64,
+    // Automatic captures since the hands left, only the first is logged
+    playzone_auto_series: bool,
+    last_playzone_log: Instant,
     // Smoothed, meters per second, stage space
     hand_velocities: [Cell<Vec3>; 2],
     hand_solid: [Cell<[f32; HAND_SEGMENTS]>; 2],
@@ -329,13 +347,20 @@ impl StreamContext {
             #[cfg(target_os = "android")]
             auto_color_key: None,
             arm_shift: true,
-            last_arm_shift_poll: Instant::now(),
-            tracked_hands: Cell::new([false; 2]),
+            playzone_auto: true,
+            last_property_poll: Instant::now(),
+            last_dump_value: None,
+            pending_dump: None,
+            depth_capture_time: None,
+            hand_bounds: Cell::new([None; 2]),
             last_hand_rects: [None; 2],
             last_hand_rect_time: None,
             last_hands_seen: Instant::now(),
             last_playzone_capture: Instant::now(),
-            last_playzone_request: 0,
+            // A value left from before is not a request
+            last_playzone_request: debug_property("debug.alvr.playzone").unwrap_or(0),
+            playzone_auto_series: false,
+            last_playzone_log: Instant::now(),
             hand_velocities: [const { Cell::new(Vec3::ZERO) }; 2],
             hand_solid: [const { Cell::new([0.0; HAND_SEGMENTS]) }; 2],
             bridge_solid: [const { Cell::new(0.0) }; 2],
@@ -384,31 +409,106 @@ impl StreamContext {
     }
 
     // Objects that are held are partly missing in the depth image, so remember how the playzone looks
-    // without hands
-    fn should_capture_playzone(&mut self) -> bool {
-        if self.tracked_hands.get().contains(&true) {
+    // without hands: automatically when no hand was near the view of the depth camera for a while (the
+    // runtime reports hands as tracked also when they are out of view), or on request. Whether to
+    // remember the depth image of this frame
+    fn should_capture_playzone(&mut self, frame: Option<&DepthFrame>) -> bool {
+        let request = debug_property("debug.alvr.playzone").unwrap_or(0);
+        let is_new_request = request != self.last_playzone_request;
+        // A positive request waits for a depth image
+        if is_new_request && (request <= 0 || frame.is_some()) {
+            self.last_playzone_request = request;
+            // A negative value forgets the playzone
+            if request < 0 {
+                self.renderer.clear_playzone();
+                self.playzone_auto_series = false;
+                crate::stream_log("playzone: forgotten (requested)");
+            }
+        }
+        let is_requested = is_new_request && request > 0;
+
+        let Some(frame) = frame else {
+            if is_requested {
+                self.log_playzone_wait("requested, no depth image");
+            }
+            return false;
+        };
+
+        let hands_in_view = self.hand_bounds.get().iter().flatten().any(|bounds| {
+            frame.depth_views.iter().any(|view| {
+                alvr_graphics::sphere_in_view(
+                    view,
+                    bounds.truncate(),
+                    bounds.w + PLAYZONE_HAND_MARGIN,
+                )
+            })
+        });
+        if hands_in_view {
             self.last_hands_seen = Instant::now();
+            self.playzone_auto_series = false;
         }
 
-        let request = crate::passthrough::debug_property("debug.alvr.playzone").unwrap_or(0);
-        let is_requested = request != self.last_playzone_request && request > 0;
-        // A negative value forgets the playzone
-        if request < 0 && request != self.last_playzone_request {
-            self.renderer.clear_playzone();
-        }
-        self.last_playzone_request = request;
-
-        let is_automatic = self.color_key.is_some()
+        let is_auto_on = self.color_key.is_some() && self.playzone_auto;
+        let is_automatic = is_auto_on
             && self.last_hands_seen.elapsed() > PLAYZONE_HANDS_TIMEOUT
-            && self.last_playzone_capture.elapsed() > PLAYZONE_INTERVAL
-            && crate::passthrough::debug_property("debug.alvr.playzone_auto").unwrap_or(1) > 0;
+            && self.last_playzone_capture.elapsed() > PLAYZONE_INTERVAL;
+
+        if is_requested {
+            crate::stream_log(&format!(
+                "playzone: remembered (requested {request}), a hand was near the depth view {:.1} s ago",
+                self.last_hands_seen.elapsed().as_secs_f32()
+            ));
+        } else if is_automatic && !self.playzone_auto_series {
+            crate::stream_log(&format!(
+                "playzone: remembered (automatic, no hand near the depth view for {:.1} s), again \
+                 every {} ms while none is",
+                PLAYZONE_HANDS_TIMEOUT.as_secs_f32(),
+                PLAYZONE_INTERVAL.as_millis()
+            ));
+        } else if is_auto_on && self.renderer.playzone_age().is_none() {
+            let reason = if hands_in_view {
+                "a hand is near the depth view".into()
+            } else {
+                format!(
+                    "no hand near the depth view for {:.1} s",
+                    self.last_hands_seen.elapsed().as_secs_f32()
+                )
+            };
+            self.log_playzone_wait(&reason);
+        }
 
         let capture = is_requested || is_automatic;
         if capture {
             self.last_playzone_capture = Instant::now();
+            self.playzone_auto_series |= is_automatic;
         }
 
         capture
+    }
+
+    fn log_playzone_wait(&mut self, reason: &str) {
+        if self.last_playzone_log.elapsed() > PLAYZONE_LOG_INTERVAL {
+            self.last_playzone_log = Instant::now();
+            crate::stream_log(&format!("playzone: none remembered, {reason}"));
+        }
+    }
+
+    // `debug.alvr.arm_shift`, `debug.alvr.playzone_auto`, and a new `debug.alvr.key_dump` (like the learner, which writes the camera
+    // image: the depth of the next frame with a depth image)
+    fn poll_properties(&mut self) {
+        if self.last_property_poll.elapsed() < PROPERTY_POLL_INTERVAL {
+            return;
+        }
+        self.last_property_poll = Instant::now();
+
+        self.arm_shift = debug_property("debug.alvr.arm_shift").unwrap_or(1) != 0;
+        self.playzone_auto = debug_property("debug.alvr.playzone_auto").unwrap_or(1) > 0;
+
+        let dump = debug_property("debug.alvr.key_dump").unwrap_or(0);
+        if self.last_dump_value.is_some_and(|last| last != dump) && dump != 0 {
+            self.pending_dump = Some((dump, Instant::now()));
+        }
+        self.last_dump_value = Some(dump);
     }
 
     // How the arms moved since the depth image was captured. None if `debug.alvr.arm_shift` is 0
@@ -423,11 +523,6 @@ impl StreamContext {
         // Rough position of the elbows, relative to the head
         const ELBOW_OFFSET: Vec3 = Vec3::new(0.2, -0.5, 0.05);
 
-        if self.last_arm_shift_poll.elapsed() > ARM_SHIFT_POLL_INTERVAL {
-            self.last_arm_shift_poll = Instant::now();
-            self.arm_shift =
-                crate::passthrough::debug_property("debug.alvr.arm_shift").unwrap_or(1) != 0;
-        }
         if !self.arm_shift {
             return [None; 2];
         }
@@ -739,7 +834,8 @@ impl StreamContext {
             Some((shape, zones))
         });
 
-        self.tracked_hands.set(hands.map(|hand| hand.is_some()));
+        self.hand_bounds
+            .set(hands.map(|hand| hand.map(|(shape, _)| shape.bounds())));
 
         // To measure the cost of the hands on the GPU. The playzone still knows about them.
         let (mut hands, mut bridges) = if params.hands {
@@ -823,6 +919,7 @@ impl StreamContext {
     /// `change_time`: when the change takes effect, None: now
     pub fn update_reference_space(&mut self, change_time: Option<xr::Time>) {
         self.renderer.clear_playzone();
+        self.playzone_auto_series = false;
         #[cfg(target_os = "android")]
         if let Some(key) = &self.auto_color_key {
             key.clear_leak_map(change_time.unwrap_or(xr::Time::from_nanos(0)));
@@ -956,6 +1053,7 @@ impl StreamContext {
                         color_key: self.color_key_input(display_time, None),
                         arms: [None; 2],
                         capture_playzone: false,
+                        playzone_view: false,
                         key_lower_rects: None,
                     });
                 }
@@ -977,7 +1075,9 @@ impl StreamContext {
         });
 
         let (frame, capture_time) = frame.unzip();
-        let arms = capture_time.flatten().map_or([None; 2], |time| {
+        self.depth_capture_time = capture_time.flatten();
+        self.poll_properties();
+        let arms = self.depth_capture_time.map_or([None; 2], |time| {
             self.arm_motions(display_time, time, current_headset_views)
         });
 
@@ -986,7 +1086,7 @@ impl StreamContext {
             crate::from_xr_vec3(current_headset_views[1].pose.position),
         ];
         let color_key = self.color_key_input(display_time, Some(eye_positions));
-        let capture_playzone = frame.is_some() && self.should_capture_playzone();
+        let capture_playzone = self.should_capture_playzone(frame.as_ref());
 
         Some(DepthRenderInput {
             frame,
@@ -994,6 +1094,7 @@ impl StreamContext {
             color_key,
             arms,
             capture_playzone,
+            playzone_view: self.color_key.is_some_and(|params| params.playzone_view),
             key_lower_rects: None,
         })
     }
@@ -1116,7 +1217,8 @@ impl StreamContext {
             }
         }
         let key_frame = ColorKeyFrame {
-            tracked_hands: self.tracked_hands.get(),
+            tracked_hands: self.hand_bounds.get().map(|bounds| bounds.is_some()),
+            playzone_age: self.renderer.playzone_age(),
             hand_rects,
             hands_in_view: self
                 .last_hand_rect_time
@@ -1156,6 +1258,29 @@ impl StreamContext {
             }));
         }
 
+        // `debug.alvr.key_dump`: the depth of a frame that has a depth image
+        if let Some((n, time)) = self.pending_dump
+            && time.elapsed() > alvr_graphics::DEPTH_DUMP_TIMEOUT
+        {
+            self.pending_dump = None;
+            crate::stream_log(&format!("depth dump {n}: no depth image"));
+        }
+        if depth_input
+            .as_ref()
+            .is_some_and(|input| input.frame.is_some())
+            && let Some((n, _)) = self.pending_dump.take()
+        {
+            if let Some(replaced) = self.renderer.request_depth_dump(DepthDumpRequest {
+                n,
+                display_ns: xr_vsync_time.as_nanos(),
+                depth_capture_ns: self.depth_capture_time.map(|time| time.as_nanos()),
+                now_ns: crate::xr_runtime_now(self.xr_session.instance())
+                    .map(|time| time.as_nanos()),
+            }) {
+                crate::stream_log(&format!("depth dump {replaced}: replaced by {n}"));
+            }
+        }
+
         self.renderer.render(
             buffer_ptr,
             [
@@ -1176,6 +1301,10 @@ impl StreamContext {
                 .map(|centers| centers.map(Vec2::from_array)),
             depth_input.as_ref(),
         );
+
+        if let Some((n, result)) = self.renderer.poll_depth_dump() {
+            write_depth_dump(n, result);
+        }
 
         self.swapchains[0].release_image().unwrap();
         self.swapchains[1].release_image().unwrap();
@@ -1267,6 +1396,34 @@ impl StreamContext {
 
         (layer, openxr_display_time, key_frame)
     }
+}
+
+// Not on the render thread: a few MB
+fn write_depth_dump(n: i64, result: Result<DepthDumpFiles, String>) {
+    let dump = match result {
+        Ok(dump) => dump,
+        Err(e) => {
+            crate::stream_log(&format!("depth dump {n}: {e}"));
+            return;
+        }
+    };
+    thread::spawn(move || {
+        let files = dump.into_files();
+        let result = fs::create_dir_all(passthrough::FILES_DIR).and_then(|()| {
+            for (name, data) in &files {
+                fs::write(format!("{}/{name}", passthrough::FILES_DIR), data)?;
+            }
+            Ok(())
+        });
+        match result {
+            Ok(()) => crate::stream_log(&format!(
+                "depth dump {n}: {} files in {}",
+                files.len(),
+                passthrough::FILES_DIR,
+            )),
+            Err(e) => crate::stream_log(&format!("depth dump {n}: {e}")),
+        }
+    });
 }
 
 impl Drop for StreamContext {

@@ -49,7 +49,8 @@ struct DepthUniforms {
     // the wrist to the elbow, xyz: displacement (0: plain depth)
     arms: array<vec4f, 6>,
     playzone_eyes: array<PlayzoneEye, 2>,
-    // x: available (0/1), y, z: debug view, how much the rim of each hand is narrowed (0..1)
+    // x: available (0/1), y, z: debug view, how much the rim of each hand is narrowed (0..1), w: debug
+    // view of the playzone (0/1)
     playzone: vec4f,
     // Color key: part of each view where the lower game layer is shown, xy: min, zw: max view uv
     key_lower: array<vec4f, 2>,

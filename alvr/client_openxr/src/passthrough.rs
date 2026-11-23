@@ -106,8 +106,12 @@ impl PassthroughLayer<'_> {
 /// - `setprop debug.alvr.key_steady 0`: a hand is verified only if all its joints are tracked and slow, as
 ///   before. 1: if its palm is, each segment whose two joints are. Its reliability then comes from its own
 ///   background only
-/// - `setprop debug.alvr.playzone <n>`: another value remembers the playzone now (keep the hands away)
-/// - `setprop debug.alvr.playzone_auto 0`: don't remember the playzone when no hands are tracked
+/// - `setprop debug.alvr.playzone <n>`: another positive value remembers the playzone at the next depth image
+///   (keep the hands away). The value at the start of the stream is not a request
+/// - `setprop debug.alvr.playzone_auto 0`: don't remember the playzone when no hand was near the view of the
+///   depth camera for 1.5 s (then every 0.5 s while none is)
+/// - `setprop debug.alvr.playzone_view 1`: with the "Tint mask" debug view, what only the remembered playzone
+///   shows is half opaque blue, and the area near the hands where it is used faintly blue
 /// - `setprop debug.alvr.auto_key 1` before starting the app: learn the colors with the camera
 /// - `setprop debug.alvr.key_solid <n>`: capsules that are always solid, 0: none, 6: wrist, 9: palm, 28: whole hand
 /// - `setprop debug.alvr.key_scale <percent>`: thickness of the hands
@@ -143,6 +147,10 @@ impl PassthroughLayer<'_> {
 ///   folder of the app, `alvr_dump_<n>_<index>`: the camera image as the learner reads it (`.rgb`), the hands,
 ///   the camera and the counts of the pass (`.json`), with the first pass the key table (`_key.lut`), the
 ///   alpha of the key table as the learner uses it (`_key_alpha.lut`) and of the confirm table (`_confirm.lut`)
+///   The render thread writes the depth of the next frame with a depth image once per new value (also without
+///   `auto_key`): `alvr_dump_<n>_depth.json`, the depth and the remembered playzone of each eye in meters
+///   (`_depth_left.f32`, `_playzone_left.f32`, ...), the depth mask and the focus area (`_mask_left.rgba`,
+///   `_focus_left.rgba`, ...)
 /// - `setprop debug.alvr.key_dump_burst <n>`: that many consecutive passes (1..30)
 /// - `setprop debug.alvr.key_wrist_len <mm>`: length of the key zone from the wrist towards the forearm, its
 ///   direction is chosen with the camera (`auto_key`), 0: off
@@ -195,6 +203,8 @@ pub struct ColorKeyParams {
     pub leak_probe_m: f32,
     /// Key zone from the wrist towards the forearm. None: off
     pub wrist: Option<WristParams>,
+    /// Debug view of the remembered playzone (`debug.alvr.playzone_view`)
+    pub playzone_view: bool,
 }
 
 /// Key zone from the wrist towards the forearm, its direction chosen by the camera
@@ -291,6 +301,7 @@ impl ColorKeyParams {
                 .clamp(10, 500) as f32
                 / 100.0,
             wrist: WristParams::load(),
+            playzone_view: debug_property("debug.alvr.playzone_view").unwrap_or(0) != 0,
         }
     }
 
@@ -304,6 +315,9 @@ impl ColorKeyParams {
         }
     }
 }
+
+/// Files folder of the app, for the dumps
+pub const FILES_DIR: &str = "/sdcard/Android/data/alvr.client.dev/files";
 
 const COLOR_KEY_PATHS: [&str; 2] = [
     "/data/local/tmp/alvr_color_key.lut",

@@ -742,8 +742,11 @@ pub fn entry_point() {
                         )
                     })
                 });
+                let playzone = key_frame
+                    .playzone_age
+                    .map_or("none".into(), |age| format!("{:.1} s", age.as_secs_f32()));
                 stream_log(&format!(
-                    "key: tracked hands {:?}, rects {:.2?}, layers {}, zones {}, {}",
+                    "key: tracked hands {:?}, rects {:.2?}, layers {}, zones {}, {}, playzone {playzone}",
                     key_frame.tracked_hands,
                     key_frame.hand_rects,
                     layers.len(),

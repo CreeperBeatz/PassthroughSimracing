@@ -1,11 +1,21 @@
 use super::{GraphicsContext, MAX_IMMEDIATE_SIZE, staging::StagingRenderer};
-use crate::depth_mask::{self, DEPTH_UNIFORMS_SIZE, DepthRenderInput};
+use crate::{
+    depth_dump::{self, DEPTH_DUMP_TIMEOUT, DepthDumpFiles, DepthDumpRequest, DumpReadback},
+    depth_mask::{self, DEPTH_UNIFORMS_SIZE, DepthRenderInput},
+};
 use alvr_common::{
     AlvrFoveatedEncodingParams, ViewParams,
     glam::{Mat4, UVec2, Vec2, Vec3, Vec4},
 };
 use alvr_session::{DepthPassthroughConfig, PassthroughMode, UpscalingConfig};
-use std::{borrow::Cow, cell::Cell, ffi::c_void, iter, mem, rc::Rc};
+use std::{
+    borrow::Cow,
+    cell::{Cell, OnceCell, RefCell},
+    ffi::c_void,
+    iter, mem,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindingResource, BindingType, BlendComponent, BlendFactor,
@@ -61,6 +71,7 @@ const DEPTH_COMMON_WGSL: &str = include_str!("../resources/depth_common.wgsl");
 const DEPTH_MASK_WGSL: &str = include_str!("../resources/depth_mask.wgsl");
 const FOCUS_AREA_WGSL: &str = include_str!("../resources/focus_area.wgsl");
 const PLAYZONE_COPY_WGSL: &str = include_str!("../resources/playzone_copy.wgsl");
+const DEPTH_DUMP_WGSL: &str = include_str!("../resources/depth_dump.wgsl");
 const STREAM_WGSL: &str = include_str!("../resources/stream.wgsl");
 const LIGHT_PROBE_LOCAL_WGSL: &str = include_str!("../resources/light_probe_local.wgsl");
 const LIGHT_PROBE_GLOBAL_WGSL: &str = include_str!("../resources/light_probe_global.wgsl");
@@ -77,6 +88,10 @@ pub(crate) fn depth_mask_shader_source() -> String {
 
 pub(crate) fn playzone_copy_shader_source() -> String {
     format!("{PLAYZONE_COPY_WGSL}\n{DEPTH_COMMON_WGSL}")
+}
+
+pub(crate) fn depth_dump_shader_source() -> String {
+    format!("{DEPTH_DUMP_WGSL}\n{DEPTH_COMMON_WGSL}")
 }
 
 pub(crate) fn focus_area_shader_source() -> String {
@@ -454,6 +469,46 @@ impl StreamPipelines {
     }
 }
 
+/// For `debug.alvr.key_dump`, created at the first dump. Uses `depth_layout` and `playzone_layout`
+pub(crate) fn create_depth_dump_pipeline(
+    device: &Device,
+    pipelines: &StreamPipelines,
+) -> RenderPipeline {
+    let module = shader_module(device, "depth dump", depth_dump_shader_source());
+    device.create_render_pipeline(&RenderPipelineDescriptor {
+        label: Some("depth dump"),
+        layout: Some(&device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[
+                Some(&pipelines.depth_layout),
+                Some(&pipelines.playzone_layout),
+            ],
+            immediate_size: VIEW_IDX_IMMEDIATE_SIZE,
+        })),
+        vertex: VertexState {
+            module: &module,
+            entry_point: None,
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: Default::default(),
+        depth_stencil: None,
+        multisample: Default::default(),
+        fragment: Some(FragmentState {
+            module: &module,
+            entry_point: None,
+            compilation_options: Default::default(),
+            targets: &[Some(ColorTargetState {
+                format: TextureFormat::Rgba8Unorm,
+                blend: None,
+                write_mask: ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 pub(crate) fn create_light_probe_texture(device: &Device, size: u32) -> Texture {
     device.create_texture(&TextureDescriptor {
         label: Some("light probe"),
@@ -497,7 +552,10 @@ fn create_mask_texture(device: &Device, label: &str, size: UVec2) -> Texture {
         sample_count: 1,
         dimension: TextureDimension::D2,
         format: DEPTH_MASK_FORMAT,
-        usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+        // Copied by `debug.alvr.key_dump`
+        usage: TextureUsages::RENDER_ATTACHMENT
+            | TextureUsages::TEXTURE_BINDING
+            | TextureUsages::COPY_SRC,
         view_formats: &[],
     })
 }
@@ -663,8 +721,14 @@ pub struct StreamRenderer {
     sampler: Sampler,
     playzone_textures: [TextureView; 2],
     playzone_bind_groups: [BindGroup; 2],
-    // Depth cameras of the remembered playzone
-    playzone_views: Cell<Option<[ViewParams; 2]>>,
+    // Depth cameras of the remembered playzone, and when it was remembered
+    playzone: Cell<Option<([ViewParams; 2], Instant)>>,
+    depth_resolution: UVec2,
+    depth_mask_resolution: UVec2,
+    // `debug.alvr.key_dump`: waiting for a depth frame, then for the GPU
+    dump_request: Cell<Option<(DepthDumpRequest, Instant)>>,
+    dump_pipeline: OnceCell<RenderPipeline>,
+    dump_readback: RefCell<Option<DumpReadback>>,
 }
 
 impl StreamRenderer {
@@ -853,7 +917,12 @@ impl StreamRenderer {
             sampler,
             playzone_textures,
             playzone_bind_groups,
-            playzone_views: Cell::new(None),
+            playzone: Cell::new(None),
+            depth_resolution: UVec2::ONE,
+            depth_mask_resolution: (target_view_resolution / DEPTH_MASK_DOWNSCALE).max(UVec2::ONE),
+            dump_request: Cell::new(None),
+            dump_pipeline: OnceCell::new(),
+            dump_readback: RefCell::new(None),
         }
     }
 
@@ -889,6 +958,7 @@ impl StreamRenderer {
             &self.sampler,
             resolution,
         );
+        self.depth_resolution = resolution;
         self.clear_playzone();
     }
 
@@ -899,7 +969,44 @@ impl StreamRenderer {
 
     /// Forget the playzone, e.g. if the reference space changed
     pub fn clear_playzone(&self) {
-        self.playzone_views.set(None);
+        self.playzone.set(None);
+    }
+
+    /// How long ago the playzone was remembered. None: there is none
+    pub fn playzone_age(&self) -> Option<Duration> {
+        self.playzone.get().map(|(_, time)| time.elapsed())
+    }
+
+    /// Read back the depth, the playzone, the depth mask and the focus area of the next frame with a
+    /// depth image, see `poll_depth_dump`. Returns the n of a request that was still waiting and is
+    /// replaced
+    pub fn request_depth_dump(&self, request: DepthDumpRequest) -> Option<i64> {
+        self.dump_request
+            .replace(Some((request, Instant::now())))
+            .map(|(request, _)| request.n)
+    }
+
+    /// Call every frame. Some when a dump is finished or failed, with its n
+    pub fn poll_depth_dump(&self) -> Option<(i64, Result<DepthDumpFiles, String>)> {
+        if let Some((request, time)) = self.dump_request.get()
+            && time.elapsed() > DEPTH_DUMP_TIMEOUT
+        {
+            self.dump_request.set(None);
+            return Some((request.n, Err("no depth frame".into())));
+        }
+
+        let result = {
+            let readback = self.dump_readback.borrow();
+            let readback = readback.as_ref()?;
+            let result = match self.context.device.poll(wgpu::PollType::Poll) {
+                Ok(_) => readback.poll()?,
+                Err(e) => Err(format!("poll: {e}")),
+            };
+            (readback.n, result)
+        };
+        self.dump_readback.replace(None);
+
+        Some(result)
     }
 
     /// Runtime foveation centers must already be encoder-aligned. `None` uses the negotiated centers.
@@ -955,6 +1062,8 @@ impl StreamRenderer {
             })
         });
         let mut lighting_response = None;
+        // `debug.alvr.key_dump`: the request, the depth frame and the JSON
+        let mut dump = None;
         if let Some(config) = depth_config {
             let input = depth.copied().unwrap_or(DepthRenderInput {
                 frame: None,
@@ -962,6 +1071,7 @@ impl StreamRenderer {
                 color_key: None,
                 arms: [None; 2],
                 capture_playzone: false,
+                playzone_view: false,
                 key_lower_rects: None,
             });
 
@@ -979,20 +1089,21 @@ impl StreamRenderer {
             if input.capture_playzone
                 && let Some(frame) = &input.frame
             {
-                self.playzone_views.set(Some(frame.depth_views));
+                self.playzone.set(Some((frame.depth_views, Instant::now())));
                 capture_playzone = true;
             }
 
             lighting_response = config.lighting.as_option().map(|l| l.response_speed);
 
+            let stream_views = [
+                view_params[0].input_view_params,
+                view_params[1].input_view_params,
+            ];
             let uniforms = depth_mask::depth_uniforms(
                 config,
-                &[
-                    view_params[0].input_view_params,
-                    view_params[1].input_view_params,
-                ],
+                &stream_views,
                 &input,
-                self.playzone_views.get().as_ref(),
+                self.playzone.get().map(|(views, _)| views).as_ref(),
                 lighting_response.is_some(),
             );
             self.context.queue.write_buffer(
@@ -1000,6 +1111,28 @@ impl StreamRenderer {
                 0,
                 &floats_to_bytes(&uniforms),
             );
+
+            if let Some(frame) = &input.frame
+                && self.dump_readback.borrow().is_none()
+                && let Some((request, _)) = self.dump_request.take()
+            {
+                let json = depth_dump::DumpFrame {
+                    request,
+                    config,
+                    stream_views: &stream_views,
+                    input: &input,
+                    frame,
+                    playzone: self
+                        .playzone
+                        .get()
+                        .map(|(views, time)| (views, time.elapsed().as_secs_f32())),
+                    depth_size: self.depth_resolution,
+                    mask_size: self.depth_mask_resolution,
+                    focus_size: self.focus_area_resolution,
+                }
+                .to_json();
+                dump = Some((request.n, *frame, json));
+            }
         }
 
         let mut encoder = self
@@ -1064,6 +1197,9 @@ impl StreamRenderer {
                 );
             }
         }
+        let dump = dump.map(|(n, frame, json)| {
+            self.encode_depth_dump(&mut encoder, depth_bind_group, n, &frame, json)
+        });
 
         for (view_idx, view_params) in view_params.iter().enumerate() {
             let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
@@ -1095,7 +1231,64 @@ impl StreamRenderer {
 
         self.context.queue.submit(iter::once(encoder.finish()));
 
+        if let Some(dump) = dump {
+            // wgpu doesn't look at the GL errors (of an unsupported copy), and the next `check_error`
+            // would abort
+            let dump = match self.context.take_gl_error() {
+                Some(error) => dump.fail(format!("GL error {error:#x}")),
+                None => dump.start(),
+            };
+            self.dump_readback.replace(Some(dump));
+        }
+
         hand_rects
+    }
+
+    fn encode_depth_dump(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        depth_bind_group: &BindGroup,
+        n: i64,
+        frame: &depth_mask::DepthFrame,
+        json: String,
+    ) -> DumpReadback {
+        let device = &self.context.device;
+        let pipeline = self
+            .dump_pipeline
+            .get_or_init(|| create_depth_dump_pipeline(device, &self.pipelines));
+        let has_playzone = self.playzone.get().is_some();
+
+        let mut sources = vec![];
+        for (eye, objects) in self.views_objects.iter().enumerate() {
+            sources.extend([
+                depth_dump::DumpSource::Depth {
+                    eye: eye as u32,
+                    depth_bind_group,
+                    playzone_bind_group: &self.playzone_bind_groups[eye],
+                    size: self.depth_resolution,
+                    file: depth_dump::file_name(n, "depth", eye),
+                    playzone_file: has_playzone.then(|| depth_dump::file_name(n, "playzone", eye)),
+                },
+                depth_dump::DumpSource::Rgba {
+                    texture: objects.depth_mask.texture().clone(),
+                    file: depth_dump::file_name(n, "mask", eye),
+                },
+                depth_dump::DumpSource::Rgba {
+                    texture: objects.focus_area.texture().clone(),
+                    file: depth_dump::file_name(n, "focus", eye),
+                },
+            ]);
+        }
+
+        DumpReadback::encode(
+            device,
+            encoder,
+            pipeline,
+            n,
+            sources,
+            frame,
+            (depth_dump::json_name(n), json),
+        )
     }
 }
 
@@ -1267,6 +1460,36 @@ pub(crate) fn encode_playzone_copy(
     });
     pass.set_pipeline(&pipelines.playzone_copy);
     pass.set_bind_group(0, depth_bind_group, &[]);
+    pass.set_immediates(0, &view_idx.to_le_bytes());
+    pass.draw(0..3, 0..1);
+}
+
+/// One eye of the environment depth and the playzone, see depth_dump.wgsl. `target`: RGBA8, the size of
+/// the depth map
+pub(crate) fn encode_depth_dump(
+    encoder: &mut wgpu::CommandEncoder,
+    pipeline: &RenderPipeline,
+    target: &TextureView,
+    depth_bind_group: &BindGroup,
+    playzone_bind_group: &BindGroup,
+    view_idx: u32,
+) {
+    let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+        label: Some("depth dump"),
+        color_attachments: &[Some(RenderPassColorAttachment {
+            view: target,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: LoadOp::Clear(Color::TRANSPARENT),
+                store: StoreOp::Store,
+            },
+        })],
+        ..Default::default()
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, depth_bind_group, &[]);
+    pass.set_bind_group(1, playzone_bind_group, &[]);
     pass.set_immediates(0, &view_idx.to_le_bytes());
     pass.draw(0..3, 0..1);
 }

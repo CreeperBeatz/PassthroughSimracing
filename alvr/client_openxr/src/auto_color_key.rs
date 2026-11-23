@@ -46,7 +46,7 @@ const LEAK_MAP_STEP: u32 = 8;
 // Grid of the camera view for `debug.alvr.key_leak_dump`
 const LEAK_DUMP_SIZE: [u32; 2] = [40, 30];
 // For `debug.alvr.key_lut_dump` and `debug.alvr.key_dump`
-const LEARNED_LUT_DIR: &str = "/sdcard/Android/data/alvr.client.dev/files";
+const LEARNED_LUT_DIR: &str = crate::passthrough::FILES_DIR;
 
 pub fn enabled() -> bool {
     debug_property("debug.alvr.auto_key").unwrap_or(0) > 0

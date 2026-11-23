@@ -148,13 +148,22 @@ fn depth_passthrough(game_color: vec3f, uv: vec2f) -> vec4f {
         let hand = textureSampleLevel(focus_area, stream_sampler, uv, 0.0);
         let focus = hand.r;
         let solid = max(mask, hand.g);
-        let lower_alpha = 1.0 - solid;
-        let upper_alpha = 1.0 - max(solid, focus);
+        var lower_alpha = 1.0 - solid;
+        var upper_alpha = 1.0 - max(solid, focus);
         var rgb = game_color;
         if debug_view == DEBUG_VIEW_TINT_MASK {
             rgb = mix(rgb, vec3f(0.0, 0.8, 0.0), 0.5 * focus);
             // Where the rim is narrowed
             rgb = mix(rgb, vec3f(0.9, 0.0, 0.0), 0.7 * hand.a);
+            if depth_u.playzone.w > 0.5 {
+                // Shown only because of the remembered playzone: half opaque blue over the passthrough.
+                // Faintly blue where it is used, near the hands
+                let remembered =
+                    mask - smoothstep(MASK_EDGE_MIN, MASK_EDGE_MAX, mask_sample.r - mask_sample.a);
+                rgb = mix(rgb, vec3f(0.0, 0.3, 1.0), max(0.25 * hand.b, remembered));
+                // Only the lower layer: both at 0.5 would pack to 0.5, an opaque lower layer
+                lower_alpha = max(lower_alpha, 0.5 * remembered);
+            }
         }
         var alpha = 0.5 * (lower_alpha + upper_alpha);
         // Where the lower layer is cropped away or not used, the upper one shows what both would show

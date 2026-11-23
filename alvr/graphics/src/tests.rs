@@ -3,6 +3,7 @@
 //! - the depth passthrough shader is run on the desktop GPU against a synthetic depth scene
 
 use crate::{
+    depth_dump::{DumpReadback, DumpSource},
     depth_mask::{
         self, ArmMotion, ColorKeyInput, DepthFrame, DepthRenderInput, HAND_SEGMENTS, HandShape,
         HandSweep, HandZones, SweepParams, WristBridge,
@@ -126,6 +127,11 @@ fn depth_mask_shader_translates_to_gles() {
 #[test]
 fn playzone_copy_shader_translates_to_gles() {
     translate_to_gles("playzone copy", &stream::playzone_copy_shader_source(), &[]);
+}
+
+#[test]
+fn depth_dump_shader_translates_to_gles() {
+    translate_to_gles("depth dump", &stream::depth_dump_shader_source(), &[]);
 }
 
 #[test]
@@ -337,6 +343,7 @@ fn render_with_key(
         [None; 2],
         None,
         None,
+        false,
     )
 }
 
@@ -353,6 +360,7 @@ fn render_full(
     arms: [Option<ArmMotion>; 2],
     playzone: Option<&Scene>,
     key_lower_rects: Option<[(Vec2, Vec2); 2]>,
+    playzone_view: bool,
 ) -> Output {
     let target_format = TextureFormat::Rgba8Unorm;
     let constants = [
@@ -520,6 +528,7 @@ fn render_full(
         color_key,
         arms,
         capture_playzone: false,
+        playzone_view,
         key_lower_rects,
     };
     let lighting_enabled = config.lighting.as_option().is_some();
@@ -821,6 +830,7 @@ fn color_key_upper_layer_alone_matches_both() {
             [None; 2],
             None,
             rects,
+            false,
         )
     };
     let whole = render_rects(None);
@@ -1381,6 +1391,7 @@ fn late_arms_are_moved() {
             [None, arm],
             None,
             None,
+            false,
         )
     };
     let motion = |displacement| ArmMotion {
@@ -1422,6 +1433,7 @@ fn late_arms_are_moved() {
         [None, Some(motion(Vec3::new(0.1, 0.0, 0.0)))],
         None,
         None,
+        false,
     );
     assert_eq!(keyed.alpha(0.45, 0.37), 0.0);
     assert!(keyed.alpha(0.55, 0.48) < 0.1, "{}", keyed.alpha(0.55, 0.48));
@@ -1658,11 +1670,11 @@ fn playzone_fills_objects_removed_near_the_hand() {
         leak: [0.0; 2],
         bridges: [None; 2],
     };
-    let render_playzone = |playzone| {
+    let render_view = |config: &DepthPassthroughConfig, playzone, playzone_view| {
         render_full(
             &device,
             &queue,
-            &config,
+            config,
             &current,
             Vec3::ZERO,
             Vec3::ZERO,
@@ -1671,8 +1683,10 @@ fn playzone_fills_objects_removed_near_the_hand() {
             [None; 2],
             playzone,
             None,
+            playzone_view,
         )
     };
+    let render_playzone = |playzone| render_view(&config, playzone, false);
 
     // Beside the hand, 4 cm from its surface
     let without = render_playzone(None);
@@ -1684,6 +1698,212 @@ fn playzone_fills_objects_removed_near_the_hand() {
     assert_eq!(with.alpha(0.5, 0.36), 1.0);
     // Far from the hand the current depth map is right: somebody moved the wheel
     assert_eq!(with.alpha(0.8, 0.5), 1.0);
+
+    // Debug view: what only the playzone shows is half opaque blue in the lower layer, the upper one
+    // stays open. Unpacked as by the layers: lower 2a, upper 2a - 1
+    let mut tint = config.clone();
+    tint.debug_view = DepthPassthroughDebugView::TintMask;
+    let tinted = render_view(&tint, Some(&remembered), true);
+    let [red, _, blue, _] = tinted.at(0.555, 0.5);
+    assert!(blue > 200 && red < 50, "{red} {blue}");
+    let alpha = tinted.alpha(0.555, 0.5);
+    let lower = (2.0 * alpha).min(1.0);
+    let upper = (2.0 * alpha - 1.0).max(0.0);
+    assert!((lower - 0.5).abs() < 0.1, "{lower}");
+    assert!(upper < 0.01, "{upper}");
+    // Off, and far from the hand: as before
+    let plain = render_view(&tint, Some(&remembered), false);
+    assert!(plain.alpha(0.555, 0.5) < 0.1);
+    let far = render_view(&tint, Some(&remembered), true).at(0.8, 0.5);
+    assert_eq!(far, plain.at(0.8, 0.5));
+    assert_eq!(far[3], 255);
+}
+
+// Two layers, one per eye, like the environment depth swapchain
+fn depth_array(device: &Device, queue: &Queue, layers: [&Scene; 2]) -> wgpu::Texture {
+    let texture = device.create_texture(&TextureDescriptor {
+        label: None,
+        size: Extent3d {
+            width: DEPTH_SIZE,
+            height: DEPTH_SIZE,
+            depth_or_array_layers: 2,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::R32Float,
+        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    for (layer, scene) in layers.iter().enumerate() {
+        write_texture_2d(
+            queue,
+            &texture,
+            &floats_to_bytes(&scene.depth),
+            DEPTH_SIZE * 4,
+            DEPTH_SIZE,
+            layer as u32,
+        );
+    }
+    texture
+}
+
+// `debug.alvr.key_dump` of the render thread: the right eye of the depth in meters, the playzone, and a
+// mask whose rows need padding in the buffer
+#[test]
+fn depth_dump_reads_back_meters_and_masks() {
+    let (device, queue) = gpu_or_skip!();
+    let config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
+    let constants = [
+        ("ENABLE_SRGB_CORRECTION", 0.0),
+        ("ENCODING_GAMMA", 0.0),
+        ("ENABLE_FFE", 0.0),
+    ];
+    let pipelines = StreamPipelines::new(&device, TextureFormat::Rgba8Unorm, &constants, false);
+
+    // The left eye only sees the background: a wrong layer would show
+    let background = Scene::new(3.0, [2.0, 2.0, 2.0, 2.0], 0.4);
+    let depth_texture = depth_array(&device, &queue, [&background, &hand_scene()]);
+    let remembered = Scene::new(2.0, [0.1, 0.1, 0.4, 0.3], 0.6);
+    let playzone_texture = depth_array(&device, &queue, [&background, &remembered]);
+
+    let frame = DepthFrame {
+        swapchain_index: 0,
+        near: NEAR,
+        far: f32::INFINITY,
+        depth_views: [view(Vec3::ZERO); 2],
+    };
+    let input = DepthRenderInput {
+        frame: Some(frame),
+        eye_positions: [Vec3::ZERO; 2],
+        color_key: None,
+        arms: [None; 2],
+        capture_playzone: false,
+        playzone_view: false,
+        key_lower_rects: None,
+    };
+    let uniforms = depth_mask::depth_uniforms(
+        &config,
+        &[view(Vec3::ZERO); 2],
+        &input,
+        Some(&[view(Vec3::ZERO); 2]),
+        false,
+    );
+    let uniform_buffer = stream::create_depth_uniform_buffer(&device);
+    queue.write_buffer(&uniform_buffer, 0, &floats_to_bytes(&uniforms));
+    let depth_bind_group = |texture| {
+        stream::create_depth_bind_group(
+            &device,
+            &pipelines,
+            &uniform_buffer,
+            &stream::depth_array_view(texture),
+        )
+    };
+
+    let sampler = device.create_sampler(&SamplerDescriptor::default());
+    let playzone_view = stream::create_playzone_texture(&device, UVec2::splat(DEPTH_SIZE))
+        .create_view(&TextureViewDescriptor::default());
+    let focus_area_view = stream::create_focus_area_texture(&device, UVec2::splat(5))
+        .create_view(&TextureViewDescriptor::default());
+    let playzone_bind_group = stream::create_playzone_bind_group(
+        &device,
+        &pipelines,
+        &playzone_view,
+        &focus_area_view,
+        &sampler,
+    );
+    // 50 x 30 texels: 200 bytes per row, 256 in the buffer
+    let mask = stream::create_depth_mask_texture(&device, UVec2::new(250, 150));
+    let dump_pipeline = stream::create_depth_dump_pipeline(&device, &pipelines);
+
+    let mut encoder = device.create_command_encoder(&Default::default());
+    stream::encode_playzone_copy(
+        &mut encoder,
+        &pipelines,
+        &playzone_view,
+        &depth_bind_group(&playzone_texture),
+        1,
+    );
+    let depth_bind_group = depth_bind_group(&depth_texture);
+    stream::encode_depth_mask(
+        &mut encoder,
+        &pipelines,
+        &mask.create_view(&TextureViewDescriptor::default()),
+        &depth_bind_group,
+        &playzone_bind_group,
+        1,
+    );
+    let readback = DumpReadback::encode(
+        &device,
+        &mut encoder,
+        &dump_pipeline,
+        1,
+        vec![
+            DumpSource::Depth {
+                eye: 1,
+                depth_bind_group: &depth_bind_group,
+                playzone_bind_group: &playzone_bind_group,
+                size: UVec2::splat(DEPTH_SIZE),
+                file: "depth".into(),
+                playzone_file: Some("playzone".into()),
+            },
+            DumpSource::Rgba {
+                texture: mask,
+                file: "mask".into(),
+            },
+        ],
+        &frame,
+        ("json".into(), "{}".into()),
+    );
+    queue.submit([encoder.finish()]);
+    let readback = readback.start();
+    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    let files = readback.poll().unwrap().unwrap().into_files();
+
+    let names = files
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["depth", "playzone", "mask", "json"]);
+    let meters = |bytes: &[u8]| {
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect::<Vec<_>>()
+    };
+    // Rows of the depth texture: row 0 is the bottom of the view
+    let at = |values: &[f32], u: f32, v: f32| {
+        values[(v * DEPTH_SIZE as f32) as usize * DEPTH_SIZE as usize
+            + (u * DEPTH_SIZE as f32) as usize]
+    };
+    let close = |value: f32, expected: f32| (value - expected).abs() < 1e-3 * expected;
+
+    let depth = meters(&files[0].1);
+    assert_eq!(depth.len(), (DEPTH_SIZE * DEPTH_SIZE) as usize);
+    assert!(close(at(&depth, 0.5, 0.7), 0.4), "{}", at(&depth, 0.5, 0.7));
+    assert!(close(at(&depth, 0.1, 0.1), 3.0), "{}", at(&depth, 0.1, 0.1));
+    let playzone = meters(&files[1].1);
+    assert!(
+        close(at(&playzone, 0.25, 0.2), 0.6),
+        "{}",
+        at(&playzone, 0.25, 0.2)
+    );
+    assert!(
+        close(at(&playzone, 0.7, 0.7), 2.0),
+        "{}",
+        at(&playzone, 0.7, 0.7)
+    );
+
+    // RGBA, row 0 is the top of the view: the hand is in the upper half
+    let mask = &files[2].1;
+    assert_eq!(mask.len(), 50 * 30 * 4);
+    let texel = |x: usize, y: usize| &mask[(y * 50 + x) * 4..][..4];
+    assert_eq!(texel(25, 7)[0], 255);
+    assert_eq!(texel(25, 22)[0], 0);
+    // Depth data everywhere, nothing from the playzone without the color key
+    assert_eq!(texel(25, 22)[2], 255);
+    assert_eq!(texel(25, 7)[3], 0);
+    assert_eq!(files[3].1, b"{}");
 }
 
 #[test]

@@ -74,7 +74,7 @@ pub struct KeyDump {
     pub hands: [DumpHand; 2],
 }
 
-fn number(value: f32) -> String {
+pub(crate) fn number(value: f32) -> String {
     if value.is_finite() {
         value.to_string()
     } else {
@@ -82,7 +82,7 @@ fn number(value: f32) -> String {
     }
 }
 
-fn number64(value: f64) -> String {
+pub(crate) fn number64(value: f64) -> String {
     if value.is_finite() {
         value.to_string()
     } else {
@@ -90,19 +90,19 @@ fn number64(value: f64) -> String {
     }
 }
 
-fn string(value: &str) -> String {
+pub(crate) fn string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-fn array(items: impl IntoIterator<Item = String>) -> String {
+pub(crate) fn array(items: impl IntoIterator<Item = String>) -> String {
     format!("[{}]", items.into_iter().collect::<Vec<_>>().join(","))
 }
 
-fn numbers(values: &[f32]) -> String {
+pub(crate) fn numbers(values: &[f32]) -> String {
     array(values.iter().map(|value| number(*value)))
 }
 
-fn object<'a>(fields: impl IntoIterator<Item = (&'a str, String)>) -> String {
+pub(crate) fn object<'a>(fields: impl IntoIterator<Item = (&'a str, String)>) -> String {
     let fields = fields
         .into_iter()
         .map(|(name, value)| format!("{}:{value}", string(name)))
@@ -111,7 +111,7 @@ fn object<'a>(fields: impl IntoIterator<Item = (&'a str, String)>) -> String {
     format!("{{{}}}", fields.join(","))
 }
 
-fn pose(pose: &Pose) -> String {
+pub(crate) fn pose(pose: &Pose) -> String {
     object([
         ("position", numbers(&pose.position.to_array())),
         ("orientation", numbers(&pose.orientation.to_array())),
@@ -203,7 +203,7 @@ impl KeyDump {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use alvr_common::glam::{Quat, Vec4};
 
@@ -269,7 +269,7 @@ mod tests {
         Some(rest)
     }
 
-    fn is_valid_json(text: &str) -> bool {
+    pub(crate) fn is_valid_json(text: &str) -> bool {
         value(text).is_some_and(|rest| rest.trim().is_empty())
     }
 

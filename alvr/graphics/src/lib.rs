@@ -1,4 +1,5 @@
 mod color_model;
+mod depth_dump;
 mod depth_mask;
 mod key_dump;
 mod leak_map;
@@ -10,6 +11,7 @@ mod stream;
 mod tests;
 
 pub use color_model::*;
+pub use depth_dump::{DEPTH_DUMP_TIMEOUT, DepthDumpFiles, DepthDumpRequest};
 pub use depth_mask::*;
 pub use key_dump::*;
 pub use leak_map::*;
@@ -440,6 +442,23 @@ impl GraphicsContext {
                 )
                 .unwrap();
         };
+    }
+
+    /// Clears the error flags of GL and returns the first one. wgpu doesn't check them
+    pub fn take_gl_error(&self) -> Option<u32> {
+        self.make_current();
+
+        let mut first = None;
+        // There is one flag per kind of error
+        for _ in 0..8 {
+            let error = unsafe { self.gl_context.get_error() };
+            if error == glow::NO_ERROR {
+                break;
+            }
+            first.get_or_insert(error);
+        }
+
+        first
     }
 
     /// Make sure an external depth texture array can be read with texelFetch: no depth comparison

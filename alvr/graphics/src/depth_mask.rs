@@ -383,6 +383,8 @@ pub struct DepthRenderInput {
     pub arms: [Option<ArmMotion>; 2],
     /// Remember the current depth image as the playzone. There must be no hands in it
     pub capture_playzone: bool,
+    /// Debug view (with "Tint mask" and the color key): what only the playzone shows is blue
+    pub playzone_view: bool,
     /// With the color key: the part of each view (min and max view uv) where the lower game layer is
     /// shown. Outside of it the upper layer shows what both would. None: the whole view
     pub key_lower_rects: Option<[(Vec2, Vec2); 2]>,
@@ -395,12 +397,12 @@ pub const DEPTH_UNIFORMS_FLOAT_COUNT: usize = 2 * EYE_FLOAT_COUNT
     + 4 * (2 + 2 * HAND_SEGMENTS / 4 + 2 + 2 * 2 * HAND_SEGMENTS + 6 + 2 * 9 + 1 + 2 + 2 + 2 * 2);
 pub const DEPTH_UNIFORMS_SIZE: usize = DEPTH_UNIFORMS_FLOAT_COUNT * size_of::<f32>();
 
-fn pose_to_mat4(pose: Pose) -> Mat4 {
+pub(crate) fn pose_to_mat4(pose: Pose) -> Mat4 {
     Mat4::from_rotation_translation(pose.orientation, pose.position)
 }
 
 /// Maps (u, v, 1, 0) with view-space uv (origin top-left) to a world-space ray direction
-fn uv_to_world_dir(view: &ViewParams) -> Mat4 {
+pub(crate) fn uv_to_world_dir(view: &ViewParams) -> Mat4 {
     let tanl = view.fov.left.tan();
     let tanr = view.fov.right.tan();
     let tanu = view.fov.up.tan();
@@ -416,7 +418,8 @@ fn uv_to_world_dir(view: &ViewParams) -> Mat4 {
     Mat4::from_quat(view.pose.orientation) * uv_to_view_dir
 }
 
-fn fov_tangents(fov: Fov) -> Vec4 {
+/// Left, right, down, up
+pub(crate) fn fov_tangents(fov: Fov) -> Vec4 {
     Vec4::new(
         fov.left.tan(),
         fov.right.tan(),
@@ -565,7 +568,7 @@ pub fn depth_uniforms(
         f32::from(u8::from(playzone.is_some())),
         leak[0],
         leak[1],
-        0.0,
+        f32::from(u8::from(input.playzone_view)),
     ]);
     for (min, max) in input
         .key_lower_rects
@@ -596,6 +599,30 @@ pub fn depth_uniforms(
     data.try_into().unwrap()
 }
 
+// Distance of a point (in the space of the view) outside the side planes of the view (through its
+// origin), in meters. Tangents: left, down and right, up
+fn outside_view_sides(tan_min: Vec2, tan_max: Vec2, local: Vec3) -> f32 {
+    let depth = -local.z;
+    [
+        (tan_min.x * depth - local.x) / tan_min.x.hypot(1.0),
+        (local.x - tan_max.x * depth) / tan_max.x.hypot(1.0),
+        (tan_min.y * depth - local.y) / tan_min.y.hypot(1.0),
+        (local.y - tan_max.y * depth) / tan_max.y.hypot(1.0),
+    ]
+    .into_iter()
+    .fold(f32::MIN, f32::max)
+}
+
+/// Whether a sphere is at least partly inside the view (pose and fov), in front of it. Conservative
+/// near the corners of the view
+pub fn sphere_in_view(view: &ViewParams, center: Vec3, radius: f32) -> bool {
+    let local = view.pose.orientation.inverse() * (center - view.pose.position);
+    let tan_min = Vec2::new(view.fov.left.tan(), view.fov.down.tan());
+    let tan_max = Vec2::new(view.fov.right.tan(), view.fov.up.tan());
+
+    -local.z + radius > 0.0 && outside_view_sides(tan_min, tan_max, local) <= radius
+}
+
 /// Part of the view that contains the hands with their rim: min and max view uv. None if there is nothing.
 pub fn hands_view_rect(
     view: &ViewParams,
@@ -609,18 +636,7 @@ pub fn hands_view_rect(
 
     let tan_min = Vec2::new(view.fov.left.tan(), view.fov.down.tan());
     let tan_max = Vec2::new(view.fov.right.tan(), view.fov.up.tan());
-    // Distance of a point outside each side plane of the view (through the eye), in meters
-    let outside_sides = |local: Vec3| {
-        let depth = -local.z;
-        [
-            (tan_min.x * depth - local.x) / tan_min.x.hypot(1.0),
-            (local.x - tan_max.x * depth) / tan_max.x.hypot(1.0),
-            (tan_min.y * depth - local.y) / tan_min.y.hypot(1.0),
-            (local.y - tan_max.y * depth) / tan_max.y.hypot(1.0),
-        ]
-        .into_iter()
-        .fold(f32::MIN, f32::max)
-    };
+    let outside_sides = |local: Vec3| outside_view_sides(tan_min, tan_max, local);
 
     color_key
         .hands
@@ -931,6 +947,26 @@ mod tests {
     }
 
     #[test]
+    fn sphere_in_view_tests_the_frustum() {
+        let mut v = view();
+        v.pose.position = Vec3::new(0.1, 1.5, 0.0);
+        // Turned 90 degrees to the left: forward is -X
+        v.pose.orientation = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        let ahead = |x: f32, z: f32| v.pose.position + Vec3::new(-x, 0.0, z);
+
+        assert!(sphere_in_view(&v, ahead(0.5, 0.0), 0.01));
+        // Behind, unless it reaches the eye
+        assert!(!sphere_in_view(&v, ahead(-0.3, 0.0), 0.1));
+        assert!(sphere_in_view(&v, ahead(-0.3, 0.0), 0.4));
+        // Beside: right of the view at 45 degrees, its right edge is at 0.7 rad
+        let beside = ahead(0.5, -0.5);
+        let tan = v.fov.right.tan();
+        let outside = (0.5 - tan * 0.5) / tan.hypot(1.0);
+        assert!(!sphere_in_view(&v, beside, outside - 0.01));
+        assert!(sphere_in_view(&v, beside, outside + 0.01));
+    }
+
+    #[test]
     fn uv_dir_follows_view_rotation() {
         let mut v = view();
         // Turn 90° to the left: forward (-Z) becomes -X
@@ -986,6 +1022,7 @@ mod tests {
             color_key: None,
             arms: [None; 2],
             capture_playzone: false,
+            playzone_view: false,
             key_lower_rects: None,
         };
         let data = depth_uniforms(&cfg, &[view(), view()], &input, None, false);
@@ -1027,6 +1064,7 @@ mod tests {
             color_key: None,
             arms: [None; 2],
             capture_playzone: false,
+            playzone_view: false,
             key_lower_rects: None,
         };
         let base = 2 * EYE_FLOAT_COUNT + 16 + 4 * 3;

@@ -18,7 +18,7 @@ Words used here:
 | Holes in a still hand | Solid fill of the hand segments that the camera confirms | Better, some noise left |
 | Hands over complex backgrounds | Same, stricter colors, small zone | Leaks much lower, not gone |
 | Forearms | Depth map only, shifted by the motion of the wrist (`arm_shift`), plus a keyed bridge from the wrist whose direction the camera chooses | Coarse edge, lags or jitters. The body tracking forearm was removed: not accurate enough. Bridge not tested |
-| Held objects (wheel, shifter) | Remember the depth map without hands | Not tested on the headset |
+| Held objects (wheel, shifter) | Remember the depth map without hands | First test: a gripped bottle cap disappeared, most likely nothing was ever remembered (see below). New trigger not tested |
 | GPU budget | - | **Main open problem**: 58-73 fps with the last tested build |
 
 ## How it works now
@@ -113,6 +113,23 @@ bounding test of the bridge (about 15 operations, 2 square roots), near it one c
 the 28 (two for a moving bridge with solid fill); no texture samples. `key_wrist_len 0`: the output is the
 same as before (GPU test). The `auto key` line of `ALVR_CAM` logs `wrist` flexion / deviation (degrees)
 and the confidence of each hand.
+
+**Remembered playzone** (`playzone`, `playzone_auto`, `playzone_view`, **not tested**). The runtime removes
+tracked hands and what they hold from the depth map, so within 6 cm of a hand (bounding sphere, across the
+view ray) the mask also shows what a copy of the depth map taken without hands shows. First test on the
+headset (bottle on the desk, hands hidden for 5 s, then gripped): the cap disappeared. The log had
+`tracked hands [true, true]` in all 96 lines, also in the 16 with no hand in view: the runtime keeps out of
+view hands active, so the old trigger (1.5 s without tracked hands) most likely never fired and nothing was
+remembered. Now the copy is taken when no hand (bounding sphere + 10 cm) was inside the view of either depth
+camera for 1.5 s, then every 0.5 s while none is; `playzone` still requests one. While driving the hands
+never leave, so the copy is never refreshed then. `ALVR_CAM` logs each requested copy and the first of an
+automatic series (`playzone: remembered ...`), and every 2 s why there is none yet (`playzone: none
+remembered, a hand is near the depth view`); the `key:` line ends with `playzone none` or its age.
+`playzone_view 1` with the "Tint mask" debug view: what only the copy shows is half opaque blue, the area
+near the hands where it is used faintly blue. Known limits: it only adds (an object moved while held stays
+where it was, a ghost), it is forgotten only by a new copy, `playzone -1`, a recenter or a new stream, a hand
+in view that the runtime doesn't track is remembered as an object, and the copy is a whole snapshot (no
+per-texel update).
 
 **Steadier verification** (`key_steady`, `key_confirm`, `key_smooth`). Aim: fewer holes
 and less flicker on the hand without showing more of the room. One fast or untracked finger no longer
@@ -255,6 +272,12 @@ Measured in the SteamVR home, 72 Hz, with color key on unless noted:
   in the headset.
 - **OpenXR games** (BeamNG.drive) need SteamVR as the active OpenXR runtime, see the README.
 - **A hand that is in view but not tracked** is learned as an object of the playzone.
+- **Hands out of view are still "tracked".** `relate_hand_joints` gives a pose as long as the runtime says
+  the hand is active, also when it is out of the display view (measured: 96 of 96 `key:` lines with
+  `tracked hands [true, true]`, 16 of them without a hand in view). Use the view, not that flag.
+- **A GL error left behind aborts the app.** wgpu doesn't call glGetError, `check_error` (staging renderer)
+  does and aborts. Code that may fail on the GL side (the readback of `key_dump`) must clear the flags itself
+  (`GraphicsContext::take_gl_error`).
 - **Leaving the play area** pauses the app and restarts the stream. The key comes back by itself.
 
 ## Settings
@@ -277,7 +300,8 @@ Measured in the SteamVR home, 72 Hz, with color key on unless noted:
 | `key_confirm` | 12 % | `key_tight` of a second table that is never uploaded: the points on the axis of a segment are verified with it (the points beside it with the key), and the reliability comes from the share of the background around the hands that it keeps. Capped at `key_tight`, so it keeps everything the key keeps. 0: off. On the headset with 12: of the segments that are voted on 71 % are confirmed (65 % without), verified weight 0.55 (0.44), background unchanged; user: "the best one so far", in some cases the hand is still not full enough |
 | `key_steady` | 1 | 1: a hand is verified while its palm (palm, wrist, knuckles) is tracked and slower than 0.5 m/s, each segment while its own two joints are too; its background is then sampled for the reliability only, and a hand with a fast finger is judged by its own background (fewer than 50 colors: no fill). Colors are still learned only from whole hands. 0: the whole hand or nothing, as before. Runs on the headset, not compared with 0 |
 | `key_delay` / `key_scale` | 0 ms / 100 % | Hand pose offset (negative predicts), thickness |
-| `playzone` / `playzone_auto` | 0 / 1 | New value: remember now, -1 forgets it (not tested). Automatic after 1.5 s without hands |
+| `playzone` / `playzone_auto` | 0 / 1 | New positive value: remember at the next depth image, -1 forgets it; the value at the start of the stream is not a request. Automatic after 1.5 s without a hand near the view of the depth cameras. Not tested |
+| `playzone_view` | 0 | 1: with the "Tint mask" debug view what only the remembered playzone shows is half opaque blue, where it is used (near the hands) faintly blue. Not tested |
 | `key_layers` | 4 | 4: extra layers only with hands in view, 2: never, 5: always, 30 / 31: always three (no upper game layer / no keyed passthrough). Not tested |
 | `key_crop` | 1 | Lower game layer only around the hands. 0: full, 2: y origin at the top (if 1 is upside down). Not tested |
 | `key_hands` | 1 | 0: no hands in the GPU passes. Not tested |
@@ -294,7 +318,7 @@ Measured in the SteamVR home, 72 Hz, with color key on unless noted:
 | `key_leak_dump` | 0 | New value: log the leak map of the camera view, 40x30 (`#` leaks, `.` doesn't, `?` unknown, `H` hand). Not 0: the map is learned |
 | `key_leak_probe` | 60 cm | Distance of the spheres of `key_leak_view 2` from the anchor of the map |
 | `key_lut_dump` | 0 | New value: write the learned LUT to `/sdcard/Android/data/alvr.client.dev/files/alvr_learned_key_<time>.lut` |
-| `key_dump` / `key_dump_burst` | 0 / 1 | New value `n` other than 0: write the next `key_dump_burst` (1..30) learning passes to the same folder, `alvr_dump_<n>_<00..>`, also without hands. Each line `dump <n>/<index>: <path>` on `ALVR_CAM`. Not tested |
+| `key_dump` / `key_dump_burst` | 0 / 1 | New value `n` other than 0: write the next `key_dump_burst` (1..30) learning passes to the same folder, `alvr_dump_<n>_<00..>`, also without hands. Each line `dump <n>/<index>: <path>` on `ALVR_CAM`. The render thread also writes the depth of one frame, `alvr_dump_<n>_depth*` (below), also without `auto_key`; `depth dump <n>: ...` on `ALVR_CAM`. Not tested |
 | `key_wrist_len` | 80 mm | Keyed bridge from the wrist towards the forearm, 0: off (as before), up to 300. The direction and the solid fill need `auto_key`, without it: opposite to the fingers, never solid. Not tested |
 | `key_wrist_scale` / `key_wrist_conf` | 100 / 60 % | Its radius (of the wrist joint radius), how sure the camera must be of its direction for the solid fill |
 | `key_wrist_follow` | 30 % | Below this score of the best direction (share of points the key keeps, 0 over skin-like backgrounds) the bridge goes back to the default direction. 0: always the best one. Not tested |
@@ -332,6 +356,38 @@ confirm, not the published key. Keep only the files whose `burst_ns` matches the
 Project the capsules with the camera pose and `fx`, `fy`, `cx`, `cy`: `pixel = (x / z * fx + cx, y / z * fy + cy)` for a point `(x, y, z)` in the
 camera frame (`orientation` inverse times the point minus `position`).
 
+**`key_dump` depth files** (render thread, **not tested** on the headset), once per new `n`, from the next frame
+with a depth image. If nothing arrives within 1 s, or a copy or the file fails, one `depth dump <n>: <error>`
+line and nothing else (`depth dump <n>: replaced by <m>` if a new value came before a depth frame). A dump may cost a frame or two: the first one compiles its shader, and the frame
+whose readback is ready copies about 4 MB of mapped memory on the render thread (decoded and written on
+another thread):
+- `alvr_dump_<n>_depth_left.f32` / `_right`: the environment depth as the mask pass reads it, little-endian
+  f32, meters from the plane of the depth camera (along its -z), 0: no data. `depth.width` x `depth.height`,
+  rows in the order of the depth texture: row 0 is the bottom of the depth view (`flip_y` false). Converted on
+  the CPU from the exact 16 bit values with `near` / `far` (`far` null: infinite).
+- `alvr_dump_<n>_playzone_left.f32` / `_right`: the remembered depth, same layout (stored as 16 bit floats,
+  0: no data), only if there is one. Its camera is `playzone_camera`, not the current one.
+- `alvr_dump_<n>_mask_left.rgba` / `_right`: the depth mask, `mask.width` x `mask.height` x 4 bytes, row 0 is
+  the top of the view. r: region coverage, g: proximity (1 at the eye, 0 at 3 m), b: depth data (0/1), a: the
+  part of r that comes from the playzone.
+- `alvr_dump_<n>_focus_left.rgba` / `_right`: the focus area, same layout (`focus` size). r: hand with its
+  rim, g: solid fill, b: near a hand (where the playzone is used), a: narrowed rim.
+- `alvr_dump_<n>_depth.json`: `n`; `display_ns` (predicted display time of the frame), `depth_capture_ns`
+  (null: not reported), `now_ns` (when it was rendered), all XrTime, which is CLOCK_MONOTONIC on Quest like
+  `image_ns` of the camera dumps; `depth` (`width`, `height`, `near`, `far`, `flip_y`), `mask`, `focus`
+  (sizes); `playzone` (`age_s`, null: none); `region` (`mode` distance: `max_distance`, volume: `center`,
+  `yaw_deg`, `size`; `feathering`); `debug_view`; `color_key`; `eyes` (left, right): `eye_position`, `view`
+  (`pose` and `tangents` left, right, down, up of the streamed view), `uv_to_world_dir` (column major 4x4:
+  `dir = M * (u, v, 1, 0)`, uv from the top left), `depth_camera` and `playzone_camera` (`pose`, `tangents`,
+  `world_to_view`, `view_to_world`), `files`; `hands` (`bounds` xyz r, `capsules` like the camera dumps,
+  `rim`, null: none); `arms` (`wrist`, `direction`, `displacement`, null: plain depth). Stage space, meters.
+
+Depth texel (x, y) to the world: `tx = l + (x + 0.5) / width * (r - l)`, `ty = d + (y + 0.5) / height * (u - d)`
+with the `tangents` of `depth_camera` (`y` from the bottom), point `view_to_world * (tx * z, ty * z, -z, 1)`
+with `z` the value in meters. To a mask texel of an eye: the direction from `eye_position`, `uv` from
+`uv_to_world_dir` (the tangents of `view` in the orientation of its pose); to the camera image of the camera
+dumps: `pose` and `fx`, `fy`, `cx`, `cy` there, at its `image_ns`.
+
 **Testing the leak map on the headset** (`adb logcat -s ALVR_CAM`, `auto_key 1`, debug view "Tint mask"):
 - [ ] `key_leak_map 0`: same look and same App / TW times as before; no `leak map` lines in the log.
 - [ ] Hands in the lap, `key_leak_map 100`, wait 5 s, then `key_leak_dump 1`, `2`, ...: `#` where wood
@@ -358,7 +414,9 @@ camera frame (`orientation` inverse times the point minus `position`).
 
 ## Privacy
 
-Camera images are only used in memory to learn colors. Nothing is stored or sent. Average colors and
+Camera images are only used in memory to learn colors. Nothing is stored or sent. Only on request
+(`key_lut_dump`, `key_dump`) the learned tables, camera images and depth maps of one moment are written to
+the files folder of the app on the headset. Average colors and
 sample counts are written to the log of the headset.
 
 ## Sources
