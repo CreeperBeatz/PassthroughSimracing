@@ -37,6 +37,36 @@ new value other than 0 at any time. Everything else is a default.
   for the hand up to the wrist, no arm extension from it (`key_wrist_len` 0).
 - The real rig will have QR codes as anchors, and the play area is set around them, not around the head.
 
+**Evening session of 2026-11-23** (same build, live settings only, the user judging by eye).
+- `arm_shift 0` (plain depth for the forearm): first impression "the length of the arm looks like it tracks
+  worse", after switching back to 1 "the arm tracking is actually a bit better" without the shift. A small
+  difference either way; left at 0 on the headset, the default in the code is still 1. Not settled.
+- `key_solid 0`: "no noticeable difference". Stays 6. The 18 % less room predicted from the camera images
+  did not show.
+- `key_inset 6` against 4, switched every 3 s for a minute: "no noticeable difference". Stays 4. 8 not
+  tried. The user: "at this point the fine tuning is so precise, I need a side by side". Fine settings of
+  the hand can no longer be judged one after the other: a comparison needs one setting per hand, which
+  needs a build.
+- The region "Cockpit volume" ran on the headset for the first time: a box typed into the settings
+  (placed from the head pose and the desk plane of a capture; the setting is applied live, no restart).
+  72 fps as before. The user: "it does stay, the borders are jagged, but it stays consistent depth wise".
+  A recenter "only moves the SteamVR page": the box stays. Measured on captures before and after (the
+  headset was off for 25 minutes in between, then the recenter): the desk at the same height, a wall at
+  the same direction within about 2 degrees and the same place within about 1 cm in stage space. The
+  headset is on an automatic stationary boundary and the runtime announced a stage update three times at
+  the recenter without moving the frame; when it does redefine it (reboot, lost tracking, a new boundary)
+  is not known. That is what an anchor has to cover.
+- The jagged border of the box: where a face of the box cuts through a surface. A level cut through
+  surfaces at different distances steps on screen even with perfect depth (the eye is not at the height of
+  the cut); the roughness along it is the depth map. A box whose faces lie in free air around the rig
+  shows no such border. `edge_feathering` 0.08 instead of 0.03 was set live, not judged.
+- Horizon OS on the headset: v210.
+- What the user wants from the anchors (their words, shortened): when the software starts it recognizes
+  which rig it is looking at, and what the borders should be from the position of that marker; an option
+  to control with pinch, scale and placing different objects what the rig / play area looks like, "tools
+  similar to Virtual Desktop"; QR codes can be printed. "We still need better edge precision on arms and
+  wheel".
+
 **Open for the user.** Way A or way B first (below)? Is the rig a motion rig? Where will the QR codes be
 (in the camera's view when looking ahead: wheel deck or monitor stand, not the base behind the legs), how
 many, what size? Does "no arm extension" also mean `arm_shift 0` (the depth is shifted along a 45 cm arm
@@ -103,6 +133,44 @@ user, 8 on 2 captures).
    around the eye (2 captures: the mask follows the radial distance in 99.8 % of the texels where sphere
    and plane differ).
 
+**Added in the evening** (code reading, 8 captures with depth measured once with hand-drawn outlines, and
+a search of public sources; not yet re-measured by a second analysis, so read the numbers as estimates).
+9. *The color key never removes anything.* In the hand's zone a pixel is real if the depth mask says so,
+   or the solid fill covers it, or the key keeps its color (`stream.wgsl`, the `max` of the three). The
+   forearm and a held object are cut because the depth mask is already empty there, not because of the
+   key: the user's "cut out where the color mask for the fingers is made" is the place, not the cause.
+10. *The runtime removes more than the hand from the depth map.* Around the fingers about 3-5 cm of a held
+    bottle are gone too (7 captures: no depth at the bottle's distance within 3 cm of the hand shape, most
+    of it back from 5-8 cm), replaced by far values (median 0.8-1.5 m). The forearm is hardly touched: 1-2
+    cm at the wrist. Of the bottle pixels that are not shown, 57-95 % lie outside the hand's key zone in 6
+    of 7 captures: no setting of the key can show them.
+11. *Continuing the object from the depth that remains* is an extrapolation: the bottle remains on one
+    side of the hand only. A straight continuation in the camera image covered 24-68 % of the missing part
+    in 5 captures (with 1-39 % of it beside the bottle) and failed in 2. A wheel rim passes through the
+    hand on both sides and may behave differently: no captures.
+12. *Depth against the camera image.* For a bottle held in the air the depth region reaches 2-3 camera px
+    (4-6 mm) past the camera outline, 4-5 px at the worst tenth. Static depth edges fit the camera image
+    best after a scale of about 5 % about the image centre, also in the set where the skeleton shows no
+    offset: a hint, and no more, that part of point 2 is the camera model (the lens distortion is never
+    read). Moving the border to camera edges means moving it by about as much as this is uncertain.
+13. *No shortcut from the platform.* No Quest feature gives a native app a mask of the body, the arms or
+    held objects; other cockpit tools show fixed windows or boxes placed by hand or with a controller,
+    none shows arms or held objects cut out of the camera image. One report says the hands return to the
+    depth map when hand tracking is turned off in the system settings (not tried here; the key needs the
+    joints).
+14. *For anchors:* the `openxr` 0.21.1 / `openxr-sys` 0.13.1 crates in use already contain
+    `XR_EXT_spatial_entity`, `XR_EXT_spatial_marker_tracking` (QR, Micro QR, ArUco, AprilTag),
+    `XR_EXT_spatial_anchor`, `XR_EXT_spatial_persistence` and `XR_EXT_future`: nothing to declare by hand.
+    Meta's documents name `com.oculus.permission.USE_ANCHOR_API`, the log of the headset asks for
+    `horizonos.permission.USE_ANCHOR_API`: declare both. QR tracking through the standard extension is
+    reported working from OS v83 by one forum post; Meta describes QR poses as slow to update and not for
+    moving things; nobody has published accuracy numbers. A published Quest 3 app built on ALVR keeps its
+    passthrough shapes relative to one saved spatial anchor (`XR_FB_spatial_entity` with storage and query,
+    the `com.oculus` permission) and lets the user place it by hand: saved anchors work for a native app of
+    this kind, QR codes would only replace the manual realignment after the seat moves or the room setup is
+    redone. The box of the region takes any pose in the shader; the settings only offer a yaw, and they come
+    from the PC, so a calibration on the headset needs its own path.
+
 **Method: what cost time today.**
 - Offline tests on screenshots of the display with a skeleton placed by hand were wrong twice (no leak
   predicted for `key_smooth` 70; gains of a shape detector against a baseline the headset doesn't have).
@@ -133,7 +201,9 @@ are never committed).
 1. Live, no build: is the skeleton tail gone with `key_wrist_len` 0; `arm_shift 0` if the arm still looks
    wrong (it shifts the depth along a 45 cm arm from the wrist); `key_solid 0` (predicted: 18 % less room
    for 1.25 % of the hand) and `key_inset` 6-8 (11-20 % for 0.65-1.2 %). Predictions from the camera
-   images: only the user's eyes decide.
+   images: only the user's eyes decide. Done in the evening session (above): `key_solid 0` and
+   `key_inset 6` make no visible difference, `arm_shift 0` a small and unsettled one. The live settings of
+   the hand are used up.
 2. The background gate of point 3. First measure on the captures with depth: the registration with the
    depth of the sensor instead of a fitted one, the gate applied one pass late with the head pose of the
    display, a lamp change, and a session in the driving seat: behind hands that stay in place the
@@ -645,7 +715,8 @@ The order of the user on 2026-11-23; how to go on with each is in "Where it stan
 6. GPU budget: 80 % with hands in view, peaks of 95-97 %. The extra layers of the key are a big part
    (key off: about 85 -> 62 % in one measurement); anything new on the GPU has to be cheap.
 7. Never tested on the headset: the lighting match, the leak map (`key_leak_map`), the narrower rim
-   (`key_leak`), `arm_shift 0`.
+   (`key_leak`). The box region ran once and is not judged.
+8. A way to compare two settings of the hand side by side (one per hand): asked for by the user.
 
 ## Privacy
 
