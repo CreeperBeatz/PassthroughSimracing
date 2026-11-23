@@ -1,5 +1,6 @@
 //! The box of the depth mask region placed from a marker (a QR code) on the rig, see
-//! `debug.alvr.marker_box` in the client. Pure geometry, stage space (meters, +Y up).
+//! `debug.alvr.marker_box` in the client. Pure geometry, stage space (meters, +Y up), and the size
+//! gate of the marker poses (`debug.alvr.marker_sizes`).
 //!
 //! The frame of the box is level: it takes only a heading from the marker, never its tilt. A tilt error
 //! of a few degrees would move the far end of a 1 m box by several centimeters. That holds for a flat
@@ -117,6 +118,136 @@ pub fn yaw_scatter(yaws: impl IntoIterator<Item = f32>) -> Option<(f32, f32)> {
         .fold(f32::NEG_INFINITY, f32::max);
 
     Some((variance.sqrt(), max - min))
+}
+
+// A runtime reports the size of a code it has not measured as a whole multiple of 50 mm (Quest: 50.0
+// and 100.0 mm, with wrong poses)
+const DEFAULT_SIZE_STEP: f32 = 0.05;
+const DEFAULT_SIZE_MARGIN: f32 = 0.000_05;
+/// A learned size needs this many reported sizes
+pub const MIN_LEARNED_SIZES: usize = 3;
+/// Largest size of `debug.alvr.marker_sizes` (mm)
+const MAX_GIVEN_SIZE_MM: f32 = 2000.0;
+
+/// Whether a reported size (width, height in meters) is a default size of the runtime: both within
+/// 0.05 mm of the same whole multiple of 50 mm
+pub fn is_default_marker_size(size: Vec2) -> bool {
+    let multiple = (size.x / DEFAULT_SIZE_STEP).round();
+    let default = multiple * DEFAULT_SIZE_STEP;
+
+    multiple >= 1.0
+        && (size.x - default).abs() <= DEFAULT_SIZE_MARGIN
+        && (size.y - default).abs() <= DEFAULT_SIZE_MARGIN
+}
+
+/// Median of the widths of the reported sizes that are not a default size (meters). None: fewer than
+/// `MIN_LEARNED_SIZES` of them
+pub fn learned_marker_size(sizes: impl IntoIterator<Item = Vec2>) -> Option<f32> {
+    let mut widths = sizes
+        .into_iter()
+        .filter(|size| size.x > 0.0 && !is_default_marker_size(*size))
+        .map(|size| size.x)
+        .collect::<Vec<_>>();
+    if widths.len() < MIN_LEARNED_SIZES {
+        return None;
+    }
+    widths.sort_by(f32::total_cmp);
+    let middle = widths.len() / 2;
+
+    Some(if widths.len().is_multiple_of(2) {
+        (widths[middle - 1] + widths[middle]) / 2.0
+    } else {
+        widths[middle]
+    })
+}
+
+/// Side lengths of the codes given with `debug.alvr.marker_sizes` (meters)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MarkerSizes {
+    /// Of every code without its own entry
+    pub all: Option<f32>,
+    /// By payload (case sensitive)
+    pub by_payload: Vec<(String, f32)>,
+}
+
+impl MarkerSizes {
+    /// The size of a code with this payload. None: not given
+    pub fn get(&self, payload: Option<&str>) -> Option<f32> {
+        payload
+            .and_then(|payload| {
+                self.by_payload
+                    .iter()
+                    .find(|(other, _)| other == payload)
+                    .map(|(_, size)| *size)
+            })
+            .or(self.all)
+    }
+}
+
+/// Parses `debug.alvr.marker_sizes`: one size in mm for every code ("144.2") or payload:mm pairs
+/// separated by commas ("RIG1:144.2,SCR1:150"; a number without payload is the size of the other
+/// codes). Returns the sizes and the entries that are malformed (left out)
+pub fn parse_marker_sizes(text: &str) -> (MarkerSizes, Vec<String>) {
+    let mut sizes = MarkerSizes::default();
+    let mut malformed = vec![];
+    for entry in text
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        // The last colon: a payload may contain colons
+        let (payload, mm) = match entry.rsplit_once(':') {
+            Some((payload, mm)) => (Some(payload.trim()), mm.trim()),
+            None => (None, entry),
+        };
+        match (payload, mm.parse::<f32>()) {
+            (Some(""), _) => malformed.push(entry.to_owned()),
+            (_, Ok(mm)) if mm.is_finite() && mm > 0.0 && mm <= MAX_GIVEN_SIZE_MM => {
+                let size = mm / 1000.0;
+                if let Some(payload) = payload {
+                    sizes.by_payload.retain(|(other, _)| other != payload);
+                    sizes.by_payload.push((payload.to_owned(), size));
+                } else {
+                    sizes.all = Some(size);
+                }
+            }
+            _ => malformed.push(entry.to_owned()),
+        }
+    }
+
+    (sizes, malformed)
+}
+
+/// The size of a code that poses are checked against (meters)
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SizeBaseline {
+    /// `debug.alvr.marker_sizes`
+    Given(f32),
+    /// `learned_marker_size` of the sizes the runtime reported
+    Learned(f32),
+}
+
+impl SizeBaseline {
+    pub fn size(self) -> f32 {
+        match self {
+            Self::Given(size) | Self::Learned(size) => size,
+        }
+    }
+}
+
+/// Whether a pose reported with this size is trusted: its width is within `tolerance` (a fraction)
+/// of the baseline. A default size is never trusted, unless the baseline is given and is itself a
+/// multiple of 50 mm
+pub fn marker_size_trusted(size: Vec2, baseline: SizeBaseline, tolerance: f32) -> bool {
+    let default_allowed = match baseline {
+        SizeBaseline::Given(given) => is_default_marker_size(Vec2::splat(given)),
+        SizeBaseline::Learned(_) => false,
+    };
+    if !default_allowed && is_default_marker_size(size) {
+        return false;
+    }
+
+    (size.x - baseline.size()).abs() <= baseline.size() * tolerance
 }
 
 /// Where the box is relative to the marker
@@ -848,6 +979,101 @@ mod tests {
         assert!((position - moved).length() < 0.005, "{position}");
         assert_eq!(smoother.len(), 11);
         assert_eq!(smoother.rejected(), 0);
+    }
+
+    fn square(mm: f32) -> Vec2 {
+        Vec2::splat(mm / 1000.0)
+    }
+
+    #[test]
+    fn marker_default_sizes() {
+        assert!(is_default_marker_size(square(100.0)));
+        assert!(is_default_marker_size(square(50.0)));
+        assert!(is_default_marker_size(square(150.0)));
+        assert!(is_default_marker_size(Vec2::new(0.10004, 0.09996)));
+        assert!(!is_default_marker_size(square(145.6)));
+        assert!(!is_default_marker_size(square(99.2)));
+        assert!(!is_default_marker_size(square(100.1)));
+        // Both must be the same multiple
+        assert!(!is_default_marker_size(Vec2::new(0.1, 0.05)));
+        assert!(!is_default_marker_size(Vec2::ZERO));
+    }
+
+    #[test]
+    fn marker_size_learned_without_defaults() {
+        let sizes = [145.4, 100.0, 146.1, 50.0, 145.6].map(square);
+        let learned = learned_marker_size(sizes).unwrap();
+        assert!((learned - 0.1456).abs() < 1e-6, "{learned}");
+        // Even count: between the middle two
+        let learned = learned_marker_size([145.0, 146.0, 100.0, 147.0, 144.0].map(square)).unwrap();
+        assert!((learned - 0.1455).abs() < 1e-6, "{learned}");
+        // Fewer than 3 that are not defaults
+        assert_eq!(
+            learned_marker_size([145.4, 100.0, 146.1, 50.0].map(square)),
+            None
+        );
+        assert_eq!(learned_marker_size([]), None);
+    }
+
+    #[test]
+    fn marker_sizes_parse() {
+        let (sizes, malformed) = parse_marker_sizes("RIG1:144.2,SCR1:150");
+        assert!(malformed.is_empty());
+        assert_eq!(sizes.all, None);
+        assert!((sizes.get(Some("RIG1")).unwrap() - 0.1442).abs() < 1e-6);
+        assert!((sizes.get(Some("SCR1")).unwrap() - 0.15).abs() < 1e-6);
+        // Case sensitive
+        assert_eq!(sizes.get(Some("rig1")), None);
+        assert_eq!(sizes.get(None), None);
+
+        let (sizes, malformed) = parse_marker_sizes("144.2");
+        assert!(malformed.is_empty());
+        assert!((sizes.get(Some("RIG2")).unwrap() - 0.1442).abs() < 1e-6);
+        assert!((sizes.get(None).unwrap() - 0.1442).abs() < 1e-6);
+
+        let (sizes, malformed) = parse_marker_sizes("RIG1:abc");
+        assert_eq!(malformed, ["RIG1:abc"]);
+        assert_eq!(sizes, MarkerSizes::default());
+
+        // Spaces, a payload with a colon, the others kept beside malformed entries
+        let (sizes, malformed) = parse_marker_sizes(" RIG1 : 95.6 , a:b:67.4,:12,0,-5,SCR1:");
+        assert_eq!(malformed, [":12", "0", "-5", "SCR1:"]);
+        assert!((sizes.get(Some("RIG1")).unwrap() - 0.0956).abs() < 1e-6);
+        assert!((sizes.get(Some("a:b")).unwrap() - 0.0674).abs() < 1e-6);
+    }
+
+    #[test]
+    fn marker_size_gate() {
+        let learned = SizeBaseline::Learned(0.1456);
+        assert!(!marker_size_trusted(square(100.0), learned, 0.03));
+        assert!(marker_size_trusted(square(146.9), learned, 0.03));
+        assert!(marker_size_trusted(square(143.1), learned, 0.03));
+        assert!(!marker_size_trusted(square(151.0), learned, 0.03));
+        assert!(marker_size_trusted(square(151.0), learned, 0.05));
+
+        // A default size inside the band: trusted only against a given size that is one too
+        let learned = SizeBaseline::Learned(0.1012);
+        assert!(!marker_size_trusted(square(100.0), learned, 0.03));
+        assert!(!marker_size_trusted(
+            square(100.0),
+            SizeBaseline::Given(0.1012),
+            0.03
+        ));
+        assert!(marker_size_trusted(
+            square(100.0),
+            SizeBaseline::Given(0.1),
+            0.03
+        ));
+        assert!(!marker_size_trusted(
+            square(50.0),
+            SizeBaseline::Given(0.1),
+            0.03
+        ));
+        assert!(marker_size_trusted(
+            square(144.9),
+            SizeBaseline::Given(0.1442),
+            0.03
+        ));
     }
 
     #[test]

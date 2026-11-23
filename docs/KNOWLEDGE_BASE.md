@@ -742,8 +742,9 @@ dumps: `pose` and `fx`, `fy`, `cx`, `cy` there, at its `image_ns`.
 - [ ] The `leak map ... ms` part of the `auto key` line and the `lookup ... us` of the render thread.
 - [ ] `key_lut_dump 1`, then `adb pull` the file for offline tests.
 
-**QR code markers and the box placed from them** (not tested on the headset: compiles and passes the unit
-tests only; nothing in this section ran on the headset yet). Step one of way B: does the runtime give this
+**QR code markers and the box placed from them** (the tracker ran on the headset once, see "First run on
+the headset" below; the box and the size gate are not tested: they compile and pass the unit tests only).
+Step one of way B: does the runtime give this
 app QR code poses (`XR_EXT_spatial_entity` and `XR_EXT_spatial_marker_tracking`), how good are they, and
 the box region placed from one. The manifest now declares `com.oculus.permission.USE_ANCHOR_API` and
 `horizonos.permission.USE_ANCHOR_API`. The extensions are enabled at the start of the app if
@@ -762,13 +763,53 @@ mounted on the rig (flat or standing) or shown on the monitor facing the driver 
 is used as it is and measured precisely; that measurement is the baseline, and its size may be changed
 after the first measurement.
 
+**First run on the headset (2026-11-23, build ce5ccfb9), measured** (log `alvr-20261123-2115-ce5ccfb9.log`,
+Horizon OS v210). The runtime listed `XR_EXT_future`, `XR_EXT_spatial_entity`,
+`XR_EXT_spatial_marker_tracking`, `XR_EXT_spatial_anchor` and `XR_EXT_spatial_persistence`, all yes. It
+lists the capability `MARKER_TRACKING_QR_CODE` with the components `MARKER` and `BOUNDED_2D` and NO
+features: no static markers and no fixed size, so `marker_static` and `marker_size` do nothing on Quest.
+The spatial context was ready 136 ms after the request, the code was found 0.27 s later. The pose changes
+about every 0.5 s; an update snapshot costs 0.1 ms. The printed code `RIG1` (144.2 mm), standing, was seen
+from 0.65-1.0 m. When the runtime measures the size itself it reports 143.1-146.9 mm (median 145.6) and the
+pose is good: standard deviation of the position 1.7 / 0.7 / 3.5 mm, heading 0.5 deg, over 52 summary lines
+with the head moving. But for the SAME entity it often reports exactly 100.0 x 100.0 mm or exactly 50.0 x
+50.0 mm (27 of 79 summary lines), also with the head still, sometimes for 30 s in a row, and then the pose
+is wrong. With 100.0 mm the code is placed along the same line of sight but nearer (0.51 m instead of 0.69
+m, scaled by about 100/145.6), 18 cm from the true place; with 50.0 mm about 1 m in front of the head,
+facing it, up to 0.8 m from the true place. These are default sizes the runtime uses when it has not
+measured the size. The tracking state is `tracking` in both cases, and it flips between tracking and paused
+often. So the reported size tells good poses from bad ones; without a check a bad pose that lasts more than
+`marker_move_ms` (1 s) would move the box by 18 cm. Hence the size gate below (not tested).
+
+**A code on the monitor, same run, measured.** `tools/show_qr.py SCR1 --monitor 1 --mm 150` on a 21.5 inch
+1920x1080 monitor: 21 modules of 29 px, 609 px, 151.3 mm by the monitor's own size (0.2484 mm per px); the
+user measured 151 mm with a ruler. The headset found it at once (`new "SCR1"`) and reports 151.6 mm
+(median; 146.2 mm while the code was shown at 146.1 mm for a moment, so it follows a change of the size).
+Over 46 summary lines with a measured size, the head 0.48-0.88 m away and moving: standard deviation of the
+position 1.3 / 0.4 / 2.4 mm, heading 2.2 deg (195-208 deg, the code was resized during that time: not
+separated); the printed `RIG1` in the same two minutes: 1.4 / 0.9 / 2.4 mm and 0.5 deg. Default sizes: 1 of
+47 lines for the monitor code, 2 of 33 for the print. So a code shown on the monitor works as an anchor;
+its heading is the weaker part (2 deg move the far end of a 1 m box by 3.5 cm). White at full brightness,
+room light on; a dimmer white, a smaller code and the game running on the same monitor are not tested.
+
+**Size gate** (not tested). Each code has a baseline size: the one given with `marker_sizes`, else the
+learned one, the median width of the last 50 distinct poses whose size is not a default size (valid from 3
+such poses). A size is a default size when width and height are both within 0.05 mm of the same whole
+multiple of 50 mm. A pose is trusted when its width is within `marker_size_tol` (3 %) of the baseline; a
+default size is never trusted, unless the given size is itself a multiple of 50 mm. Until a code has a
+baseline none of its poses is trusted. Only trusted poses place the box, and the statistics of the summary
+lines (pose changes, scatter, heading scatter) take the trusted poses only; the description of a code
+shows the pose as last reported, with ` (size not trusted)` when it is not trusted.
+
 | Property (`debug.alvr.`) | Default | Meaning |
 |---|---|---|
 | `marker` | unset | 1: look for QR codes while the session runs. Unset: only while `marker_box` is 1 (so a normal race pays nothing). 0: the tracker is stopped and a placed box is forgotten. The extensions are chosen at the start of the app: 0 at the start needs a restart for 1 to work. To restart the tracker (to apply `marker_static` / `marker_size`, or after a line starting `marker: off, ...`): `setprop debug.alvr.marker 0`, wait a second, then `1` |
 | `marker_discovery` | 2 s | A discovery snapshot (finds new codes) this often without the runtime's discovery-recommended event; also right after the context is ready, after an event and after a stage change, but then at most every 250 ms |
 | `marker_rate` | 10 Hz | Update snapshots (fresh poses of the known codes, stage space, at the display time of the frame). 0: none |
-| `marker_static` | 0 | 1: tell the runtime the codes don't move, only if it lists that feature (read when the tracker starts, see `marker`) |
-| `marker_size` | unset (0) | Side length in mm, decimals allowed (e.g. `95.6`), 0 to 2000: black edge to black edge, without the white margin. The runtime takes EVERY code as this size, so set it only while codes of one size are in view; with it set the size in the `new ...` line is this value, not a measurement. Only if the runtime lists that feature. Read when the tracker starts (see `marker`): check the `creating the spatial context (...)` line. A value that is not a number is logged and ignored |
+| `marker_static` | 0 | 1: tell the runtime the codes don't move, only if it lists that feature (Quest doesn't, measured; read when the tracker starts, see `marker`) |
+| `marker_size` | unset (0) | Does nothing on Quest: it lists no fixed size feature (measured); for the baseline size use `marker_sizes`. Side length in mm, decimals allowed (e.g. `95.6`), 0 to 2000: black edge to black edge, without the white margin. The runtime takes EVERY code as this size, so set it only while codes of one size are in view; with it set the size in the `new ...` line is this value, not a measurement. Only if the runtime lists that feature. Read when the tracker starts (see `marker`): check the `creating the spatial context (...)` line. A value that is not a number is logged and ignored |
+| `marker_sizes` | unset | The baseline size of the codes (see "Size gate"), mm with decimals, black edge to black edge: `144.2` for every code, or payload:mm pairs separated by commas, `RIG1:144.2,SCR1:150` (payloads case sensitive; a number without payload is the size of the other codes; at most 91 characters, an Android limit). Unset: learned from the sizes the runtime reports. A malformed entry is logged once and ignored. Polled, applies at once |
+| `marker_size_tol` | 3 % | A pose is trusted when its width is within this of the baseline, 0 to 50. 0 turns the size gate off: every pose is trusted, as before. Polled, applies to the next pose |
 | `marker_box` | 0 | 1: while a code is known, the depth mask uses a box placed from it instead of the region of the settings (also instead of "Distance") |
 | `marker_id` | unset | Use the code with this payload (text, case sensitive: `RIG1`). A change is logged and the box is forgotten at once. Unset: the box stays with codes that carry the payload of the code used first, until `marker_box 0`, `marker 0`, or `marker_id` changes |
 | `marker_window` | 1000 ms | Length of the average of the pose of the code, 100 to 60000. A change is logged and applies at once (a shorter window drops older poses at once) |
@@ -838,10 +879,17 @@ Log lines (`ALVR_CAM`, all start with `marker`):
   fixed size: <mm> mm | no)`, `spatial context ready after <ms>`, `first discovery-recommended event after
   <s>`. `no view space, lines without the head: ...` if the head reference space can't be made.
 - `marker_size "<text>" is not a number, ignored`.
+- `marker_sizes entry "<entry>" is not <payload>:<mm> or <mm>, ignored`, once each time the property
+  changes to a text with that entry.
+- `size baseline of "<payload>" #<id>: <mm> mm (given)` or `(learned from <n> poses)` when a code gets a
+  baseline, when it changes between given and learned, when the given size changes, and when the learned
+  one changes by more than 0.5 mm. With a given size, once the runtime has measured 3 poses that are not a
+  default size: `"<payload>" #<id>: given <mm> mm, the runtime measures <mm> mm (<+-%> %)` (its median).
 - `discovery: <n> markers (<n> tracking), <ms> after the request, ...` when the number changes.
 - A code is described everywhere as `"<payload>" #<id> <state> at (x, y, z) m, normal <deg> deg from
-  vertical (lying|standing), heading <deg> deg, <w> x <h> mm` (stage space; position to 0.1 mm, heading to
-  0.01 deg, size as the runtime reports it). The heading is the one the box would use (degrees about
+  vertical (lying|standing), heading <deg> deg, <w> x <h> mm{ (size not trusted)}` (stage space; position
+  to 0.1 mm, heading to 0.01 deg, size as the runtime reports it; the pose as last reported, trusted or
+  not, see "Size gate"). The heading is the one the box would use (degrees about
   vertical, counter-clockwise from above, 0 = stage -Z), printed in -90..270 so that a code facing the
   driver (about 180) doesn't jump between +180 and -180; the same range in the `marker box:` and
   `ReferenceSpaceChangePending` lines. Lines using it: `new <description><head>`, `<old state> -> <new state>: <description><head>`
@@ -859,7 +907,13 @@ Log lines (`ALVR_CAM`, all start with `marker`):
 - Every 2 s while codes are known: `<n> known; discoveries <n> (...); update snapshots <rate>/s, <ms>
   each` (or `none`, or `failed (poses from the discoveries)`), and per code `  <description><head>, pose
   changes every <ms> (<n> > 0.1 mm / 0.01 deg, <n> bit-exact in 2 s), scatter x/y/z <mm> over <k>
-  distinct poses in 10 s, heading scatter <deg> deg (range <deg>), seen <s> ago`. "pose changes" counts
+  distinct poses in 10 s, heading scatter <deg> deg (range <deg>), seen <s> ago, <n> poses of another
+  size left out in 2 s{ (last <w> mm)}, baseline <mm> mm (given|learned)`; without a baseline the end is
+  `, <n> poses left out in 2 s{ (last <w> mm)}, no size baseline yet`, with `marker_size_tol 0` it is
+  `, size gate off (marker_size_tol 0), baseline ... | no size baseline yet`. The poses left out are
+  distinct poses (a repeat of the pose before is not counted again), the size is the width. "pose
+  changes", the scatter and the heading scatter count trusted poses only, "seen" is the last pose
+  reported. "pose changes" counts
   the changes of more than 0.1 mm or 0.01 deg, and how often they come is how often the runtime really
   updates the pose (update snapshots repeat the last one; the bit-exact count includes smaller changes,
   which show whether the runtime changes the pose by tiny amounts). The scatter is the standard
@@ -874,8 +928,10 @@ Log lines (`ALVR_CAM`, all start with `marker`):
   only (debug.alvr.marker 0, then 1 tries again)` and the poses then come from the discoveries only.
 - `marker box: marker_id is now "<text>" | unset`, `marker box: averaging window <s> s`, `marker box: a
   move must hold <s> s` (when `marker_window` / `marker_move_ms` are set to other than the defaults).
-- `marker box: {keeping the last pose, }waiting for <the marker "<id>" | a marker with a pose> (known:
-  ...)` every 10 s while no code fits (also while a pose is kept).
+- `marker box: {keeping the last pose, }waiting for <the marker "<id>" | a marker with a pose>{, none has
+  a trusted pose yet (size gate)} (known: ...)` every 10 s while no code fits (also while a pose is kept).
+  The middle part comes when codes that fit have poses but none of them a trusted one; the descriptions
+  after `known:` show their sizes. Only trusted poses place the box.
 - `marker box: <n> poses away from the average left out so far`, at most every 2 s when the count grew.
 - `marker box: placed at (x, y, z) m, heading <deg> deg, size ..., marker #<id> at (...), <n> samples
   over <s> s (window <s> s), <n> outliers left out`, again as `moved by <cm> cm, at ...` when a corner of
@@ -909,11 +965,12 @@ Testing (`adb logcat -s ALVR_CAM` running):
       each of the three codes; read the normal angle (about 0 on a level desk), the pose changes interval
       and the scatter, once with the head still and once while moving it (the head part says how fast).
       Then from further away and at a flat angle (the head part gives the distance and the angle).
-- [ ] Then one code at a time: `setprop debug.alvr.marker_size 144.2`, restart the tracker (`marker 0`,
-      a second, `1`), check the `creating the spatial context (... fixed size: 144.2 mm)` line (if it
-      says `no`, the runtime does not list the feature: nothing changes), and compare the scatter and
-      the position with the run without it. Only one size in view at a time: the size applies to every
-      code. Change the size (the user may change it after the first measurement) the same way.
+- [ ] Size gate, `marker_sizes` unset: `size baseline of "RIG1" #1: ... mm (learned from 3 poses)`
+      near the ruler size. While the runtime reports 100.0 or 50.0 mm, the description says `(size not
+      trusted)`, the summary counts the poses left out, and the box does not move. Then `setprop
+      debug.alvr.marker_sizes RIG1:144.2,SCR1:<ruler mm>`: `size baseline ... (given)` and the line with
+      what the runtime measures against it. `marker_size_tol 0` turns the gate off to compare. (The
+      `marker_size` step of before does nothing on Quest: no fixed size feature, measured.)
 - [ ] Turn the head away for 10 s and back: `paused` / `tracking` lines, and whether the position comes
       back to the same millimeters.
 - [ ] Passthrough = Depth, then `setprop debug.alvr.marker_box 1`: `marker box: placed ...`, then

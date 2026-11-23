@@ -17,6 +17,8 @@
 //! degrees of vertical) the direction of the top of the code, for a standing code the direction out of
 //! its front. So for a standing code facing the driver +x is the driver's LEFT and +z comes TOWARDS the
 //! driver; for a flat code whose top points away from the driver +x is the driver's right and +z away.
+//! Only trusted poses place the box (the size gate of the tracker, `debug.alvr.marker_sizes`): a pose
+//! of another size than the baseline of the code is wrong by up to a meter.
 //! The pose is averaged over the window while the marker is still, and kept while the marker is not
 //! seen, also without a tracker (the tracker failed or the session stopped; `debug.alvr.marker 0`
 //! forgets it). Single poses away from the average are left out; three in a row at the same new place
@@ -214,16 +216,19 @@ impl MarkerRegion {
             .or(self.selected_payload.as_deref())
     }
 
-    // The marker to place the box from, among the markers with a pose and the wanted payload: the
-    // marker in use while it is tracked; else one that is tracked now (the one seen last); else the
-    // marker in use (paused); else the one seen last
+    fn is_wanted(&self, marker: &Marker) -> bool {
+        self.wanted_payload()
+            .is_none_or(|payload| marker.payload.as_deref() == Some(payload))
+    }
+
+    // The marker to place the box from, among the markers with a trusted pose and the wanted
+    // payload: the marker in use while it is tracked; else one that is tracked now (the one trusted
+    // last); else the marker in use (paused); else the one trusted last
     fn choose<'a>(&self, tracker: &'a SpatialMarkerTracker) -> Option<&'a Marker> {
-        let payload = self.wanted_payload();
         let candidates = || {
-            tracker.markers().filter(move |marker| {
-                marker.updated.is_some()
-                    && payload.is_none_or(|payload| marker.payload.as_deref() == Some(payload))
-            })
+            tracker
+                .markers()
+                .filter(|marker| marker.trusted_updated.is_some() && self.is_wanted(marker))
         };
         let tracked = |marker: &&Marker| marker.state == MarkerState::Tracking;
         let in_use = |marker: &&Marker| Some(marker.id) == self.selected;
@@ -233,10 +238,10 @@ impl MarkerRegion {
             .or_else(|| {
                 candidates()
                     .filter(tracked)
-                    .max_by_key(|marker| marker.updated)
+                    .max_by_key(|marker| marker.trusted_updated)
             })
             .or_else(|| candidates().find(in_use))
-            .or_else(|| candidates().max_by_key(|marker| marker.updated))
+            .or_else(|| candidates().max_by_key(|marker| marker.trusted_updated))
     }
 
     /// The box for the frame displayed at `now`. None: the region of the settings
@@ -336,18 +341,18 @@ impl MarkerRegion {
             if marker.payload.is_some() {
                 self.selected_payload.clone_from(&marker.payload);
             }
-            if marker.updated != self.last_sample
-                && let Some(updated) = marker.updated
+            if marker.trusted_updated != self.last_sample
+                && let Some(updated) = marker.trusted_updated
             {
                 self.last_sample = Some(updated);
                 // A pose in the current stage space
                 self.drop_at = None;
-                let heading = alvr_graphics::marker_heading(marker.orientation);
+                let heading = alvr_graphics::marker_heading(marker.trusted_orientation);
                 let time = updated.saturating_duration_since(self.start).as_secs_f64();
                 // The smoother counts a repeated pose once
                 self.kept = Some(self.smoother.push(
                     time,
-                    marker.position,
+                    marker.trusted_position,
                     alvr_graphics::heading_yaw(heading.direction),
                 ));
             }
@@ -360,8 +365,12 @@ impl MarkerRegion {
                 .markers()
                 .map(crate::extra_extensions::describe)
                 .collect::<Vec<_>>();
+            // Markers that fit have poses, but none of the size baseline (or no baseline yet)
+            let untrusted = tracker
+                .markers()
+                .any(|marker| marker.updated.is_some() && self.is_wanted(marker));
             crate::stream_log(&format!(
-                "marker box: {}waiting for {} (known: {})",
+                "marker box: {}waiting for {}{} (known: {})",
                 if self.kept.is_some() {
                     "keeping the last pose, "
                 } else {
@@ -371,6 +380,11 @@ impl MarkerRegion {
                     .map_or("a marker with a pose".into(), |id| format!(
                         "the marker {id:?}"
                     )),
+                if untrusted {
+                    ", none has a trusted pose yet (size gate)"
+                } else {
+                    ""
+                },
                 if known.is_empty() {
                     "none".into()
                 } else {

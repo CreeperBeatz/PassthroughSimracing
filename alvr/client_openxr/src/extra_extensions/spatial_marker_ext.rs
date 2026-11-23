@@ -23,10 +23,20 @@
 //! - `debug.alvr.marker_static 1`: tell the runtime that the markers don't move (only if it lists the
 //!   feature; not on a motion rig)
 //! - `debug.alvr.marker_size <mm>`: side length of every code, decimals allowed (e.g. 95.6; only if
-//!   the runtime lists the feature)
+//!   the runtime lists the feature, Quest doesn't)
+//! - `debug.alvr.marker_sizes <text>`: the baseline size of the codes, "144.2" for every code or
+//!   "RIG1:144.2,SCR1:150" by payload (polled). Unset: learned from the sizes the runtime reports
+//! - `debug.alvr.marker_size_tol <%>`: a pose is trusted when its size is within this of the baseline
+//!   (0..50, default 3, polled; 0: every pose is trusted)
+//!
+//! Size gate: the runtime reports a code whose size it has not measured as 50.0 or 100.0 mm, and its
+//! pose is then wrong (placed along the line of sight as if the code had that size, measured on
+//! Quest). Such poses are not trusted: the box and the statistics of the summary lines take the
+//! trusted poses only.
 
 use crate::passthrough::{debug_property, debug_property_string};
 use alvr_common::glam::{Quat, Vec2, Vec3};
+use alvr_graphics::{MarkerSizes, SizeBaseline};
 use openxr::{
     self as xr, raw,
     sys::{self, Handle},
@@ -75,6 +85,11 @@ const MIN_DISCOVERY_GAP: Duration = Duration::from_millis(250);
 const MAX_LOGGED_PAYLOAD: usize = 64;
 // The payload cache is cleared when it holds more (a runtime may give new buffer ids per snapshot)
 const MAX_CACHED_PAYLOADS: usize = 64;
+// The learned size is the median of the sizes of this many distinct poses
+const LEARNED_SIZES: usize = 50;
+// A learned size is logged again when it changed by more than this
+const LOG_SIZE_CHANGE: f32 = 0.0005;
+const DEFAULT_SIZE_TOLERANCE: i64 = 3;
 
 fn log(text: &str) {
     crate::stream_log(&format!("marker: {text}"));
@@ -126,7 +141,7 @@ impl MarkerState {
     }
 }
 
-/// A marker as last reported, stage space
+/// A marker as last reported, and its last trusted pose (see the size gate), stage space
 #[derive(Clone, Debug)]
 pub struct Marker {
     /// Spatial entity id, unique within the session
@@ -142,6 +157,14 @@ pub struct Marker {
     /// When the pose was last reported (state tracking). None: never since the tracker started or the
     /// stage space changed, the pose is not valid
     pub updated: Option<Instant>,
+    /// The pose in position / orientation / extents passed the size gate. False before the first pose
+    pub trusted: bool,
+    /// The last pose that passed the size gate
+    pub trusted_position: Vec3,
+    pub trusted_orientation: Quat,
+    /// When it was reported. None: no trusted pose since the tracker started or the stage space
+    /// changed
+    pub trusted_updated: Option<Instant>,
 }
 
 struct TrackedMarker {
@@ -150,22 +173,90 @@ struct TrackedMarker {
     entity: sys::SpatialEntityEXT,
     // Buffer id of the payload last read, 0: none
     payload_buffer: u64,
-    // When the reported pose changed by more than `MIN_MOVE` or `MIN_TURN_DEG`, and when it changed
+    // When the trusted pose changed by more than `MIN_MOVE` or `MIN_TURN_DEG`, and when it changed
     // at all (bit-exact compare), over `STATS_WINDOW`
     changes: VecDeque<Instant>,
     exact_changes: VecDeque<Instant>,
-    // The poses that counted as changed, with their heading yaw (radians), over `SCATTER_WINDOW`
+    // The trusted poses that counted as changed, with their heading yaw (radians), over
+    // `SCATTER_WINDOW`
     samples: VecDeque<(Instant, Vec3, f32)>,
+    // Sizes of the last `LEARNED_SIZES` distinct poses that are not a default size, and their median
+    sizes: VecDeque<Vec2>,
+    learned: Option<f32>,
+    // The baseline last logged, and whether the runtime's size was logged against the given one
+    logged_baseline: Option<SizeBaseline>,
+    measured_logged: bool,
+    // Distinct poses left out by the size gate over `STATS_WINDOW`, and the size of the last one
+    left_out: VecDeque<Instant>,
+    last_left_out: Option<Vec2>,
 }
 
 impl TrackedMarker {
+    fn baseline(&self, given: &MarkerSizes) -> Option<SizeBaseline> {
+        given
+            .get(self.marker.payload.as_deref())
+            .map(SizeBaseline::Given)
+            .or(self.learned.map(SizeBaseline::Learned))
+    }
+
+    // Logs a new baseline (a learned one again when it changed by more than `LOG_SIZE_CHANGE`), and
+    // once the size the runtime measures against a given one
+    fn log_baseline(&mut self, given: &MarkerSizes) {
+        let baseline = self.baseline(given);
+        let changed = match (baseline, self.logged_baseline) {
+            (Some(SizeBaseline::Learned(new)), Some(SizeBaseline::Learned(old))) => {
+                (new - old).abs() > LOG_SIZE_CHANGE
+            }
+            (new, old) => new != old,
+        };
+        if changed {
+            self.logged_baseline = baseline;
+            self.measured_logged = false;
+            if let Some(baseline) = baseline {
+                log(&format!(
+                    "size baseline of {} #{}: {:.1} mm ({})",
+                    payload_text(self.marker.payload.as_deref()),
+                    self.marker.id,
+                    baseline.size() * 1000.0,
+                    match baseline {
+                        SizeBaseline::Given(_) => "given".into(),
+                        SizeBaseline::Learned(_) =>
+                            format!("learned from {} poses", self.sizes.len()),
+                    }
+                ));
+            }
+        }
+        if let Some(SizeBaseline::Given(size)) = baseline
+            && let Some(measured) = self.learned
+            && !self.measured_logged
+        {
+            self.measured_logged = true;
+            log(&format!(
+                "{} #{}: given {:.1} mm, the runtime measures {:.1} mm ({:+.1} %)",
+                payload_text(self.marker.payload.as_deref()),
+                self.marker.id,
+                size * 1000.0,
+                measured * 1000.0,
+                (measured / size - 1.0) * 100.0
+            ));
+        }
+    }
+
     fn clear_stats(&mut self) {
         self.changes.clear();
         self.exact_changes.clear();
         self.samples.clear();
+        self.left_out.clear();
     }
 
     fn prune_stats(&mut self) {
+        while self
+            .left_out
+            .front()
+            .is_some_and(|t| t.elapsed() > STATS_WINDOW)
+        {
+            self.left_out.pop_front();
+        }
         while self
             .changes
             .front()
@@ -251,6 +342,11 @@ pub struct SpatialMarkerTracker {
     update_interval: Option<Duration>,
     // An update snapshot failed for good: none from then on, the poses come from the discoveries
     updates_failed: bool,
+    // `debug.alvr.marker_sizes` as last read, and the sizes in it
+    sizes_text: Option<String>,
+    given_sizes: MarkerSizes,
+    // Percent, 0: the size gate is off
+    size_tolerance: u32,
     last_update_snapshot: Option<Instant>,
     // Update snapshots since the last summary, and their total time
     update_count: u32,
@@ -313,6 +409,9 @@ impl SpatialMarkerTracker {
             discovery_interval: Duration::from_secs(2),
             update_interval: Some(Duration::from_millis(100)),
             updates_failed: false,
+            sizes_text: None,
+            given_sizes: MarkerSizes::default(),
+            size_tolerance: DEFAULT_SIZE_TOLERANCE as u32,
             last_update_snapshot: None,
             update_count: 0,
             update_time: Duration::ZERO,
@@ -371,6 +470,8 @@ impl SpatialMarkerTracker {
         self.ignore_before = Some(change_time);
         for tracked in &mut self.markers {
             tracked.marker.updated = None;
+            tracked.marker.trusted = false;
+            tracked.marker.trusted_updated = None;
             tracked.clear_stats();
         }
         // In the old stage space
@@ -435,6 +536,27 @@ impl SpatialMarkerTracker {
             .unwrap_or(10)
             .clamp(0, 90);
         self.update_interval = (rate > 0).then(|| Duration::from_secs_f32(1.0 / rate as f32));
+
+        self.size_tolerance = debug_property("debug.alvr.marker_size_tol")
+            .unwrap_or(DEFAULT_SIZE_TOLERANCE)
+            .clamp(0, 50) as u32;
+        let text = debug_property_string("debug.alvr.marker_sizes");
+        if text != self.sizes_text {
+            let (sizes, malformed) = text
+                .as_deref()
+                .map(alvr_graphics::parse_marker_sizes)
+                .unwrap_or_default();
+            for entry in malformed {
+                log(&format!(
+                    "marker_sizes entry {entry:?} is not <payload>:<mm> or <mm>, ignored"
+                ));
+            }
+            self.given_sizes = sizes;
+            self.sizes_text = text;
+            for tracked in &mut self.markers {
+                tracked.log_baseline(&self.given_sizes);
+            }
+        }
     }
 
     // Head pose for the log, at most every `HEAD_SAMPLE_INTERVAL`. A failure only drops the head
@@ -1263,12 +1385,22 @@ impl SpatialMarkerTracker {
                         extents: Vec2::ZERO,
                         state,
                         updated: None,
+                        trusted: false,
+                        trusted_position: Vec3::ZERO,
+                        trusted_orientation: Quat::IDENTITY,
+                        trusted_updated: None,
                     },
                     entity,
                     payload_buffer: 0,
                     changes: VecDeque::new(),
                     exact_changes: VecDeque::new(),
                     samples: VecDeque::new(),
+                    sizes: VecDeque::new(),
+                    learned: None,
+                    logged_baseline: None,
+                    measured_logged: false,
+                    left_out: VecDeque::new(),
+                    last_left_out: None,
                 });
                 let index = self.markers.len() - 1;
                 self.update_marker(index, data, now);
@@ -1352,25 +1484,93 @@ impl SpatialMarkerTracker {
         }
 
         let time = Instant::now();
-        let first = tracked.marker.updated.is_none();
-        let moved = first
+        let extents = Vec2::new(data.bounds.extents.width, data.bounds.extents.height);
+        // Not a repeat of the pose reported before: counted once for the size and the left out poses
+        let distinct = tracked.marker.updated.is_none()
             || position.distance(tracked.marker.position) > MIN_MOVE
-            || turn_deg(tracked.marker.orientation, orientation) > MIN_TURN_DEG;
-        if moved {
-            let yaw =
-                alvr_graphics::heading_yaw(alvr_graphics::marker_heading(orientation).direction);
-            tracked.changes.push_back(time);
-            tracked.samples.push_back((time, position, yaw));
+            || turn_deg(tracked.marker.orientation, orientation) > MIN_TURN_DEG
+            || extents != tracked.marker.extents;
+        if distinct && extents.x > 0.0 && !alvr_graphics::is_default_marker_size(extents) {
+            if tracked.sizes.len() >= LEARNED_SIZES {
+                tracked.sizes.pop_front();
+            }
+            tracked.sizes.push_back(extents);
+            tracked.learned = alvr_graphics::learned_marker_size(tracked.sizes.iter().copied());
         }
-        if first || position != tracked.marker.position || orientation != tracked.marker.orientation
-        {
-            tracked.exact_changes.push_back(time);
-        }
+        let trusted = self.size_tolerance == 0
+            || tracked.baseline(&self.given_sizes).is_some_and(|baseline| {
+                alvr_graphics::marker_size_trusted(
+                    extents,
+                    baseline,
+                    self.size_tolerance as f32 / 100.0,
+                )
+            });
         tracked.marker.position = position;
         tracked.marker.orientation = orientation;
-        tracked.marker.extents = Vec2::new(data.bounds.extents.width, data.bounds.extents.height);
+        tracked.marker.extents = extents;
         tracked.marker.updated = Some(time);
+        tracked.marker.trusted = trusted;
+
+        if trusted {
+            // The statistics take the trusted poses only: the others jump by up to a meter
+            let first = tracked.marker.trusted_updated.is_none();
+            let moved = first
+                || position.distance(tracked.marker.trusted_position) > MIN_MOVE
+                || turn_deg(tracked.marker.trusted_orientation, orientation) > MIN_TURN_DEG;
+            if moved {
+                let yaw = alvr_graphics::heading_yaw(
+                    alvr_graphics::marker_heading(orientation).direction,
+                );
+                tracked.changes.push_back(time);
+                tracked.samples.push_back((time, position, yaw));
+            }
+            if first
+                || position != tracked.marker.trusted_position
+                || orientation != tracked.marker.trusted_orientation
+            {
+                tracked.exact_changes.push_back(time);
+            }
+            tracked.marker.trusted_position = position;
+            tracked.marker.trusted_orientation = orientation;
+            tracked.marker.trusted_updated = Some(time);
+        } else if distinct {
+            tracked.left_out.push_back(time);
+            tracked.last_left_out = Some(extents);
+        }
         tracked.prune_stats();
+        tracked.log_baseline(&self.given_sizes);
+    }
+
+    // The size gate part of a summary line
+    fn size_text(&self, tracked: &TrackedMarker) -> String {
+        let baseline = tracked.baseline(&self.given_sizes);
+        let baseline_text = match baseline {
+            Some(SizeBaseline::Given(size)) => format!("baseline {:.1} mm (given)", size * 1000.0),
+            Some(SizeBaseline::Learned(size)) => {
+                format!("baseline {:.1} mm (learned)", size * 1000.0)
+            }
+            None => "no size baseline yet".into(),
+        };
+        if self.size_tolerance == 0 {
+            return format!(", size gate off (marker_size_tol 0), {baseline_text}");
+        }
+        let last = match tracked.last_left_out {
+            Some(size) if !tracked.left_out.is_empty() => {
+                format!(" (last {:.1} mm)", size.x * 1000.0)
+            }
+            _ => String::new(),
+        };
+
+        format!(
+            ", {} poses {}left out in {} s{last}, {baseline_text}",
+            tracked.left_out.len(),
+            if baseline.is_some() {
+                "of another size "
+            } else {
+                ""
+            },
+            STATS_WINDOW.as_secs()
+        )
     }
 
     fn create_entity(&mut self, id: sys::SpatialEntityIdEXT) -> sys::SpatialEntityEXT {
@@ -1474,7 +1674,7 @@ impl SpatialMarkerTracker {
             log(&format!(
                 "  {}{}, pose changes every {interval} ({} > {:.1} mm / {MIN_TURN_DEG} deg, {} \
                  bit-exact in {} s), scatter x/y/z {scatter} in {} s, heading scatter \
-                 {heading_scatter}, seen {:.1} s ago",
+                 {heading_scatter}, seen {:.1} s ago{}",
                 describe(marker),
                 self.head_text(marker),
                 tracked.changes.len(),
@@ -1482,7 +1682,8 @@ impl SpatialMarkerTracker {
                 tracked.exact_changes.len(),
                 STATS_WINDOW.as_secs(),
                 SCATTER_WINDOW.as_secs(),
-                updated.elapsed().as_secs_f32()
+                updated.elapsed().as_secs_f32(),
+                self.size_text(tracked)
             ));
         }
     }
@@ -1547,13 +1748,13 @@ fn payload_text(payload: Option<&str>) -> String {
 }
 
 /// Payload, id, state, position, angle of the normal from vertical, heading (yaw of the direction
-/// the box takes from the code), size
+/// the box takes from the code), size, all as last reported; whether that pose is trusted
 pub fn describe(marker: &Marker) -> String {
     let pose = if marker.updated.is_some() {
         let heading = alvr_graphics::marker_heading(marker.orientation);
         format!(
             " at ({:.4}, {:.4}, {:.4}) m, normal {:.1} deg from vertical ({}), heading {:.2} deg, \
-             {:.1} x {:.1} mm",
+             {:.1} x {:.1} mm{}",
             marker.position.x,
             marker.position.y,
             marker.position.z,
@@ -1561,7 +1762,12 @@ pub fn describe(marker: &Marker) -> String {
             if heading.flat { "lying" } else { "standing" },
             alvr_graphics::yaw_log_deg(alvr_graphics::heading_yaw(heading.direction)),
             marker.extents.x * 1000.0,
-            marker.extents.y * 1000.0
+            marker.extents.y * 1000.0,
+            if marker.trusted {
+                ""
+            } else {
+                " (size not trusted)"
+            }
         )
     } else {
         String::new()
