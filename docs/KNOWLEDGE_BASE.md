@@ -231,6 +231,7 @@ Measured in the SteamVR home, 72 Hz, with color key on unless noted:
 | `color_key` | 0 | 0 off, another value (re)loads `/data/local/tmp/alvr_color_key.lut` |
 | `auto_key` | 0 | 1 before starting the app: learn the colors, asks for the camera permission |
 | `key_rim` / `key_rim_error` / `key_rim_max` | 0 mm / 45 ms / 16 mm | Zone at rest, growth with the speed, limit |
+| `key_speed` | 1 | 1: the zone grows with the speed of the palm, the wrist and the knuckles (the whole hand moves), 0: of the fastest joint as before (moving fingers grow it too). Not tested |
 | `key_sweep` | 1 | 1: the zone grows along the motion of the hand, 0: in all directions as before. Not tested |
 | `key_sweep_max` / `key_sweep_iso` / `key_sweep_bias` | 40 mm / 25 % / 0 % | Limit of the growth along the motion (each side, before the bias), share of the growth that stays in all directions (limited by `key_rim_max`), -100..100: more ahead (positive) or behind |
 | `key_inset` / `key_falloff` | 4 mm / 4 mm | Where the solid fill starts and how it fades out |
