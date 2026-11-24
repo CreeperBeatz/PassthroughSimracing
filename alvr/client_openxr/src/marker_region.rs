@@ -18,6 +18,9 @@
 //!   reported (the value at the start of the app is not a request)
 //! - `debug.alvr.marker_hands 0`: the hands of the color key show also outside the box (1: only
 //!   inside it, faded at its surface)
+//! - `debug.alvr.marker_carry 1`: a change of the STAGE space with a valid pose carries the box, its
+//!   estimate, the saved anchor and the pose frozen by the editor by that pose (0: their coordinates
+//!   are kept, see below). Read when the event comes
 //! - `debug.alvr.area_test <n>`: a test layout of the play area instead of the one box, made from the
 //!   box of the properties (see `PlayArea`): 1: two boxes and a dome on the top of the first, 8: that
 //!   box cut into 8 boxes with 24 domes (the worst case for the GPU). Unset or 0: the one box
@@ -38,9 +41,12 @@
 //! `debug.alvr.marker 0` forgets it). Single poses away from the estimate are left out; three in a row
 //! at the same new place over `marker_move_ms` are a move and start a new measurement (five over at
 //! least 3 s once measured). The same code under a new entity id keeps the estimate. A change of the
-//! STAGE space (only that one, not LOCAL) with a valid pose carries the box into the new space at the
-//! change time (poses before it are in the old space); without a valid pose the box is kept up to the
-//! change time, then dropped until the marker is seen again.
+//! STAGE space (only that one, not LOCAL) with a valid pose keeps the coordinates of the box and of
+//! its estimate (logged with the reported pose): on 2026-11-24 the code was seen at the same STAGE
+//! coordinates after such a change, and the box carried by the pose was 83 cm off.
+//! `debug.alvr.marker_carry 1` carries them into the new space by the pose at the change time instead
+//! (poses before it are in the old space), as before (0: keep, the default; read at the event). Without
+//! a valid pose the box is kept up to the change time, then dropped until the marker is seen again.
 
 use crate::{
     extra_extensions::{Marker, MarkerState, SpatialMarkerTracker},
@@ -48,7 +54,7 @@ use crate::{
 };
 use alvr_common::glam::{Quat, Vec2, Vec3};
 use alvr_graphics::{
-    MarkerBoxParams, PlacedArea, PlayArea, PoseSmoother, RegionOverride, StageChange,
+    MarkerBoxParams, PlacedArea, PlayArea, PoseSmoother, RegionOverride, StageEvent,
 };
 use openxr as xr;
 use std::time::{Duration, Instant};
@@ -95,8 +101,8 @@ pub struct MarkerRegion {
     // Times the box was carried over a stage change
     carried: u64,
     // Changes of the stage space at their change time, in order: the kept pose is carried into the
-    // new space then (or dropped without a valid pose)
-    stage_changes: Vec<(xr::Time, Option<StageChange>)>,
+    // new space then, or kept as it is (`debug.alvr.marker_carry 0`), or dropped without a valid pose
+    stage_changes: Vec<(xr::Time, StageEvent)>,
     // `debug.alvr.marker_scan` as last read
     last_scan_request: i64,
     // `debug.alvr.marker_hands`
@@ -351,38 +357,50 @@ impl MarkerRegion {
     }
 
     /// The STAGE space changes at `change_time`: the kept pose is valid until then, in the old space.
-    /// With the pose of the new space in the old one (`change`) the box and the poses of its estimate
-    /// are carried into the new space then; without it the estimate starts again (the tracker reports
-    /// no pose before `change_time`) and the box is dropped then
-    pub fn on_reference_space_change(
-        &mut self,
-        change_time: xr::Time,
-        change: Option<StageChange>,
-    ) {
+    /// `StageEvent::Carry` (a valid pose, `debug.alvr.marker_carry 1`): the box and the poses of its
+    /// estimate are carried into the new space then. `Keep` (a valid pose, `marker_carry 0`): their
+    /// coordinates stay, the event is logged then. `NoPose`: the estimate starts again (the tracker
+    /// reports no pose before `change_time`) and the box is dropped then
+    pub fn on_reference_space_change(&mut self, change_time: xr::Time, event: StageEvent) {
         self.last_sample = None;
-        if change.is_none() {
+        if event == StageEvent::NoPose {
             self.smoother.reset();
         }
         if self.kept.is_some() || !self.smoother.is_empty() {
-            self.stage_changes.push((change_time, change));
+            self.stage_changes.push((change_time, event));
         }
     }
 
     // The changes of the stage space that are due at `now`, in order
     fn apply_stage_changes(&mut self, now: xr::Time) {
-        while let Some(&(time, change)) = self.stage_changes.first()
+        while let Some(&(time, event)) = self.stage_changes.first()
             && now.as_nanos() >= time.as_nanos()
         {
             self.stage_changes.remove(0);
-            let Some(change) = change else {
-                if self.kept.is_some() {
-                    crate::stream_log("marker box: stage space changed, waiting for the marker");
+            let change = match event {
+                StageEvent::NoPose => {
+                    if self.kept.is_some() {
+                        crate::stream_log(
+                            "marker box: stage space changed, waiting for the marker",
+                        );
+                    }
+                    // Changes after this one have nothing to carry
+                    self.smoother.reset();
+                    self.kept = None;
+                    self.last_logged = None;
+                    continue;
                 }
-                // Changes after this one have nothing to carry
-                self.smoother.reset();
-                self.kept = None;
-                self.last_logged = None;
-                continue;
+                StageEvent::Keep(_) => {
+                    // The code was seen at the same STAGE coordinates after such a change (measured
+                    // 2026-11-24), so the box and the estimate stay as they are
+                    crate::stream_log(&format!(
+                        "marker box: stage space changed, coordinates kept (marker_carry 0; the \
+                         reported pose {} is not applied)",
+                        event.describe_pose()
+                    ));
+                    continue;
+                }
+                StageEvent::Carry(change) => change,
             };
             self.smoother.transform(&change);
             let Some((position, yaw)) = self.kept else {
@@ -398,7 +416,7 @@ impl MarkerRegion {
             let moved = new.center() - old.center();
             crate::stream_log(&format!(
                 "marker box: stage space changed, box carried over (moved by ({:.3}, {:.3}, {:.3}) \
-                 m, yaw {:.1} deg in the new space)",
+                 m, yaw {:.1} deg in the new space; marker_carry 1)",
                 moved.x,
                 moved.y,
                 moved.z,

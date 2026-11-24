@@ -1,5 +1,6 @@
 use super::{GraphicsContext, MAX_IMMEDIATE_SIZE, staging::StagingRenderer};
 use crate::{
+    depth_burst::BurstReadbacks,
     depth_dump::{self, DEPTH_DUMP_TIMEOUT, DepthDumpFiles, DepthDumpRequest, DumpReadback},
     depth_mask::{self, DEPTH_UNIFORMS_SIZE, DepthRenderInput},
     overlay::{self, OVERLAY_UNIFORMS_SIZE, OverlayEye, OverlaySegment, SEGMENT_FLOAT_COUNT},
@@ -835,6 +836,9 @@ pub struct StreamRenderer {
     dump_request: Cell<Option<(DepthDumpRequest, Instant)>>,
     dump_pipeline: OnceCell<RenderPipeline>,
     dump_readback: RefCell<Option<DumpReadback>>,
+    // `debug.alvr.burst`: the depth of the next frame to read back (its token), and the readbacks
+    burst_request: Cell<Option<u32>>,
+    burst_readbacks: RefCell<BurstReadbacks>,
     // Outline overlay: segments of both eyes
     overlay_buffer: Buffer,
     overlay_bind_group: BindGroup,
@@ -1035,6 +1039,8 @@ impl StreamRenderer {
             dump_request: Cell::new(None),
             dump_pipeline: OnceCell::new(),
             dump_readback: RefCell::new(None),
+            burst_request: Cell::new(None),
+            burst_readbacks: RefCell::new(BurstReadbacks::default()),
             overlay_buffer,
             overlay_bind_group,
             target_view_resolution,
@@ -1124,6 +1130,29 @@ impl StreamRenderer {
         Some(result)
     }
 
+    /// `debug.alvr.burst`: read back both eyes of the depth image of the next `render` (16 bit values,
+    /// through the pass of the depth dump), answered by `poll_burst_depth` with `token`. A request that
+    /// is still waiting is answered with an error
+    pub fn request_burst_depth(&self, token: u32) {
+        if let Some(replaced) = self.burst_request.replace(Some(token)) {
+            self.burst_readbacks
+                .borrow_mut()
+                .fail(replaced, "replaced by the next request");
+        }
+    }
+
+    /// Call every frame: the burst readbacks that are done or failed, with their token. Values of the
+    /// left eye then of the right one, rows in the order of the depth texture
+    pub fn poll_burst_depth(&self) -> Vec<(u32, Result<Vec<u16>, String>)> {
+        let mut readbacks = self.burst_readbacks.borrow_mut();
+        if readbacks.is_waiting() {
+            // A failed poll leaves them waiting until they time out
+            self.context.device.poll(wgpu::PollType::Poll).ok();
+        }
+
+        readbacks.poll()
+    }
+
     /// Runtime foveation centers must already be encoder-aligned. `None` uses the negotiated centers.
     /// `overlay`: lines in stage space drawn over the stream, only with Passthrough = Depth (empty:
     /// nothing is uploaded or drawn). Returns the part of each view with the hands, if the color key is
@@ -1182,6 +1211,9 @@ impl StreamRenderer {
         let mut lighting_response = None;
         // `debug.alvr.key_dump`: the request, the depth frame and the JSON
         let mut dump = None;
+        // `debug.alvr.burst`: the depth of this frame is read back if there is one
+        let burst_token = self.burst_request.take();
+        let mut has_depth_frame = false;
         if let Some(config) = depth_config {
             let input = depth.copied().unwrap_or(DepthRenderInput {
                 frame: None,
@@ -1204,6 +1236,7 @@ impl StreamRenderer {
             };
             if let Some(frame) = &input.frame {
                 depth_bind_group = &self.depth_bind_groups[frame.swapchain_index as usize];
+                has_depth_frame = true;
             }
 
             if input.capture_playzone
@@ -1320,6 +1353,30 @@ impl StreamRenderer {
         let dump = dump.map(|(n, frame, json)| {
             self.encode_depth_dump(&mut encoder, depth_bind_group, n, &frame, json)
         });
+        let burst_encoded = match burst_token {
+            Some(token) if has_depth_frame => {
+                let device = &self.context.device;
+                let pipeline = self
+                    .dump_pipeline
+                    .get_or_init(|| create_depth_dump_pipeline(device, &self.pipelines));
+                self.burst_readbacks.borrow_mut().encode(
+                    device,
+                    &mut encoder,
+                    pipeline,
+                    depth_bind_group,
+                    &self.playzone_bind_groups,
+                    self.depth_resolution,
+                    token,
+                )
+            }
+            Some(token) => {
+                self.burst_readbacks
+                    .borrow_mut()
+                    .fail(token, "no depth image in the renderer");
+                false
+            }
+            None => false,
+        };
 
         let overlay_draws = (depth_config.is_some() && !overlay.is_empty())
             .then(|| self.write_overlay(&view_params, depth, overlay));
@@ -1368,14 +1425,24 @@ impl StreamRenderer {
 
         self.context.queue.submit(iter::once(encoder.finish()));
 
+        // wgpu doesn't look at the GL errors (of an unsupported copy), and the next `check_error` would
+        // abort
+        let gl_error = if dump.is_some() || burst_encoded {
+            self.context.take_gl_error()
+        } else {
+            None
+        };
         if let Some(dump) = dump {
-            // wgpu doesn't look at the GL errors (of an unsupported copy), and the next `check_error`
-            // would abort
-            let dump = match self.context.take_gl_error() {
+            let dump = match gl_error {
                 Some(error) => dump.fail(format!("GL error {error:#x}")),
                 None => dump.start(),
             };
             self.dump_readback.replace(Some(dump));
+        }
+        if burst_encoded {
+            self.burst_readbacks
+                .borrow_mut()
+                .submitted(gl_error.map(|error| format!("{error:#x}")).as_deref());
         }
 
         hand_rects

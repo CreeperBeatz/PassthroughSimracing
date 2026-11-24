@@ -199,9 +199,10 @@ goes with them (thigh, a held bottle, later the wheel rim under the hands) is th
 In the user's picture (the depth is the late truth, the key the instant signal) the other way round is
 worth a test: leave the hands in the depth map, so that a resting hand and everything next to it is
 simply shown by the depth (a resting hand moves 6 mm in 124 ms), and let the key and the hand tracking
-only correct a moving hand. `debug.alvr.hand_removal 0` does the first half live (not tested): expected
+only correct a moving hand. `debug.alvr.hand_removal 0` was meant to do the first half live: expected
 are legs and held things back next to the hands, and a hand that moves fast shown twice or with the room
-where it was 124 ms ago. If the first half holds on the headset, the second half is: depth texels that
+where it was 124 ms ago. Tested on 2026-11-24 with `hand_removal 0`: the runtime still removed tracked
+hands (captures 626 / 627, see the `hand_removal` row), so this switch cannot test the depth-first idea. If the first half holds on the headset, the second half is: depth texels that
 lie on the hand's capsules as they were at the capture time of the depth are decided by the hand logic at
 the display time, everything else by the depth; that takes the hand out tightly (about 1 cm) instead of
 by 3-15 cm.
@@ -788,7 +789,7 @@ Measured in the SteamVR home, 72 Hz, with color key on unless noted:
 | `key_layers` | 4 | 4: extra layers only with hands in view, 2: never, 5: always, 30 / 31: always three (no upper game layer / no keyed passthrough). Not tested |
 | `key_crop` | 1 | Lower game layer only around the hands. 0: full, 2: y origin at the top (if 1 is upside down). Not tested |
 | `key_hands` | 1 | 0: no hands in the GPU passes. Not tested |
-| `hand_removal` | 1 | 1: with the key on the runtime takes the hands out of the depth map, and an uneven 3-15 cm around them (measured). 0: the hands stay in the depth map, live; log line `hand removal from the depth map: on / off`. Not tested |
+| `hand_removal` | 1 | 1: with the key on the runtime takes the hands out of the depth map, and an uneven 3-15 cm around them (measured). 0: asks the runtime to keep the hands in the depth map, but it does NOT bring them back: measured on 2026-11-24 with the property at 0 (log `hand removal from the depth map: off` at 08:53:13.8), the runtime still removed tracked hands and filled tiles around them with far depth (captures 626 / 627, analysis in `logs/analysis-20261124-lap`). It stays as a probe. Log lines with the answer of the runtime, both ways: `hand removal from the depth map: on / off: the runtime answered <SUCCESS or ERROR_...>` on a change, `hand removal from the depth map at the start of the depth: on / off: the runtime answered ...` when the depth starts (until 2026-11-24 only a failed enable was logged, as an error, and the change line had no answer) |
 | `arm_shift` | 1 | 1: the depth around each arm is shifted by the motion of the wrist (with the key only up to the wrist, the hands are removed from the depth map; plain depth for a wrist that moved more than 25 cm or has no valid position), 0: plain depth. Also without the key. 1 runs on the headset, 0 not tested |
 | `key_leak` | 0 % | Narrower rim where the background around a hand looks like it, 0: off, 100: on. Needs `auto_key`. Not tested |
 | `key_leak_lo` / `key_leak_hi` | 5 / 20 % | Share of the colors around the hand that the key keeps: where the narrowing starts / is complete |
@@ -803,6 +804,7 @@ Measured in the SteamVR home, 72 Hz, with color key on unless noted:
 | `key_leak_probe` | 60 cm | Distance of the spheres of `key_leak_view 2` from the anchor of the map |
 | `key_lut_dump` | 0 | New value: write the learned LUT to `/sdcard/Android/data/alvr.client.dev/files/alvr_learned_key_<time>.lut` |
 | `key_dump` / `key_dump_burst` | 0 / 1 | New value `n` other than 0: write the next `key_dump_burst` (1..30) learning passes to the same folder, `alvr_dump_<n>_<00..>`, also without hands. Each line `dump <n>/<index>: <path>` on `ALVR_CAM`. The render thread also writes the depth of one frame, `alvr_dump_<n>_depth*` (below), also without `auto_key`; `depth dump <n>: ...` on `ALVR_CAM`. Works on the headset; 25 requests 3 s apart cost no visible frames |
+| `burst` / `burst_ms` | 0 / 3000 ms | New value `n` other than 0 (the value at the start of the app is not a request, a new `n` during a burst ends it early and starts the new one): record `burst_ms` (100 to 6000) of consecutive frames into `alvr_burst_<n>/` in the files folder (format below): every new depth frame (both eyes), one record per display frame, the camera images of the key learner (only with `auto_key` and the key on), and one normal depth dump `alvr_dump_<n>_depth*` at the start in the same folder. Kept in RAM, written by a thread after the burst. Lines `burst: <n> started ...`, `burst: <n> ended after ...: <d> depth frames (<r> read back, <s> not recorded), <k> display frames, <c> camera images, ...; writing <MB> MB to <folder>`, `burst: <n> written: <files> files, <MB> MB in <folder> (<ms> ms)`, failures `burst: <n> depth frame <i>: <error>` (the first 3; all of them are counted in `failed readbacks` of the `ended` line), `burst: <n> cut short: the stream stopped` (the stream ended during the burst: what was recorded is written all the same), `depth dump <old>: replaced by burst <n>` (a `key_dump` still waiting gave way to the dump of the burst) and `burst: <n> writing to <folder> failed: <error>`. Only with Passthrough = Depth. Not tested on the headset |
 | `key_wrist_len` | 0 mm | Keyed bridge from the wrist towards the forearm, 0: off, up to 300. Was 80 until 2026-11-23: the user sees it as a tail of the skeleton that "messes up where the arm continues"; the skeleton is for the hand up to the wrist only, the arm is not to be extended from it. The direction and the solid fill need `auto_key`, without it: opposite to the fingers, never solid |
 | `key_wrist_scale` / `key_wrist_conf` | 100 / 60 % | Its radius (of the wrist joint radius), how sure the camera must be of its direction for the solid fill |
 | `key_wrist_follow` | 30 % | Below this score of the best direction (share of points the key keeps, 0 over skin-like backgrounds) the bridge goes back to the default direction. 0: always the best one. Not tested |
@@ -873,6 +875,73 @@ with `z` the value in meters. To a mask texel of an eye: the direction from `eye
 `uv_to_world_dir` (the tangents of `view` in the orientation of its pose); to the camera image of the camera
 dumps: `pose` and `fx`, `fy`, `cx`, `cy` there, at its `image_ns`.
 
+**`burst` files** (`debug.alvr.burst <n>`, added 2026-11-24, compiles for Android and passes the unit
+tests, not run on the headset): consecutive frames for offline tests (stacking depth frames of static
+things, moving the arm's depth with the wrist between depth frames, the tiles the runtime fills around
+tracked hands, whether the camera sees motion before the depth). Everything is kept in RAM during the burst
+(about 0.4 MB per depth frame as 16 bit values, 0.23 MB per camera image; at most 240 depth, 720 display,
+200 camera records) and written by a thread after it. Folder `<files>/alvr_burst_<n>/` (`adb pull
+/sdcard/Android/data/alvr.client.dev/files/alvr_burst_<n>`); files of an older burst with the same `n` are
+overwritten by name, the index lists the ones of this burst. Reader: `tools/read_burst.py <folder>` (numpy
+arrays and a summary: counts, the interval of the depth frames, the age of the depth at display), tested
+on a synthetic burst written by the Rust unit test `depth_burst::tests::files_hold_the_depth_in_meters`
+(`ALVR_BURST_TEST_DIR=<folder> cargo test -p alvr_graphics depth_burst` keeps it).
+- `alvr_burst_<n>_depth_<iiii>_left.f32` / `_right`: depth frame `iiii` (from 0000), same layout as
+  `alvr_dump_<n>_depth_left.f32` (little-endian f32, meters from the plane of the depth camera, 0: no
+  data, row 0 is the bottom of the depth view with `flip_y` false), converted from the exact 16 bit values
+  with the `near` / `far` of that frame. Read back like the depth dump (the pass of `depth_dump.wgsl`).
+- `alvr_burst_<n>_camera_<iiii>.rgb`: a camera image of the key learner as in the `key_dump` files
+  (`width` x `height` x 3 bytes).
+- `alvr_dump_<n>_depth*`: one normal depth dump (above) from the first frame with a depth image after
+  the start, with the mask and the focus area (the burst itself does not keep the mask: it can be rebuilt
+  from the records).
+- `alvr_burst_<n>.json`, the index: `format` "alvr_burst", `version` 1, `n`, `duration_ms` (asked),
+  `start_ns` / `end_ns` (XrTime, CLOCK_MONOTONIC on Quest like every time here), `depth` (`width`,
+  `height`, `flip_y`), `camera` (`width`, `height`, null: no image), `counts` (`depth`, `depth_read`,
+  `depth_skipped`: new depth frames not recorded because the limit of 240 was reached (a new depth frame
+  that finds 6 readbacks on their way is recorded, with `error` "too many readbacks on their way", and
+  counted in `failed readbacks` of the log; `read_burst.py` lists it under "readback errors"), `display`, `camera`, `region`), `dump` (the JSON of the depth dump that was asked for; the line
+  `depth dump <n>: ...` says whether it was written), and `records`:
+  every record in time order of `t_ns` (when the app got it; at equal times region, depth, display,
+  camera). Each record has `kind` and `index` (from 0 per kind):
+  - `depth`: a new depth frame (a new capture time, swapchain index or depth view pose; the first one of a
+    burst may have come before the start: its `now_ns` is the start and its `display_ns` that of the first
+    display frame, so `read_burst.py` leaves it out of the times when the app got the frames). `capture_ns` (as the runtime
+    reports it, null: not reported), `display_ns` (predicted display time of the frame it came with
+    first, passed to the acquire), `now_ns` (when the app got it, = `t_ns`), `swapchain_index`, `near`,
+    `far` (null: infinite), `eyes` (left, right: `pose`, `tangents`, `world_to_view`, `view_to_world`
+    like `depth_camera` of the dump; column major), `files` (left, right; null: not read back), `error`
+    (why not, else null).
+  - `display`: one display frame (72 Hz). `display_ns` (predicted), `now_ns` (when it was rendered),
+    `depth` (index of the depth frame the mask used, null: none, or a frame past the depth limit),
+    `region` (index of the region record
+    that applies), `views` (the eyes located at the display time: `pose`, `tangents`; the mask casts its
+    rays from their positions), `stream_views` (of the streamed image: the directions of the mask pixels),
+    `eye_positions`, `hand_ns` (when the hands were located: the display time minus `key_delay`), `hands`
+    (left, right, null: not located: `joints` 26 x [x, y, z, radius], `tracked` 26 x POSITION_TRACKED,
+    `velocities` 26 x [x, y, z] or null without LINEAR_VALID; joint radii as reported, not scaled by
+    `key_scale`; located by a second lookup at the same time and space as the key's, later in the frame,
+    so the runtime may answer slightly differently), `capsules` (left, right, null: no hand in the mask or no key: `capsules` 28 x start xyz r,
+    end xyz r exactly as the mask used them, scaled, after `marker_hands`; `rim`), `arms` (left, right, null:
+    plain depth: `wrist`, `direction`, `displacement`). Stage space, meters.
+  - `camera`: one pass of the key learner (about every 60 ms, not every camera frame: the learner takes
+    the newest image when it runs). `t_ns` = `now_ns` (CLOCK_MONOTONIC when the pass started),
+    `image_ns`, `width`, `height`, `fx`, `fy`, `cx`, `cy`, `pose` and `head` (as in the `key_dump` JSON:
+    stage space at the time of the image, the camera looks at +z with +y down), `file`, `hands` (like
+    `display`, located at the time of the image).
+  - `region`: the region the mask uses, at the start and each time it changes: `region` as in the depth
+    dump JSON.
+
+What a burst costs (in principle, not measured): per new depth frame (about 30 Hz) two passes of 320 x 320
+texels into two kept RGBA8 textures, an 800 KB copy into one of up to 6 reused buffers, and on the render
+thread, once it is mapped (a frame or two later), 800 KB read from mapped memory into 400 KB of 16 bit
+values; per display frame the hand joints located once more (both hands, at the time of the key), the region
+JSON built and compared, and a record of a few KB. The camera images are converted to RGB on the thread of
+the learner (its pass is that much later). The conversion to meters and every file are done by the writer
+thread after the burst (a 3 s burst: about 90 depth frames, 74 MB of depth files). The first readback of
+an app run compiles the pipeline of the depth dump (a frame or two, as for `key_dump`). The records are in
+stage space: a STAGE change during a burst moves their coordinates (it is in the log).
+
 **Testing the leak map on the headset** (`adb logcat -s ALVR_CAM`, `auto_key 1`, debug view "Tint mask"):
 - [ ] `key_leak_map 0`: same look and same App / TW times as before; no `leak map` lines in the log.
 - [ ] Hands in the lap, `key_leak_map 100`, wait 5 s, then `key_leak_dump 1`, `2`, ...: `#` where wood
@@ -887,9 +956,10 @@ dumps: `pose` and `fx`, `fy`, `cx`, `cy` there, at its `image_ns`.
 
 **QR code markers and the box placed from them** (the tracker, the size gate and the box ran on the
 headset, see "First run on the headset" and "Second run on the headset" below; the measured baseline of
-the pose, the box carried through a stage change, the hands limited by the box, the changes of the
-size gate of 2026-11-24 and the outline of the anchor and the box are not tested: they compile and pass
-the unit tests only).
+the pose, the box kept or carried through a stage change (`marker_carry`), the hands limited by the box,
+the changes of the size gate of 2026-11-24 and the outline of the anchor and the box are not tested: they
+compile and pass the unit tests only. Carrying the box by the pose of a STAGE event was seen wrong on the
+headset on 2026-11-24, see `marker_carry`).
 Step one of way B: does the runtime give this
 app QR code poses (`XR_EXT_spatial_entity` and `XR_EXT_spatial_marker_tracking`), how good are they, and
 the box region placed from one. The manifest now declares `com.oculus.permission.USE_ANCHOR_API` and
@@ -958,7 +1028,8 @@ playzone, my hands don't" (observed; the keyed hands ignored the region, see bel
 What changed after it (2026-11-24, not tested: everything in this paragraph compiles and passes the unit
 tests only): the pose is a measured baseline (a robust estimate over up to 60 s, frozen once measured)
 instead of a 1 s average (a move away from a measured pose needs 5 poses over 3 s, and the same code
-found again under a new entity id keeps it); the box is carried through a STAGE change with a valid pose; the keyed hands
+found again under a new entity id keeps it); the box is carried through a STAGE change with a valid pose
+(since the afternoon of 2026-11-24 only with `marker_carry 1`, the default keeps its coordinates); the keyed hands
 show only inside a marker box (`marker_hands`); a given size below 10 mm is malformed, the tolerance of
 the size gate is logged and shown in the summary, and a resized code is learned again after 6 sizes.
 
@@ -991,10 +1062,11 @@ shows the pose as last reported, with ` (size not trusted)` when it is not trust
 | `marker_scan_poses` | 20 | Distinct poses that measure the pose of the code, 3 to 240; they must also span at least 8 s. A change is logged and applies to the next pose |
 | `marker_scan` | unset | Another positive value measures the pose again from the next pose the runtime reports after the request (the box stays where it is until then; with the code hidden, until the code is seen again). The value at the start of the app is not a request (like `playzone`) |
 | `marker_hands` | 1 | 1: with the color key and a marker box, the keyed hands show only inside the box, faded over 2 cm on each side of its surface. 0: everywhere, as before. The region of the settings (Distance, Cockpit volume) never limits the hands. A change is logged and applies at once |
+| `marker_carry` | 0 | What a STAGE `ReferenceSpaceChangePending` with a valid pose does to the box, the poses of its estimate, the saved anchor and the frozen editor pose. 0: their coordinates are kept, the event and its pose are logged (on 2026-11-24 the code was seen at the same STAGE coordinates after such an event, the carried box was 83 cm off, see the pose paragraph below). 1: carried into the new space by the pose, as before. An event without a valid pose drops them either way. Read when the event comes. Not tested on the headset |
 | `marker_box_x` / `_y` / `_z` | 0 / 150 / 0 mm | Center of the box from the code: to the right of the heading, up, along the heading. A flat code with its top away from you: +x is your right, +z away from you. A standing code facing you: +x is your LEFT, +z comes TOWARDS you (moving a code from flat to standing needs new values; the defaults fit a flat code, for a standing one start from z 400, y -150, see Testing) |
 | `marker_box_w` / `_h` / `_d` | 1200 / 900 / 1000 mm | Width (across the heading), height, depth (along the heading) |
 | `marker_box_yaw` | 0 deg | Added to the heading, counter-clockwise from above; turns the box about the code |
-| `area_show` | unset | Outline of the code and the box over the stream (see "Outline of the anchor and the box"). Unset: for 8 s each time the pose of the code becomes measured, each time the box is carried over a STAGE change and each time a box is placed after there was none. 1 (any number but 0): always while there is a box. 0: never. Only with a marker box and Passthrough = Depth. Polled, applies at once |
+| `area_show` | unset | Outline of the code and the box over the stream (see "Outline of the anchor and the box"). Unset: for 8 s each time the pose of the code becomes measured, each time the box is carried over a STAGE change (`marker_carry 1` only) and each time a box is placed after there was none. 1 (any number but 0): always while there is a box. 0: never. Only with a marker box and Passthrough = Depth. Polled, applies at once |
 | `area_line` | 12 | Width of the lines of the outline on screen, hundredths of a degree (12 = 0.12 deg, about 2 px at the center of a view about 2000 px wide), 2 to 100. Polled |
 | `area_test` | unset | A test layout of the play area (see "Play area: boxes and domes") made from the box of the `marker_box_*` properties. 1: that box with a dome on its top (25 cm) and a second box on its +x side (40 cm beyond it, half as high, same floor). 8: that box cut into 2 x 2 x 2 boxes with domes on their 24 outer sides (15 cm), the worst case for the GPU. Unset, 0 or another number: the one box, as before. A change is logged. Polled |
 | `area_dashed` | unset | 1: the play area in the outline is dashed (4 cm period, 60 % drawn, fixed in the room). It is dashed anyway while it is placed from the anchor saved in the layout file, before the code is seen in this run (the editor). Polled |
@@ -1035,13 +1107,28 @@ stopped and started again); the same code found again under a new entity id (`lo
 `new ...` line, or a new tracker) keeps it too, a measured pose included: the move rule decides whether
 its poses differ. Only `marker_box 0`, `marker 0` or a new `marker_id` forget it. A change of
 the STAGE space (`ReferenceSpaceChangePending` for STAGE; events for LOCAL or VIEW are ignored here) with
-a valid pose carries the box into the new space at the change time of the event (not tested): the kept
-pose and the poses of the estimate become p_new = inverse(pose_in_previous_space) * p_old, the heading
-changes by minus the yaw of that pose, a measured estimate stays measured (`marker box: stage space
-changed, box carried over (...)`). If the pose in the new space disagrees, five poses there over 3 s are
-a move and measure again. Without a valid pose the box is kept up to the change time and dropped from then
-until the code is seen again, as before. The tracker itself still drops its poses at a STAGE change until
-the codes are seen again (`marker: stage space changed, ...`); the box does not need them. The box applies
+a valid pose now KEEPS the coordinates of the box (`debug.alvr.marker_carry` 0, the default since
+2026-11-24, not tested on the headset yet): the kept pose, the poses of the estimate, the anchor of the
+layout file and the pose frozen by the editor stay as they are, and at the change time the event is
+logged with the pose it reported (`marker box: stage space changed, coordinates kept (marker_carry 0; the
+reported pose (x, y, z) m, yaw d deg is not applied)`, and `area editor: stage space changed, coordinates
+of the saved anchor and the frozen pose kept (...)` while the editor has one). The reason, measured on
+2026-11-24 (log `alvr-20261124-0839-bd0dc0f7.log` around 08:46:01): a STAGE event reported the pose
+(-0.130, 0.007, 0.167) m, yaw 39.4 deg in the previous space; the box was carried by it (`box carried over
+(moved by (0.256, -0.007, -0.144) m, yaw -39.4 deg ...)`), but the code measured 4 s later sat at the SAME
+STAGE coordinates as before the event (and as the evening before, across sleep and reinstall), so the box
+had to jump back 83 cm. Ordinary recenters send only LOCAL / LOCAL_FLOOR events and are not affected.
+`marker_carry 1` (read when the event comes) is the old behaviour: the kept pose and the poses of the
+estimate become p_new = inverse(pose_in_previous_space) * p_old, the heading changes by minus the yaw of
+that pose, a measured estimate stays measured (`marker box: stage space changed, box carried over (moved
+by ...; marker_carry 1)`); the saved anchor and the frozen pose are carried the same way. Each STAGE
+event with a valid pose also logs `STAGE change with a valid pose: the box keeps its coordinates
+(marker_carry 0)` (or `is carried by it (marker_carry 1)`) right after the `ReferenceSpaceChangePending`
+line. If the pose in the new space disagrees, five poses there over 3 s are a move and measure again.
+Without a valid pose the box is kept up to the change time and dropped from then until the code is seen
+again, as before, whatever `marker_carry` says. The tracker itself still drops its poses at a STAGE change
+until the codes are seen again (`marker: stage space changed, ...`); the box does not need them. A kept
+box is not counted as carried, so the outline is not shown for it (`area_show` unset). The box applies
 with Passthrough = Depth only, and live; the settings stay as they are.
 
 With the color key on, the keyed hand zones (the capsules around the hand joints, drawn by
@@ -1166,8 +1253,9 @@ first line, another version, a box line that does not read or no box is an error
 gesture, glyphs, undo, file name and text; unit tests). Only with a marker box and Passthrough = Depth.
 - Modes: hidden (racing; only the gesture is watched, the hands are located every frame at the display
   time, in STAGE), shown (the outline for 3 s after editing), editing (game dimmed by `area_edit_dim`,
-  handles drawn, the mask follows every drag at once, the pose of the code frozen and carried over
-  STAGE changes at their change time like the box of the marker region; the hands are not limited to
+  handles drawn, the mask follows every drag at once, the pose of the code frozen and, over STAGE
+  changes at their change time, kept or carried (`marker_carry`) like the box of the marker region; the
+  hands are not limited to
   the area while editing, since the handles are on and outside it).
 - Start and end: the two-hand gesture, both hands pinched with both palms turned away from the eyes
   (cos > 0.5 between the normal out of the palm, -Y of the palm joint, and eyes-to-palm), the two
@@ -1223,8 +1311,9 @@ gesture, glyphs, undo, file name and text; unit tests). Only with a marker box a
   run. `tools/install_apk.sh` copies `files/areas/area-*.txt` there with `adb shell` before it
   uninstalls (by hand: `adb pull` before, `adb push` to `/data/local/tmp/alvr-areas/` after).
 - Restore: before the code is seen in this run the area is placed from the anchor of the file (STAGE
-  coordinates stayed the same across sleep and reinstall on 2026-11-24; a STAGE change carries it at its
-  change time, one without a valid pose drops it until the code is seen); once the code is seen, from the
+  coordinates stayed the same across sleep and reinstall on 2026-11-24; a STAGE change with a valid pose
+  keeps its coordinates, or carries it at its change time with `marker_carry 1`; one without a valid pose
+  drops it until the code is seen); once the code is seen, from the
   code. The outline is dashed while placed from the saved anchor (the code outline is amber while the
   pose is being measured). Restoring before the code is seen needs `marker_box 1`; without `marker_id`
   the file is the newest one (its payload), so after a reboot only `marker_box 1` must be set again.
@@ -1489,11 +1578,14 @@ Log lines (`ALVR_CAM`, all start with `marker`):
   `area_show 0`).
 - `ReferenceSpaceChangePending type: <type>, change time <ns> ns, pose valid: <bool>, pose in previous
   space (x, y, z) m, yaw <deg> deg` (now in `ALVR_CAM`, for every reference space type; only STAGE ones
-  give `marker: stage space changed, poses dropped until the markers are seen again` and, at the change
-  time while a box is kept, `marker box: stage space changed, box carried over (moved by (x, y, z) m, yaw
-  <deg> deg in the new space)` with a valid pose (the change of the coordinates of the box centre and of
-  its heading, the box itself stays in the room) or `marker box: stage space changed, waiting for the
-  marker` without one).
+  give `marker: stage space changed, poses dropped until the markers are seen again`; with a valid pose
+  also `STAGE change with a valid pose: the box keeps its coordinates (marker_carry 0)` or `... is carried
+  by it (marker_carry 1)`; and, at the change time while a box is kept, with a valid pose `marker box:
+  stage space changed, coordinates kept (marker_carry 0; the reported pose (x, y, z) m, yaw <deg> deg is
+  not applied)` or with `marker_carry 1` `marker box: stage space changed, box carried over (moved by (x,
+  y, z) m, yaw <deg> deg in the new space; marker_carry 1)` (the change of the coordinates of the box
+  centre and of its heading, the box itself should stay in the room), or `marker box: stage space
+  changed, waiting for the marker` without a valid pose).
 
 Testing (`adb logcat -s ALVR_CAM` running):
 - [ ] The printed codes `RIG1`, `RIG2`, `RIG3` (black edge 144.2, 95.6, 67.4 mm; the payload is case
@@ -1561,18 +1653,20 @@ Testing (`adb logcat -s ALVR_CAM` running):
       m above the code with `_h` 900, for the wheel and the hands). Compare the `marker box: placed at
       ...` centre with the `marker #.. at ...` position in the same line to check the offset.
 - [ ] Recenter with the code hidden after `measured:`: note the `ReferenceSpaceChangePending type:`
-      lines; a STAGE one with `pose valid: true` must give `marker box: stage space changed, box carried
-      over (...)` and the box must stay at the same place in the room (judge it against the rig). With a
-      STAGE pose of 0 and yaw 0 (as in the second run) the box doesn't move at all. Then show the code
-      again: no `the marker moved, measuring its pose again` line (the new poses fit the carried
-      estimate). A `pose valid: false`
-      change still drops the box until the code is seen again.
+      lines (ordinary recenters send only LOCAL / LOCAL_FLOOR: nothing happens to the box). A STAGE one
+      with `pose valid: true` must give `marker box: stage space changed, coordinates kept (marker_carry
+      0; ...)` and the box must stay at the same place in the room (judge it against the rig). Then show
+      the code again: no `the marker moved, measuring its pose again` line (the new poses fit the kept
+      estimate). If the box is off after such an event and the code shows it at new coordinates, try
+      `marker_carry 1` at the next one (the old carrying, `box carried over (...; marker_carry 1)`). A
+      `pose valid: false` change still drops the box until the code is seen again.
 - [ ] Outline (`area_show` unset, box on, code shown): `area: outline shown (placed)`, amber square on
       the code, then after `marker box: measured:` `area: outline shown (measured)`, green, and `area:
       outline hidden` 8 s later. `setprop debug.alvr.area_show 1`: the square on the real code and
       turned like it; the white lines along the border of the passthrough; move the head 10 cm sideways:
       the lines stay on the desk; both eyes fuse them. Note fps and GPU load (VrApi) with `area_show 1`
-      and `0`. Recenter: `area: outline shown (carried over)` and the outline stays on the rig.
+      and `0`. Recenter: the outline stays on the rig (`area: outline shown (carried over)` only after
+      a STAGE event with `marker_carry 1`; a kept box shows no outline for it).
 - [ ] Play area (box on, `area_show 1`): `setprop debug.alvr.area_test 1`: `play area: test layout 1`
       and the layout line; a white dome over the top of the box and a lower box on its +x side; the real
       room shows inside both and under the dome, the lines on the border of the hole. `area_dashed 1`:

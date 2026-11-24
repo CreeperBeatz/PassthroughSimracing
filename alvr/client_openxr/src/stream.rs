@@ -1,6 +1,7 @@
 #[cfg(target_os = "android")]
 use crate::auto_color_key::AutoColorKey;
 use crate::{
+    burst::{self, BurstRecorder},
     extra_extensions::EnvironmentDepthMETA,
     graphics::{self, ProjectionLayerAlphaConfig, ProjectionLayerBuilder},
     interaction::{self, InteractionContext, InteractionSourcesConfig},
@@ -20,10 +21,10 @@ use alvr_common::{
     parking_lot::RwLock,
 };
 use alvr_graphics::{
-    ArmMotion, BridgeChoice, ColorKeyInput, DepthDumpFiles, DepthDumpRequest, DepthFrame,
-    DepthRenderInput, EditorHand, EditorInput, GraphicsContext, HAND_SEGMENTS, HandShape,
-    HandZones, LeakGains, OverlaySegment, PlacedArea, SEGMENT_JOINTS, StreamRenderer,
-    StreamViewParams, WristBridge,
+    ArmMotion, BridgeChoice, BurstHand, ColorKeyInput, DepthDumpFiles, DepthDumpRequest,
+    DepthFrame, DepthRenderInput, DumpJoint, EditorHand, EditorInput, GraphicsContext,
+    HAND_SEGMENTS, HandShape, HandZones, LeakGains, OverlaySegment, PlacedArea, SEGMENT_JOINTS,
+    StreamRenderer, StreamViewParams, WristBridge,
 };
 use alvr_packets::{ClientStreamConfig, RealTimeConfig, TrackingData};
 use alvr_session::{
@@ -34,7 +35,9 @@ use alvr_system_info::Platform;
 use openxr as xr;
 use std::{
     cell::Cell,
-    fs, ptr,
+    fs,
+    path::PathBuf,
+    ptr,
     rc::Rc,
     sync::Arc,
     thread::{self, JoinHandle},
@@ -172,6 +175,9 @@ pub struct StreamContext {
     // `debug.alvr.key_dump`: last value, a new one waits for a depth image (since when)
     last_dump_value: Option<i64>,
     pending_dump: Option<(i64, Instant)>,
+    // `debug.alvr.burst`, and the n of the depth dump it asked for (written into its folder)
+    burst: BurstRecorder,
+    burst_dump: Option<i64>,
     // When the depth image of this frame was captured
     depth_capture_time: Option<xr::Time>,
     // Bounding spheres of the hands with a pose (xyz, radius), before `key_hands` and `key_leak_view`
@@ -360,6 +366,8 @@ impl StreamContext {
             last_property_poll: Instant::now(),
             last_dump_value: None,
             pending_dump: None,
+            burst: BurstRecorder::new(),
+            burst_dump: None,
             depth_capture_time: None,
             hand_bounds: Cell::new([None; 2]),
             last_hand_rects: [None; 2],
@@ -393,14 +401,15 @@ impl StreamContext {
 
     pub fn set_color_key(&mut self, params: Option<ColorKeyParams>) {
         // The depth map shows the hands where they were a while ago. With the color key they are not
-        // needed there (`debug.alvr.hand_removal 0` keeps them, live)
+        // needed there. `debug.alvr.hand_removal 0` asks the runtime to keep them, but on 2026-11-24 it
+        // still removed them (captures 626 / 627): a probe, the answer of the runtime is logged
         let removal = params.is_some_and(|params| params.hand_removal);
         if self.color_key.is_some_and(|params| params.hand_removal) != removal
             && let Some(depth) = &self.environment_depth
         {
-            depth.set_hand_removal(removal);
+            let answer = depth.set_hand_removal(removal);
             crate::stream_log(&format!(
-                "hand removal from the depth map: {}",
+                "hand removal from the depth map: {}: the runtime answered {answer:?}",
                 if removal { "on" } else { "off" }
             ));
         }
@@ -414,6 +423,7 @@ impl StreamContext {
                 Arc::clone(&self.stage_reference_space),
                 Arc::clone(&self.view_reference_space),
                 Arc::clone(&self.interaction_context),
+                self.burst.camera_sink(),
             ));
         }
     }
@@ -606,10 +616,109 @@ impl StreamContext {
         self.playzone_auto = debug_property("debug.alvr.playzone_auto").unwrap_or(1) > 0;
 
         let dump = debug_property("debug.alvr.key_dump").unwrap_or(0);
-        if self.last_dump_value.is_some_and(|last| last != dump) && dump != 0 {
-            self.pending_dump = Some((dump, Instant::now()));
+        if self.last_dump_value.is_some_and(|last| last != dump)
+            && dump != 0
+            && let Some((replaced, _)) = self.pending_dump.replace((dump, Instant::now()))
+        {
+            crate::stream_log(&format!("depth dump {replaced}: replaced by {dump}"));
         }
         self.last_dump_value = Some(dump);
+
+        // A new burst also asks for a depth dump, written into its folder
+        let depth_size = self
+            .environment_depth
+            .as_ref()
+            .map_or(UVec2::ZERO, |depth| depth.resolution());
+        let flip_y = alvr_graphics::depth_passthrough_config(self.config.passthrough.as_ref())
+            .is_some_and(|config| config.flip_depth_y);
+        if let Some(n) = self
+            .burst
+            .poll(runtime_now_ns(&self.xr_session), depth_size, flip_y)
+        {
+            if let Some((replaced, _)) = self.pending_dump.replace((n, Instant::now())) {
+                crate::stream_log(&format!("depth dump {replaced}: replaced by burst {n}"));
+            }
+            self.burst_dump = Some(n);
+            self.burst.set_dump(format!("alvr_dump_{n}_depth.json"));
+        }
+    }
+
+    // `debug.alvr.burst`: the joints of both hands at `time` (stage space), as the key locates them
+    fn burst_hands(&self, time: xr::Time) -> [Option<BurstHand>; 2] {
+        let int_ctx = self.interaction_context.read();
+
+        [0, 1].map(|i| {
+            let tracker = int_ctx.hands_interaction[i].skeleton_tracker.as_ref()?;
+            let (joints, velocities) = self
+                .stage_reference_space
+                .relate_hand_joints(tracker, time)
+                .ok()
+                .flatten()?;
+
+            Some(std::array::from_fn(|j| DumpJoint {
+                position: crate::from_xr_vec3(joints[j].pose.position),
+                radius: joints[j].radius,
+                tracked: joints[j]
+                    .location_flags
+                    .contains(xr::SpaceLocationFlags::POSITION_TRACKED),
+                velocity: crate::from_xr_vec3(velocities[j].linear_velocity),
+                velocity_valid: velocities[j]
+                    .velocity_flags
+                    .contains(xr::SpaceVelocityFlags::LINEAR_VALID),
+            }))
+        })
+    }
+
+    // `debug.alvr.burst`: the depth frame (if new: its readback is asked for) and the display frame
+    fn record_burst_frame(
+        &mut self,
+        display_time: xr::Time,
+        depth_input: &DepthRenderInput,
+        headset_views: &[xr::View],
+        stream_views: [ViewParams; 2],
+    ) {
+        let now_ns = runtime_now_ns(&self.xr_session);
+        if let Some(frame) = &depth_input.frame
+            && let Some(token) = self.burst.depth_frame(
+                frame,
+                self.depth_capture_time.map(|time| time.as_nanos()),
+                display_time.as_nanos(),
+                now_ns,
+            )
+        {
+            self.renderer.request_burst_depth(token);
+        }
+
+        let delay = self
+            .color_key
+            .map_or(0, |params| params.passthrough_delay_ms * 1_000_000);
+        let hand_ns = display_time.as_nanos() - delay;
+        let hands = self.burst_hands(xr::Time::from_nanos(hand_ns));
+        let region = alvr_graphics::depth_passthrough_config(self.config.passthrough.as_ref())
+            .map_or("null".into(), |config| {
+                alvr_graphics::region_json(depth_input.region_override.as_ref(), config)
+            });
+        let views = [0, 1].map(|i| {
+            headset_views
+                .get(i)
+                .map_or(ViewParams::DUMMY, |view| ViewParams {
+                    pose: crate::from_xr_pose(view.pose),
+                    fov: crate::from_xr_fov(view.fov),
+                })
+        });
+        self.burst.display_frame(burst::DisplayInput {
+            display_ns: display_time.as_nanos(),
+            now_ns,
+            views,
+            stream_views,
+            eye_positions: depth_input.eye_positions,
+            has_depth: depth_input.frame.is_some(),
+            hand_ns,
+            hands,
+            color_key: depth_input.color_key.as_ref(),
+            arms: depth_input.arms,
+            region,
+        });
     }
 
     // How the arms moved since the depth image was captured. None if `debug.alvr.arm_shift` is 0
@@ -1406,6 +1515,17 @@ impl StreamContext {
             }
         }
 
+        if self.burst.is_recording()
+            && let Some(input) = &depth_input
+        {
+            self.record_burst_frame(
+                xr_vsync_time,
+                input,
+                &current_headset_views,
+                input_view_params,
+            );
+        }
+
         self.renderer.render(
             buffer_ptr,
             [
@@ -1429,7 +1549,21 @@ impl StreamContext {
         );
 
         if let Some((n, result)) = self.renderer.poll_depth_dump() {
-            write_depth_dump(n, result);
+            // The dump of the start of a burst goes into its folder
+            let dir = if self.burst_dump == Some(n) {
+                self.burst_dump = None;
+                burst::burst_dir(n)
+            } else {
+                PathBuf::from(passthrough::FILES_DIR)
+            };
+            write_depth_dump(n, result, dir);
+        }
+        let burst_images = self.renderer.poll_burst_depth();
+        if !burst_images.is_empty() {
+            self.burst.depth_images(burst_images);
+        }
+        if self.burst.is_active() {
+            self.burst.update(runtime_now_ns(&self.xr_session));
         }
 
         self.swapchains[0].release_image().unwrap();
@@ -1525,7 +1659,7 @@ impl StreamContext {
 }
 
 // Not on the render thread: a few MB
-fn write_depth_dump(n: i64, result: Result<DepthDumpFiles, String>) {
+fn write_depth_dump(n: i64, result: Result<DepthDumpFiles, String>, dir: PathBuf) {
     let dump = match result {
         Ok(dump) => dump,
         Err(e) => {
@@ -1535,9 +1669,9 @@ fn write_depth_dump(n: i64, result: Result<DepthDumpFiles, String>) {
     };
     thread::spawn(move || {
         let files = dump.into_files();
-        let result = fs::create_dir_all(passthrough::FILES_DIR).and_then(|()| {
+        let result = fs::create_dir_all(&dir).and_then(|()| {
             for (name, data) in &files {
-                fs::write(format!("{}/{name}", passthrough::FILES_DIR), data)?;
+                fs::write(dir.join(name), data)?;
             }
             Ok(())
         });
@@ -1545,11 +1679,16 @@ fn write_depth_dump(n: i64, result: Result<DepthDumpFiles, String>) {
             Ok(()) => crate::stream_log(&format!(
                 "depth dump {n}: {} files in {}",
                 files.len(),
-                passthrough::FILES_DIR,
+                dir.display(),
             )),
             Err(e) => crate::stream_log(&format!("depth dump {n}: {e}")),
         }
     });
+}
+
+// XrTime now (CLOCK_MONOTONIC on Quest), 0 if the runtime doesn't say
+fn runtime_now_ns(session: &xr::Session<xr::OpenGlEs>) -> i64 {
+    crate::xr_runtime_now(session.instance()).map_or(0, |time| time.as_nanos())
 }
 
 impl Drop for StreamContext {

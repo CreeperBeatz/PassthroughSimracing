@@ -3,6 +3,7 @@
 //! to the world and to the eyes. The file format is in the knowledge base.
 
 use crate::{
+    PlacedArea,
     depth_mask::{self, DepthFrame, DepthRenderInput},
     key_dump::{array, number, numbers, object, pose, string},
     stream,
@@ -345,7 +346,8 @@ pub(crate) struct DumpFrame<'a> {
     pub focus_size: UVec2,
 }
 
-fn camera(view: &ViewParams) -> String {
+/// A depth camera: `pose`, `tangents` (left, right, down, up), `world_to_view`, `view_to_world`
+pub(crate) fn camera(view: &ViewParams) -> String {
     let view_to_world = depth_mask::pose_to_mat4(view.pose);
     object([
         ("pose", pose(&view.pose)),
@@ -372,65 +374,72 @@ fn size(size: UVec2) -> [(&'static str, String); 2] {
     ]
 }
 
+/// The region the mask uses as JSON (`region` of the depth dump, also in the burst): the play area
+/// placed from a marker replaces the one of the settings. center, yaw_deg, size and volume_to_world are
+/// of its first box, "boxes" has all of them in the area frame
+pub fn region_json(
+    region_override: Option<&PlacedArea>,
+    config: &DepthPassthroughConfig,
+) -> String {
+    let mut region = match (region_override, &config.region) {
+        (Some(placed), _) => {
+            let volume = placed.box_region(0);
+            vec![
+                ("mode", string("volume")),
+                ("source", string("marker")),
+                ("center", numbers(&volume.center().to_array())),
+                ("yaw_deg", number(volume.yaw().to_degrees())),
+                ("size", numbers(&volume.size().to_array())),
+                (
+                    "volume_to_world",
+                    numbers(&volume.volume_to_world.to_cols_array()),
+                ),
+                (
+                    "area_to_world",
+                    numbers(&placed.area_to_world.to_cols_array()),
+                ),
+                (
+                    "boxes",
+                    array(placed.area.boxes().iter().map(|area_box| {
+                        object([
+                            ("center", numbers(&area_box.center.to_array())),
+                            ("half", numbers(&area_box.half.to_array())),
+                            (
+                                "domes",
+                                numbers(&crate::Side::ALL.map(|side| area_box.dome_height(side))),
+                            ),
+                        ])
+                    })),
+                ),
+            ]
+        }
+        (None, DepthMaskRegion::Distance { max_distance }) => vec![
+            ("mode", string("distance")),
+            ("max_distance", number(*max_distance)),
+        ],
+        (None, DepthMaskRegion::Volume(volume)) => vec![
+            ("mode", string("volume")),
+            (
+                "center",
+                numbers(&[volume.center_x, volume.center_y, volume.center_z]),
+            ),
+            ("yaw_deg", number(volume.yaw_deg)),
+            (
+                "size",
+                numbers(&[volume.width, volume.height, volume.depth]),
+            ),
+        ],
+    };
+    region.push(("feathering", number(config.edge_feathering)));
+
+    object(region)
+}
+
 impl DumpFrame<'_> {
     pub fn to_json(&self) -> String {
         let n = self.request.n;
         let config = self.config;
-        // The region the mask used: the play area placed from a marker replaces the one of the
-        // settings. center, yaw_deg, size and volume_to_world are of its first box, "boxes" has all of
-        // them in the area frame
-        let mut region = match (&self.input.region_override, &config.region) {
-            (Some(placed), _) => {
-                let volume = placed.box_region(0);
-                vec![
-                    ("mode", string("volume")),
-                    ("source", string("marker")),
-                    ("center", numbers(&volume.center().to_array())),
-                    ("yaw_deg", number(volume.yaw().to_degrees())),
-                    ("size", numbers(&volume.size().to_array())),
-                    (
-                        "volume_to_world",
-                        numbers(&volume.volume_to_world.to_cols_array()),
-                    ),
-                    (
-                        "area_to_world",
-                        numbers(&placed.area_to_world.to_cols_array()),
-                    ),
-                    (
-                        "boxes",
-                        array(placed.area.boxes().iter().map(|area_box| {
-                            object([
-                                ("center", numbers(&area_box.center.to_array())),
-                                ("half", numbers(&area_box.half.to_array())),
-                                (
-                                    "domes",
-                                    numbers(
-                                        &crate::Side::ALL.map(|side| area_box.dome_height(side)),
-                                    ),
-                                ),
-                            ])
-                        })),
-                    ),
-                ]
-            }
-            (None, DepthMaskRegion::Distance { max_distance }) => vec![
-                ("mode", string("distance")),
-                ("max_distance", number(*max_distance)),
-            ],
-            (None, DepthMaskRegion::Volume(volume)) => vec![
-                ("mode", string("volume")),
-                (
-                    "center",
-                    numbers(&[volume.center_x, volume.center_y, volume.center_z]),
-                ),
-                ("yaw_deg", number(volume.yaw_deg)),
-                (
-                    "size",
-                    numbers(&[volume.width, volume.height, volume.depth]),
-                ),
-            ],
-        };
-        region.push(("feathering", number(config.edge_feathering)));
+        let region = region_json(self.input.region_override.as_ref(), config);
         let debug_view = match config.debug_view {
             DepthPassthroughDebugView::Off => "off",
             DepthPassthroughDebugView::TintMask => "tint_mask",
@@ -538,7 +547,7 @@ impl DumpFrame<'_> {
                 self.playzone
                     .map_or("null".into(), |(_, age)| object([("age_s", number(age))])),
             ),
-            ("region", object(region)),
+            ("region", region),
             ("debug_view", string(debug_view)),
             ("color_key", self.input.color_key.is_some().to_string()),
             ("eyes", array(eyes)),

@@ -13,8 +13,9 @@ use alvr_common::{
     parking_lot::{Mutex, RwLock},
 };
 use alvr_graphics::{
-    BridgeChoice, CameraView, ColorModel, DumpHand, DumpJoint, HAND_SEGMENTS, HandColorSamples,
-    HandShape, KeyDump, LeakMap, LeakSnapshot, LocatedHand, SEGMENT_JOINTS, SampledHand, WristAxes,
+    BridgeChoice, BurstCamera, CameraView, ColorModel, DumpHand, DumpJoint, HAND_SEGMENTS,
+    HandColorSamples, HandShape, KeyDump, LeakMap, LeakSnapshot, LocatedHand, SEGMENT_JOINTS,
+    SampledHand, SharedCameraBurst, WristAxes,
 };
 use openxr as xr;
 use std::{
@@ -100,6 +101,8 @@ struct Context {
     lut: Arc<Mutex<Option<Vec<u8>>>>,
     verified: Arc<Mutex<Option<Verified>>>,
     leak_map: Arc<Mutex<SharedLeakMap>>,
+    // `debug.alvr.burst`: takes the camera image of each pass while a burst runs
+    camera_burst: SharedCameraBurst,
 }
 
 pub struct AutoColorKey {
@@ -111,10 +114,12 @@ pub struct AutoColorKey {
 }
 
 impl AutoColorKey {
+    /// `camera_burst`: see `debug.alvr.burst` (burst.rs)
     pub fn new(
         stage_space: Arc<xr::Space>,
         view_space: Arc<xr::Space>,
         interaction_context: Arc<RwLock<InteractionContext>>,
+        camera_burst: SharedCameraBurst,
     ) -> Self {
         let running = Arc::new(RelaxedAtomic::new(true));
         let lut = Arc::new(Mutex::new(None));
@@ -128,6 +133,7 @@ impl AutoColorKey {
             lut: Arc::clone(&lut),
             verified: Arc::clone(&verified),
             leak_map: Arc::clone(&leak_map),
+            camera_burst,
         };
 
         Self {
@@ -262,9 +268,16 @@ fn learn_loop(context: &Context) {
                     pass_start_ns: 0,
                 });
             }
+            let pass_start_ns = monotonic_ns();
             if let Some(dump) = &mut dump {
-                dump.pass_start_ns = monotonic_ns();
+                dump.pass_start_ns = pass_start_ns;
             }
+            // `debug.alvr.burst` runs: the image of this pass is kept with its camera and hands
+            let burst_wants = context
+                .camera_burst
+                .lock()
+                .as_ref()
+                .is_some_and(|sink| sink.wants());
 
             // Once the camera is sure where the forearm is, it is not background
             let wrist = WristParams::load();
@@ -290,11 +303,41 @@ fn learn_loop(context: &Context) {
                 arm_directions,
                 steady,
                 &mut gates,
-                dump.is_some(),
+                dump.is_some() || burst_wants,
             )
             else {
                 continue;
             };
+            // The conversion to RGB (320 x 240 pixels) runs on this thread, not on the render thread;
+            // the pass is that much later
+            if burst_wants && let Some(&(head, located_hands)) = located.as_deref() {
+                let calibration = &camera.calibration;
+                let mut rgb = Vec::with_capacity(
+                    calibration.width as usize * calibration.height as usize * 3,
+                );
+                for y in 0..calibration.height {
+                    for x in 0..calibration.width {
+                        rgb.extend(frame.rgb(x, y));
+                    }
+                }
+                let record = BurstCamera {
+                    now_ns: pass_start_ns,
+                    image_ns: frame.timestamp_ns,
+                    width: calibration.width,
+                    height: calibration.height,
+                    intrinsics: calibration.intrinsics,
+                    camera: Pose {
+                        orientation: view.orientation,
+                        position: view.position,
+                    },
+                    head,
+                    rgb,
+                    hands: located_hands.map(|hand| hand.map(|hand| hand.joints)),
+                };
+                if let Some(sink) = context.camera_burst.lock().as_mut() {
+                    sink.push(record);
+                }
+            }
             model.unknown_keep = percent("debug.alvr.key_unknown", 10);
             model.skin_bias = percent("debug.alvr.key_bias", 150);
             model.tightness = percent("debug.alvr.key_tight", 30);

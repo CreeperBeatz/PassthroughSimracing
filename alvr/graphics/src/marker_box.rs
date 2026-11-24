@@ -395,6 +395,56 @@ impl StageChange {
     }
 }
 
+/// What a change of the STAGE space does to the poses kept in stage space: the box of the code, the
+/// poses of its estimate, the anchor of the layout file and the pose frozen by the editor
+/// (`debug.alvr.marker_carry`)
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum StageEvent {
+    /// A valid pose, `marker_carry 1`: the poses are carried into the new space by it
+    Carry(StageChange),
+    /// A valid pose, `marker_carry 0` (default): the coordinates are kept, the pose is only logged.
+    /// Measured on 2026-11-24: after a STAGE change with a pose of 30 cm and 39 degrees the code was
+    /// seen at the same STAGE coordinates as before it, the carried box was 83 cm off
+    Keep(StageChange),
+    /// No valid pose: the poses are dropped until the code is seen again
+    NoPose,
+}
+
+impl StageEvent {
+    /// `change`: the pose of the event if it is valid. `carry`: `debug.alvr.marker_carry` is 1
+    pub fn new(change: Option<StageChange>, carry: bool) -> Self {
+        match change {
+            Some(change) if carry => Self::Carry(change),
+            Some(change) => Self::Keep(change),
+            None => Self::NoPose,
+        }
+    }
+
+    /// A position and a heading yaw of the previous space in the new one: carried, or as they are.
+    /// None: dropped
+    pub fn apply(&self, position: Vec3, yaw: f32) -> Option<(Vec3, f32)> {
+        match self {
+            Self::Carry(change) => Some(change.apply(position, yaw)),
+            Self::Keep(_) => Some((position, yaw)),
+            Self::NoPose => None,
+        }
+    }
+
+    /// The reported pose, for the log: "(x, y, z) m, yaw d deg"
+    pub fn describe_pose(&self) -> String {
+        match self {
+            Self::Carry(change) | Self::Keep(change) => format!(
+                "({:.3}, {:.3}, {:.3}) m, yaw {:.1} deg",
+                change.position.x,
+                change.position.y,
+                change.position.z,
+                yaw_log_deg(change.yaw())
+            ),
+            Self::NoPose => "not valid".into(),
+        }
+    }
+}
+
 /// Estimate of the pose of a marker that doesn't move (`robust_pose` of its distinct poses over a time
 /// window). A pose away from the estimate by more than the limits is left out, unless `reset_count`
 /// poses in a row are away, agree with each other and span the move hold (or one stays for
@@ -1442,6 +1492,37 @@ mod tests {
         let value = smoother.push(10.5, new_marker, new_yaw);
         assert_eq!(value, (carried, carried_yaw));
         assert_eq!(smoother.rejected(), 0);
+    }
+
+    // `debug.alvr.marker_carry`: 1 carries by the pose of the event, 0 keeps the coordinates, an event
+    // without a valid pose drops them either way. The pose of the event measured on 2026-11-24
+    #[test]
+    fn stage_event_carries_or_keeps() {
+        let change = StageChange {
+            position: Vec3::new(-0.130, 0.007, 0.167),
+            orientation: Quat::from_rotation_y(39.4_f32.to_radians()),
+        };
+        let (position, yaw) = (Vec3::new(0.3, 1.0, -0.8), 1.2);
+
+        let carry = StageEvent::new(Some(change), true);
+        assert_eq!(carry, StageEvent::Carry(change));
+        assert_eq!(
+            carry.apply(position, yaw),
+            Some(change.apply(position, yaw))
+        );
+        let keep = StageEvent::new(Some(change), false);
+        assert_eq!(keep, StageEvent::Keep(change));
+        assert_eq!(keep.apply(position, yaw), Some((position, yaw)));
+        for carry in [false, true] {
+            let event = StageEvent::new(None, carry);
+            assert_eq!(event, StageEvent::NoPose);
+            assert_eq!(event.apply(position, yaw), None);
+        }
+        assert_eq!(
+            keep.describe_pose(),
+            "(-0.130, 0.007, 0.167) m, yaw 39.4 deg"
+        );
+        assert_eq!(StageEvent::NoPose.describe_pose(), "not valid");
     }
 
     #[test]

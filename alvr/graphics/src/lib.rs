@@ -1,5 +1,6 @@
 mod area_edit;
 mod color_model;
+mod depth_burst;
 mod depth_dump;
 mod depth_mask;
 mod key_dump;
@@ -16,7 +17,12 @@ mod tests;
 
 pub use area_edit::*;
 pub use color_model::*;
-pub use depth_dump::{DEPTH_DUMP_TIMEOUT, DepthDumpFiles, DepthDumpRequest};
+pub use depth_burst::{
+    BURST_DEFAULT_MS, BURST_MAX_DEPTH, BURST_MAX_DISPLAY, BURST_MAX_MS, BURST_MIN_MS, Burst,
+    BurstCamera, BurstDepth, BurstDisplay, BurstHand, BurstRegion, CameraBurstSink,
+    SharedCameraBurst, burst_dir_name,
+};
+pub use depth_dump::{DEPTH_DUMP_TIMEOUT, DepthDumpFiles, DepthDumpRequest, region_json};
 pub use depth_mask::*;
 pub use key_dump::*;
 pub use leak_map::*;

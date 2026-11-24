@@ -152,6 +152,12 @@ impl PassthroughLayer<'_> {
 ///   (`_depth_left.f32`, `_playzone_left.f32`, ...), the depth mask and the focus area (`_mask_left.rgba`,
 ///   `_focus_left.rgba`, ...)
 /// - `setprop debug.alvr.key_dump_burst <n>`: that many consecutive passes (1..30)
+/// - `setprop debug.alvr.burst <n>`: another value other than 0 records `debug.alvr.burst_ms` (3000, 100 to
+///   6000) of consecutive frames into the folder `alvr_burst_<n>` of the files folder: every new depth frame
+///   (both eyes), one record per display frame (poses, hands, the depth frame the mask used), the camera
+///   images of the learner, and one depth dump at the start (see burst.rs). Written after the burst
+/// - `setprop debug.alvr.hand_removal 0`: asks the runtime to keep the hands in the depth map with the key on.
+///   It does not: on 2026-11-24 the hands were still removed with 0 (a probe; the answer is logged)
 /// - `setprop debug.alvr.key_wrist_len <mm>`: length of the key zone from the wrist towards the forearm, its
 ///   direction is chosen with the camera (`auto_key`), 0: off
 /// - `setprop debug.alvr.key_wrist_scale <percent>`: its radius, of the radius of the wrist joint

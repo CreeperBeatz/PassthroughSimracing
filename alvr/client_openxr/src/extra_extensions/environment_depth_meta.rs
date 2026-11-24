@@ -107,31 +107,30 @@ impl EnvironmentDepthMETA {
             return Err(sys::Result::ERROR_RUNTIME_FAILURE);
         }
 
-        this.set_hand_removal(hand_removal);
+        // Logged in both directions: on 2026-11-24 the runtime removed the hands also with removal off
+        let answer = this.set_hand_removal(hand_removal);
+        crate::stream_log(&format!(
+            "hand removal from the depth map at the start of the depth: {}: the runtime answered \
+             {answer:?}",
+            if hand_removal { "on" } else { "off" }
+        ));
 
         unsafe { super::xr_res((ext_fns.start_environment_depth_provider)(provider))? };
 
         Ok(this)
     }
 
-    /// Whether the runtime replaces the hands in the depth map with an estimated background
-    pub fn set_hand_removal(&self, enabled: bool) {
+    /// Whether the runtime replaces the hands in the depth map with an estimated background. Returns
+    /// the answer of the runtime as it is (SUCCESS or an error), for the log. An answer of SUCCESS does
+    /// not mean the hands stay in the depth map with `false`: measured on 2026-11-24, they did not
+    pub fn set_hand_removal(&self, enabled: bool) -> sys::Result {
         let info = sys::EnvironmentDepthHandRemovalSetInfoMETA {
             ty: sys::EnvironmentDepthHandRemovalSetInfoMETA::TYPE,
             next: ptr::null(),
             enabled: enabled.into(),
         };
-        let result = unsafe {
-            super::xr_res((self.ext_fns.set_environment_depth_hand_removal)(
-                self.provider,
-                &info,
-            ))
-        };
-        if let Err(e) = result
-            && enabled
-        {
-            alvr_common::error!("Environment depth hand removal: {e}");
-        }
+
+        unsafe { (self.ext_fns.set_environment_depth_hand_removal)(self.provider, &info) }
     }
 
     pub fn resolution(&self) -> UVec2 {

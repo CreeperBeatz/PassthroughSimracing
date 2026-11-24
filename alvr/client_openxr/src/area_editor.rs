@@ -39,7 +39,8 @@
 //! code gets measured while a layout file is used (to keep its anchor). A layout file replaces the box
 //! of the `marker_box_*` properties (and `area_test`); without one the box of the properties is the
 //! layout, as before. The file holds the pose of the code measured last (stage space): until the code
-//! is seen in this run the area is placed from it (carried over STAGE changes) and drawn dashed.
+//! is seen in this run the area is placed from it (kept over STAGE changes, or carried by their pose
+//! with `debug.alvr.marker_carry 1`) and drawn dashed.
 
 use crate::{
     marker_region::MarkerRegion,
@@ -49,7 +50,7 @@ use alvr_common::glam::{Vec3, Vec4};
 use alvr_graphics::{
     EditorHand, EditorInput, Handle, HandleId, HandleKind, HoldTimer, OVERLAY_AMBER, OVERLAY_CYAN,
     OVERLAY_DIM, OVERLAY_GREEN, OVERLAY_RED, OVERLAY_WHITE, OverlaySegment, Pinch, PinchEvent,
-    PlacedArea, PlayArea, SavedAnchor, StageChange, UndoStack,
+    PlacedArea, PlayArea, SavedAnchor, StageEvent, UndoStack,
 };
 use openxr as xr;
 use std::{
@@ -194,8 +195,9 @@ pub struct AreaEditor {
     // The payload of the newest layout file was looked for (once, before any code is seen)
     newest_tried: bool,
     // Changes of the STAGE space at their change time, in order: the saved anchor and the frozen pose
-    // are carried into the new space then (in the same frame as the marker region carries its pose)
-    stage_changes: Vec<(xr::Time, Option<StageChange>)>,
+    // are carried into the new space then, or kept (`debug.alvr.marker_carry 0`), in the same frame
+    // as the marker region handles its pose
+    stage_changes: Vec<(xr::Time, StageEvent)>,
     // The eyes and the view direction of the last input, and when (seconds)
     last_view: Option<(Vec3, Vec3, f64)>,
     placement: Placement,
@@ -372,32 +374,42 @@ impl AreaEditor {
         }
     }
 
-    /// The STAGE space changes at `change_time`; `change`: the pose of the new space in the old one
-    /// (None: not valid). A grab is dropped; at the change time the saved anchor and the frozen pose of
-    /// the code are carried into the new space (without `change` they are dropped)
-    pub fn on_stage_change(&mut self, change_time: xr::Time, change: Option<StageChange>) {
+    /// The STAGE space changes at `change_time`, see `StageEvent`. A grab is dropped; at the change
+    /// time the saved anchor and the frozen pose of the code are carried into the new space
+    /// (`debug.alvr.marker_carry 1`), kept as they are (0) or dropped (no valid pose), like the box of
+    /// the marker region
+    pub fn on_stage_change(&mut self, change_time: xr::Time, event: StageEvent) {
         if self.mode == Mode::Editing {
             self.drop_grab("stage space changed");
         }
-        self.stage_changes.push((change_time, change));
+        self.stage_changes.push((change_time, event));
     }
 
     // The changes of the STAGE space that are due at `now`, in order
     fn apply_stage_changes(&mut self, now: xr::Time) {
-        while let Some(&(time, change)) = self.stage_changes.first()
+        while let Some(&(time, event)) = self.stage_changes.first()
             && now.as_nanos() >= time.as_nanos()
         {
             self.stage_changes.remove(0);
-            match change {
-                Some(change) => {
+            match event {
+                StageEvent::Carry(_) | StageEvent::Keep(_) => {
+                    let has_pose = self.saved_anchor.is_some() || self.frozen.is_some();
                     self.saved_anchor = self
                         .saved_anchor
-                        .map(|(position, yaw)| change.apply(position, yaw));
+                        .and_then(|(position, yaw)| event.apply(position, yaw));
                     if let Some(((position, yaw), placement)) = self.frozen {
-                        self.frozen = Some((change.apply(position, yaw), placement));
+                        self.frozen = event.apply(position, yaw).map(|pose| (pose, placement));
+                    }
+                    if has_pose && matches!(event, StageEvent::Keep(_)) {
+                        crate::stream_log(&format!(
+                            "area editor: stage space changed, coordinates of the saved anchor and \
+                             the frozen pose kept (marker_carry 0; the reported pose {} is not \
+                             applied)",
+                            event.describe_pose()
+                        ));
                     }
                 }
-                None => {
+                StageEvent::NoPose => {
                     if self.saved_anchor.is_some() || self.frozen.is_some() {
                         crate::stream_log(
                             "area editor: stage space changed without a pose, the saved anchor is \

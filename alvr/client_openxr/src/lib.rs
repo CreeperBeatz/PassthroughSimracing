@@ -2,6 +2,7 @@ mod area_editor;
 mod area_overlay;
 #[cfg(target_os = "android")]
 mod auto_color_key;
+mod burst;
 mod c_api;
 #[cfg(target_os = "android")]
 mod camera;
@@ -596,8 +597,11 @@ pub fn entry_point() {
                         }
 
                         // The markers are located in STAGE: a change of LOCAL (a recenter) or VIEW
-                        // doesn't move them. The box is carried into the new space if the pose is
-                        // valid; the tracker drops its poses until the markers are seen again
+                        // doesn't move them. With a valid pose the box keeps its coordinates
+                        // (`debug.alvr.marker_carry 0`: on 2026-11-24 the code was seen at the same
+                        // STAGE coordinates after such a change, the carried box was 83 cm off) or is
+                        // carried into the new space by the pose (1); the tracker drops its poses
+                        // until the markers are seen again
                         if event.reference_space_type() == xr::ReferenceSpaceType::STAGE {
                             if let Some(tracker) = &mut marker_tracker {
                                 tracker.on_reference_space_change(event.change_time());
@@ -606,8 +610,24 @@ pub fn entry_point() {
                                 position,
                                 orientation: from_xr_quat(pose.orientation).normalize(),
                             });
-                            marker_region.on_reference_space_change(event.change_time(), change);
-                            area_editor.on_stage_change(event.change_time(), change);
+                            let carry = passthrough::debug_property("debug.alvr.marker_carry")
+                                .unwrap_or(0)
+                                != 0;
+                            let stage_event = alvr_graphics::StageEvent::new(change, carry);
+                            if change.is_some() {
+                                stream_log(&format!(
+                                    "STAGE change with a valid pose: {} (marker_carry {})",
+                                    if carry {
+                                        "the box is carried by it"
+                                    } else {
+                                        "the box keeps its coordinates"
+                                    },
+                                    u8::from(carry)
+                                ));
+                            }
+                            marker_region
+                                .on_reference_space_change(event.change_time(), stage_event);
+                            area_editor.on_stage_change(event.change_time(), stage_event);
                         }
                     }
                     xr::Event::SpatialDiscoveryRecommendedEXT(event) => {
