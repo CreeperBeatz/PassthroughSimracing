@@ -10,7 +10,8 @@
 //!   arms, which depth frame the mask used, the region (a record each time it changes)
 //! - the camera images of the key learner (only with `auto_key` and the key on: one per pass of the
 //!   learner, about every 60 ms), with their time, the camera pose and intrinsics
-//! - one depth dump (`alvr_dump_<n>_depth*`) at the start, in the folder of the burst
+//! - one depth dump (`alvr_dump_<n>_depth*`) at the start, in the folder of the burst, and the learned
+//!   colour table of the key last uploaded before the start (`alvr_dump_<n>_key.lut`, if there is one)
 //!
 //! Everything is kept in RAM (about 0.4 MB per depth frame, 0.23 MB per camera image) and written by a
 //! thread after the burst to `<files>/alvr_burst_<n>/`: `alvr_burst_<n>.json` (the index, every
@@ -26,8 +27,8 @@ use alvr_common::{
 };
 use alvr_graphics::{
     ArmMotion, BURST_DEFAULT_MS, BURST_MAX_DEPTH, BURST_MAX_DISPLAY, BURST_MAX_MS, BURST_MIN_MS,
-    Burst, BurstDepth, BurstDisplay, BurstHand, BurstRegion, CameraBurstSink, ColorKeyInput,
-    DepthFrame, SharedCameraBurst,
+    Burst, BurstDepth, BurstDisplay, BurstHand, BurstLut, BurstRegion, CameraBurstSink,
+    ColorKeyInput, DepthFrame, SharedCameraBurst,
 };
 use std::{
     path::PathBuf,
@@ -144,6 +145,7 @@ impl BurstRecorder {
                 depth_size,
                 flip_y,
                 dump: None,
+                key_lut: None,
                 depth: Vec::new(),
                 depth_skipped: 0,
                 display: Vec::new(),
@@ -172,6 +174,13 @@ impl BurstRecorder {
     pub fn set_dump(&mut self, json_name: String) {
         if let Some(active) = &mut self.active {
             active.burst.dump = Some(json_name);
+        }
+    }
+
+    /// The learned colour table of the key at the start (None: none), written next to the depth dump
+    pub fn set_key_lut(&mut self, lut: Option<BurstLut>) {
+        if let Some(active) = &mut self.active {
+            active.burst.key_lut = lut;
         }
     }
 

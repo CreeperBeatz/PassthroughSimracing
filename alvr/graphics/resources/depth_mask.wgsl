@@ -267,7 +267,15 @@ fn arm_displacement(point: vec3f) -> vec3f {
         let s = clamp(-dot(offset, motion) / max(dot(motion, motion), 1e-6), 0.0, 1.0);
         let aside = length(offset + motion * s);
 
-        let weight = (1.0 - smoothstep(0.0, ARM_LENGTH, along))
+        // `debug.alvr.arm_shift 1`: a smoothstep to 45 cm. 2: linear over `arm_weight_mm`, in the
+        // w of the displacement (0 in mode 1). Offline the linear weight of about 30 cm followed the real
+        // arm best: the smoothstep keeps moving the elbow end too much
+        let weight_len = depth_u.arms[hand * 3u + 2u].w;
+        var along_weight = 1.0 - smoothstep(0.0, ARM_LENGTH, along);
+        if weight_len > 0.0 {
+            along_weight = clamp(1.0 - along / weight_len, 0.0, 1.0);
+        }
+        let weight = along_weight
             * smoothstep(hand_edge.x, hand_edge.y, along)
             * (1.0 - smoothstep(0.6 * ARM_RADIUS, ARM_RADIUS, aside));
         result += displacement * weight;

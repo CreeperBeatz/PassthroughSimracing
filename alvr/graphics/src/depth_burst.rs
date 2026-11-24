@@ -109,6 +109,18 @@ pub struct BurstCamera {
     pub hands: [Option<BurstHand>; 2],
 }
 
+/// The colour table of the key as it was uploaded to the compositor last, at the start of a burst. The
+/// bursts of 2026-11-24 had none, so offline tests had to invent one
+#[derive(Clone)]
+pub struct BurstLut {
+    /// Counts the learned tables uploaded since the stream started (from 1)
+    pub version: u32,
+    /// When it was uploaded (XrTime)
+    pub published_ns: i64,
+    /// 32 x 32 x 32 RGBA bytes, indexed `[b][g][r]`, as uploaded
+    pub data: Vec<u8>,
+}
+
 /// The region of the mask, each time it changes
 pub struct BurstRegion {
     pub now_ns: i64,
@@ -159,6 +171,9 @@ pub struct Burst {
     pub flip_y: bool,
     /// The depth dump written at the start of the burst (its JSON), None: none
     pub dump: Option<String>,
+    /// The learned colour table of the key at the start, None: none learned (the key off, no `auto_key`,
+    /// or nothing learned yet: the table of the file is shown)
+    pub key_lut: Option<BurstLut>,
     pub depth: Vec<BurstDepth>,
     /// New depth frames that were not recorded because the limit was reached. A frame that finds
     /// too many readbacks on their way is recorded, with that `error` and without images
@@ -183,6 +198,11 @@ fn depth_file_name(n: i64, index: usize, eye: usize) -> String {
 
 fn camera_file_name(n: i64, index: usize) -> String {
     format!("alvr_burst_{n}_camera_{index:04}.rgb")
+}
+
+// Named like the files of the depth dump of the start, which it belongs to
+fn key_lut_file_name(n: i64) -> String {
+    format!("alvr_dump_{n}_key.lut")
 }
 
 fn optional(value: Option<impl ToString>) -> String {
@@ -281,15 +301,10 @@ impl BurstDisplay {
                 ])
             })
         });
-        let arms = self.arms.map(|arm| {
-            arm.map_or("null".into(), |arm| {
-                object([
-                    ("wrist", numbers(&arm.wrist.to_array())),
-                    ("direction", numbers(&arm.direction.to_array())),
-                    ("displacement", numbers(&arm.displacement.to_array())),
-                ])
-            })
-        });
+        let arms = self
+            .arms
+            .each_ref()
+            .map(|arm| depth_dump::arm(arm.as_ref()));
         object([
             ("kind", string("display")),
             ("t_ns", self.now_ns.to_string()),
@@ -388,9 +403,19 @@ impl Burst {
                 ("height", camera.height.to_string()),
             ])
         });
+        let key_lut = self.key_lut.as_ref().map_or("null".into(), |lut| {
+            object([
+                ("file", string(&key_lut_file_name(n))),
+                ("version", lut.version.to_string()),
+                ("published_ns", lut.published_ns.to_string()),
+                ("bytes", lut.data.len().to_string()),
+            ])
+        });
+        // Version 2: the arms of the display records have the fields of step 1 of the arm plan, and
+        // `key_lut` is new
         object([
             ("format", string("alvr_burst")),
-            ("version", "1".into()),
+            ("version", "2".into()),
             ("n", n.to_string()),
             ("duration_ms", self.duration_ms.to_string()),
             ("start_ns", self.start_ns.to_string()),
@@ -416,6 +441,7 @@ impl Burst {
                 ]),
             ),
             ("dump", self.dump.as_deref().map_or("null".into(), string)),
+            ("key_lut", key_lut),
             (
                 "records",
                 array(records.into_iter().map(|(_, _, json)| json)),
@@ -452,6 +478,11 @@ impl Burst {
             fs::write(dir.join(camera_file_name(self.n, index)), &camera.rgb)?;
             files += 1;
             bytes += camera.rgb.len();
+        }
+        if let Some(lut) = &self.key_lut {
+            fs::write(dir.join(key_lut_file_name(self.n)), &lut.data)?;
+            files += 1;
+            bytes += lut.data.len();
         }
         let index = self.index_json();
         fs::write(dir.join(index_name(self.n)), &index)?;
@@ -760,12 +791,29 @@ mod tests {
                             },
                         )),
                     ],
+                    // The left arm as `arm_shift 1`, the right one as 2 (`arm_hands 2`)
                     arms: [
-                        None,
+                        Some(ArmMotion {
+                            wrist: Vec3::new(-0.1, 1.0, -0.4),
+                            direction: Vec3::NEG_Y,
+                            displacement: Vec3::new(0.0, 0.01, 0.0),
+                            weight_len: 0.0,
+                            mode: 1,
+                            target_ns: now_ns + 50_000_000,
+                            history_ns: now_ns + 50_000_000,
+                            wrist_history: Vec3::new(-0.1, 1.0, -0.4),
+                            extrapolated: 0.0,
+                        }),
                         Some(ArmMotion {
                             wrist: Vec3::new(0.1, 1.0, -0.4),
                             direction: Vec3::NEG_Y,
                             displacement: Vec3::new(0.01, 0.0, 0.0),
+                            weight_len: 0.3,
+                            mode: 2,
+                            target_ns: now_ns + 10_000_000,
+                            history_ns: now_ns - 30_000_000,
+                            wrist_history: Vec3::new(0.09, 1.0, -0.4),
+                            extrapolated: 0.01,
                         }),
                     ],
                 }
@@ -796,6 +844,11 @@ mod tests {
             depth_size: size,
             flip_y: false,
             dump: Some(format!("alvr_dump_{n}_depth.json")),
+            key_lut: Some(BurstLut {
+                version: 3,
+                published_ns: start_ns - 400_000_000,
+                data: (0..32 * 32 * 32 * 4).map(|i| (i % 251) as u8).collect(),
+            }),
             depth,
             depth_skipped: 1,
             display,
@@ -860,7 +913,23 @@ mod tests {
         let burst = synthetic_burst(7, UVec2::new(4, 3), 4);
         let json = burst.index_json();
         assert!(is_valid_json(&json), "{json}");
-        assert!(json.starts_with(r#"{"format":"alvr_burst","version":1,"n":7,"#));
+        assert!(json.starts_with(r#"{"format":"alvr_burst","version":2,"n":7,"#));
+        assert!(
+            json.contains(
+                r#""key_lut":{"file":"alvr_dump_7_key.lut","version":3,"published_ns":999600000000,"bytes":131072}"#
+            ),
+            "{json}"
+        );
+        // Both arm modes with the fields of step 1
+        assert!(
+            json.contains(r#""mode":1,"weight_len":0,"target_ns":"#),
+            "{json}"
+        );
+        assert!(
+            json.contains(r#""mode":2,"weight_len":0.3,"target_ns":"#),
+            "{json}"
+        );
+        assert!(json.contains(r#""extrapolated_mm":10}]"#), "{json}");
         assert!(
             json.contains(
                 r#""counts":{"depth":4,"depth_read":3,"depth_skipped":1,"display":9,"camera":2,"region":1}"#
@@ -905,8 +974,12 @@ mod tests {
         );
         let dir = dir.join(burst_dir_name(burst.n));
         let (files, bytes) = burst.write_to(&dir).unwrap();
-        // Depth of each read frame and eye, the camera images, the index
-        assert_eq!(files, (frames - 1) * 2 + frames / 2 + 1);
+        // Depth of each read frame and eye, the camera images, the key table, the index
+        assert_eq!(files, (frames - 1) * 2 + frames / 2 + 1 + 1);
+        assert_eq!(
+            fs::read(dir.join(key_lut_file_name(9))).unwrap(),
+            burst.key_lut.as_ref().unwrap().data
+        );
         assert!(bytes >= burst.image_bytes());
 
         let data = fs::read(dir.join(depth_file_name(9, 2, 1))).unwrap();

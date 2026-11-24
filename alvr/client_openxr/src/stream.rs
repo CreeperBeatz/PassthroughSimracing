@@ -21,7 +21,7 @@ use alvr_common::{
     parking_lot::RwLock,
 };
 use alvr_graphics::{
-    ArmMotion, BridgeChoice, BurstHand, ColorKeyInput, DepthDumpFiles, DepthDumpRequest,
+    ArmMotion, BridgeChoice, BurstHand, BurstLut, ColorKeyInput, DepthDumpFiles, DepthDumpRequest,
     DepthFrame, DepthRenderInput, DumpJoint, EditorHand, EditorInput, GraphicsContext,
     HAND_SEGMENTS, HandRay, HandShape, HandZones, LeakGains, OverlaySegment, PlacedArea,
     SEGMENT_JOINTS, StreamRenderer, StreamViewParams, WristBridge,
@@ -55,7 +55,7 @@ const WRIST_JOINT: usize = 1;
 const MIN_FILL_SPEED: f32 = 0.08;
 const MAX_FILL_SPEED: f32 = 0.25;
 
-// How often `debug.alvr.arm_shift`, `debug.alvr.playzone_auto` and `debug.alvr.key_dump` are read
+// How often `debug.alvr.arm_*`, `debug.alvr.playzone_auto` and `debug.alvr.key_dump` are read
 const PROPERTY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 // The playzone is remembered when no hand was near the view of the depth camera for a while
@@ -73,6 +73,146 @@ const KEY_CROP_MARGIN: f32 = 0.03;
 
 // Per hand for the log: ring, map, known share of the map, leak, rim
 type LeakLog = Option<(f32, Option<f32>, f32, f32, f32)>;
+
+// `debug.alvr.arm_shift 2`: the wrist is looked up this long before the history time too, for a
+// velocity by finite difference
+const ARM_VELOCITY_GAP: Duration = Duration::from_millis(30);
+// Longest step of the wrist from the history time to the target time (m)
+const MAX_ARM_EXTRAPOLATION: f32 = 0.06;
+// The `arm:` line is logged this often while an arm uses `arm_shift 2`, and on each change of the
+// properties
+const ARM_LOG_INTERVAL: Duration = Duration::from_secs(2);
+
+/// `debug.alvr.arm_shift` and the properties of its mode 2 (step 1 of `docs/arm-mask-build-plan.md`)
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ArmParams {
+    /// 0: plain depth. 1: the depth around each arm moves with the display-time wrist, weighted by a
+    /// smoothstep to 45 cm. 2: with a wrist looked up in the past and extrapolated to a target time,
+    /// weighted linearly
+    shift: i64,
+    /// Arms that use mode 2 when `shift` is 2 (1 left, 2 right, 3 both). The others use mode 1, to
+    /// compare them side by side
+    hands: i64,
+    /// The arm is placed for the display time minus this (the passthrough latency)
+    target_ms: i64,
+    /// The wrist is looked up at the display time minus this (at least `target_ms`): the newest
+    /// estimate of the runtime is late, the past is accurate
+    history_ms: i64,
+    /// Length of the linear weight
+    weight_mm: i64,
+}
+
+impl ArmParams {
+    fn read() -> Self {
+        Self {
+            shift: arm_shift_mode(debug_property("debug.alvr.arm_shift").unwrap_or(1)),
+            hands: debug_property("debug.alvr.arm_hands")
+                .unwrap_or(3)
+                .clamp(0, 3),
+            target_ms: debug_property("debug.alvr.arm_target_ms")
+                .unwrap_or(40)
+                .clamp(0, 150),
+            history_ms: debug_property("debug.alvr.arm_history_ms")
+                .unwrap_or(80)
+                .clamp(0, 200),
+            weight_mm: debug_property("debug.alvr.arm_weight_mm")
+                .unwrap_or(300)
+                .clamp(100, 600),
+        }
+    }
+
+    // Whether arm `hand` (0 left, 1 right) uses mode 2
+    fn is_new(&self, hand: usize) -> bool {
+        self.shift == 2 && self.hands & (1 << hand) != 0
+    }
+
+    // Mode 2 at the display time `display_ns`: the target time T, the history time H (ns) and how far
+    // the wrist is moved ahead from H to T (s, never negative)
+    fn times(&self, display_ns: i64) -> (i64, i64, f32) {
+        let target_ns = display_ns - self.target_ms * 1_000_000;
+        let history_ns = display_ns - self.history_ms.max(self.target_ms) * 1_000_000;
+
+        (
+            target_ns,
+            history_ns,
+            (target_ns - history_ns) as f32 * 1e-9,
+        )
+    }
+}
+
+// `debug.alvr.arm_shift`: 0 off, 2 the new mode, any other value today's shift (mode 1), as before
+// mode 2 existed, when every value but 0 meant on
+fn arm_shift_mode(value: i64) -> i64 {
+    match value {
+        0 => 0,
+        2 => 2,
+        _ => 1,
+    }
+}
+
+// The joint lookups of an arm, counted apart for the `arm:` line
+#[derive(Clone, Copy)]
+enum Lookup {
+    // The wrist the arm is placed from: at H in mode 2, at the display time minus `key_delay` in mode 1
+    Place,
+    // Mode 2: 30 ms before H, for the velocity
+    Velocity,
+    // At the capture time of the depth image
+    Capture,
+}
+
+// What the `arm:` line reports of one arm since the last one
+#[derive(Default)]
+struct ArmHandLog {
+    // Mode 2, frames with a velocity only: how far the wrist was extrapolated (mm), the speed of the
+    // finite difference (m/s). The distance between the wrist of the hand capsules and the wrist the arm
+    // is placed with (mm)
+    extrapolated_mm: Vec<f32>,
+    speeds: Vec<f32>,
+    gaps_mm: Vec<f32>,
+    // Frames with a hand tracker, and the failed lookups per `Lookup`. A failed `Place` lookup skips the
+    // `Capture` one
+    frames: u32,
+    failed: [u32; 3],
+}
+
+impl ArmHandLog {
+    // Joint lookup of the arm, counted
+    fn count<T>(&mut self, lookup: Lookup, result: Option<T>) -> Option<T> {
+        if result.is_none() {
+            self.failed[lookup as usize] += 1;
+        }
+
+        result
+    }
+
+    // For the `arm:` line
+    fn lookups_text(&self, is_new: bool) -> String {
+        let [place, velocity, capture] = self.failed;
+        if is_new {
+            format!(
+                "lookups failed H {place}, H-30 {velocity}, capture {capture} of {} frames",
+                self.frames
+            )
+        } else {
+            format!(
+                "lookups failed display {place}, capture {capture} of {} frames",
+                self.frames
+            )
+        }
+    }
+}
+
+// Median and 90th percentile, None without values
+fn median_p90(values: &mut [f32]) -> Option<(f32, f32)> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f32::total_cmp);
+    let at = |q: f32| values[((values.len() - 1) as f32 * q).round() as usize];
+
+    Some((at(0.5), at(0.9)))
+}
 
 // Spheres of `debug.alvr.key_leak_view 2`, meters
 const LEAK_PROBE_RADIUS: f32 = 0.0125;
@@ -169,8 +309,21 @@ pub struct StreamContext {
     #[cfg(target_os = "android")]
     auto_color_key: Option<AutoColorKey>,
     // The depth of the arms is shifted by the motion of the wrist since the depth image was captured.
-    // `setprop debug.alvr.arm_shift 0`: plain depth
-    arm_shift: bool,
+    // `setprop debug.alvr.arm_shift 0`: plain depth, 2: the past-time wrist and the linear weight
+    arm_params: ArmParams,
+    // For the `arm:` line: since when, whether the properties changed, per arm
+    last_arm_log: Instant,
+    arm_params_changed: bool,
+    arm_log: [ArmHandLog; 2],
+    // The wrists of the hand capsules of the key in this frame (display time minus `key_delay`), for
+    // the distance to the wrist of the arm
+    key_wrists: Cell<[Option<Vec3>; 2]>,
+    // The learned colour table last uploaded to the compositor, for bursts, and how many were
+    // uploaded since the stream started
+    published_lut: Option<BurstLut>,
+    lut_uploads: u32,
+    // Of the key last given to `set_color_key`, 0: none
+    color_key_version: u32,
     // `debug.alvr.playzone_auto`
     playzone_auto: bool,
     last_property_poll: Instant,
@@ -367,7 +520,15 @@ impl StreamContext {
             color_key: None,
             #[cfg(target_os = "android")]
             auto_color_key: None,
-            arm_shift: true,
+            arm_params: ArmParams::read(),
+            last_arm_log: Instant::now(),
+            // The settings at the start are logged once
+            arm_params_changed: true,
+            arm_log: Default::default(),
+            key_wrists: Cell::new([None; 2]),
+            published_lut: None,
+            lut_uploads: 0,
+            color_key_version: 0,
             playzone_auto: true,
             last_property_poll: Instant::now(),
             last_dump_value: None,
@@ -406,7 +567,8 @@ impl StreamContext {
         alvr_graphics::depth_passthrough_config(self.config.passthrough.as_ref()).is_some()
     }
 
-    pub fn set_color_key(&mut self, params: Option<ColorKeyParams>) {
+    /// `version`: of the loaded key (`debug.alvr.color_key`), a new one shows the table of its file
+    pub fn set_color_key(&mut self, params: Option<ColorKeyParams>, version: u32) {
         // The depth map shows the hands where they were a while ago. With the color key they are not
         // needed there. `debug.alvr.hand_removal 0` asks the runtime to keep them, but on 2026-11-24 it
         // still removed them (captures 626 / 627): a probe, the answer of the runtime is logged
@@ -421,6 +583,12 @@ impl StreamContext {
             ));
         }
         self.color_key = params;
+        // Without the key no learned table is shown. With it again, or after a reload (a new version),
+        // the table of the file is shown until the learner publishes one
+        if self.color_key.is_none() || version != self.color_key_version {
+            self.published_lut = None;
+        }
+        self.color_key_version = version;
 
         #[cfg(target_os = "android")]
         if self.color_key.is_none() {
@@ -544,12 +712,24 @@ impl StreamContext {
         })
     }
 
-    /// New colors for the key, learned from the camera
-    pub fn take_color_key_lut(&self) -> Option<Vec<u8>> {
+    /// New colors for the key, learned from the camera. The caller uploads them: a copy is kept for
+    /// the next burst
+    pub fn take_color_key_lut(&mut self) -> Option<Vec<u8>> {
         #[cfg(target_os = "android")]
-        return self.auto_color_key.as_ref()?.take_lut();
+        let lut = self.auto_color_key.as_ref()?.take_lut();
         #[cfg(not(target_os = "android"))]
-        None
+        let lut: Option<Vec<u8>> = None;
+
+        if let Some(lut) = &lut {
+            self.lut_uploads += 1;
+            self.published_lut = Some(BurstLut {
+                version: self.lut_uploads,
+                published_ns: runtime_now_ns(&self.xr_session),
+                data: lut.clone(),
+            });
+        }
+
+        lut
     }
 
     // Objects that are held are partly missing in the depth image, so remember how the playzone looks
@@ -637,7 +817,7 @@ impl StreamContext {
         }
     }
 
-    // `debug.alvr.arm_shift`, `debug.alvr.playzone_auto`, and a new `debug.alvr.key_dump` (like the learner, which writes the camera
+    // `debug.alvr.arm_shift` (with the other `arm_*`), `debug.alvr.playzone_auto`, and a new `debug.alvr.key_dump` (like the learner, which writes the camera
     // image: the depth of the next frame with a depth image)
     fn poll_properties(&mut self) {
         if self.last_property_poll.elapsed() < PROPERTY_POLL_INTERVAL {
@@ -645,7 +825,11 @@ impl StreamContext {
         }
         self.last_property_poll = Instant::now();
 
-        self.arm_shift = debug_property("debug.alvr.arm_shift").unwrap_or(1) != 0;
+        let arm_params = ArmParams::read();
+        if arm_params != self.arm_params {
+            self.arm_params = arm_params;
+            self.arm_params_changed = true;
+        }
         self.playzone_auto = debug_property("debug.alvr.playzone_auto").unwrap_or(1) > 0;
 
         let dump = debug_property("debug.alvr.key_dump").unwrap_or(0);
@@ -673,6 +857,7 @@ impl StreamContext {
             }
             self.burst_dump = Some(n);
             self.burst.set_dump(format!("alvr_dump_{n}_depth.json"));
+            self.burst.set_key_lut(self.published_lut.clone());
         }
     }
 
@@ -766,14 +951,23 @@ impl StreamContext {
         // Rough position of the elbows, relative to the head
         const ELBOW_OFFSET: Vec3 = Vec3::new(0.2, -0.5, 0.05);
 
-        if !self.arm_shift {
+        let params = self.arm_params;
+        if params.shift == 0 {
             return [None; 2];
         }
 
+        let display_ns = display_time.as_nanos();
+        // Mode 1: the wrist for the moment the passthrough image shows, the newest estimate of the
+        // runtime (late while the arm moves)
         let delay = self
             .color_key
             .map_or(0, |params| params.passthrough_delay_ms * 1_000_000);
-        let now = xr::Time::from_nanos(display_time.as_nanos() - delay);
+        let now_ns = display_ns - delay;
+        // Mode 2: the arm is placed for the target time T, from the wrist at the history time H (accurate,
+        // it is in the past) moved ahead to T
+        let (target_ns, history_ns, ahead_s) = params.times(display_ns);
+        let gap_s = ARM_VELOCITY_GAP.as_secs_f32();
+        let weight_len = params.weight_mm as f32 / 1000.0;
         let int_ctx = self.interaction_context.read();
 
         let head_position = (crate::from_xr_vec3(views[0].pose.position)
@@ -784,10 +978,11 @@ impl StreamContext {
 
         [0, 1].map(|i| {
             let tracker = int_ctx.hands_interaction[i].skeleton_tracker.as_ref()?;
-            let wrist = |time| {
+            let log = &mut self.arm_log[i];
+            let wrist = |time_ns: i64| {
                 let joints = self
                     .stage_reference_space
-                    .locate_hand_joints(tracker, time)
+                    .locate_hand_joints(tracker, xr::Time::from_nanos(time_ns))
                     .ok()
                     .flatten()?;
                 let wrist = joints[xr::HandJointEXT::WRIST];
@@ -797,10 +992,43 @@ impl StreamContext {
                     .contains(xr::SpaceLocationFlags::POSITION_VALID)
                     .then(|| crate::from_xr_vec3(wrist.pose.position))
             };
-            let wrist_now = wrist(now)?;
-            let displacement = wrist_now - wrist(capture_time)?;
+
+            let is_new = params.is_new(i);
+            log.frames += 1;
+            // The wrist the arm is placed with, when it was looked up and from where, how far it was
+            // extrapolated, the speed of the finite difference
+            let (wrist_now, arm_target_ns, arm_history_ns, wrist_history, extrapolated, speed) =
+                if is_new {
+                    let w_h = log.count(Lookup::Place, wrist(history_ns))?;
+                    let w_p = log.count(
+                        Lookup::Velocity,
+                        wrist(history_ns - ARM_VELOCITY_GAP.as_nanos() as i64),
+                    );
+                    let (wrist_t, extrapolated) = alvr_graphics::arm_target_wrist(
+                        w_h,
+                        w_p,
+                        gap_s,
+                        ahead_s,
+                        MAX_ARM_EXTRAPOLATION,
+                    );
+                    let speed = w_p.map(|w_p| w_h.distance(w_p) / gap_s);
+
+                    (wrist_t, target_ns, history_ns, w_h, extrapolated, speed)
+                } else {
+                    let wrist_now = log.count(Lookup::Place, wrist(now_ns))?;
+
+                    (wrist_now, now_ns, now_ns, wrist_now, 0.0, None)
+                };
+            let displacement =
+                wrist_now - log.count(Lookup::Capture, wrist(capture_time.as_nanos()))?;
             if displacement.length() > MAX_DISPLACEMENT {
                 return None;
+            }
+            // Only frames with a velocity: without the wrist 30 ms before H there is no step, and the
+            // `Velocity` failures count those frames
+            if let Some(speed) = speed {
+                log.extrapolated_mm.push(extrapolated * 1000.0);
+                log.speeds.push(speed);
             }
 
             let side = if i == 0 { -1.0 } else { 1.0 };
@@ -810,8 +1038,84 @@ impl StreamContext {
                 wrist: wrist_now,
                 direction: (elbow - wrist_now).normalize_or(Vec3::NEG_Y),
                 displacement,
+                weight_len: if is_new { weight_len } else { 0.0 },
+                mode: if is_new { 2 } else { 1 },
+                target_ns: arm_target_ns,
+                history_ns: arm_history_ns,
+                wrist_history,
+                extrapolated,
             })
         })
+    }
+
+    // The `arm:` line on `ALVR_CAM`: on each change of the `arm_*` properties (the settings only), and
+    // every `ARM_LOG_INTERVAL` while an arm uses mode 2. `key_wrists` and `arms` are of this frame: the
+    // hand-to-arm wrist gap tells whether the hand capsules (display-time joints) and the arm (the
+    // target time) part during fast moves
+    fn log_arms(&mut self, arms: &[Option<ArmMotion>; 2]) {
+        let key_wrists = self.key_wrists.get();
+        for ((log, arm), key_wrist) in self.arm_log.iter_mut().zip(arms).zip(key_wrists) {
+            if let (Some(arm), Some(key_wrist)) = (arm, key_wrist)
+                && arm.mode == 2
+            {
+                log.gaps_mm.push(arm.wrist.distance(key_wrist) * 1000.0);
+            }
+        }
+
+        let params = self.arm_params;
+        let is_due = params.is_new(0) || params.is_new(1);
+        let is_due = is_due && self.last_arm_log.elapsed() >= ARM_LOG_INTERVAL;
+        if !self.arm_params_changed && !is_due {
+            return;
+        }
+        self.last_arm_log = Instant::now();
+        let logs = std::mem::take(&mut self.arm_log);
+
+        let mut text = match (params.shift, params.hands) {
+            (0, _) => "mode 0 (plain depth)".to_string(),
+            (1, _) => "mode 1 (display-time wrist, smoothstep to 45 cm)".to_string(),
+            (_, hands) => format!(
+                "mode 2 ({}), target display-{} ms from history -{} ms, weight {} mm",
+                match hands {
+                    3 => "both",
+                    1 => "left; right 1",
+                    2 => "right; left 1",
+                    _ => "no arm; both 1",
+                },
+                params.target_ms,
+                params.history_ms.max(params.target_ms),
+                params.weight_mm,
+            ),
+        };
+        // The counts since the last line belong to the old settings
+        if self.arm_params_changed {
+            self.arm_params_changed = false;
+            crate::stream_log(&format!("arm: {text} (new settings)"));
+            return;
+        }
+
+        for (i, mut log) in logs.into_iter().enumerate() {
+            let name = if i == 0 { "L" } else { "R" };
+            let lookups = log.lookups_text(params.is_new(i));
+            if !params.is_new(i) {
+                text += &format!("; {name} mode 1, {lookups}");
+                continue;
+            }
+            let extrapolated = median_p90(&mut log.extrapolated_mm).map_or(
+                "no velocity".to_string(),
+                |(median, p90)| {
+                    let speed = median_p90(&mut log.speeds)
+                        .map_or("-".to_string(), |(median, _)| format!("{median:.2}"));
+                    format!("extrapolated {median:.0} mm p90 {p90:.0} at {speed} m/s")
+                },
+            );
+            let gap = median_p90(&mut log.gaps_mm)
+                .map_or("- (no hand capsules)".to_string(), |(median, p90)| {
+                    format!("{median:.0} mm p90 {p90:.0}")
+                });
+            text += &format!("; {name} {extrapolated}, {lookups}, hand-to-arm wrist gap {gap}");
+        }
+        crate::stream_log(&format!("arm: {text}"));
     }
 
     // The hands, at the moment shown by the passthrough image. `eye_positions` (stage space) are needed
@@ -821,6 +1125,7 @@ impl StreamContext {
         display_time: xr::Time,
         eye_positions: Option<[Vec3; 2]>,
     ) -> Option<ColorKeyInput> {
+        self.key_wrists.set([None; 2]);
         let params = self.color_key?;
         let delay = params.passthrough_delay_ms * 1_000_000;
         let time = xr::Time::from_nanos(display_time.as_nanos() - delay);
@@ -885,6 +1190,7 @@ impl StreamContext {
             1.0 - ((speed - MIN_FILL_SPEED) / (MAX_FILL_SPEED - MIN_FILL_SPEED)).clamp(0.0, 1.0)
         };
 
+        let mut key_wrists = [None; 2];
         let hands = [0, 1].map(|i| {
             let tracker = int_ctx.hands_interaction[i].skeleton_tracker.as_ref()?;
             let (joints, velocities) = self
@@ -892,6 +1198,12 @@ impl StreamContext {
                 .relate_hand_joints(tracker, time)
                 .ok()
                 .flatten()?;
+
+            let wrist = joints[xr::HandJointEXT::WRIST];
+            key_wrists[i] = wrist
+                .location_flags
+                .contains(xr::SpaceLocationFlags::POSITION_VALID)
+                .then(|| crate::from_xr_vec3(wrist.pose.position));
 
             let shape = HandShape::from_joints(&joints.map(|joint| {
                 crate::from_xr_vec3(joint.pose.position).extend(joint.radius * params.radius_scale)
@@ -1079,6 +1391,7 @@ impl StreamContext {
 
         self.hand_bounds
             .set(hands.map(|hand| hand.map(|(shape, _)| shape.bounds())));
+        self.key_wrists.set(key_wrists);
 
         // With a play area placed from a marker only the part of the hands inside it shows, faded at
         // its surface. After the bounds: the playzone still knows about the whole hands
@@ -1354,6 +1667,7 @@ impl StreamContext {
             crate::from_xr_vec3(current_headset_views[1].pose.position),
         ];
         let color_key = self.color_key_input(display_time, Some(eye_positions));
+        self.log_arms(&arms);
         let capture_playzone = self.should_capture_playzone(frame.as_ref());
 
         Some(DepthRenderInput {
@@ -1897,5 +2211,88 @@ fn stream_input_loop(
 
         deadline += frame_interval / 3;
         thread::sleep(deadline.saturating_duration_since(Instant::now()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params(shift: i64, hands: i64, target_ms: i64, history_ms: i64) -> ArmParams {
+        ArmParams {
+            shift,
+            hands,
+            target_ms,
+            history_ms,
+            weight_mm: 300,
+        }
+    }
+
+    #[test]
+    fn arm_shift_keeps_old_values() {
+        // Before mode 2 every value but 0 meant today's shift
+        assert_eq!(arm_shift_mode(0), 0);
+        assert_eq!(arm_shift_mode(1), 1);
+        assert_eq!(arm_shift_mode(2), 2);
+        for value in [-1, 3, 5, 100] {
+            assert_eq!(arm_shift_mode(value), 1, "{value}");
+        }
+    }
+
+    #[test]
+    fn arm_hands_select_mode_2() {
+        // Bit 1: left (hand 0), bit 2: right (hand 1)
+        let both = params(2, 3, 40, 80);
+        assert!(both.is_new(0) && both.is_new(1));
+        let left = params(2, 1, 40, 80);
+        assert!(left.is_new(0) && !left.is_new(1));
+        let right = params(2, 2, 40, 80);
+        assert!(!right.is_new(0) && right.is_new(1));
+        assert!(!params(2, 0, 40, 80).is_new(0));
+        // Only with `arm_shift 2`
+        assert!(!params(1, 3, 40, 80).is_new(0));
+    }
+
+    #[test]
+    fn arm_times_are_before_the_display() {
+        let display_ns = 10_000_000_000;
+        let (target_ns, history_ns, ahead_s) = params(2, 3, 40, 80).times(display_ns);
+        assert_eq!(target_ns, display_ns - 40_000_000);
+        assert_eq!(history_ns, display_ns - 80_000_000);
+        assert!((ahead_s - 0.04).abs() < 1e-6, "{ahead_s}");
+
+        // The history is never after the target: no step back
+        let (target_ns, history_ns, ahead_s) = params(2, 3, 60, 20).times(display_ns);
+        assert_eq!(target_ns, display_ns - 60_000_000);
+        assert_eq!(history_ns, target_ns);
+        assert_eq!(ahead_s, 0.0);
+    }
+
+    #[test]
+    fn arm_lookups_are_counted_apart() {
+        let mut log = ArmHandLog {
+            frames: 3,
+            ..Default::default()
+        };
+        assert_eq!(log.count(Lookup::Place, Some(1)), Some(1));
+        assert_eq!(log.count::<i32>(Lookup::Velocity, None), None);
+        log.count::<i32>(Lookup::Velocity, None);
+        log.count::<i32>(Lookup::Capture, None);
+        assert_eq!(log.failed, [0, 2, 1]);
+        assert_eq!(
+            log.lookups_text(true),
+            "lookups failed H 0, H-30 2, capture 1 of 3 frames"
+        );
+        assert_eq!(
+            log.lookups_text(false),
+            "lookups failed display 0, capture 1 of 3 frames"
+        );
+    }
+
+    #[test]
+    fn median_and_p90() {
+        assert_eq!(median_p90(&mut []), None);
+        let mut values = [5.0, 1.0, 3.0, 2.0, 4.0];
+        assert_eq!(median_p90(&mut values), Some((3.0, 5.0)));
     }
 }

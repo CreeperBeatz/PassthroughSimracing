@@ -4,7 +4,7 @@
 
 use crate::{
     PlacedArea,
-    depth_mask::{self, DepthFrame, DepthRenderInput},
+    depth_mask::{self, ArmMotion, DepthFrame, DepthRenderInput},
     key_dump::{array, number, numbers, object, pose, string},
     stream,
 };
@@ -363,6 +363,23 @@ pub(crate) fn camera(view: &ViewParams) -> String {
     ])
 }
 
+/// The shift of the depth around an arm, null: plain depth. Also in the display records of bursts
+pub(crate) fn arm(arm: Option<&ArmMotion>) -> String {
+    arm.map_or("null".into(), |arm| {
+        object([
+            ("wrist", numbers(&arm.wrist.to_array())),
+            ("direction", numbers(&arm.direction.to_array())),
+            ("displacement", numbers(&arm.displacement.to_array())),
+            ("mode", arm.mode.to_string()),
+            ("weight_len", number(arm.weight_len)),
+            ("target_ns", arm.target_ns.to_string()),
+            ("history_ns", arm.history_ns.to_string()),
+            ("wrist_history", numbers(&arm.wrist_history.to_array())),
+            ("extrapolated_mm", number(arm.extrapolated * 1000.0)),
+        ])
+    })
+}
+
 fn optional(value: Option<i64>) -> String {
     value.map_or("null".into(), |value| value.to_string())
 }
@@ -511,15 +528,11 @@ impl DumpFrame<'_> {
                 },
             )
         });
-        let arms = self.input.arms.map(|arm| {
-            arm.map_or("null".into(), |arm| {
-                object([
-                    ("wrist", numbers(&arm.wrist.to_array())),
-                    ("direction", numbers(&arm.direction.to_array())),
-                    ("displacement", numbers(&arm.displacement.to_array())),
-                ])
-            })
-        });
+        let arms = self
+            .input
+            .arms
+            .each_ref()
+            .map(|motion| arm(motion.as_ref()));
 
         let mut depth = size(self.depth_size).to_vec();
         depth.extend([
@@ -650,7 +663,20 @@ mod tests {
                 leak: [0.0; 2],
                 bridges: [None; 2],
             }),
-            arms: [None; 2],
+            arms: [
+                None,
+                Some(ArmMotion {
+                    wrist: Vec3::new(0.1, 1.2, -0.3),
+                    direction: Vec3::NEG_Y,
+                    displacement: Vec3::new(0.02, 0.0, 0.0),
+                    weight_len: 0.25,
+                    mode: 2,
+                    target_ns: 1_234_527_890_123,
+                    history_ns: 1_234_487_890_123,
+                    wrist_history: Vec3::new(0.08, 1.2, -0.3),
+                    extrapolated: 0.015625,
+                }),
+            ],
             capture_playzone: false,
             playzone_view: false,
             key_lower_rects: None,
@@ -688,6 +714,13 @@ mod tests {
             );
             assert_eq!(json.contains(r#""playzone":null"#), playzone.is_none());
             assert!(json.contains(r#""hands":[null,{"bounds":"#), "{json}");
+            assert!(
+                json.contains(
+                    r#""displacement":[0.02,0,0],"mode":2,"weight_len":0.25,"target_ns":1234527890123,"history_ns":1234487890123,"wrist_history":[0.08,1.2,-0.3],"extrapolated_mm":15.625}]"#
+                ),
+                "{json}"
+            );
+            assert!(json.contains(r#""arms":[null,{"wrist":"#), "{json}");
         }
 
         // A box placed from a marker is written instead of the region of the settings

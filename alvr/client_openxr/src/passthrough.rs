@@ -123,7 +123,13 @@ impl PassthroughLayer<'_> {
 ///   at the top of the image
 /// - `setprop debug.alvr.key_hands 0`: no hands in the GPU passes (to measure them)
 /// - `setprop debug.alvr.arm_shift 0`: plain depth for the arms, not shifted by the motion of the wrist (also
-///   without the key, see `StreamContext`)
+///   without the key, see `StreamContext`). 1 (default): shifted with the display-time wrist, a smoothstep to
+///   45 cm. 2: with a wrist looked up in the past and extrapolated to a target time, a linear weight
+/// - `setprop debug.alvr.arm_hands <n>`: arms that use `arm_shift 2` (1 left, 2 right, 3 both), the others 1
+/// - `setprop debug.alvr.arm_target_ms <ms>` / `arm_history_ms <ms>` / `arm_weight_mm <mm>`: with
+///   `arm_shift 2`, the arm is placed for the display time minus `arm_target_ms` (0..150, 40), from the wrist
+///   at the display time minus `arm_history_ms` (0..200, 80, at least `arm_target_ms`); the weight falls
+///   linearly to 0 over `arm_weight_mm` (100..600, 300)
 /// - `setprop debug.alvr.playzone -1`: forget the remembered playzone
 /// - `setprop debug.alvr.key_leak <percent>`: narrow the rim where the background around a hand looks like
 ///   the hand (needs `auto_key`), 0: off, 100: on
@@ -166,7 +172,7 @@ impl PassthroughLayer<'_> {
 /// - `setprop debug.alvr.key_wrist_follow <percent>`: below this score the camera doesn't see the forearm,
 ///   the bridge goes back to the default direction. 0: always the best candidate
 pub struct ColorKey {
-    version: u32,
+    pub version: u32,
     lut: Vec<u8>,
     pub params: ColorKeyParams,
 }

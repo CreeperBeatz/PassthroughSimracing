@@ -896,7 +896,11 @@ pub fn entry_point() {
                 .as_mut()
                 .is_some_and(|layer| layer.update_color_key(color_key));
             if let Some(stream) = &mut stream_context {
-                stream.set_color_key(color_key.filter(|_| use_color_key).map(|key| key.params));
+                let color_key = color_key.filter(|_| use_color_key);
+                stream.set_color_key(
+                    color_key.map(|key| key.params),
+                    color_key.map_or(0, |key| key.version),
+                );
 
                 if use_color_key
                     && let Some(lut) = stream.take_color_key_lut()

@@ -400,6 +400,16 @@ impl Output {
     fn alpha(&self, u: f32, v: f32) -> f32 {
         f32::from(self.at(u, v)[3]) / 255.0
     }
+
+    /// Mean u of the pixels of the row at `v` where the room shows (alpha below 0.5). NaN: none
+    fn room_centre(&self, v: f32) -> f32 {
+        let room = (0..TARGET_SIZE)
+            .map(|x| (x as f32 + 0.5) / TARGET_SIZE as f32)
+            .filter(|u| self.alpha(*u, v) < 0.5)
+            .collect::<Vec<_>>();
+
+        room.iter().sum::<f32>() / room.len() as f32
+    }
 }
 
 fn write_texture_2d(
@@ -1671,11 +1681,7 @@ fn late_arms_are_moved() {
             &[],
         )
     };
-    let motion = |displacement| ArmMotion {
-        wrist: Vec3::new(0.05, 0.05, -0.5),
-        direction: Vec3::NEG_Y,
-        displacement,
-    };
+    let motion = |displacement| arm_motion(Vec3::new(0.05, 0.05, -0.5), displacement, 0.0);
 
     let still = render_arm(Some(motion(Vec3::ZERO)));
     assert_eq!(still.alpha(0.45, 0.48), 0.0);
@@ -1715,6 +1721,66 @@ fn late_arms_are_moved() {
     );
     assert_eq!(keyed.alpha(0.45, 0.37), 0.0);
     assert!(keyed.alpha(0.55, 0.48) < 0.1, "{}", keyed.alpha(0.55, 0.48));
+
+    // `arm_shift 2`: the linear weight over 30 cm. A longer arm (y from -0.4 to 0.4 m, the wrist at
+    // y = 0.1) that moved 20 cm to the right
+    let long_scene = Scene::new(3.0, [0.4, 0.1, 0.5, 0.9], 0.5);
+    let render_long = |arm: ArmMotion| {
+        render_full(
+            &device,
+            &queue,
+            &config,
+            &long_scene,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            true,
+            None,
+            [None, Some(arm)],
+            None,
+            None,
+            false,
+            &[],
+        )
+    };
+    let displacement = Vec3::new(0.2, 0.0, 0.0);
+    let wrist = Vec3::new(0.15, 0.1, -0.5);
+    let still = render_long(arm_motion(wrist - displacement, Vec3::ZERO, 0.3));
+    let linear = render_long(arm_motion(wrist, displacement, 0.3));
+    let today = render_long(arm_motion(wrist, displacement, 0.0));
+    // Rows about 20 cm (y = -0.1), 31 cm (y = -0.21) and 35 cm (y = -0.25) along the arm from the
+    // wrist (the pixel centres are at 20.2, 31.1 and 35.8 cm). At 0.5 m one meter is one view uv, one
+    // pixel 1/64 = 0.0156
+    let (row_20, row_31, row_35) = (0.6, 0.71, 0.75);
+    let shift = |output: &Output, v| output.room_centre(v) - still.room_centre(v);
+
+    // 20 cm along: moved by 1 - 20 / 30 = 1/3 of the displacement (today's smoothstep: 58 %)
+    let shift_20 = shift(&linear, row_20);
+    assert!((shift_20 - 0.2 / 3.0).abs() < 0.012, "{shift_20}");
+    let today_20 = shift(&today, row_20);
+    assert!((today_20 - 0.2 * 0.584).abs() < 0.012, "{today_20}");
+    // 31 cm along: past the weight, not moved. Today's smoothstep still moves it by 23 % (0.046, 3
+    // pixels; measured 3): at least 2 pixels, so a pixel of rounding does not fail it
+    let shift_31 = shift(&linear, row_31);
+    assert!(shift_31.abs() < 0.005, "{shift_31}");
+    let today_31 = shift(&today, row_31);
+    assert!(today_31 > 1.5 / TARGET_SIZE as f32, "{today_31}");
+    // 35 cm along: not moved either
+    let shift_35 = shift(&linear, row_35);
+    assert!(shift_35.abs() < 0.005, "{shift_35}");
+}
+
+fn arm_motion(wrist: Vec3, displacement: Vec3, weight_len: f32) -> ArmMotion {
+    ArmMotion {
+        wrist,
+        direction: Vec3::NEG_Y,
+        displacement,
+        weight_len,
+        mode: if weight_len > 0.0 { 2 } else { 1 },
+        target_ns: 0,
+        history_ns: 0,
+        wrist_history: wrist,
+        extrapolated: 0.0,
+    }
 }
 
 #[test]

@@ -455,11 +455,51 @@ pub struct ColorKeyInput {
 /// Motion of an arm since the depth image was captured
 #[derive(Clone, Copy)]
 pub struct ArmMotion {
-    /// Now
+    /// Where the arm is placed: the wrist at `target_ns`
     pub wrist: Vec3,
     /// From the wrist to the elbow
     pub direction: Vec3,
     pub displacement: Vec3,
+    /// Length of the linear weight along the arm (meters, `debug.alvr.arm_weight_mm`): the depth moves
+    /// fully at the wrist and not at all this far towards the elbow. 0: the smoothstep to 45 cm of
+    /// `arm_shift 1`
+    pub weight_len: f32,
+    /// The rest is for bursts and dumps only.
+    /// `debug.alvr.arm_shift` of this arm: 1 (display-time wrist) or 2 (past-time target)
+    pub mode: u8,
+    /// The time the arm is placed for (XrTime): the display time minus `key_delay` in mode 1, minus
+    /// `arm_target_ms` in mode 2
+    pub target_ns: i64,
+    /// When the wrist was looked up. The same as `target_ns` in mode 1
+    pub history_ns: i64,
+    /// The wrist at `history_ns`
+    pub wrist_history: Vec3,
+    /// How far the wrist was extrapolated from `wrist_history` to `wrist` (meters)
+    pub extrapolated: f32,
+}
+
+/// Step 1 of the arm plan: the wrist at the target time T, from the wrist at an earlier time H (`w_h`)
+/// and the wrist `gap_s` before H (`w_p`, None: not located). `ahead_s` is T - H. Lookups in the past
+/// are accurate, the newest estimate of the runtime is late, so the arm is placed from the past and
+/// moved ahead with the velocity of a finite difference: the joint velocities the runtime reports were
+/// 1.5-2x too large (measured). The step is at most `cap` long, and 0 if T is not after H. Returns the
+/// wrist at T and the length of the step
+pub fn arm_target_wrist(
+    w_h: Vec3,
+    w_p: Option<Vec3>,
+    gap_s: f32,
+    ahead_s: f32,
+    cap: f32,
+) -> (Vec3, f32) {
+    let Some(w_p) = w_p.filter(|_| ahead_s > 0.0 && gap_s > 0.0) else {
+        return (w_h, 0.0);
+    };
+    let step = ((w_h - w_p) / gap_s * ahead_s).clamp_length_max(cap);
+    if !step.is_finite() {
+        return (w_h, 0.0);
+    }
+
+    (w_h + step, step.length())
 }
 
 /// Per-frame depth inputs for the stream renderer
@@ -756,12 +796,18 @@ pub fn depth_uniforms(
             data.extend(point.to_array());
         }
     }
+    // The `w` of the third vec4 is the length of the linear weight (0: the smoothstep of mode 1)
     for arm in &input.arms {
         let [wrist, direction, displacement] = arm.map_or([Vec3::ZERO; 3], |arm| {
             [arm.wrist, arm.direction, arm.displacement]
         });
-        for v in [wrist, direction, displacement] {
-            data.extend(v.extend(0.0).to_array());
+        let weight_len = arm.map_or(0.0, |arm| arm.weight_len);
+        for v in [
+            wrist.extend(0.0),
+            direction.extend(0.0),
+            displacement.extend(weight_len),
+        ] {
+            data.extend(v.to_array());
         }
     }
 
@@ -1151,6 +1197,41 @@ mod tests {
         );
         // 28 capsules per hand, the bridges from the wrists, the boxes of the play area
         assert_eq!(DEPTH_UNIFORMS_SIZE, 4144);
+    }
+
+    #[test]
+    fn arm_target_wrist_extrapolates_from_the_past() {
+        let w_h = Vec3::new(0.1, 1.0, -0.4);
+        // 0.5 m/s along x: 15 mm in 30 ms
+        let w_p = w_h - Vec3::new(0.015, 0.0, 0.0);
+
+        // Constant motion is reproduced exactly: 40 ms ahead, 20 mm
+        let (wrist, step) = arm_target_wrist(w_h, Some(w_p), 0.030, 0.040, 0.06);
+        assert!(
+            wrist.distance(w_h + Vec3::new(0.02, 0.0, 0.0)) < 1e-6,
+            "{wrist}"
+        );
+        assert!((step - 0.02).abs() < 1e-6, "{step}");
+
+        // No step when T is not after H, or without the earlier wrist
+        assert_eq!(
+            arm_target_wrist(w_h, Some(w_p), 0.030, 0.0, 0.06),
+            (w_h, 0.0)
+        );
+        assert_eq!(
+            arm_target_wrist(w_h, Some(w_p), 0.030, -0.02, 0.06),
+            (w_h, 0.0)
+        );
+        assert_eq!(arm_target_wrist(w_h, None, 0.030, 0.040, 0.06), (w_h, 0.0));
+
+        // The cap holds: 3 m/s for 40 ms would be 12 cm, capped at 6 cm in the same direction
+        let fast = w_h - Vec3::new(0.0, 0.0, 0.09);
+        let (wrist, step) = arm_target_wrist(w_h, Some(fast), 0.030, 0.040, 0.06);
+        assert!((step - 0.06).abs() < 1e-6, "{step}");
+        assert!(
+            wrist.distance(w_h + Vec3::new(0.0, 0.0, 0.06)) < 1e-6,
+            "{wrist}"
+        );
     }
 
     // A hand reaching out of a marker box: inside unchanged, outside nothing reaches even the rim,

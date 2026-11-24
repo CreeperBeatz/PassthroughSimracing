@@ -15,10 +15,18 @@
 #          eye_positions (K, 2, 3), view_position (K, 2, 3), view_orientation (K, 2, 4), view_tangents
 #          (K, 2, 4), stream_orientation (K, 2, 4), stream_tangents (K, 2, 4), joints (K, 2, 26, 4) xyz r,
 #          tracked (K, 2, 26), velocities (K, 2, 26, 3), capsules (K, 2, 28, 8) start xyz r end xyz r,
-#          rim (K, 2), arm_wrist / arm_direction / arm_displacement (K, 2, 3)
+#          rim (K, 2), arm_wrist / arm_direction / arm_displacement (K, 2, 3), and of step 1 of the arm plan
+#          (burst version 2): arm_mode (K, 2) (0: no arm, plain depth: arm_shift 0, no hand tracker, a failed
+#          lookup or a wrist step over 25 cm; 1: display-time wrist, 2: past-time target),
+#          arm_weight_len (K, 2) (m, 0: smoothstep of mode 1), arm_target_ns / arm_history_ns (K, 2) (-1: no
+#          arm), arm_wrist_history (K, 2, 3), arm_extrapolated_mm (K, 2). Version 1 bursts only had mode 1:
+#          their arms read as mode 1, weight 0, target and history = hand_ns (the time mode 1 used), the
+#          history wrist = arm_wrist, extrapolated 0
 # camera:  image_ns, now_ns (C,), intrinsics (C, 4) fx fy cx cy, position (C, 3), orientation (C, 4),
 #          head_position, head_orientation, joints (C, 2, 26, 4), rgb (C, H, W, 3) uint8
 # regions: list of the region JSON objects; index: the whole index JSON
+# key_lut: the learned colour table of the key last uploaded before the start (version 2), None: none (or a
+#          version 1 burst): version, published_ns, rgba (32, 32, 32, 4) uint8 indexed [b][g][r]
 import json
 import os
 import sys
@@ -125,6 +133,12 @@ def load_burst(path, images=True):
         "arm_wrist": np.full((k, 2, 3), np.nan),
         "arm_direction": np.full((k, 2, 3), np.nan),
         "arm_displacement": np.full((k, 2, 3), np.nan),
+        "arm_mode": np.zeros((k, 2), np.int64),
+        "arm_weight_len": np.full((k, 2), np.nan),
+        "arm_target_ns": np.full((k, 2), -1, np.int64),
+        "arm_history_ns": np.full((k, 2), -1, np.int64),
+        "arm_wrist_history": np.full((k, 2, 3), np.nan),
+        "arm_extrapolated_mm": np.full((k, 2), np.nan),
     }
     for i, r in enumerate(display_records):
         _hands(r["hands"], display["joints"], display["tracked"], display["velocities"], i)
@@ -137,6 +151,13 @@ def load_burst(path, images=True):
                 display["arm_wrist"][i, side] = _floats(arm["wrist"], 3)
                 display["arm_direction"][i, side] = _floats(arm["direction"], 3)
                 display["arm_displacement"][i, side] = _floats(arm["displacement"], 3)
+                # Version 1 had no fields of step 1: mode 1 at the time the hands were located
+                display["arm_mode"][i, side] = arm.get("mode", 1)
+                display["arm_weight_len"][i, side] = _float(arm.get("weight_len", 0.0))
+                display["arm_target_ns"][i, side] = arm.get("target_ns", r["hand_ns"])
+                display["arm_history_ns"][i, side] = arm.get("history_ns", r["hand_ns"])
+                display["arm_wrist_history"][i, side] = _floats(arm.get("wrist_history", arm["wrist"]), 3)
+                display["arm_extrapolated_mm"][i, side] = _float(arm.get("extrapolated_mm", 0.0))
 
     camera_records = by_kind["camera"]
     c = len(camera_records)
@@ -160,6 +181,15 @@ def load_burst(path, images=True):
             [np.fromfile(os.path.join(folder, r["file"]), dtype=np.uint8).reshape(ch, cw, 3) for r in camera_records]
         )
 
+    key_lut = None
+    lut = index.get("key_lut")
+    if lut is not None:
+        key_lut = {
+            "version": lut["version"],
+            "published_ns": lut["published_ns"],
+            "rgba": np.fromfile(os.path.join(folder, lut["file"]), dtype=np.uint8).reshape(32, 32, 32, 4),
+        }
+
     return {
         "index": index,
         "folder": folder,
@@ -167,6 +197,7 @@ def load_burst(path, images=True):
         "display": display,
         "camera": camera,
         "regions": [r["region"] for r in by_kind["region"]],
+        "key_lut": key_lut,
     }
 
 
@@ -231,6 +262,36 @@ def summary(burst):
     lines.append("display frame interval: " + _stats(np.diff(display["display_ns"]) / 1e6))
     tracked_hands = (~np.isnan(display["joints"][..., 0, 0])).sum(axis=0)
     lines.append("display frames with a located hand: left %d, right %d" % tuple(tracked_hands))
+    modes = display["arm_mode"]
+    arm_parts = []
+    for side, name in enumerate(("left", "right")):
+        counts = np.bincount(modes[:, side], minlength=3)
+        part = "%s: no arm (plain depth: off or failed) %d, mode 1 %d, mode 2 %d" % (
+            name,
+            counts[0],
+            counts[1],
+            counts[2],
+        )
+        new = modes[:, side] == 2
+        if new.any():
+            part += ", mode 2 extrapolated median %.1f mm, max %.1f mm" % (
+                np.median(display["arm_extrapolated_mm"][new, side]),
+                display["arm_extrapolated_mm"][new, side].max(),
+            )
+        arm_parts.append(part)
+    lines.append("display frames per arm mode (burst version %d): %s" % (index.get("version", 1), "; ".join(arm_parts)))
+    key_lut = burst.get("key_lut")
+    if key_lut is None:
+        lines.append("key table: none recorded")
+    else:
+        lines.append(
+            "key table: version %d, uploaded %.0f ms before the start, %d of 32768 colours kept (alpha >= 128)"
+            % (
+                key_lut["version"],
+                (index["start_ns"] - key_lut["published_ns"]) / 1e6,
+                int((key_lut["rgba"][..., 3] >= 128).sum()),
+            )
+        )
     if len(camera["image_ns"]):
         lines.append("camera image interval: " + _stats(np.diff(camera["image_ns"]) / 1e6))
         lines.append("camera image age when the pass started: " + _stats((camera["now_ns"] - camera["image_ns"]) / 1e6))

@@ -355,10 +355,18 @@ from the render-time capsules):
     runtime" test marks thousands of points; a hand going from the lap to the bottle carried a patch of
     thigh along). Tested on ONE move only.
 
-*The arm mask plan (design pass of the day, not built).* The plan and the design will be in the repo as
-`docs/arm-mask-build-plan.md` and `docs/arm-mask-design.md` (the main session copies them). Step 1 is NOT
-built yet. Where plan and offline simulation (`logs/analysis-20261124-arm-mask/`) disagree, the simulation
-wins.
+*The arm mask plan (design pass of the day).* The plan and the design will be in the repo as
+`docs/arm-mask-build-plan.md` and `docs/arm-mask-design.md` (the main session copies them). Where plan and
+offline simulation (`logs/analysis-20261124-arm-mask/`) disagree, the simulation wins.
+
+**Step 1 is built (after 1503fb42), not yet judged on the headset.** `arm_shift 2` (the default stays 1),
+`arm_hands`, `arm_target_ms`, `arm_history_ms`, `arm_weight_mm` (Settings), the `arm:` log line, the new
+arm fields in bursts and depth dumps, and the learned key table in each burst (`alvr_dump_<n>_key.lut`,
+burst format version 2; `read_burst.py` reads old and new bursts). The maths is
+`alvr_graphics::arm_target_wrist`; the shader takes the linear weight from the `w` of the third `arms`
+vector (no layout change). Unit tests pass (a GPU test: 20 cm along the arm moves by 1/3 of the
+displacement, 35 cm not at all). To try: `arm_shift 2` with `arm_hands 1` (left new, right today), a fast
+wave; then `arm_target_ms` 20 / 40 / 60.
 - **Decision: build smaller. Step 1 now, the keyed zone later, in a reduced form, behind gates.**
 - The numbers (offline, wrong pixels as % of the true arm area, bursts 8 / 2 / 6, passthrough latency
   assumed 49.5 ms):
@@ -389,7 +397,7 @@ wins.
   at most 30 % of the frames with the hands on a wheel; G4 new bursts carrying the live colour table still
   show a lower cut + halo for the zone than for step 1 alone. The zone's likely main benefit (the 0.6-2.6
   cm gap next to the wrist, 5-8 cm on a wheel) was never scored offline.
-- Properties of step 1 (planned, `debug.alvr.`): `arm_shift` 0 / 1 / 2 (2 = new; the default stays 1 until
+- Properties of step 1 (built, see the note above; `debug.alvr.`): `arm_shift` 0 / 1 / 2 (2 = new; the default stays 1 until
   the user's verdict), `arm_hands` 3 (which arms use mode 2: for a side-by-side check), `arm_target_ms` 40,
   `arm_history_ms` 80, `arm_weight_mm` 300. The wrist is looked up in the past (display - 80 ms) and
   extrapolated by finite difference, at most 6 cm; the weight is linear 1 to 0 over 30 cm. Costs no GPU
@@ -405,7 +413,8 @@ wins.
   port 8082) and needed a SteamVR restart.
 
 *Next steps as of the evening of 2026-11-24.*
-1. Build step 1 of the arm plan, with the live switch; the user judges on the headset.
+1. Build step 1 of the arm plan, with the live switch; the user judges on the headset. (Built, not yet
+   installed or judged.)
 2. A design pass on the session's top model for the mask around hands, arms and held objects, before the
    keyed zone or the change to the remembered copy is built (the user asked why design work was not given
    to it).
@@ -1147,7 +1156,11 @@ Measured in the SteamVR home, 72 Hz, with color key on unless noted:
 | `key_crop` | 1 | Lower game layer only around the hands. 0: full, 2: y origin at the top (if 1 is upside down). Not tested |
 | `key_hands` | 1 | 0: no hands in the GPU passes. Not tested |
 | `hand_removal` | 1 | 1: with the key on the runtime takes the hands out of the depth map, and an uneven 3-15 cm around them (measured). 0: asks the runtime to keep the hands in the depth map, but it does NOT bring them back: measured on 2026-11-24 with the property at 0 (log `hand removal from the depth map: off` at 08:53:13.8), the runtime still removed tracked hands and filled tiles around them with far depth (captures 626 / 627, analysis in `logs/analysis-20261124-lap`). It stays as a probe. Log lines with the answer of the runtime, both ways: `hand removal from the depth map: on / off: the runtime answered <SUCCESS or ERROR_...>` on a change, `hand removal from the depth map at the start of the depth: on / off: the runtime answered ...` when the depth starts (until 2026-11-24 only a failed enable was logged, as an error, and the change line had no answer) |
-| `arm_shift` | 1 | 1: the depth around each arm is shifted by the motion of the wrist (with the key only up to the wrist, the hands are removed from the depth map; plain depth for a wrist that moved more than 25 cm or has no valid position), 0: plain depth. Also without the key. 1 runs on the headset, 0 not tested |
+| `arm_shift` | 1 | 1: the depth around each arm is shifted by the motion of the wrist (with the key only up to the wrist, the hands are removed from the depth map; plain depth for a wrist that moved more than 25 cm or has no valid position), the wrist located at the display time minus `key_delay`, the weight a smoothstep from 1 at the wrist to 0 at 45 cm. 0: plain depth. Any other value (negative, 3 and up) means 1, as before mode 2 existed. 2 (step 1 of `docs/arm-mask-build-plan.md`, built 2026-11-24, not yet run on the headset): the wrist is looked up in the past at H = display − max(`arm_history_ms`, `arm_target_ms`) and 30 ms before H, moved ahead to the target T = display − `arm_target_ms` with the finite-difference velocity (at most 6 cm), and the weight falls linearly from 1 to 0 over `arm_weight_mm`. Also without the key. 1 runs on the headset, 0 not tested. Line `arm: ...` on `ALVR_CAM` on each change of an `arm_*` property (the settings, "(new settings)") and every 2 s while an arm uses mode 2: per arm the extrapolation (median and p90, mm, only of frames with a velocity; "no velocity" if none had one) at the median speed of the finite difference, the failed joint lookups per kind of the frames since the last line (mode 2: `lookups failed H a, H-30 b, capture c of N frames`, H the history time, H-30 the lookup 30 ms before it for the velocity, capture the depth capture time; mode 1: `display a, capture c`; a failed H or display lookup skips the capture lookup; a failed H-30 lookup means no step that frame) and the `hand-to-arm wrist gap` (median and p90, mm, between the wrist of the hand capsules, display time minus `key_delay`, and the wrist the arm is placed with; "-" without the key's hands) |
+| `arm_hands` | 3 | With `arm_shift 2`: the arms that use mode 2 (1 left, 2 right, 3 both, 0 none); the others use mode 1, for a side-by-side check |
+| `arm_target_ms` | 40 ms | With `arm_shift 2`: the arm is placed for the display time minus this (the passthrough latency; try 20 / 40 / 60 while waving). 0..150 |
+| `arm_history_ms` | 80 ms | With `arm_shift 2`: the wrist is looked up at the display time minus this, at least `arm_target_ms` (the runtime's newest estimate is late, the past is accurate). 0..200. If the H or H-30 lookups fail (`arm:` line), lower it (and check the tracking): a lookup too far in the past is the likely cause (not measured) |
+| `arm_weight_mm` | 300 mm | With `arm_shift 2`: length of the linear weight along the arm. Offline best 26-35 cm, 20 cm worse. 100..600 |
 | `key_leak` | 0 % | Narrower rim where the background around a hand looks like it, 0: off, 100: on. Needs `auto_key`. Not tested |
 | `key_leak_lo` / `key_leak_hi` | 5 / 20 % | Share of the colors around the hand that the key keeps: where the narrowing starts / is complete |
 | `key_leak_inset` | 3 mm | Rim at full narrowing, inside the hand. 0: down to the soft edge only |
@@ -1224,7 +1237,11 @@ another thread):
   (`pose` and `tangents` left, right, down, up of the streamed view), `uv_to_world_dir` (column major 4x4:
   `dir = M * (u, v, 1, 0)`, uv from the top left), `depth_camera` and `playzone_camera` (`pose`, `tangents`,
   `world_to_view`, `view_to_world`), `files`; `hands` (`bounds` xyz r, `capsules` like the camera dumps,
-  `rim`, null: none); `arms` (`wrist`, `direction`, `displacement`, null: plain depth). Stage space, meters.
+  `rim`, null: none); `arms` (`wrist` (where the arm is placed: the wrist at `target_ns`), `direction`,
+  `displacement`, and since 2026-11-24 `mode` (1 or 2, see `arm_shift`), `weight_len` (m, 0: the smoothstep
+  of mode 1), `target_ns` (the time the arm is placed for), `history_ns` (when the wrist was looked up; =
+  `target_ns` in mode 1), `wrist_history` (the wrist at `history_ns`), `extrapolated_mm` (from
+  `wrist_history` to `wrist`); null: plain depth). Stage space, meters.
 
 Depth texel (x, y) to the world: `tx = l + (x + 0.5) / width * (r - l)`, `ty = d + (y + 0.5) / height * (u - d)`
 with the `tangents` of `depth_camera` (`y` from the bottom), point `view_to_world * (tx * z, ty * z, -z, 1)`
@@ -1252,13 +1269,22 @@ on a synthetic burst written by the Rust unit test `depth_burst::tests::files_ho
 - `alvr_dump_<n>_depth*`: one normal depth dump (above) from the first frame with a depth image after
   the start, with the mask and the focus area (the burst itself does not keep the mask: it can be rebuilt
   from the records).
-- `alvr_burst_<n>.json`, the index: `format` "alvr_burst", `version` 1, `n`, `duration_ms` (asked),
+- `alvr_dump_<n>_key.lut` (since version 2, only if there is one): the learned colour table of the key as
+  it was last uploaded to the compositor before the start (32x32x32 RGBA, `[b][g][r]`, like
+  `key_lut_dump`). None while the key is off, without `auto_key`, or before the learner published a table
+  (then the table of the file is shown). After a `color_key` reload the file's table is shown until the
+  learner publishes again, and the burst records none (since the review fix of 2026-11-24: a new
+  `color_key` version clears the recorded table). None therefore means the file's table (or no key).
+- `alvr_burst_<n>.json`, the index: `format` "alvr_burst", `version` 2 (1 until 2026-11-24: no `key_lut`
+  and only `wrist`, `direction`, `displacement` per arm; `read_burst.py` reads both), `n`, `duration_ms` (asked),
   `start_ns` / `end_ns` (XrTime, CLOCK_MONOTONIC on Quest like every time here), `depth` (`width`,
   `height`, `flip_y`), `camera` (`width`, `height`, null: no image), `counts` (`depth`, `depth_read`,
   `depth_skipped`: new depth frames not recorded because the limit of 240 was reached (a new depth frame
   that finds 6 readbacks on their way is recorded, with `error` "too many readbacks on their way", and
   counted in `failed readbacks` of the log; `read_burst.py` lists it under "readback errors"), `display`, `camera`, `region`), `dump` (the JSON of the depth dump that was asked for; the line
-  `depth dump <n>: ...` says whether it was written), and `records`:
+  `depth dump <n>: ...` says whether it was written), `key_lut` (`file`, `version`: counts the learned
+  tables uploaded since the stream started, `published_ns`: when it was uploaded, `bytes`; null: none),
+  and `records`:
   every record in time order of `t_ns` (when the app got it; at equal times region, depth, display,
   camera). Each record has `kind` and `index` (from 0 per kind):
   - `depth`: a new depth frame (a new capture time, swapchain index or depth view pose; the first one of a
@@ -1280,7 +1306,9 @@ on a synthetic burst written by the Rust unit test `depth_burst::tests::files_ho
     `key_scale`; located by a second lookup at the same time and space as the key's, later in the frame,
     so the runtime may answer slightly differently), `capsules` (left, right, null: no hand in the mask or no key: `capsules` 28 x start xyz r,
     end xyz r exactly as the mask used them, scaled, after `marker_hands`; `rim`), `arms` (left, right, null:
-    plain depth: `wrist`, `direction`, `displacement`). Stage space, meters.
+    plain depth: `wrist`, `direction`, `displacement`, and since version 2 `mode`, `weight_len`,
+    `target_ns`, `history_ns`, `wrist_history`, `extrapolated_mm` as in the depth dump JSON). Stage space,
+    meters.
   - `camera`: one pass of the key learner (about every 60 ms, not every camera frame: the learner takes
     the newest image when it runs). `t_ns` = `now_ns` (CLOCK_MONOTONIC when the pass started),
     `image_ns`, `width`, `height`, `fx`, `fy`, `cx`, `cy`, `pose` and `head` (as in the `key_dump` JSON:
@@ -2385,6 +2413,54 @@ The order of the user on 2026-11-23; how to go on with each is in "Where it stan
 7. Never tested on the headset: the lighting match, the leak map (`key_leak_map`), the narrower rim
    (`key_leak`). The box region ran once and is not judged.
 8. A way to compare two settings of the hand side by side (one per hand): asked for by the user.
+
+## Ideas, not agreed and not built (2026-11-24)
+
+Ideas of the user about the hand key, with my evaluation from the code. Nothing measured yet; after arm
+step 1 in the agreed order.
+
+**1. A width filter on the key** (user: "if lines are less than X pixels wide, remove the area/pixels, so
+we capture more of the hands, but then remove leakage from the background, without fetching the camera
+feed"). Not possible as stated: the key is a LUT that the compositor applies per camera pixel
+(`set_color_key` in `extra_extensions/passthrough_fb.rs`); a LUT sees one pixel's colour, never its
+neighbours, and the keyed result exists only inside the compositor (`stream.wgsl` only sets the alpha of
+the game layers around the keyed layer). A morphological opening needs that result, so it means reading
+the camera (the learning thread already reads camera pixels, so the route exists) and keying ourselves:
+then the key is as late as those frames and loses what makes it the "accelerometer" of the fusion.
+Fingers at lap distance are several cm wide, so an opening sized for speckle would keep them but round
+the tips and close the gaps. Ways to the same goal without the camera: a rim that follows the finger
+capsules tightly, so the colour range can be wide and a leak a few cm away falls outside the rim; a depth
+veto inside the rim where the depth is sure a texel lies well behind the hand (static background, so its
+age matters less; fails next to a fast hand). Cheap check first: an opening offline on the lap captures
+626 / 627 (`logs/dumps-20261124-lap`): mostly thin speckle (a width filter would help) or wide patches of
+trousers / desk colour (only rim shape or depth help). The user's own finding (the flicker appears where
+the VR area is behind the hands) points to the second.
+
+**2. Spatial chunks, each with its own hand + background mask** (user: "make a spacial hand + background
+mask, where the space is divided into spacial chunks and each chunk has its own mask"). Two parts of very
+different cost:
+- *Own policy per chunk: possible and cheap.* Chunks in the frame of the QR code (like the editor boxes),
+  each with a rule which signal decides: e.g. lap chunk = never trust the key, only depth and the moved
+  hand shape; wheel chunk = key with a wide range (the VR area is behind); shifter chunk = remembered copy
+  + hand. Only the alpha of the existing layers changes, no new layer. The rules could be learned per
+  chunk from the late depth (where it shows the key leaked, the chunk trusts the key less), as in
+  the user's principle "depth is delayed ground truth, the key is instantaneous". Related: the leak map (`key_leak_map`) already rates leaks per direction around
+  the head and narrows the rim, but it is not in the anchor frame and never acted on the headset.
+- *Own colour table per chunk: only with more passthrough layers.* There is one keyed layer for the whole
+  view with one LUT; stacking several full-view keyed layers does not work (each applies everywhere, and
+  hiding it outside its chunk also hides the chunks below). The way that works is projected passthrough
+  (XR_FB_passthrough projected surfaces + XR_FB_triangle_mesh, as in the cockpit-passthrough fork, see
+  `external/cockpit-passthrough/NOTES.md`): one mesh + one style (LUT) per chunk. Costs: the camera image
+  is pasted onto the mesh, so things off the surface look flat / shifted (a hand 10-20 cm above a lap
+  mesh is drawn on the lap) unless the mesh follows the hand every frame; each passthrough layer is
+  another full composite (the key's layers are already a large part of the GPU budget, open problem 6);
+  not verified that a projected layer takes our LUT and combines with the reconstruction keyed layer.
+  Gain: the lap leak exists because one global table must keep skin colours that appear in the
+  background somewhere; per chunk the background is known (trousers, desk, VR area), so the table can
+  drop what lies behind the hands there.
+- My recommendation: first the policy per chunk (tests "distrust the key on the lap" on the leg problem
+  at no new cost); a projected layer with its own LUT only if a chunk truly needs other colours, after a
+  short headset probe (does the runtime allow it, how bad is the warp).
 
 ## Privacy
 
