@@ -6,7 +6,7 @@ replaces everything after step 1 of `ALVR/docs/arm-mask-build-plan.md`. It merge
 
 Words: **measured** = on the headset, or offline on recorded data by an earlier job (KB). **A / B checked** =
 computed by designer A or B today. **lead checked** = computed for this document; scripts and outputs are in
-`C:\Users\dani\Documents\passthroughRacing\logs\analysis-20261124-design\lead\` (local only).
+`logs/analysis-20261124-design/lead/` of the project folder (local only, not in this repository).
 **estimated**, **unchecked** = nobody has tested it.
 
 ## 1. The idea
@@ -524,7 +524,7 @@ worry about the real rig and its learner can be seen working before a wheelbase 
 
 ## 10. Files
 
-- This design: `C:\Users\dani\Documents\passthroughRacing\design\mask-v2\design.md`.
+- This design: `design/mask-v2/design.md` of the project folder (this file is its copy in the repository).
 - The two designs it merges: `design-a-prediction.md`, `design-b-appearance.md` (same folder), with their
   checks in `logs\analysis-20261124-design\design-a-prediction\` and `design-b-appearance\`.
 - The lead's checks: `logs\analysis-20261124-design\lead\`: `l1_edge_registration.py`, `l1b_hist.py`,

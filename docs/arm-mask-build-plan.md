@@ -1,6 +1,8 @@
 # Arm mask: build plan
 
-Status 2026-11-24. This is a plan: nothing is built. It merges the design (`design/arm-mask/design.md`) and
+Status 2026-11-24. Step 1 is built (`arm_shift 2`, commit d6764b85) and not yet judged on the
+headset; nothing else is. Everything after step 1 is replaced by `docs/mask-v2-design.md` (checked in
+`docs/mask-v2-check.md`). It merges the design (`design/arm-mask/design.md`) and
 the offline simulation (`logs/analysis-20261124-arm-mask/results.md`, `s7_summary.md`). An implementer should
 not need either of them. Where they disagree, the simulation wins. Where the design proposes something the
 simulation did not test, this plan marks it **untested**.
