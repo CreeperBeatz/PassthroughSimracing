@@ -243,6 +243,8 @@ pub fn entry_point() {
     selected_exts.fb_face_tracking2 = true;
     selected_exts.fb_foveation = true;
     selected_exts.fb_foveation_configuration = true;
+    // The ray of each hand for the play area editor (area_editor.rs), as the system pointer
+    selected_exts.fb_hand_tracking_aim = true;
     selected_exts.fb_passthrough = true;
     selected_exts.fb_swapchain_update_state = true;
     selected_exts.htc_facial_tracking = true;
@@ -850,6 +852,7 @@ pub fn entry_point() {
                     marker_region.limits_hands() && !area_editor.is_editing(),
                 );
                 stream.set_game_dim(area_editor.game_dim());
+                stream.set_game_see(area_editor.game_see());
                 // The pinches of the editor are not sent to the PC
                 stream.withhold_hands(area_editor.withholds_hands());
             }

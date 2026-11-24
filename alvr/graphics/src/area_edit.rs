@@ -7,28 +7,51 @@
 //! of its dome (drag along the normal of the side: that side moves, the opposite one stays), a smaller
 //! one next to it for the dome (drag out: higher, back to the side: flat, snapped below `DOME_SNAP`), one
 //! at its center (moves the box), a curved arrow beside the center (turns the box about its vertical
-//! axis by the angle the cursor sweeps around that axis, with detents every `TURN_DETENT`), "+" (adds a
-//! box next to the side the eyes look at) and "x" (held for `REMOVE_HOLD_S`: removes the box; not on the
-//! last one). The other boxes show their center handle only; pinching any handle of a box selects it.
-//! Above the code: undo (takes the last change back) and done (ends editing). Buttons ("+", undo, done)
-//! act when the pinch opens with the hand usable, however far the hand moved: they have no drag.
+//! axis by the angle the cursor sweeps around that axis, with detents every `TURN_DETENT`) and "x" (held
+//! for `REMOVE_HOLD_S`: removes the box; not on the last one). The other boxes show their center handle
+//! only; the first pinch on a handle of another box only selects it (`pinch_action`), the next one
+//! edits. Above the code: undo (takes the last change back) and done (ends editing). Buttons (undo,
+//! done) act when the pinch opens with the hand usable, however far the hand moved: they have no drag.
+//!
+//! One hand or two (`PinchRoles`), the rule of the user: "pinch to resize is always with one hand.
+//! adding a new box or exiting edit mode is always with 2". A pinch works handles (grab, select, the
+//! buttons, the hold of "x") only while the other hand is open; alone on empty space it is free and does
+//! nothing. Whenever both hands are pinched it is the two-hand pinch or nothing, wherever the pinches
+//! closed. Two hands never close in the same frame, so when a hand closes while the other is pinched:
+//! the other pinch free: both are the two-hand pinch; the other pinch on a handle since at most
+//! `GRAB_YIELD_S` (near or by the ray) and its grab not out of its dead zone nor done: it gives way
+//! (the grab dropped without a change, a button does nothing on release, a selection stays) and both are
+//! the two-hand pinch; else (one hand resizing) the new pinch does nothing until it opens and does not
+//! disturb the grab. The pinches closed when editing began do nothing until they open.
+//!
+//! A new box: the two-hand pinch (both pinches free; `TwoHandPinch`). While the pinch points stay within
+//! `GESTURE_MAX_SPAN` of each other it may be the gesture that ends editing (its timer runs); once they
+//! were farther apart in this pinch it is a new box, drawn as a ghost that spans the two points
+//! (`new_box_between`: level, unturned in the area frame, each side at least `NEW_BOX_MIN_SIZE`), and
+//! the timer of the gesture does not run again until a pinch opens. The box is made when a hand lets go,
+//! unless its points are nearer than `NEW_BOX_MIN_SPAN` or there is no room (`new_box_refusal`).
 //!
 //! Picking: the cursor of a hand is the midpoint of its thumb and index tips. The handle nearest to the
 //! cursor within `HANDLE_REACH` is lit; handles about as near as that one (`HANDLE_TIE`) go by the line
-//! of sight from the eyes through the cursor. With none in reach, the handle nearest to that line of
-//! sight within `RAY_PICK_ANGLE` is lit (handles out of reach, like the far side of the box). The lit
-//! handle stays lit against small changes, and the client keeps it while the fingers close: what is lit
-//! before the pinch is what is taken. A grab moves the handle by the displacement of the cursor since
-//! the pinch (no jump), after a small dead zone that is caught up over `DRAG_RAMP`.
+//! of sight from the eyes through the cursor. With none in reach, the handle nearest to the ray of the
+//! hand (`HandRay`: the aim pose of the runtime, else from an estimated shoulder through the cursor)
+//! within `RAY_PICK_ANGLE` is lit (handles out of reach, like the far side of the box). The lit handle
+//! stays lit against small changes, and the client keeps it while the fingers close: what is lit before
+//! the pinch is what is taken. A grab moves the handle by the displacement of the cursor since the pinch
+//! (no jump), after a small dead zone that is caught up over `DRAG_RAMP`. A handle taken by the ray
+//! follows the ray instead (`FarDrag`): a side or a dome to where the ray passes nearest to its axis, the
+//! center on the sphere at the distance of the grab, the turn handle around the axis of the box where
+//! the ray meets the plane of the handle; the dead zone grows with the distance (`FarDrag::gain`).
 //!
 //! A hand is usable while both its tips are tracked and its cursor is within `IN_VIEW_ANGLE` of the
-//! view direction; the hand that holds a grab within `GRAB_IN_VIEW_ANGLE` (an arm reaching for a far
-//! side leaves the middle of the view), and its pinch opens only after it was not usable for
-//! `GRAB_LOST_HOLD_S` (else `HAND_LOST_HOLD_S`).
+//! view direction; the hand that holds a grab, and both hands while they pull a new box open, within
+//! `GRAB_IN_VIEW_ANGLE` (an arm reaching for a far side leaves the middle of the view, a wide box takes
+//! the hands apart), and their pinches open only after they were not usable for `GRAB_LOST_HOLD_S`
+//! (else `HAND_LOST_HOLD_S`).
 
 use crate::{
-    AreaBox, OVERLAY_AMBER, OVERLAY_GREEN, OverlaySegment, ParsedArea, PlacedArea, PlayArea, Side,
-    play_area::OTHER_AREA_AXES,
+    AreaBox, MAX_AREA_BOXES, MAX_BOX_CENTER, MAX_BOX_HALF, OVERLAY_AMBER, OVERLAY_GREEN,
+    OverlaySegment, ParsedArea, PlacedArea, PlayArea, Side,
 };
 use alvr_common::glam::{Mat4, Vec2, Vec3, Vec4};
 use std::fmt::Write;
@@ -37,12 +60,47 @@ use std::fmt::Write;
 pub const HANDLE_REACH: f32 = 0.08;
 /// Handles this much farther than the nearest one go by the line of sight too (meters)
 pub const HANDLE_TIE: f32 = 0.015;
-/// Without a handle in reach: the handle nearest to the line of sight within this (radians)
-pub const RAY_PICK_ANGLE: f32 = 4.0 * std::f32::consts::PI / 180.0;
-/// A lit handle stays lit up to this angle from the line of sight (radians)
-pub const RAY_KEEP_ANGLE: f32 = 6.0 * std::f32::consts::PI / 180.0;
-/// Handles within this of the best angle: the one nearer to the eyes (radians)
+/// Without a handle in reach: the handle nearest to the ray of the hand within this (radians). Wider
+/// than the 4 deg of the line of sight that picked far handles before: the ray of a hand shakes more
+/// than the head
+pub const RAY_PICK_ANGLE: f32 = 5.0 * std::f32::consts::PI / 180.0;
+/// A lit handle stays lit up to this angle from the ray (radians)
+pub const RAY_KEEP_ANGLE: f32 = 8.0 * std::f32::consts::PI / 180.0;
+/// Handles within this of the best angle: the one nearer to the hand (radians)
 pub const RAY_TIE_ANGLE: f32 = 1.5 * std::f32::consts::PI / 180.0;
+/// The ray of a hand without the aim pose of the runtime: from a shoulder this far below, to the side
+/// of and behind the eyes (meters, level frame of the head) through the cursor
+pub const SHOULDER_DROP: f32 = 0.15;
+pub const SHOULDER_SIDE: f32 = 0.18;
+pub const SHOULDER_BACK: f32 = 0.08;
+/// Drawn ray without a handle on it (meters)
+pub const RAY_DRAW_LENGTH: f32 = 1.0;
+
+/// A far drag (a handle taken by the ray, `FarDrag`): the dead zone and the ramp of a drag times the
+/// distance of the handle from the hand at the grab over this, at least 1 (meters)
+pub const FAR_HAND_REACH: f32 = 0.45;
+/// A side or a dome follows the ray only while the ray is at least this far from parallel to its axis;
+/// nearer, the hand moving along the axis moves it (times the gain), so that pulling a far side straight
+/// away works (radians)
+pub const FAR_AXIS_MIN_ANGLE: f32 = 20.0 * std::f32::consts::PI / 180.0;
+/// The turn handle follows where the ray meets the level plane of the handle while the ray is at least
+/// this steep and meets it within `FAR_PLANE_MAX_FACTOR` times the distance of the grab; else the point
+/// of the ray at that distance (radians)
+pub const FAR_PLANE_MIN_ANGLE: f32 = 15.0 * std::f32::consts::PI / 180.0;
+pub const FAR_PLANE_MAX_FACTOR: f32 = 2.0;
+/// A pinch that works a handle (a grab of any handle, near or by the ray, or a selection) gives way when
+/// the other hand pinches within this time, a grab only while it has not left its dead zone nor removed
+/// its box (dropped: no change, a button does nothing on release; a selection stays): both pinches are
+/// then the two-hand pinch (`PinchRoles`). Two hands never close in the same frame, and hands held up
+/// for a new box often have a handle at a pinch point or under a ray. Was `FAR_GRAB_YIELD_S`, for pinches
+/// by the ray only (seconds)
+pub const GRAB_YIELD_S: f64 = 0.5;
+
+/// A new box (two-hand pinch): each side at least this (meters), so that a flat pull gives a box
+pub const NEW_BOX_MIN_SIZE: f32 = 0.15;
+/// The pinch points of a new box at least this far apart when a hand lets go, else no box is made (a
+/// pinch that never opened; meters)
+pub const NEW_BOX_MIN_SPAN: f32 = 0.10;
 /// A lit handle in reach stays lit unless another one is nearer by this (meters), and up to this
 /// share of the reach beyond it
 const KEEP_DISTANCE: f32 = 0.01;
@@ -73,7 +131,7 @@ pub const UNDO_DEPTH: usize = 20;
 const DOME_HANDLE_SHARE: f32 = 0.35;
 const DOME_HANDLE_MIN: f32 = 0.04;
 const DOME_HANDLE_MAX: f32 = 0.12;
-/// "+" and "x": above the center of the box, to its left and right (meters, frame of the box)
+/// "x": above the center of the box, to its right (meters, frame of the box)
 const BUTTON_HEIGHT: f32 = 0.09;
 const BUTTON_GAP: f32 = 0.05;
 /// The turn handle: beside the center towards the +x +z corner (frame of the box), this share of the
@@ -92,6 +150,8 @@ const HANDLE_ANGULAR_SIZE: f32 = 0.012;
 const HANDLE_MIN_RADIUS: f32 = 0.015;
 /// Of the cursor of a hand (meters)
 const CURSOR_RADIUS: f32 = 0.008;
+/// The dot at the end of a ray: this share of the size of a handle there
+const RAY_DOT_SCALE: f32 = 0.45;
 
 /// Pinch: the gap between the surfaces of the thumb and index tips (center distance minus the two
 /// radii) below `on` for this many updates closes it, above `off` for this long opens it (seconds).
@@ -103,7 +163,7 @@ pub const DEFAULT_PINCH_OFF: f32 = 0.005;
 pub const PINCH_ON_UPDATES: u32 = 2;
 pub const PINCH_OFF_HOLD_S: f64 = 0.08;
 /// A closed pinch of a hand that is not usable (not tracked, out of view) opens after this (seconds);
-/// of the hand that holds a grab after `GRAB_LOST_HOLD_S`
+/// of the hand that holds a grab (and of both hands pulling a new box open) after `GRAB_LOST_HOLD_S`
 pub const HAND_LOST_HOLD_S: f64 = 0.3;
 pub const GRAB_LOST_HOLD_S: f64 = 1.0;
 /// On release the drag goes back to where it was this long before the release was confirmed: the
@@ -125,8 +185,9 @@ pub const GESTURE_CONE: f32 = 45.0 * std::f32::consts::PI / 180.0;
 /// direction from the eyes to the palm, at least this
 pub const PALM_AWAY_COS: f32 = 0.5;
 /// A hand is used only while its cursor is within this angle of the view direction: the runtime
-/// reports hands as tracked also out of view (radians). The hand that holds a grab: within
-/// `GRAB_IN_VIEW_ANGLE` (still in the field of view of the Quest 3, about 110 deg wide)
+/// reports hands as tracked also out of view (radians). The hand that holds a grab, and both hands
+/// pulling a new box open: within `GRAB_IN_VIEW_ANGLE` (still in the field of view of the Quest 3,
+/// about 110 deg wide)
 pub const IN_VIEW_ANGLE: f32 = 50.0 * std::f32::consts::PI / 180.0;
 pub const GRAB_IN_VIEW_ANGLE: f32 = 75.0 * std::f32::consts::PI / 180.0;
 
@@ -146,8 +207,6 @@ pub enum HandleKind {
     Center,
     /// Turns the box about its vertical axis
     Turn,
-    /// Adds a box next to this one
-    Add,
     /// Held: removes this box
     Remove,
     /// Takes the last change back
@@ -164,7 +223,6 @@ impl HandleKind {
             Self::Dome(side) => format!("dome {}", side.name()),
             Self::Center => "center".into(),
             Self::Turn => "turn".into(),
-            Self::Add => "add".into(),
             Self::Remove => "remove".into(),
             Self::Undo => "undo".into(),
             Self::Done => "done".into(),
@@ -179,14 +237,33 @@ impl HandleKind {
         )
     }
 
-    /// A button: it acts when the pinch opens, wherever the hand went (add, undo, done)
+    /// A button: it acts when the pinch opens, wherever the hand went (undo, done)
     pub fn is_button(self) -> bool {
-        matches!(self, Self::Add | Self::Undo | Self::Done)
+        matches!(self, Self::Undo | Self::Done)
     }
 
     /// It belongs to a box (pinching it selects that box)
     pub fn of_box(self) -> bool {
         !matches!(self, Self::Undo | Self::Done)
+    }
+}
+
+/// What a pinch on a lit handle does
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PinchAction {
+    /// A handle of a box that is not the selected one: that box is selected, nothing else happens in
+    /// this pinch (no drag, no undo step, nothing saved)
+    Select(usize),
+    /// The handle is taken
+    Grab,
+}
+
+/// What a pinch on handle `id` does with box `selected` selected
+pub fn pinch_action(id: HandleId, selected: usize) -> PinchAction {
+    if id.kind.of_box() && id.box_index != selected {
+        PinchAction::Select(id.box_index)
+    } else {
+        PinchAction::Grab
     }
 }
 
@@ -275,18 +352,11 @@ pub fn edit_handles(placed: &PlacedArea, selected: usize, can_undo: bool) -> Vec
             area_box.center + turn_handle_offset(area_box),
             Vec3::ZERO,
         ));
-        let button = |x: f32| area_box.to_area(Vec3::new(x, BUTTON_HEIGHT, 0.0));
-        handles.push(handle(
-            HandleKind::Add,
-            index,
-            button(-BUTTON_GAP),
-            Vec3::ZERO,
-        ));
         if boxes.len() > 1 {
             handles.push(handle(
                 HandleKind::Remove,
                 index,
-                button(BUTTON_GAP),
+                area_box.to_area(Vec3::new(BUTTON_GAP, BUTTON_HEIGHT, 0.0)),
                 Vec3::ZERO,
             ));
         }
@@ -301,20 +371,67 @@ pub fn edit_handles(placed: &PlacedArea, selected: usize, can_undo: bool) -> Vec
     handles
 }
 
-/// The handle a hand points at (see the module), `current`: the one lit until now. None: none
+/// A ray of a hand, stage space, like the system pointer of the Quest
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HandRay {
+    pub origin: Vec3,
+    /// Unit
+    pub direction: Vec3,
+}
+
+impl HandRay {
+    /// None: a direction of zero length or not finite
+    pub fn new(origin: Vec3, direction: Vec3) -> Option<Self> {
+        let direction = direction.normalize_or_zero();
+        (direction != Vec3::ZERO && direction.is_finite() && origin.is_finite())
+            .then_some(Self { origin, direction })
+    }
+
+    pub fn at(&self, distance: f32) -> Vec3 {
+        self.origin + self.direction * distance
+    }
+
+    /// Angle between the ray and the direction from its origin to `point` (radians)
+    pub fn angle_to(&self, point: Vec3) -> f32 {
+        self.direction
+            .angle_between((point - self.origin).normalize_or(self.direction))
+    }
+
+    /// The point of the ray nearest to `point` (not behind its origin)
+    pub fn nearest_point(&self, point: Vec3) -> Vec3 {
+        self.at((point - self.origin).dot(self.direction).max(0.0))
+    }
+}
+
+/// A handle a hand points at
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pick {
+    pub id: HandleId,
+    /// Out of reach of the cursor: by the ray of the hand
+    pub far: bool,
+}
+
+/// The handle a hand points at (see the module), `ray`: of the hand, `current`: the one lit until now.
+/// None: none
 pub fn pick_handle(
     handles: &[Handle],
     eye: Vec3,
     cursor: Vec3,
+    ray: &HandRay,
     current: Option<HandleId>,
-) -> Option<HandleId> {
-    let ray = (cursor - eye).normalize_or_zero();
-    if ray == Vec3::ZERO || !ray.is_finite() {
+) -> Option<Pick> {
+    let sight = (cursor - eye).normalize_or_zero();
+    if sight == Vec3::ZERO || !sight.is_finite() {
         return None;
     }
-    let angle = |handle: &Handle| ray.angle_between((handle.position - eye).normalize_or(ray));
+    let sight_angle =
+        |handle: &Handle| sight.angle_between((handle.position - eye).normalize_or(sight));
     let distance = |handle: &Handle| handle.position.distance(cursor);
     let current = current.and_then(|id| handles.iter().find(|handle| handle.id == id));
+    let near = |handle: &Handle| Pick {
+        id: handle.id,
+        far: false,
+    };
 
     // In reach: the nearest, about as near ones by the line of sight
     let nearest = handles
@@ -326,23 +443,24 @@ pub fn pick_handle(
         let chosen = handles
             .iter()
             .filter(|handle| distance(handle) <= nearest + HANDLE_TIE)
-            .min_by(|a, b| angle(a).total_cmp(&angle(b)))?;
+            .min_by(|a, b| sight_angle(a).total_cmp(&sight_angle(b)))?;
         if let Some(current) = current
             && distance(current) < HANDLE_REACH * KEEP_REACH_FACTOR
             && distance(current) <= distance(chosen) + KEEP_DISTANCE
         {
-            return Some(current.id);
+            return Some(near(current));
         }
-        return Some(chosen.id);
+        return Some(near(chosen));
     }
     // The lit one a little out of reach stays
     if let Some(current) = current
         && distance(current) < HANDLE_REACH * KEEP_REACH_FACTOR
     {
-        return Some(current.id);
+        return Some(near(current));
     }
 
-    // Out of reach: by the line of sight, about as good ones by the distance from the eyes
+    // Out of reach: by the ray of the hand, about as good ones by the distance from the hand
+    let angle = |handle: &Handle| ray.angle_to(handle.position);
     let best = handles
         .iter()
         .map(angle)
@@ -354,18 +472,22 @@ pub fn pick_handle(
             .filter(|handle| angle(handle) <= best + RAY_TIE_ANGLE)
             .min_by(|a, b| {
                 a.position
-                    .distance(eye)
-                    .total_cmp(&b.position.distance(eye))
+                    .distance(ray.origin)
+                    .total_cmp(&b.position.distance(ray.origin))
             })
     });
+    let far = |handle: &Handle| Pick {
+        id: handle.id,
+        far: true,
+    };
     if let Some(current) = current
         && angle(current) < RAY_KEEP_ANGLE
         && chosen.is_none_or(|chosen| angle(current) <= angle(chosen) + RAY_TIE_ANGLE)
     {
-        return Some(current.id);
+        return Some(far(current));
     }
 
-    chosen.map(|handle| handle.id)
+    chosen.map(far)
 }
 
 /// The displacement a drag applies for a displacement of the hand: nothing within the dead zone,
@@ -383,6 +505,13 @@ pub fn drag_displacement(hand: Vec3) -> Vec3 {
         (length - DRAG_DEAD_ZONE) * caught_up / DRAG_RAMP
     };
     hand * (applied / length)
+}
+
+/// `drag_displacement` with the dead zone and the ramp `gain` times as long (a far drag, see
+/// `FarDrag::gain`; 1: the same)
+pub fn scaled_drag_displacement(moved: Vec3, gain: f32) -> Vec3 {
+    let gain = if gain.is_finite() { gain.max(1.0) } else { 1.0 };
+    drag_displacement(moved / gain) * gain
 }
 
 /// The layout `start` with handle `id` dragged by `displacement` (area frame, after
@@ -447,6 +576,173 @@ pub fn apply_turn(start: &PlayArea, index: usize, swept: f32) -> (PlayArea, f32,
     (area, yaw, snapped)
 }
 
+/// Where the ray passes nearest to the line through `point` along `axis` (unit): the distance along the
+/// axis from `point`. None: the ray within `FAR_AXIS_MIN_ANGLE` of parallel to it, or nearest behind
+/// its origin
+pub fn ray_axis_param(ray: &HandRay, point: Vec3, axis: Vec3) -> Option<f32> {
+    let b = ray.direction.dot(axis);
+    if b.abs() > FAR_AXIS_MIN_ANGLE.cos() || !b.is_finite() {
+        return None;
+    }
+    let w = ray.origin - point;
+    let (d, e) = (ray.direction.dot(w), axis.dot(w));
+    let denom = 1.0 - b * b;
+    let along_ray = (b * e - d) / denom;
+    (along_ray >= 0.0).then(|| (e - b * d) / denom)
+}
+
+/// What a far drag gives in an update (stage space)
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FarStep {
+    /// Displacement since the grab, to apply like the displacement of the cursor of a near drag (with
+    /// `scaled_drag_displacement` and `FarDrag::gain`). Of a turn: of `point` from where it was at the
+    /// grab (added up over changes of the way it is found: zero at the grab, no jump at a change)
+    pub moved: Vec3,
+    /// Of a turn: the point that sweeps around the axis of the box
+    pub point: Vec3,
+    /// Of a turn: `point` was found the same way as in the update before (else the client takes it as
+    /// the new start of the sweep: no jump when the way changes)
+    pub continuous: bool,
+}
+
+/// A handle taken by the ray of a hand (out of reach): it follows the ray, not the small motion of the
+/// hand. A side or a dome: where the ray passes nearest to its axis (the line through the handle along
+/// the normal of the side), added up per update; while the ray is near parallel to that axis the motion
+/// of the cursor along it times the gain. The center: the point of the ray at the distance of the grab
+/// (a sphere around the hand). The turn handle: where the ray meets the level plane of the handle, else
+/// the point at the distance of the grab (see `FAR_PLANE_MIN_ANGLE`). Relative to the grab: no jump
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FarDrag {
+    kind: HandleKind,
+    /// The handle at the grab
+    start: Vec3,
+    normal: Vec3,
+    /// From the origin of the ray to the handle at the grab (meters)
+    distance: f32,
+    /// The point of the ray at `distance` at the grab; of a turn the point it follows at the grab,
+    /// moved along at each change of the way it is found (`moved` stays where it was)
+    grab_point: Vec3,
+    /// See `gain`
+    gain: f32,
+    last_cursor: Vec3,
+    last_axis: Option<f32>,
+    // Of a turn: the way the last point was found (true: on the plane)
+    last_on_plane: Option<bool>,
+    moved: Vec3,
+}
+
+impl FarDrag {
+    /// None: not a handle that is dragged (buttons, remove)
+    pub fn new(handle: &Handle, ray: &HandRay, cursor: Vec3) -> Option<Self> {
+        if !handle.id.kind.is_drag() {
+            return None;
+        }
+        let distance = ray.origin.distance(handle.position);
+        let mut drag = Self {
+            kind: handle.id.kind,
+            start: handle.position,
+            normal: handle.normal.normalize_or_zero(),
+            distance,
+            grab_point: ray.at(distance),
+            gain: (distance / FAR_HAND_REACH).max(1.0),
+            last_cursor: cursor,
+            last_axis: None,
+            last_on_plane: None,
+            moved: Vec3::ZERO,
+        };
+        drag.last_axis = drag.axis_param(ray);
+        if drag.kind == HandleKind::Turn {
+            let (point, on_plane) = drag.turn_point(ray);
+            drag.grab_point = point;
+            drag.last_on_plane = Some(on_plane);
+        }
+        Some(drag)
+    }
+
+    /// The dead zone and the ramp of the drag are this many times as long as for a hand at the handle:
+    /// the distance of the handle from the hand at the grab over `FAR_HAND_REACH`, at least 1
+    pub fn gain(&self) -> f32 {
+        self.gain
+    }
+
+    fn axis_param(&self, ray: &HandRay) -> Option<f32> {
+        matches!(self.kind, HandleKind::Side(_) | HandleKind::Dome(_))
+            .then(|| ray_axis_param(ray, self.start, self.normal))
+            .flatten()
+    }
+
+    // The point a turn follows and whether it is on the plane
+    fn turn_point(&self, ray: &HandRay) -> (Vec3, bool) {
+        let dy = ray.direction.y;
+        if dy.abs() >= FAR_PLANE_MIN_ANGLE.sin() {
+            let t = (self.start.y - ray.origin.y) / dy;
+            if t > 0.0 && t <= FAR_PLANE_MAX_FACTOR * self.distance {
+                return (ray.at(t), true);
+            }
+        }
+        (ray.at(self.distance), false)
+    }
+
+    /// The drag for the ray and the cursor of the hand in this update
+    pub fn follow(&mut self, ray: &HandRay, cursor: Vec3) -> FarStep {
+        let step = match self.kind {
+            HandleKind::Side(_) | HandleKind::Dome(_) => {
+                let param = self.axis_param(ray);
+                let delta = match (param, self.last_axis) {
+                    (Some(now), Some(last)) => now - last,
+                    // Near parallel: the hand along the axis, faster by the gain
+                    (None, _) => (cursor - self.last_cursor).dot(self.normal) * self.gain,
+                    // Out of parallel again: from here on, no jump
+                    (Some(_), None) => 0.0,
+                };
+                if delta.is_finite() {
+                    self.moved += self.normal * delta;
+                }
+                self.last_axis = param;
+                FarStep {
+                    moved: self.moved,
+                    point: self.start + self.moved,
+                    continuous: true,
+                }
+            }
+            HandleKind::Turn => {
+                let (point, on_plane) = self.turn_point(ray);
+                let continuous = self.last_on_plane == Some(on_plane);
+                self.last_on_plane = Some(on_plane);
+                if point.is_finite() {
+                    if !continuous {
+                        self.grab_point = point - self.moved;
+                    }
+                    self.moved = point - self.grab_point;
+                }
+                FarStep {
+                    moved: self.moved,
+                    point,
+                    continuous,
+                }
+            }
+            _ => {
+                let point = ray.at(self.distance);
+                FarStep {
+                    moved: point - self.grab_point,
+                    point,
+                    continuous: true,
+                }
+            }
+        };
+        self.last_cursor = cursor;
+        if step.moved.is_finite() {
+            step
+        } else {
+            FarStep {
+                moved: Vec3::ZERO,
+                point: self.start,
+                continuous: false,
+            }
+        }
+    }
+}
+
 /// What is drawn while a box is turned (stage space): a dashed line from its center through the turn
 /// handle as it was at the grab, a line through it now (green on a detent) and the arc between them at
 /// the radius of the handle (at most `TURN_GUIDE_SEGMENTS`). `start` and `now`: the box at the grab and
@@ -503,83 +799,193 @@ pub fn turn_guide(
     lines
 }
 
-/// The side of a box a ray goes through first (area frame): where it leaves the box when it starts
-/// inside, where it enters when it starts outside. None: it misses
-fn ray_box_side(area_box: &AreaBox, origin: Vec3, direction: Vec3) -> Option<Side> {
-    let mut best: Option<(f32, Side)> = None;
-    for side in Side::ALL {
-        let axis = side.axis;
-        if direction[axis].abs() < 1e-6 {
-            continue;
-        }
-        let plane = area_box.center[axis] + side.sign() * area_box.half[axis];
-        let t = (plane - origin[axis]) / direction[axis];
-        if t.is_nan() || t <= 0.0 {
-            continue;
-        }
-        let point = origin + direction * t;
-        let (u, v) = OTHER_AREA_AXES[axis];
-        let within = |k: usize| (point[k] - area_box.center[k]).abs() <= area_box.half[k] + 1e-4;
-        if within(u) && within(v) && best.is_none_or(|(best_t, _)| t < best_t) {
-            best = Some((t, side));
-        }
-    }
-    best.map(|(_, side)| side)
+/// The box a two-hand pinch makes (area frame): the two pinch points at opposite corners, level and
+/// unturned in the area frame (the frame of the code, which is mounted square on the rig; the yaw of
+/// the selected box would depend on which box happened to be edited last), each side at least
+/// `NEW_BOX_MIN_SIZE` around the middle of the two points, at most `MAX_BOX_HALF` half, no domes
+pub fn new_box_between(a: Vec3, b: Vec3) -> AreaBox {
+    let half = ((a - b).abs() * 0.5)
+        .max(Vec3::splat(0.5 * NEW_BOX_MIN_SIZE))
+        .min(Vec3::splat(MAX_BOX_HALF));
+    AreaBox::new((a + b) * 0.5, half)
 }
 
-/// Adds a box next to box `from` (see `PlayArea::add_box`) on the side the eyes look at: the side the
-/// line of sight goes through first, then the others in the order they face the eyes (from inside the
-/// box: the direction of the view, from outside: the eyes). A side is skipped where the new box would
-/// have its center in another box. `eye` and `gaze` in the area frame. Returns the new box and its side.
-/// None: 8 boxes already, or no side has room
-pub fn add_box_facing(
-    area: &mut PlayArea,
-    from: usize,
-    eye: Vec3,
-    gaze: Vec3,
-) -> Option<(usize, Side)> {
-    let area_box = *area.boxes().get(from)?;
-    // In the frame of the box
-    let source = AreaBox {
-        center: Vec3::ZERO,
-        yaw: 0.0,
-        ..area_box
-    };
-    let eye = area_box.to_local(eye);
-    let gaze = area_box.turn_back(gaze).normalize_or_zero();
-    let inside = (eye.abs() - source.half).max_element() < 0.0;
-    let facing = |side: Side| {
-        if inside {
-            gaze.dot(side.normal())
-        } else {
-            side.normal()
-                .dot((eye - source.side_center(side)).normalize_or_zero())
-        }
-    };
-    let mut order = Side::ALL.to_vec();
-    order.sort_by(|a, b| facing(*b).total_cmp(&facing(*a)));
-    if let Some(hit) = ray_box_side(&source, eye, gaze) {
-        order.retain(|&side| side != hit);
-        order.insert(0, hit);
+/// Why the box of a two-hand pinch with the pinch points `a` and `b` (area frame) can't be made, for
+/// the log. None: it can. The cue: a ghost too small is drawn dim, one without room red
+pub fn new_box_refusal(area: &PlayArea, a: Vec3, b: Vec3) -> Option<String> {
+    let span = a.distance(b);
+    if span.is_nan() || span < NEW_BOX_MIN_SPAN {
+        return Some(format!(
+            "the pinch points were {:.0} mm apart, a new box needs {:.0} mm",
+            span * 1000.0,
+            NEW_BOX_MIN_SPAN * 1000.0
+        ));
     }
-
-    for side in order {
-        let mut trial = *area;
-        let Some(index) = trial.add_box(from, side) else {
-            continue;
-        };
-        let center = trial.boxes()[index].center;
-        let taken = area
-            .boxes()
-            .iter()
-            .enumerate()
-            .any(|(other, area_box)| other != from && area_box.contains(center));
-        if !taken {
-            *area = trial;
-            return Some((index, side));
-        }
+    if area.len() >= MAX_AREA_BOXES {
+        return Some(format!(
+            "{MAX_AREA_BOXES} boxes already, at most {MAX_AREA_BOXES}"
+        ));
+    }
+    let center = new_box_between(a, b).center;
+    if !center.is_finite() || center.abs().max_element() > MAX_BOX_CENTER {
+        return Some(format!(
+            "its center would be more than {MAX_BOX_CENTER:.0} m from the code along an axis of its              frame"
+        ));
     }
     None
+}
+
+/// What the two-hand pinch (both pinches free, `PinchRoles`) does while editing
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TwoHand {
+    /// Not both pinches free
+    None,
+    /// The pinch points have stayed within `GESTURE_MAX_SPAN`: maybe the gesture that ends editing
+    Undecided,
+    /// They were farther apart in this pinch: a new box
+    Adding,
+}
+
+/// The two-hand pinch while editing (see the module): once the pinch points were farther apart than
+/// `GESTURE_MAX_SPAN` it is a new box until a pinch opens. The client runs the timer of the gesture
+/// that ends editing only while this is not `Adding`, and cancels it (`HoldTimer::cancel`) while it is
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TwoHandPinch {
+    adding: bool,
+}
+
+impl TwoHandPinch {
+    /// `both_free`: both pinches closed and free (`PinchRoles::two_hand`). `span`: the distance between
+    /// the two pinch points (meters)
+    pub fn update(&mut self, both_free: bool, span: f32) -> TwoHand {
+        if !both_free {
+            self.adding = false;
+            return TwoHand::None;
+        }
+        if span > GESTURE_MAX_SPAN {
+            self.adding = true;
+        }
+        if self.adding {
+            TwoHand::Adding
+        } else {
+            TwoHand::Undecided
+        }
+    }
+}
+
+/// What the closed pinch of a hand is for while editing (`PinchRoles`)
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum PinchRole {
+    /// Open
+    #[default]
+    Open,
+    /// Closed on empty space with the other hand open, or one of the two-hand pinch: alone it does
+    /// nothing
+    Free,
+    /// Works a handle (a grab, a selection, a button, the hold of "x") since `since` (seconds);
+    /// `by_ray`: picked by the ray of the hand (out of reach)
+    Handle { since: f64, by_ray: bool },
+    /// Does nothing until it opens: it closed while the other hand worked a handle that no longer
+    /// gives way (or did nothing itself), or it was closed when editing began
+    Idle,
+}
+
+/// What a pinch that closes while editing does (`PinchRoles::close`)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PinchStart {
+    /// The other hand is open, this one closed on empty space: free (alone it does nothing)
+    Free,
+    /// The other hand is open, this one closed on a handle: what it does with it (`pinch_action`)
+    Handle(PinchAction),
+    /// The other pinch is free, or gives way: both are free, the two-hand pinch (a new box or the
+    /// gesture that ends editing), whatever this one closed on. `gives_way`: the other pinch worked a
+    /// handle and gives it up (its grab is dropped without a change, a button does nothing on release,
+    /// a selection stays)
+    TwoHand { gives_way: bool },
+    /// Does nothing until it opens (no grab, no selection, no button, not free): the other hand works a
+    /// handle that no longer gives way (resizing with one hand), or its pinch does nothing either
+    Idle,
+}
+
+/// The pinches of both hands while editing, by the rule of the user: "pinch to resize is always with
+/// one hand. adding a new box or exiting edit mode is always with 2". Whenever both hands are pinched
+/// it is the two-hand pinch (a new box, or the gesture that ends editing) or nothing; one pinch works
+/// handles only while the other hand is open, and one pinch alone never adds a box or ends editing.
+/// Two hands never close in the same frame, so the order decides (see `close`)
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PinchRoles {
+    roles: [PinchRole; 2],
+}
+
+impl PinchRoles {
+    /// Editing begins (or a new box is dropped, editing pauses): a pinch closed then (the gesture that
+    /// started editing) does nothing until it opens, so that it starts no box and does not end editing
+    /// again
+    pub fn reset(&mut self, closed: [bool; 2]) {
+        self.roles = closed.map(|closed| {
+            if closed {
+                PinchRole::Idle
+            } else {
+                PinchRole::Open
+            }
+        });
+    }
+
+    pub fn role(&self, hand: usize) -> PinchRole {
+        self.roles[hand]
+    }
+
+    /// Every update, whether the pinch of `hand` is closed: an open pinch has no role
+    pub fn follow(&mut self, hand: usize, closed: bool) {
+        if !closed {
+            self.roles[hand] = PinchRole::Open;
+        }
+    }
+
+    /// Both pinches are free: the two-hand pinch
+    pub fn two_hand(&self) -> bool {
+        self.roles == [PinchRole::Free; 2]
+    }
+
+    /// The pinch of `hand` closes. `pick`: the handle it closed on (None: empty space), `selected`: the
+    /// selected box, `other_acted`: the grab of the other hand has left its dead zone or removed its
+    /// box, `now`: seconds. With the other hand open it works the handle (or is free); with the other
+    /// pinch free both are the two-hand pinch; with the other pinch on a handle since at most
+    /// `GRAB_YIELD_S` and its grab not acted, that one gives way and both are the two-hand pinch; else
+    /// it does nothing until it opens (one hand is resizing: the other does not disturb it)
+    pub fn close(
+        &mut self,
+        hand: usize,
+        pick: Option<Pick>,
+        selected: usize,
+        other_acted: bool,
+        now: f64,
+    ) -> PinchStart {
+        let other = 1 - hand;
+        let start = match self.roles[other] {
+            PinchRole::Open => match pick {
+                None => PinchStart::Free,
+                Some(pick) => PinchStart::Handle(pinch_action(pick.id, selected)),
+            },
+            PinchRole::Free => PinchStart::TwoHand { gives_way: false },
+            PinchRole::Handle { since, .. } if !other_acted && now - since <= GRAB_YIELD_S => {
+                PinchStart::TwoHand { gives_way: true }
+            }
+            PinchRole::Handle { .. } | PinchRole::Idle => PinchStart::Idle,
+        };
+        match start {
+            PinchStart::Free => self.roles[hand] = PinchRole::Free,
+            PinchStart::Handle(_) => {
+                self.roles[hand] = PinchRole::Handle {
+                    since: now,
+                    by_ray: pick.is_some_and(|pick| pick.far),
+                }
+            }
+            PinchStart::TwoHand { .. } => self.roles = [PinchRole::Free; 2],
+            PinchStart::Idle => self.roles[hand] = PinchRole::Idle,
+        }
+        start
+    }
 }
 
 /// Half the size of a handle as drawn (meters): larger far away, so it stays visible
@@ -619,8 +1025,8 @@ fn glyph(
 }
 
 /// The lines of a handle, facing the eyes, `scale` times its size: a square (side), a triangle
-/// pointing out of the side (dome, smaller), a diamond (center), a curved arrow (turn), a plus (add), a
-/// cross (remove), an arrow to the left (undo), a check mark (done). At most 4 segments
+/// pointing out of the side (dome, smaller), a diamond (center), a curved arrow (turn), a cross
+/// (remove), an arrow to the left (undo), a check mark (done). At most 4 segments
 pub fn handle_glyph(
     handle: &Handle,
     eye: Vec3,
@@ -680,14 +1086,6 @@ pub fn handle_glyph(
             let barb = [tip, tip + p(-0.7, 0.05)];
             glyph(handle.position, eye, radius, &[&arc, &barb], color, width)
         }
-        HandleKind::Add => glyph(
-            handle.position,
-            eye,
-            radius,
-            &[&[p(-1.0, 0.0), p(1.0, 0.0)], &[p(0.0, -1.0), p(0.0, 1.0)]],
-            color,
-            width,
-        ),
         HandleKind::Remove => glyph(
             handle.position,
             eye,
@@ -748,6 +1146,39 @@ pub fn cursor_glyph(
     }
 }
 
+/// The ray of a hand as drawn: a thin line from its origin to `end` (where it meets the handle it
+/// picks or holds) with a small diamond there, or `RAY_DRAW_LENGTH` long without one. At most 5
+/// segments
+pub fn ray_lines(
+    ray: &HandRay,
+    end: Option<Vec3>,
+    eye: Vec3,
+    color: Vec4,
+    width: f32,
+) -> Vec<OverlaySegment> {
+    let tip = end.unwrap_or_else(|| ray.at(RAY_DRAW_LENGTH));
+    let mut lines = vec![OverlaySegment {
+        start: ray.origin,
+        end: tip,
+        color,
+        width,
+        dashed: false,
+    }];
+    if let Some(end) = end {
+        let p = Vec2::new;
+        let diamond = [
+            p(0.0, -1.0),
+            p(1.0, 0.0),
+            p(0.0, 1.0),
+            p(-1.0, 0.0),
+            p(0.0, -1.0),
+        ];
+        let radius = handle_radius(end, eye) * RAY_DOT_SCALE;
+        lines.extend(glyph(end, eye, radius, &[&diamond], color, width));
+    }
+    lines
+}
+
 /// A square of half size `half` facing the eyes, drawn clockwise from its top left corner up to
 /// `progress` (0..1) of its outline. At most 4 segments
 pub fn progress_square(
@@ -790,6 +1221,9 @@ pub struct EditorHand {
     pub palm_normal: Vec3,
     /// Both tips tracked, not only estimated
     pub tracked: bool,
+    /// The aim pose of the runtime (XR_FB_hand_tracking_aim, the ray of the system pointer). None: not
+    /// available, `ray` estimates one
+    pub aim: Option<HandRay>,
 }
 
 impl EditorHand {
@@ -801,6 +1235,20 @@ impl EditorHand {
     /// Between the surfaces of the thumb and index tips (meters, negative when they overlap)
     pub fn gap(&self) -> f32 {
         self.thumb_tip.distance(self.index_tip) - self.tip_radii.max(0.0)
+    }
+
+    /// The ray of the hand: the aim pose of the runtime, else from an estimated shoulder (`SHOULDER_*`
+    /// from the eyes, in the level frame of the view) through the cursor, starting at the cursor. `left`:
+    /// the left hand. None: no direction (the cursor at the shoulder)
+    pub fn ray(&self, eye: Vec3, forward: Vec3, left: bool) -> Option<HandRay> {
+        if let Some(aim) = self.aim {
+            return Some(aim);
+        }
+        let ahead = Vec3::new(forward.x, 0.0, forward.z).normalize_or(Vec3::NEG_Z);
+        let right = ahead.cross(Vec3::Y);
+        let side = if left { -SHOULDER_SIDE } else { SHOULDER_SIDE };
+        let shoulder = eye - Vec3::Y * SHOULDER_DROP + right * side - ahead * SHOULDER_BACK;
+        HandRay::new(self.cursor(), self.cursor() - shoulder)
     }
 
     /// Tracked and in view (within `IN_VIEW_ANGLE`)
@@ -943,6 +1391,13 @@ pub struct HoldTimer {
 }
 
 impl HoldTimer {
+    /// Starts it again at once, without the tolerance for short drops (the two-hand pinch became a new
+    /// box: its square goes at once)
+    pub fn cancel(&mut self) {
+        self.start = None;
+        self.last_held = None;
+    }
+
     /// Returns how far it is (0..1) and whether it fired in this update
     pub fn update(&mut self, held: bool, now: f64) -> (f32, bool) {
         if held {
@@ -1131,6 +1586,7 @@ mod tests {
             palm: cursor + Vec3::new(0.0, -0.03, 0.04),
             palm_normal,
             tracked: true,
+            aim: None,
         }
     }
 
@@ -1410,8 +1866,8 @@ mod tests {
         area.add_box(0, Side::new(2, true)).unwrap();
         let placed = placed(area);
         let handles = edit_handles(&placed, 0, false);
-        // 6 sides, 6 domes, center, turn, add, remove; the centers of the 2 other boxes; done
-        assert_eq!(handles.len(), 6 + 6 + 4 + 2 + 1);
+        // 6 sides, 6 domes, center, turn, remove; the centers of the 2 other boxes; done
+        assert_eq!(handles.len(), 6 + 6 + 3 + 2 + 1);
         let to_area = placed.area_to_world.inverse();
         let area_box = placed.area.boxes()[0];
         for side in Side::ALL {
@@ -1466,7 +1922,7 @@ mod tests {
                 .iter()
                 .any(|handle| handle.id.kind == HandleKind::Remove)
         );
-        assert_eq!(handles.len(), 6 + 6 + 3 + 1);
+        assert_eq!(handles.len(), 6 + 6 + 2 + 1);
     }
 
     fn at(kind: HandleKind, position: Vec3) -> Handle {
@@ -1478,54 +1934,133 @@ mod tests {
     }
 
     #[test]
-    fn picking_by_nearness_and_line_of_sight() {
+    fn picking_by_nearness_and_the_hand_ray() {
         let eye = Vec3::new(0.0, 1.2, 0.0);
         let a = at(HandleKind::Center, Vec3::new(0.0, 1.0, -0.4));
-        let b = at(HandleKind::Add, Vec3::new(0.05, 1.0, -0.4));
+        let b = at(HandleKind::Turn, Vec3::new(0.05, 1.0, -0.4));
         let far = at(HandleKind::Done, Vec3::new(0.3, 1.0, -1.5));
         let handles = [a, b, far];
+        let ray_to = |from: Vec3, to: Vec3| HandRay::new(from, to - from).unwrap();
+        let pick = |handles: &[Handle], cursor: Vec3, ray: &HandRay, current| {
+            pick_handle(handles, eye, cursor, ray, current)
+        };
+        let near = |handle: &Handle| {
+            Some(Pick {
+                id: handle.id,
+                far: false,
+            })
+        };
+        let by_ray = |handle: &Handle| {
+            Some(Pick {
+                id: handle.id,
+                far: true,
+            })
+        };
 
-        // The nearest in reach
+        // The nearest in reach, also with the ray on the far handle: near handles first
         let cursor = Vec3::new(0.035, 1.0, -0.4);
-        assert_eq!(pick_handle(&handles, eye, cursor, None), Some(b.id));
-        // Nothing near and nothing on the line of sight
         assert_eq!(
-            pick_handle(&handles, eye, Vec3::new(-0.3, 1.3, -0.4), None),
+            pick(&handles, cursor, &ray_to(cursor, far.position), None),
+            near(&b)
+        );
+        // Nothing near and nothing on the ray
+        let cursor = Vec3::new(-0.3, 1.3, -0.4);
+        assert_eq!(
+            pick(&handles, cursor, &ray_to(cursor, cursor + Vec3::Y), None),
             None
         );
-        // Out of reach: along the line of sight through the cursor
-        let towards_far = eye + (far.position - eye).normalize() * 0.4;
-        assert_eq!(pick_handle(&handles, eye, towards_far, None), Some(far.id));
-        // Off by 5 degrees: not picked, but kept when it was lit
-        let off = Quat::from_rotation_y(5.0_f32.to_radians()) * (far.position - eye).normalize();
-        let cursor = eye + off * 0.4;
-        assert_eq!(pick_handle(&handles, eye, cursor, None), None);
+        // Out of reach: along the ray of the hand, wherever the eyes look
+        let cursor = Vec3::new(-0.2, 0.9, -0.3);
+        let ray = ray_to(cursor, far.position);
+        assert_eq!(pick(&handles, cursor, &ray, None), by_ray(&far));
+        // The line of sight through the cursor no longer picks
+        let on_sight = eye + (far.position - eye).normalize() * 0.4;
         assert_eq!(
-            pick_handle(&handles, eye, cursor, Some(far.id)),
-            Some(far.id)
+            pick(
+                &handles,
+                on_sight,
+                &ray_to(on_sight, on_sight + Vec3::NEG_Y),
+                None
+            ),
+            None
         );
+        // Off by 6 degrees: not picked, but kept when it was lit; off by 9: gone
+        let turned = |degrees: f32| {
+            HandRay::new(
+                cursor,
+                Quat::from_rotation_y(degrees.to_radians()) * ray.direction,
+            )
+            .unwrap()
+        };
+        assert_eq!(pick(&handles, cursor, &turned(6.0), None), None);
+        assert_eq!(
+            pick(&handles, cursor, &turned(6.0), Some(far.id)),
+            by_ray(&far)
+        );
+        assert_eq!(pick(&handles, cursor, &turned(9.0), Some(far.id)), None);
+        // Two handles on the ray: the one nearer to the hand
+        let behind = at(HandleKind::Undo, far.position + ray.direction * 0.5);
+        assert_eq!(pick(&[behind, far], cursor, &ray, None), by_ray(&far));
 
         // About as near: the one on the line of sight wins. One handle 2.5 cm straight behind the
         // cursor, the other 2 cm beside it
         let cursor = Vec3::new(0.0, 1.0, -0.4);
-        let ray = (cursor - eye).normalize();
-        let behind = at(HandleKind::Center, cursor + ray * 0.025);
-        let beside = at(HandleKind::Add, cursor + Vec3::X * 0.02);
-        let handles = [beside, behind];
-        assert_eq!(pick_handle(&handles, eye, cursor, None), Some(behind.id));
+        let sight = (cursor - eye).normalize();
+        let ray = ray_to(cursor, cursor + Vec3::NEG_Z);
+        let behind = at(HandleKind::Center, cursor + sight * 0.025);
+        let beside = at(HandleKind::Turn, cursor + Vec3::X * 0.02);
+        assert_eq!(pick(&[beside, behind], cursor, &ray, None), near(&behind));
         // Beside it by more than the tie: the nearer one
-        let farther = at(HandleKind::Center, cursor + ray * 0.04);
-        assert_eq!(
-            pick_handle(&[beside, farther], eye, cursor, None),
-            Some(beside.id)
-        );
+        let farther = at(HandleKind::Center, cursor + sight * 0.04);
+        assert_eq!(pick(&[beside, farther], cursor, &ray, None), near(&beside));
 
         // Hysteresis: the lit one stays unless another is nearer by a centimeter
         let handles = [a, b];
         let middle = (a.position + b.position) * 0.5 + Vec3::new(0.003, 0.0, 0.0);
-        assert_eq!(pick_handle(&handles, eye, middle, Some(a.id)), Some(a.id));
+        assert_eq!(pick(&handles, middle, &ray, Some(a.id)), near(&a));
         let nearer_b = b.position + Vec3::new(0.0, 0.0, 0.005);
-        assert_eq!(pick_handle(&handles, eye, nearer_b, Some(a.id)), Some(b.id));
+        assert_eq!(pick(&handles, nearer_b, &ray, Some(a.id)), near(&b));
+    }
+
+    #[test]
+    fn hand_ray_from_the_runtime_or_the_shoulder() {
+        let eye = Vec3::new(0.0, 1.2, 0.0);
+        let cursor = Vec3::new(0.25, 1.0, -0.35);
+        let mut right = hand(cursor, Vec3::NEG_Z, 0.0);
+        // Estimated: from the right shoulder (below, right of and behind the eyes) through the cursor
+        let ray = right.ray(eye, Vec3::NEG_Z, false).unwrap();
+        assert!(ray.origin.distance(cursor) < 1e-6);
+        let shoulder = Vec3::new(SHOULDER_SIDE, 1.2 - SHOULDER_DROP, SHOULDER_BACK);
+        assert!(ray.direction.distance((cursor - shoulder).normalize()) < 1e-5);
+        // Forward, a little to the right and down
+        assert!(ray.direction.z < -0.9 && ray.direction.x > 0.0 && ray.direction.y < 0.0);
+        // The left hand from the left shoulder; looking down does not tilt the shoulders
+        let left = hand(Vec3::new(-0.25, 1.0, -0.35), Vec3::NEG_Z, 0.0);
+        let down = Vec3::new(0.0, -0.8, -0.6).normalize();
+        let ray = left.ray(eye, down, true).unwrap();
+        let shoulder = Vec3::new(-SHOULDER_SIDE, 1.2 - SHOULDER_DROP, SHOULDER_BACK);
+        assert!(
+            ray.direction
+                .distance((left.cursor() - shoulder).normalize())
+                < 1e-5
+        );
+        // The aim pose of the runtime when there is one
+        let aim = HandRay::new(Vec3::new(0.2, 1.0, -0.3), Vec3::new(0.0, 0.5, -1.0)).unwrap();
+        right.aim = Some(aim);
+        assert_eq!(right.ray(eye, Vec3::NEG_Z, false), Some(aim));
+        assert!(HandRay::new(Vec3::ZERO, Vec3::ZERO).is_none());
+        assert!(HandRay::new(Vec3::ZERO, Vec3::NAN).is_none());
+        // Nearest point, not behind the origin
+        assert!(
+            aim.nearest_point(aim.origin - aim.direction)
+                .distance(aim.origin)
+                < 1e-6
+        );
+        assert!(
+            aim.nearest_point(aim.at(2.0) + Vec3::X * 0.1)
+                .distance(aim.at(2.0))
+                < 1e-5
+        );
     }
 
     #[test]
@@ -1592,43 +2127,636 @@ mod tests {
         assert_eq!(moved_area.boxes()[0].half, start.half);
 
         // Buttons change nothing
-        let add = HandleId {
-            kind: HandleKind::Add,
+        let undo = HandleId {
+            kind: HandleKind::Undo,
             box_index: 0,
         };
-        assert_eq!(apply_drag(&area, add, delta).0, area);
+        assert_eq!(apply_drag(&area, undo, delta).0, area);
     }
 
     #[test]
-    fn added_box_goes_where_the_eyes_look() {
+    fn first_pinch_on_another_box_only_selects_it() {
+        let id = |kind, box_index| HandleId { kind, box_index };
+        // Box 2 selected: the center of box 1 (all the other boxes show) selects it
+        assert_eq!(
+            pinch_action(id(HandleKind::Center, 1), 2),
+            PinchAction::Select(1)
+        );
+        // Any handle of another box (a hand that kept a handle lit while the selection changed)
+        assert_eq!(
+            pinch_action(id(HandleKind::Side(Side::new(0, true)), 0), 2),
+            PinchAction::Select(0)
+        );
+        // The selected box: taken
+        for kind in [
+            HandleKind::Center,
+            HandleKind::Turn,
+            HandleKind::Remove,
+            HandleKind::Dome(Side::new(1, true)),
+        ] {
+            assert_eq!(pinch_action(id(kind, 2), 2), PinchAction::Grab);
+        }
+        // Undo and done belong to no box (index 0): always taken
+        assert_eq!(pinch_action(id(HandleKind::Done, 0), 2), PinchAction::Grab);
+        assert_eq!(pinch_action(id(HandleKind::Undo, 0), 1), PinchAction::Grab);
+    }
+
+    #[test]
+    fn new_box_spans_the_pinch_points() {
+        // Opposite corners
+        let (a, b) = (Vec3::new(-0.2, 0.1, -0.5), Vec3::new(0.3, 0.6, -0.9));
+        let new_box = new_box_between(a, b);
+        assert!(new_box.center.distance((a + b) * 0.5) < 1e-6);
+        assert!(new_box.half.distance(Vec3::new(0.25, 0.25, 0.2)) < 1e-6);
+        assert_eq!((new_box.yaw, new_box.domes), (0.0, [0.0; 6]));
+        // The same whichever hand is where
+        assert_eq!(new_box_between(b, a), new_box);
+        // A flat pull (both hands at one height and depth): the other sides at the minimum
+        let flat = new_box_between(Vec3::new(-0.3, 1.0, -0.5), Vec3::new(0.3, 1.0, -0.5));
+        assert!((flat.half.x - 0.3).abs() < 1e-6);
+        assert_eq!(
+            (flat.half.y, flat.half.z),
+            (0.5 * NEW_BOX_MIN_SIZE, 0.5 * NEW_BOX_MIN_SIZE)
+        );
+
         let area = PlayArea::from_marker_box(&params());
-        let area_box = area.boxes()[0];
-        // From inside the box, looking along +x: the +x side
-        let mut inside = area;
-        let (index, side) = add_box_facing(&mut inside, 0, area_box.center, Vec3::X).unwrap();
-        assert_eq!((index, side), (1, Side::new(0, true)));
-        assert!(inside.boxes()[1].center.x > area_box.center.x + area_box.half.x);
-        // Looking up and a little forward from inside: the top
-        let mut up = area;
-        let (_, side) =
-            add_box_facing(&mut up, 0, area_box.center, Vec3::new(0.0, 1.0, -0.2)).unwrap();
-        assert_eq!(side, Side::new(1, true));
+        assert_eq!(new_box_refusal(&area, a, b), None);
+        // A pinch that never opened
+        let near = a + Vec3::new(0.05, 0.05, 0.0);
+        let refusal = new_box_refusal(&area, a, near).unwrap();
+        assert!(
+            refusal.starts_with("the pinch points were 71 mm apart"),
+            "{refusal}"
+        );
+        // Full, too far from the code
+        let full = PlayArea::stress_layout(&params());
+        let refusal = new_box_refusal(&full, a, b).unwrap();
+        assert!(refusal.starts_with("8 boxes already"), "{refusal}");
+        let far = Vec3::new(0.0, 0.0, -MAX_BOX_CENTER - 0.5);
+        let refusal = new_box_refusal(&area, far, far + Vec3::X * 0.3).unwrap();
+        assert!(refusal.contains("more than 3 m"), "{refusal}");
+        // Made: the box as drawn, selected as the last one
+        let mut made = area;
+        assert_eq!(made.push_box(new_box), Some(1));
+        assert_eq!(made.boxes()[1], new_box);
+    }
 
-        // From outside in front of the -z side, looking at it: the -z side
-        let eye = area_box.center + Vec3::new(0.1, 0.2, -area_box.half.z - 0.8);
-        let mut outside = area;
-        let (_, side) = add_box_facing(&mut outside, 0, eye, area_box.center - eye).unwrap();
-        assert_eq!(side, Side::new(2, false));
+    // Recorded-like hands at 72 Hz, run as the client does: the timer of the gesture that ends editing
+    // runs while the pose holds and the two-hand pinch is not a new box
+    struct TwoHands {
+        two: TwoHandPinch,
+        timer: HoldTimer,
+        t: f64,
+    }
 
-        // That side taken: the next one facing the eyes
-        let (_, side) = add_box_facing(&mut outside, 0, eye, area_box.center - eye).unwrap();
-        assert_ne!(side, Side::new(2, false));
-        assert_eq!(outside.len(), 3);
+    impl TwoHands {
+        fn new() -> Self {
+            Self {
+                two: TwoHandPinch::default(),
+                timer: HoldTimer::default(),
+                t: 0.0,
+            }
+        }
 
-        // Full: none
-        let mut full = PlayArea::stress_layout(&params());
-        assert_eq!(add_box_facing(&mut full, 0, Vec3::ZERO, Vec3::X), None);
-        assert_eq!(full.len(), 8);
+        // Both pinched on empty space, palms turned away, the pinch points `span` apart in front of the
+        // face; returns the state, the progress of the gesture and whether it fired
+        fn step(&mut self, pinched: bool, span: f32) -> (TwoHand, f32, bool) {
+            self.t += 1.0 / 72.0;
+            let eye = Vec3::new(0.0, 1.2, 0.0);
+            let left = hand(Vec3::new(-0.5 * span, 1.1, -0.35), Vec3::NEG_Z, 0.0);
+            let right = hand(Vec3::new(0.5 * span, 1.1, -0.35), Vec3::NEG_Z, 0.0);
+            let state = self
+                .two
+                .update(pinched, left.cursor().distance(right.cursor()));
+            let pose = pinched && edit_gesture_pose(eye, Vec3::NEG_Z, [&left, &right]);
+            if state == TwoHand::Adding {
+                self.timer.cancel();
+            }
+            let (progress, fired) = self.timer.update(pose && state != TwoHand::Adding, self.t);
+            (state, progress, fired)
+        }
+    }
+
+    #[test]
+    fn two_hand_pinch_ends_editing_or_makes_a_box() {
+        // The gesture: 10 cm apart, drifting by 1.5 cm while held: fires after 1.5 s, never a box
+        let mut hands = TwoHands::new();
+        let mut fired_at = None;
+        for i in 0..130 {
+            let drift = 0.015 * (i as f32 * 0.3).sin();
+            let (state, _, fired) = hands.step(true, 0.10 + drift);
+            assert_eq!(state, TwoHand::Undecided, "{i}");
+            if fired {
+                fired_at = Some(hands.t);
+            }
+        }
+        let fired_at = fired_at.unwrap();
+        assert!((1.49..1.53).contains(&fired_at), "{fired_at}");
+
+        // A new box: pinched 8 cm apart (the amber square starts), pulled to 50 cm over 0.4 s: a box
+        // from the frame the points are more than 20 cm apart, the square gone; back together and held
+        // with the palms away for 2 s: still a box, the gesture does not run
+        let mut hands = TwoHands::new();
+        for i in 0..20 {
+            let (state, progress, _) = hands.step(true, 0.08);
+            assert_eq!(state, TwoHand::Undecided);
+            assert!(i == 0 || progress > 0.0);
+        }
+        let mut adding_from = None;
+        for i in 0..=29 {
+            let span = 0.08 + 0.42 * i as f32 / 29.0;
+            let (state, progress, fired) = hands.step(true, span);
+            assert!(!fired);
+            if span > GESTURE_MAX_SPAN + 1e-4 {
+                assert_eq!(state, TwoHand::Adding, "{span}");
+                adding_from.get_or_insert(span);
+                assert_eq!(progress, 0.0, "{span}");
+            } else if span < GESTURE_MAX_SPAN - 1e-4 {
+                assert_eq!(state, TwoHand::Undecided, "{span}");
+            }
+        }
+        assert!(adding_from.unwrap() < GESTURE_MAX_SPAN + 0.02);
+        for _ in 0..144 {
+            let (state, progress, fired) = hands.step(true, 0.10);
+            assert_eq!((state, progress, fired), (TwoHand::Adding, 0.0, false));
+        }
+        // A hand lets go: over; a new pinch close together is the gesture again
+        assert_eq!(hands.step(false, 0.10).0, TwoHand::None);
+        for _ in 0..12 {
+            hands.step(false, 0.10);
+        }
+        let mut fired = false;
+        for _ in 0..115 {
+            let (state, _, now) = hands.step(true, 0.10);
+            assert_eq!(state, TwoHand::Undecided);
+            fired |= now;
+        }
+        assert!(fired);
+
+        // Pinched at two corners 35 cm apart: a box at once, the timer never runs
+        let mut hands = TwoHands::new();
+        for _ in 0..150 {
+            assert_eq!(hands.step(true, 0.35), (TwoHand::Adding, 0.0, false));
+        }
+
+        // One frame beyond 20 cm is enough: it stays a box (the ghost shows it)
+        let mut hands = TwoHands::new();
+        hands.step(true, 0.19);
+        assert_eq!(hands.step(true, 0.21).0, TwoHand::Adding);
+        assert_eq!(hands.step(true, 0.15).0, TwoHand::Adding);
+        // Not both pinched: nothing
+        assert_eq!(TwoHandPinch::default().update(false, 0.5), TwoHand::None);
+        // A span that is not a number decides nothing
+        assert_eq!(
+            TwoHandPinch::default().update(true, f32::NAN),
+            TwoHand::Undecided
+        );
+    }
+
+    // What a hand does in one update of `Session`
+    #[derive(Clone, Copy)]
+    struct HandStep {
+        pinched: bool,
+        // What the pinch closes on (the lit handle; None: empty space)
+        on: Option<Pick>,
+        // How far the cursor (of a far grab: what the ray gives over the gain) moved since the grab
+        // (meters)
+        moved: f32,
+    }
+
+    impl HandStep {
+        fn moved(self, moved: f32) -> Self {
+            Self { moved, ..self }
+        }
+    }
+
+    const OPEN: HandStep = HandStep {
+        pinched: false,
+        on: None,
+        moved: 0.0,
+    };
+    const EMPTY: HandStep = HandStep {
+        pinched: true,
+        on: None,
+        moved: 0.0,
+    };
+
+    fn on(kind: HandleKind, box_index: usize, far: bool) -> HandStep {
+        HandStep {
+            pinched: true,
+            on: Some(Pick {
+                id: HandleId { kind, box_index },
+                far,
+            }),
+            moved: 0.0,
+        }
+    }
+
+    struct TestGrab {
+        hand: usize,
+        id: HandleId,
+        start: f64,
+        max_move: f32,
+        removed: bool,
+    }
+
+    // Both hands at 72 Hz, run as the client does (area_editor.rs, `update` and `edit`): the pinches
+    // and their roles, one grab, the two-hand pinch and the timer of the gesture that starts and ends
+    // editing, a new box when a hand lets go of the two-hand pinch pulled open
+    struct Session {
+        editing: bool,
+        pinches: [Pinch; 2],
+        roles: PinchRoles,
+        grab: Option<TestGrab>,
+        selected: usize,
+        two: TwoHandPinch,
+        state: TwoHand,
+        timer: HoldTimer,
+        t: f64,
+        // What happened
+        starts: Vec<(usize, PinchStart)>,
+        grabs: Vec<HandleId>,
+        // Drags released out of their dead zone, buttons that acted
+        released: Vec<HandleId>,
+        // Grabs that gave way
+        dropped: Vec<HandleId>,
+        removed: u32,
+        boxes: u32,
+        ended: bool,
+    }
+
+    impl Session {
+        fn new() -> Self {
+            Self {
+                editing: true,
+                pinches: [Pinch::default(); 2],
+                roles: PinchRoles::default(),
+                grab: None,
+                selected: 0,
+                two: TwoHandPinch::default(),
+                state: TwoHand::None,
+                timer: HoldTimer::default(),
+                t: 0.0,
+                starts: Vec::new(),
+                grabs: Vec::new(),
+                released: Vec::new(),
+                dropped: Vec::new(),
+                removed: 0,
+                boxes: 0,
+                ended: false,
+            }
+        }
+
+        // The pinch points `span` apart in front of the face, palms turned away (the pose of the
+        // gesture while within `GESTURE_MAX_SPAN`)
+        fn step(&mut self, hands: [HandStep; 2], span: f32) {
+            self.t += 1.0 / 72.0;
+            let mut events = [PinchEvent::None; 2];
+            for i in 0..2 {
+                let gap = if hands[i].pinched { -0.005 } else { 0.02 };
+                events[i] = self.pinches[i].update(
+                    Some(gap),
+                    self.t,
+                    DEFAULT_PINCH_ON,
+                    DEFAULT_PINCH_OFF,
+                    HAND_LOST_HOLD_S,
+                );
+                self.roles.follow(i, self.pinches[i].is_closed());
+            }
+
+            let closed = self.pinches.iter().all(Pinch::is_closed);
+            let both_free = self.editing && self.grab.is_none() && closed && self.roles.two_hand();
+            let state = self.two.update(both_free, span);
+            if self.state == TwoHand::Adding && state != TwoHand::Adding {
+                self.boxes += 1;
+            }
+            self.state = state;
+            if state == TwoHand::Adding {
+                self.timer.cancel();
+            }
+            let eye = Vec3::new(0.0, 1.2, 0.0);
+            let left = hand(Vec3::new(-0.5 * span, 1.1, -0.35), Vec3::NEG_Z, 0.0);
+            let right = hand(Vec3::new(0.5 * span, 1.1, -0.35), Vec3::NEG_Z, 0.0);
+            let pose = closed
+                && (!self.editing || both_free)
+                && edit_gesture_pose(eye, Vec3::NEG_Z, [&left, &right]);
+            let (_, fired) = self.timer.update(pose && state != TwoHand::Adding, self.t);
+            if fired {
+                if self.editing {
+                    self.editing = false;
+                    self.ended = true;
+                    self.grab = None;
+                } else {
+                    self.editing = true;
+                    self.roles.reset([true, true]);
+                    self.two = TwoHandPinch::default();
+                }
+            }
+            if !self.editing {
+                return;
+            }
+
+            for i in 0..2 {
+                if events[i] != PinchEvent::Closed {
+                    continue;
+                }
+                let other = 1 - i;
+                let other_acted = self.grab.as_ref().is_some_and(|grab| {
+                    grab.hand == other && (grab.removed || grab.max_move > DRAG_DEAD_ZONE)
+                });
+                let start = self
+                    .roles
+                    .close(i, hands[i].on, self.selected, other_acted, self.t);
+                self.starts.push((i, start));
+                match start {
+                    PinchStart::Handle(PinchAction::Select(index)) => self.selected = index,
+                    PinchStart::Handle(PinchAction::Grab) if self.grab.is_none() => {
+                        let id = hands[i].on.unwrap().id;
+                        self.grabs.push(id);
+                        self.grab = Some(TestGrab {
+                            hand: i,
+                            id,
+                            start: self.t,
+                            max_move: 0.0,
+                            removed: false,
+                        });
+                    }
+                    PinchStart::TwoHand { gives_way: true }
+                        if self.grab.as_ref().is_some_and(|grab| grab.hand == other) =>
+                    {
+                        self.dropped.push(self.grab.take().unwrap().id);
+                    }
+                    _ => (),
+                }
+            }
+
+            let Some(grab) = self.grab.as_mut() else {
+                return;
+            };
+            grab.max_move = grab.max_move.max(hands[grab.hand].moved);
+            if grab.id.kind == HandleKind::Remove
+                && !grab.removed
+                && grab.max_move < REMOVE_HOLD_MOVE
+                && self.t - grab.start >= REMOVE_HOLD_S
+            {
+                grab.removed = true;
+                self.removed += 1;
+            }
+            if events[grab.hand] == PinchEvent::Opened {
+                let grab = self.grab.take().unwrap();
+                if grab.id.kind.is_button()
+                    || (grab.id.kind.is_drag() && grab.max_move > DRAG_DEAD_ZONE)
+                {
+                    self.released.push(grab.id);
+                }
+            }
+        }
+
+        fn run(&mut self, updates: usize, hands: [HandStep; 2], span: f32) {
+            for _ in 0..updates {
+                self.step(hands, span);
+            }
+        }
+
+        fn last_start(&self) -> (usize, PinchStart) {
+            *self.starts.last().unwrap()
+        }
+    }
+
+    fn side_handle() -> HandleId {
+        HandleId {
+            kind: HandleKind::Side(Side::new(0, true)),
+            box_index: 0,
+        }
+    }
+
+    fn near_side() -> HandStep {
+        on(HandleKind::Side(Side::new(0, true)), 0, false)
+    }
+
+    // The rule of the user: "pinch to resize is always with one hand. adding a new box or exiting edit
+    // mode is always with 2"
+    #[test]
+    fn one_hand_works_handles_alone() {
+        // A drag with one hand: taken, moved 3 cm, released
+        let mut s = Session::new();
+        for i in 0..30 {
+            s.step([near_side().moved(0.001 * i as f32), OPEN], 0.4);
+        }
+        s.run(10, [OPEN, OPEN], 0.4);
+        assert_eq!(
+            (s.grabs.as_slice(), s.released.as_slice()),
+            (&[side_handle()][..], &[side_handle()][..])
+        );
+        // A pinch on empty space alone, held 3 s, also moved about: free, nothing happens
+        let mut s = Session::new();
+        s.run(216, [EMPTY, OPEN], 0.1);
+        s.run(10, [OPEN, OPEN], 0.1);
+        s.run(216, [OPEN, EMPTY], 0.4);
+        assert_eq!(s.starts, [(0, PinchStart::Free), (1, PinchStart::Free)]);
+        assert_eq!((s.boxes, s.ended, s.state), (0, false, TwoHand::None));
+        // Done with one hand acts on release, a handle of another box only selects it
+        let mut s = Session::new();
+        s.run(20, [OPEN, on(HandleKind::Center, 1, true)], 0.4);
+        s.run(10, [OPEN, OPEN], 0.4);
+        assert_eq!(s.selected, 1);
+        s.run(20, [on(HandleKind::Done, 0, false), OPEN], 0.4);
+        s.run(10, [OPEN, OPEN], 0.4);
+        assert_eq!(
+            s.released,
+            [HandleId {
+                kind: HandleKind::Done,
+                box_index: 0
+            }]
+        );
+    }
+
+    // 3a: the other pinch is free: the two-hand pinch, whatever the new one closed on
+    #[test]
+    fn second_pinch_after_a_free_one_is_the_two_hand_pinch() {
+        // On a near side of the selected box, the pinch points 10 cm apart, palms away: no grab, the
+        // gesture ends editing after 1.5 s
+        let mut s = Session::new();
+        s.run(22, [EMPTY, OPEN], 0.10);
+        s.run(150, [EMPTY, near_side()], 0.10);
+        assert_eq!(
+            s.last_start(),
+            (1, PinchStart::TwoHand { gives_way: false })
+        );
+        assert!(s.grabs.is_empty() && s.ended);
+
+        // On done by the ray, pulled 40 cm apart: a new box, done does nothing, editing goes on
+        let mut s = Session::new();
+        s.run(22, [EMPTY, OPEN], 0.10);
+        s.run(10, [EMPTY, on(HandleKind::Done, 0, true)], 0.10);
+        s.run(30, [EMPTY, on(HandleKind::Done, 0, true)], 0.40);
+        assert_eq!(s.state, TwoHand::Adding);
+        s.run(10, [EMPTY, OPEN], 0.40);
+        assert_eq!(s.boxes, 1);
+        assert!(s.grabs.is_empty() && s.released.is_empty() && !s.ended);
+
+        // On another box: not selected
+        let mut s = Session::new();
+        s.run(22, [OPEN, EMPTY], 0.10);
+        s.run(10, [on(HandleKind::Center, 1, false), EMPTY], 0.10);
+        assert_eq!(
+            s.last_start(),
+            (0, PinchStart::TwoHand { gives_way: false })
+        );
+        assert_eq!((s.selected, s.state), (0, TwoHand::Undecided));
+
+        // Both closing in the same update, either hand on a handle: the two-hand pinch
+        for hands in [[near_side(), EMPTY], [EMPTY, near_side()]] {
+            let mut s = Session::new();
+            s.run(10, hands, 0.10);
+            assert!(s.grab.is_none() && s.roles.two_hand());
+            assert_eq!(s.state, TwoHand::Undecided);
+        }
+    }
+
+    // 3b: the other pinch on a handle since at most `GRAB_YIELD_S`, its grab not acted: it gives way
+    #[test]
+    fn a_young_grab_gives_way_to_the_second_pinch() {
+        // Near drag, 5 mm of drift (in the dead zone), the other hand pinches empty space 0.3 s later:
+        // dropped, pulled apart: a new box, no release of the side
+        let mut s = Session::new();
+        s.run(22, [OPEN, near_side().moved(0.005)], 0.40);
+        s.run(10, [EMPTY, near_side().moved(0.005)], 0.40);
+        assert_eq!(s.last_start(), (0, PinchStart::TwoHand { gives_way: true }));
+        assert_eq!(
+            (s.grabs.as_slice(), s.dropped.as_slice()),
+            (&[side_handle()][..], &[side_handle()][..])
+        );
+        s.run(10, [EMPTY, near_side()], 0.40);
+        assert_eq!(s.state, TwoHand::Adding);
+        s.run(10, [OPEN, near_side()], 0.40);
+        assert_eq!(s.boxes, 1);
+        assert!(s.released.is_empty());
+
+        // The center by the ray, the other hand closes on another box 0.3 s later: dropped, nothing
+        // selected; the gesture ends editing
+        let mut s = Session::new();
+        s.run(22, [OPEN, on(HandleKind::Center, 0, true)], 0.10);
+        s.run(
+            140,
+            [
+                on(HandleKind::Center, 1, false),
+                on(HandleKind::Center, 0, true),
+            ],
+            0.10,
+        );
+        assert_eq!(s.dropped.len(), 1);
+        assert_eq!(s.selected, 0);
+        assert!(s.ended);
+
+        // Done, 0.4 s, then the other hand: done does nothing on release, editing goes on
+        let mut s = Session::new();
+        s.run(29, [OPEN, on(HandleKind::Done, 0, false)], 0.10);
+        s.run(10, [EMPTY, on(HandleKind::Done, 0, false)], 0.10);
+        s.run(10, [EMPTY, OPEN], 0.10);
+        s.run(10, [OPEN, OPEN], 0.10);
+        assert_eq!(
+            s.dropped,
+            [HandleId {
+                kind: HandleKind::Done,
+                box_index: 0
+            }]
+        );
+        assert!(s.released.is_empty() && s.editing);
+
+        // The hold of "x": gives way before it removed, nothing removed however long both are held
+        let mut s = Session::new();
+        s.run(22, [OPEN, on(HandleKind::Remove, 0, false)], 0.30);
+        s.run(100, [EMPTY, on(HandleKind::Remove, 0, false)], 0.30);
+        assert_eq!((s.dropped.len(), s.removed), (1, 0));
+
+        // A selection (box 1), the other hand 0.2 s later: box 1 stays selected, both are the two-hand
+        // pinch, the gesture ends editing
+        let mut s = Session::new();
+        s.run(15, [on(HandleKind::Center, 1, false), OPEN], 0.10);
+        assert_eq!(s.selected, 1);
+        s.run(140, [on(HandleKind::Center, 1, false), near_side()], 0.10);
+        assert_eq!(s.last_start(), (1, PinchStart::TwoHand { gives_way: true }));
+        assert!(s.grabs.is_empty() && s.dropped.is_empty());
+        assert_eq!(s.selected, 1);
+        assert!(s.ended);
+    }
+
+    // 3c: the other hand is resizing (its grab older than `GRAB_YIELD_S`, or out of its dead zone):
+    // the new pinch does nothing while it stays closed and does not disturb the grab
+    #[test]
+    fn a_running_resize_is_not_disturbed_by_the_other_hand() {
+        // The right hand drags 3 cm in 0.2 s, the left pinches empty space at 0.3 s and holds it with
+        // the palms away 10 cm from the right for 2 s: no gesture, no box, the drag goes on and is
+        // released with its change
+        let mut s = Session::new();
+        for i in 0..22 {
+            s.step(
+                [OPEN, near_side().moved((0.0015 * i as f32).min(0.03))],
+                0.10,
+            );
+        }
+        s.run(150, [EMPTY, near_side().moved(0.05)], 0.10);
+        assert_eq!(s.last_start(), (0, PinchStart::Idle));
+        assert_eq!(s.roles.role(0), PinchRole::Idle);
+        assert!(s.grab.as_ref().is_some_and(|grab| grab.max_move == 0.05));
+        assert!(s.dropped.is_empty() && s.editing && s.state == TwoHand::None);
+        s.run(10, [EMPTY, OPEN], 0.10);
+        assert_eq!(s.released, [side_handle()]);
+        // The left still pinched (it does nothing): a new pinch of the right on the side does nothing
+        // either
+        s.run(10, [EMPTY, near_side()], 0.10);
+        assert_eq!(s.last_start(), (1, PinchStart::Idle));
+        assert_eq!(s.grabs.len(), 1);
+        // Both open: a new two-hand pinch works again
+        s.run(10, [OPEN, OPEN], 0.10);
+        s.run(130, [EMPTY, EMPTY], 0.10);
+        assert!(s.ended);
+
+        // Held 0.6 s without moving (older than `GRAB_YIELD_S`), the other hand on another box: not
+        // selected, nothing dropped
+        let mut s = Session::new();
+        s.run(44, [OPEN, near_side()], 0.40);
+        s.run(10, [on(HandleKind::Center, 1, false), near_side()], 0.40);
+        assert_eq!(s.last_start(), (0, PinchStart::Idle));
+        assert_eq!((s.selected, s.dropped.len()), (0, 0));
+        assert!(s.grab.is_some());
+
+        // Done held 0.7 s, the other hand pinches: nothing; done acts when its pinch opens (one hand)
+        let mut s = Session::new();
+        s.run(50, [OPEN, on(HandleKind::Done, 0, false)], 0.10);
+        s.run(10, [EMPTY, on(HandleKind::Done, 0, false)], 0.10);
+        s.run(10, [EMPTY, OPEN], 0.10);
+        assert_eq!(
+            s.released,
+            [HandleId {
+                kind: HandleKind::Done,
+                box_index: 0
+            }]
+        );
+    }
+
+    // 4: editing started by the gesture: the hands still pinched start no box and don't end editing
+    #[test]
+    fn pinches_that_started_editing_do_nothing() {
+        let mut s = Session::new();
+        s.editing = false;
+        s.run(130, [EMPTY, EMPTY], 0.10);
+        assert!(s.editing);
+        assert_eq!(s.roles.role(0), PinchRole::Idle);
+        s.run(220, [EMPTY, EMPTY], 0.10);
+        s.run(30, [EMPTY, EMPTY], 0.40);
+        assert!(s.editing && !s.ended);
+        assert_eq!((s.boxes, s.state), (0, TwoHand::None));
+        // One hand opens and pinches on a handle while the other stays pinched: nothing
+        s.run(10, [EMPTY, OPEN], 0.40);
+        s.run(10, [EMPTY, near_side()], 0.40);
+        assert_eq!(s.last_start(), (1, PinchStart::Idle));
+        assert!(s.grabs.is_empty());
+        // Both open: a new two-hand pinch ends editing
+        s.run(10, [OPEN, OPEN], 0.10);
+        s.run(130, [EMPTY, EMPTY], 0.10);
+        assert!(s.ended);
     }
 
     #[test]
@@ -1641,7 +2769,6 @@ mod tests {
             HandleKind::Dome(Side::new(1, true)),
             HandleKind::Center,
             HandleKind::Turn,
-            HandleKind::Add,
             HandleKind::Remove,
             HandleKind::Undo,
             HandleKind::Done,
@@ -1688,12 +2815,26 @@ mod tests {
             cursor_glyph(position, eye, true, OVERLAY_DIM, 0.002).len(),
             4
         );
+        // A ray: to the handle it meets with a dot there, else a line of the drawn length
+        let ray = HandRay::new(Vec3::new(0.2, 1.0, -0.3), Vec3::NEG_Z).unwrap();
+        let lines = ray_lines(&ray, Some(position), eye, OVERLAY_DIM, 0.002);
+        assert_eq!(lines.len(), 5);
+        assert_eq!((lines[0].start, lines[0].end), (ray.origin, position));
+        for line in &lines[1..] {
+            assert!(line.start.distance(position) <= handle_radius(position, eye) * 0.5);
+        }
+        let lines = ray_lines(&ray, None, eye, OVERLAY_DIM, 0.002);
+        assert_eq!(lines.len(), 1);
+        assert!((lines[0].end.distance(ray.origin) - RAY_DRAW_LENGTH).abs() < 1e-6);
     }
 
     #[test]
     fn handles_of_eight_boxes_leave_room_for_the_outline() {
-        // The client draws the handles, the 12 edges of the selected box, 2 cursors, a guide and 2
-        // progress squares; the outline of the area gets what is left of the 249 segments of an eye
+        // The client draws the handles, the 12 edges of the selected box and 2 cursors, and in the
+        // worst frame of each kind: a grab (the guide of a turn, the longest, or the square of a held
+        // remove, and 2 rays), the gesture (its square and 2 rays: a grab is dropped then) or a new box
+        // (its 12 edges; no rays, no grab). The outline of the area gets what is left of the 249
+        // segments of an eye
         let placed = placed(PlayArea::stress_layout(&params()));
         let eye = Vec3::new(0.0, 1.2, 0.0);
         let handles = edit_handles(&placed, 3, true);
@@ -1701,8 +2842,12 @@ mod tests {
             .iter()
             .map(|handle| handle_glyph(handle, eye, 1.3, OVERLAY_CYAN, 0.002).len())
             .sum::<usize>();
-        // The guide of a turn is the longest
-        let editor = glyphs + 12 + 2 * 4 + (2 + TURN_GUIDE_SEGMENTS) + 2 * 4;
+        let ray = HandRay::new(eye, Vec3::NEG_Z).unwrap();
+        let ray_segments = ray_lines(&ray, Some(Vec3::NEG_Z), eye, OVERLAY_DIM, 0.002).len();
+        let grab = (2 + TURN_GUIDE_SEGMENTS).max(4) + 2 * ray_segments;
+        let gesture = 4 + 2 * ray_segments;
+        let new_box = 12;
+        let editor = glyphs + 12 + 2 * 4 + grab.max(gesture).max(new_box);
         assert!(editor <= 123, "{editor}");
         // All 96 edges of the 8 boxes still fit
         assert!(crate::MAX_OVERLAY_SEGMENTS - 7 - editor >= 96 + 30);
@@ -1977,29 +3122,201 @@ mod tests {
         assert_eq!(moved_area.boxes()[0].yaw, yaw);
     }
 
+    fn far_handle(kind: HandleKind, position: Vec3, normal: Vec3) -> Handle {
+        Handle {
+            id: HandleId { kind, box_index: 0 },
+            position,
+            normal,
+        }
+    }
+
     #[test]
-    fn added_box_of_a_turned_box_goes_where_the_eyes_look() {
-        let yaw = 0.9;
-        let area = turned_area(yaw);
-        let area_box = area.boxes()[0];
-        // From outside in front of the -z side of the turned box, looking at it
-        let eye = area_box.to_area(Vec3::new(0.1, 0.2, -area_box.half.z - 0.8));
-        let mut outside = area;
-        let (index, side) = add_box_facing(&mut outside, 0, eye, area_box.center - eye).unwrap();
-        assert_eq!(side, Side::new(2, false));
-        let added = outside.boxes()[index];
-        assert_eq!(added.yaw, yaw);
-        // In front of that side in the frame of the box
-        let local = area_box.to_local(added.center);
-        assert!(
-            local.z < -area_box.half.z && local.x.abs() < 1e-5,
-            "{local}"
+    fn ray_passes_nearest_to_an_axis() {
+        // The axis along +x through (0, 1, -2); a ray from the origin straight at a point of it
+        let point = Vec3::new(0.0, 1.0, -2.0);
+        let ray = |to: Vec3| HandRay::new(Vec3::new(0.0, 1.0, 0.0), to - Vec3::Y).unwrap();
+        let param = ray_axis_param(&ray(point + Vec3::X * 0.3), point, Vec3::X).unwrap();
+        assert!((param - 0.3).abs() < 1e-5, "{param}");
+        // Passing beside the axis (10 cm above): the point of the axis below where it passes
+        let param =
+            ray_axis_param(&ray(point + Vec3::new(-0.4, 0.1, 0.0)), point, Vec3::X).unwrap();
+        assert!((param + 0.4).abs() < 0.02, "{param}");
+        // Near parallel (the ray along the axis), and behind the origin: none
+        let along = HandRay::new(point - Vec3::X, Vec3::new(1.0, 0.0, 0.1)).unwrap();
+        assert_eq!(ray_axis_param(&along, point, Vec3::X), None);
+        let away = HandRay::new(Vec3::new(0.0, 1.0, 0.0), Vec3::Z).unwrap();
+        assert_eq!(ray_axis_param(&away, point, Vec3::X), None);
+    }
+
+    #[test]
+    fn far_side_follows_the_ray_along_its_axis() {
+        // The +x side of a box 2 m ahead, its handle at (0.4, 1, -2); the hand at (0.2, 1, -0.3)
+        let handle = far_handle(
+            HandleKind::Side(Side::new(0, true)),
+            Vec3::new(0.4, 1.0, -2.0),
+            Vec3::X,
         );
-        // From inside, looking along the turned +x
-        let mut inside = area;
-        let (_, side) =
-            add_box_facing(&mut inside, 0, area_box.center, area_box.turn(Vec3::X)).unwrap();
-        assert_eq!(side, Side::new(0, true));
+        let hand = Vec3::new(0.2, 1.0, -0.3);
+        let ray_to = |from: Vec3, to: Vec3| HandRay::new(from, to - from).unwrap();
+        let start = ray_to(hand, handle.position + Vec3::new(0.02, 0.03, 0.0));
+        let mut drag = FarDrag::new(&handle, &start, hand).unwrap();
+        // The gain: 1.7 m over 0.45 m
+        assert!((drag.gain() - handle.position.distance(hand) / FAR_HAND_REACH).abs() < 1e-5);
+        // No jump: the same ray moves nothing (the grab was 2 cm beside the handle)
+        assert_eq!(drag.follow(&start, hand).moved, Vec3::ZERO);
+        // The ray turned to a point 30 cm farther out along the axis: the side follows by 30 cm, the
+        // small motion of the hand does not count
+        let step = drag.follow(
+            &ray_to(hand, handle.position + Vec3::new(0.32, 0.03, 0.0)),
+            hand + Vec3::new(0.01, 0.0, 0.0),
+        );
+        assert!((step.moved.x - 0.3).abs() < 0.01, "{}", step.moved);
+        assert!(step.moved.y.abs() < 1e-6 && step.moved.z.abs() < 1e-6);
+        assert!(step.point.distance(handle.position + step.moved) < 1e-6);
+        // The ray nearly parallel to the axis: the hand along the axis times the gain
+        let before = step.moved;
+        let along = HandRay::new(hand + Vec3::X * 0.02, Vec3::new(1.0, 0.0, -0.1)).unwrap();
+        let step = drag.follow(&along, hand + Vec3::X * 0.02);
+        assert!(
+            (step.moved.x - before.x - 0.01 * drag.gain()).abs() < 1e-5,
+            "{} {}",
+            step.moved,
+            before
+        );
+        // Out of parallel again: no jump, then it follows again
+        let before = step.moved;
+        let back = ray_to(hand, handle.position + Vec3::new(0.5, 0.0, 0.0));
+        assert_eq!(drag.follow(&back, hand).moved, before);
+        let step = drag.follow(
+            &ray_to(hand, handle.position + Vec3::new(0.4, 0.0, 0.0)),
+            hand,
+        );
+        assert!(
+            (step.moved.x - before.x + 0.1).abs() < 0.01,
+            "{}",
+            step.moved
+        );
+        // Buttons and remove are not dragged
+        let undo = far_handle(HandleKind::Undo, handle.position, Vec3::ZERO);
+        assert!(FarDrag::new(&undo, &start, hand).is_none());
+    }
+
+    #[test]
+    fn far_center_moves_on_the_sphere_of_the_grab() {
+        let handle = far_handle(HandleKind::Center, Vec3::new(0.0, 1.0, -2.0), Vec3::ZERO);
+        let hand = Vec3::new(0.0, 1.0, -0.5);
+        let ray = HandRay::new(hand, Vec3::new(0.01, 0.0, -1.0)).unwrap();
+        let mut drag = FarDrag::new(&handle, &ray, hand).unwrap();
+        assert_eq!(drag.follow(&ray, hand).moved, Vec3::ZERO);
+        // Turned by 10 deg to the left: on the sphere of 1.5 m around the hand
+        let turned = Quat::from_rotation_y(10_f32.to_radians()) * ray.direction;
+        let step = drag.follow(&HandRay::new(hand, turned).unwrap(), hand);
+        let distance = handle.position.distance(hand);
+        assert!(((step.point - hand).length() - distance).abs() < 1e-5);
+        assert!(step.moved.x < -0.2 && step.moved.x > -0.3, "{}", step.moved);
+        // The hand moving along: the box with it
+        let step = drag.follow(&HandRay::new(hand + Vec3::Y * 0.1, turned).unwrap(), hand);
+        assert!(
+            step.point
+                .distance(hand + Vec3::Y * 0.1 + turned * distance)
+                < 1e-5
+        );
+    }
+
+    #[test]
+    fn far_turn_follows_the_ray_around_the_axis() {
+        // The turn handle 10 cm from the axis of a box 1.5 m ahead, 0.5 m below the hand
+        let center = Vec3::new(0.0, 0.7, -1.5);
+        let handle = far_handle(
+            HandleKind::Turn,
+            center + Vec3::new(0.07, 0.0, 0.07),
+            Vec3::ZERO,
+        );
+        let hand = Vec3::new(0.0, 1.2, -0.3);
+        let ray_to = |to: Vec3| HandRay::new(hand, to - hand).unwrap();
+        let mut drag = FarDrag::new(&handle, &ray_to(handle.position), hand).unwrap();
+        // Steep enough: where the ray meets the level plane of the handle
+        let target = center + Vec3::new(-0.1, 0.0, 0.05);
+        let step = drag.follow(&ray_to(target), hand);
+        assert!(step.continuous);
+        assert!(step.moved.distance(target - handle.position) < 1e-5);
+        assert!(step.point.distance(target) < 1e-5, "{}", step.point);
+        // From -45 deg to -153 deg around the axis
+        let swept = sweep_angle(center, handle.position, step.point).unwrap();
+        assert!(
+            (swept.to_degrees() + 108.4).abs() < 0.5,
+            "{}",
+            swept.to_degrees()
+        );
+        // Level: the point of the ray at the distance of the grab, not continuous at the change
+        let level = HandRay::new(hand, Vec3::new(0.0, -0.05, -1.0)).unwrap();
+        let before = step.moved;
+        let step = drag.follow(&level, hand);
+        assert!(!step.continuous);
+        assert!((step.point.distance(hand) - handle.position.distance(hand)).abs() < 1e-5);
+        // The displacement does not jump at the change, and goes on from there
+        assert!(
+            step.moved.distance(before) < 1e-6,
+            "{} {before}",
+            step.moved
+        );
+        let lower = HandRay::new(hand, Vec3::new(0.1, -0.05, -1.0)).unwrap();
+        let next = drag.follow(&lower, hand);
+        assert!(next.continuous);
+        assert!(next.moved.distance(before + next.point - step.point) < 1e-5);
+    }
+
+    #[test]
+    fn far_turn_moves_nothing_at_the_grab() {
+        // The ray at the grab 5 deg beside the turn handle (a pick allows that): the dead zone is
+        // measured from where the ray points, not from the handle
+        let center = Vec3::new(0.0, 0.7, -1.5);
+        let handle = far_handle(
+            HandleKind::Turn,
+            center + Vec3::new(0.07, 0.0, 0.07),
+            Vec3::ZERO,
+        );
+        let hand = Vec3::new(0.0, 1.2, -0.3);
+        let to_handle = handle.position - hand;
+        for (axis, steep) in [(Vec3::Y, true), (Vec3::X, true), (Vec3::Y, false)] {
+            let direction = Quat::from_axis_angle(axis, 5_f32.to_radians()) * to_handle;
+            // Level: the handle at the height of the hand, the point at the distance of the grab
+            let (from, direction) = if steep {
+                (hand, direction)
+            } else {
+                let from = Vec3::new(hand.x, handle.position.y + 0.02, hand.z);
+                let to = handle.position - from;
+                (from, Quat::from_axis_angle(axis, 5_f32.to_radians()) * to)
+            };
+            let ray = HandRay::new(from, direction).unwrap();
+            let mut drag = FarDrag::new(&handle, &ray, hand).unwrap();
+            let step = drag.follow(&ray, hand);
+            assert!(step.continuous);
+            assert!(
+                step.point.distance(handle.position) > 0.05,
+                "{}",
+                step.point
+            );
+            assert_eq!(step.moved, Vec3::ZERO);
+        }
+    }
+
+    #[test]
+    fn far_drag_dead_zone_grows_with_the_gain() {
+        let gain = 4.0;
+        // 2 cm: inside 4 times the dead zone
+        assert_eq!(scaled_drag_displacement(Vec3::X * 0.02, gain), Vec3::ZERO);
+        let caught_up = (DRAG_DEAD_ZONE + DRAG_RAMP) * gain;
+        let moved = Vec3::new(0.0, 0.0, caught_up + 0.05);
+        assert!(scaled_drag_displacement(moved, gain).distance(moved) < 1e-5);
+        // Gain 1 (or below, or not a number): the near drag
+        let moved = Vec3::X * 0.02;
+        for gain in [1.0, 0.3, f32::NAN] {
+            assert_eq!(
+                scaled_drag_displacement(moved, gain),
+                drag_displacement(moved)
+            );
+        }
     }
 
     #[test]
@@ -2045,7 +3362,7 @@ mod tests {
 
     #[test]
     fn buttons_have_no_drag() {
-        for kind in [HandleKind::Add, HandleKind::Undo, HandleKind::Done] {
+        for kind in [HandleKind::Undo, HandleKind::Done] {
             assert!(kind.is_button() && !kind.is_drag());
         }
         for kind in [

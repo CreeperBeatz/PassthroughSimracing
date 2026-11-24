@@ -23,8 +23,8 @@ use alvr_common::{
 use alvr_graphics::{
     ArmMotion, BridgeChoice, BurstHand, ColorKeyInput, DepthDumpFiles, DepthDumpRequest,
     DepthFrame, DepthRenderInput, DumpJoint, EditorHand, EditorInput, GraphicsContext,
-    HAND_SEGMENTS, HandShape, HandZones, LeakGains, OverlaySegment, PlacedArea, SEGMENT_JOINTS,
-    StreamRenderer, StreamViewParams, WristBridge,
+    HAND_SEGMENTS, HandRay, HandShape, HandZones, LeakGains, OverlaySegment, PlacedArea,
+    SEGMENT_JOINTS, StreamRenderer, StreamViewParams, WristBridge,
 };
 use alvr_packets::{ClientStreamConfig, RealTimeConfig, TrackingData};
 use alvr_session::{
@@ -211,6 +211,8 @@ pub struct StreamContext {
     area_overlay: Vec<OverlaySegment>,
     // How much the game is dimmed (0..1), while the play area is edited
     game_dim: f32,
+    // How much the room shows through the game outside the mask (0..1), while the play area is edited
+    game_see: f32,
 }
 
 impl StreamContext {
@@ -392,6 +394,7 @@ impl StreamContext {
             hands_in_region: false,
             area_overlay: Vec::new(),
             game_dim: 0.0,
+            game_see: 0.0,
         };
 
         this.update_reference_space(None);
@@ -454,6 +457,12 @@ impl StreamContext {
         self.game_dim = dim;
     }
 
+    /// How much the real room shows through the game where the mask does not show it (0: not, 1: no
+    /// game), while the play area is edited. Only with Passthrough = Depth
+    pub fn set_game_see(&mut self, see: f32) {
+        self.game_see = see;
+    }
+
     /// While true the tracked hands are not sent to the PC: no hand skeletons, and no hand pose of a
     /// hand that is tracked as a hand (controllers are sent as before). The PC then sees the hands as
     /// not tracked, as when they are out of view: its hand gestures (hand_tracking_interaction) and the
@@ -463,7 +472,8 @@ impl StreamContext {
     }
 
     /// The eyes and the hands at `time` (stage space) for the play area editor. None: not Passthrough =
-    /// Depth, or no head pose. A hand without a valid pose of its thumb tip, index tip and palm is None
+    /// Depth, or no head pose. A hand without a valid pose of its thumb tip, index tip and palm is None.
+    /// The aim pose of a hand (XR_FB_hand_tracking_aim) when the runtime gives a valid one
     pub fn editor_input(&self, time: xr::Time) -> Option<EditorInput> {
         if !self.uses_depth_passthrough() {
             return None;
@@ -482,11 +492,15 @@ impl StreamContext {
 
         let hands = [0, 1].map(|i| {
             let tracker = int_ctx.hands_interaction[i].skeleton_tracker.as_ref()?;
-            let joints = self
-                .stage_reference_space
-                .locate_hand_joints(tracker, time)
-                .ok()
-                .flatten()?;
+            // With XR_FB_hand_tracking_aim also the ray of the system pointer
+            let (joints, aim) = crate::extra_extensions::locate_hand_joints_with_aim(
+                &self.xr_session,
+                tracker,
+                &self.stage_reference_space,
+                time,
+            )
+            .ok()
+            .flatten()?;
             let thumb = joints[xr::HandJointEXT::THUMB_TIP];
             let index = joints[xr::HandJointEXT::INDEX_TIP];
             let palm = joints[xr::HandJointEXT::PALM];
@@ -513,6 +527,13 @@ impl StreamContext {
                 tracked: [&thumb, &index]
                     .iter()
                     .all(|&joint| has(joint, xr::SpaceLocationFlags::POSITION_TRACKED)),
+                // The pointer looks along -Z of the aim pose
+                aim: aim.filter(|aim| aim.valid).and_then(|aim| {
+                    HandRay::new(
+                        crate::from_xr_vec3(aim.pose.position),
+                        crate::from_xr_quat(aim.pose.orientation) * Vec3::NEG_Z,
+                    )
+                }),
             })
         });
 
@@ -1301,6 +1322,7 @@ impl StreamContext {
                         key_lower_rects: None,
                         region_override: self.region_override,
                         game_dim: self.game_dim,
+                        game_see: self.game_see,
                     });
                 }
                 Err(e) => {
@@ -1344,6 +1366,7 @@ impl StreamContext {
             key_lower_rects: None,
             region_override: self.region_override,
             game_dim: self.game_dim,
+            game_see: self.game_see,
         })
     }
 

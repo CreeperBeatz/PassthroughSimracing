@@ -485,6 +485,9 @@ pub struct DepthRenderInput {
     pub region_override: Option<PlacedArea>,
     /// How much the game is dimmed (0: not, 1: black), while the play area is edited
     pub game_dim: f32,
+    /// How much the real room shows through the game where the mask does not show it fully (0: not,
+    /// 1: the game is gone), while the play area is edited. In `area.y` of the uniform block
+    pub game_see: f32,
 }
 
 /// An oriented box in stage space, used for the depth mask instead of `DepthPassthroughConfig::region`
@@ -674,8 +677,13 @@ pub fn depth_uniforms(
         } => (1.0, 0.0, area_to_world.inverse(), Some(area)),
     };
     data.extend(world_to_area.to_cols_array());
-    // The number of boxes; the boxes are at the end
-    data.extend([area.map_or(0, |area| area.len()) as f32, 0.0, 0.0, 0.0]);
+    // The number of boxes (the boxes are at the end) and how much the room shows through the game
+    let see = if input.game_see.is_finite() {
+        input.game_see.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    data.extend([area.map_or(0, |area| area.len()) as f32, see, 0.0, 0.0]);
 
     let debug_view = match config.debug_view {
         DepthPassthroughDebugView::Off => 0.0,
@@ -1320,6 +1328,7 @@ mod tests {
             key_lower_rects: None,
             region_override: None,
             game_dim: 0.0,
+            game_see: 0.0,
         };
         let data = depth_uniforms(&cfg, &[view(), view()], &input, None, false);
 
@@ -1384,6 +1393,7 @@ mod tests {
                 key_lower_rects: None,
                 region_override: Some(PlacedArea::from(region)),
                 game_dim: 0.0,
+                game_see: 0.0,
             };
             let data = depth_uniforms(&cfg, &[view(), view()], &input, None, false);
             let world_to_volume = Mat4::from_cols_slice(&data[base..base + 16]);
@@ -1464,6 +1474,7 @@ mod tests {
             key_lower_rects: None,
             region_override: None,
             game_dim: 0.0,
+            game_see: 0.0,
         };
         let base = 2 * EYE_FLOAT_COUNT + 16 + 4 * 3;
 

@@ -517,6 +517,7 @@ fn render_full(
         overlay,
         None,
         0.0,
+        0.0,
     )
 }
 
@@ -538,6 +539,7 @@ fn render_with_area(
     overlay: &[OverlaySegment],
     region_override: Option<PlacedArea>,
     game_dim: f32,
+    game_see: f32,
 ) -> Output {
     let target_format = TextureFormat::Rgba8Unorm;
     let constants = [
@@ -709,6 +711,7 @@ fn render_with_area(
         key_lower_rects,
         region_override,
         game_dim,
+        game_see,
     };
     let lighting_enabled = config.lighting.as_option().is_some();
     let playzone_views = [view(depth_camera_position); 2];
@@ -2059,6 +2062,7 @@ fn depth_dump_reads_back_meters_and_masks() {
         key_lower_rects: None,
         region_override: None,
         game_dim: 0.0,
+        game_see: 0.0,
     };
     let uniforms = depth_mask::depth_uniforms(
         &config,
@@ -2310,6 +2314,7 @@ fn editing_dims_the_game() {
             &[],
             None,
             game_dim,
+            0.0,
         )
     };
 
@@ -2327,6 +2332,107 @@ fn editing_dims_the_game() {
         }
     }
     assert!(plain.pixels[0][0] > 100);
+}
+
+// While editing the room shows through the game outside the mask (`game_see`), in the plain and the
+// color key path; inside the mask it shows fully as before, and the overlay stays opaque
+#[test]
+fn editing_shows_the_room_through_the_game() {
+    let (device, queue) = gpu_or_skip!();
+    let config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
+    let (dim, see) = (0.3, 0.45);
+    let no_hands = ColorKeyInput {
+        hands: [None; 2],
+        leak: [0.0; 2],
+        bridges: [None; 2],
+    };
+    let line = OverlaySegment {
+        start: Vec3::new(-0.3, -0.3, -1.0),
+        end: Vec3::new(0.3, -0.3, -1.0),
+        color: OVERLAY_AMBER,
+        width: 0.05,
+        dashed: false,
+    };
+    let draw = |key: Option<ColorKeyInput>,
+                rects: Option<[(Vec2, Vec2); 2]>,
+                overlay: &[OverlaySegment],
+                see: f32| {
+        render_with_area(
+            &device,
+            &queue,
+            &config,
+            &hand_scene(),
+            Vec3::ZERO,
+            Vec3::ZERO,
+            true,
+            key,
+            [None; 2],
+            None,
+            rects,
+            false,
+            overlay,
+            None,
+            dim,
+            see,
+        )
+    };
+    let gray = f32::from(STREAM_GRAY);
+    let near = |value: u8, expected: f32| (f32::from(value) - expected).abs() <= 2.0;
+
+    // Plain path, premultiplied: the background is the dimmed game at 1 - see over the room
+    let plain = draw(None, None, &[], see);
+    let background = plain.at(0.5, 0.75);
+    assert!(near(background[3], 255.0 * (1.0 - see)), "{background:?}");
+    assert!(
+        near(background[0], gray * (1.0 - dim) * (1.0 - see)),
+        "{background:?}"
+    );
+    // The near object (the mask): the room only, as without editing
+    assert_eq!(plain.at(0.5, 0.25), [0, 0, 0, 0]);
+    // 0: as before
+    assert_eq!(draw(None, None, &[], 0.0).alpha(0.5, 0.75), 1.0);
+
+    // The overlay over it: opaque in its color, nothing else is opaque
+    let lined = draw(None, None, &[line], see);
+    let opaque = lined
+        .pixels
+        .iter()
+        .filter(|pixel| pixel[3] == 255)
+        .collect::<Vec<_>>();
+    assert!(opaque.len() >= 15, "{}", opaque.len());
+    let amber = OVERLAY_AMBER * 255.0;
+    for pixel in opaque {
+        assert!(
+            near(pixel[0], amber.x) && near(pixel[1], amber.y) && near(pixel[2], amber.z),
+            "{pixel:?}"
+        );
+    }
+    assert!(plain.pixels.iter().all(|pixel| pixel[3] < 255));
+
+    // Color key, both layers: the lower one at 1 - see, the upper one open (packed: half of it)
+    let lower = |a: f32| (2.0 * a).min(1.0);
+    let upper = |a: f32| (2.0 * a - 1.0).max(0.0);
+    let keyed = draw(Some(no_hands), None, &[], see);
+    let a = keyed.alpha(0.5, 0.75);
+    assert!(
+        (lower(a) - (1.0 - see)).abs() < 0.01 && upper(a) == 0.0,
+        "{a}"
+    );
+    // Not premultiplied: the dimmed game
+    assert!(near(keyed.at(0.5, 0.75)[0], gray * (1.0 - dim)));
+    assert!(keyed.alpha(0.5, 0.25) < 0.01);
+    // Without the lower layer the upper one alone shows the same
+    let alone = draw(
+        Some(no_hands),
+        Some([(Vec2::ZERO, Vec2::ZERO); 2]),
+        &[],
+        see,
+    );
+    let a = alone.alpha(0.5, 0.75);
+    assert!((upper(a) - (1.0 - see)).abs() < 0.01, "{a}");
+    assert!(upper(alone.alpha(0.5, 0.25)) < 0.01);
+    // 0: the game opaque in both layers, as before
+    assert_eq!(draw(Some(no_hands), None, &[], 0.0).alpha(0.5, 0.75), 1.0);
 }
 
 #[test]
@@ -2449,6 +2555,7 @@ fn play_area_mask_matches_the_rust_distance() {
         &[],
         Some(placed),
         0.0,
+        0.0,
     );
 
     // Pixel centers on the wall (view uv origin top-left, +Y up)
@@ -2533,6 +2640,7 @@ fn play_area_mask_matches_the_rust_distance() {
         false,
         &[],
         Some(PlacedArea::from(region)),
+        0.0,
         0.0,
     );
     assert!(from_settings.pixels.iter().any(|pixel| pixel[3] == 0));

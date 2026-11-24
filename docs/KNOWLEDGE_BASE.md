@@ -1072,7 +1072,8 @@ shows the pose as last reported, with ` (size not trusted)` when it is not trust
 | `area_dashed` | unset | 1: the play area in the outline is dashed (4 cm period, 60 % drawn, fixed in the room). It is dashed anyway while it is placed from the anchor saved in the layout file, before the code is seen in this run (the editor). Polled |
 | `area_edit` | value at app start | Play area editor (see "Play area editor"). A change to 1 starts editing, a change to 0 ends it (and saves). The value at the start of the app is not a request: set 0, then 1. Only with a marker box, a play area placed and Passthrough = Depth (else logged: `area editor: can't edit`). Polled |
 | `area_pinch_on` / `area_pinch_off` | 0 / 5 | Editor: gap in mm between the surfaces of the thumb and index tips (joint distance minus the two joint radii) below which a pinch closes (2 updates in a row) / above which it opens (for 80 ms). On -30 to 100 (negative: tips pressed together; contact measured -2 to -16 mm on 2026-11-24), off from on to 105 (may equal it). The editor logs the min/max gap every 5 s while editing. Polled |
-| `area_edit_dim` | 60 | Editor: how much the game is dimmed while editing, percent (0 to 90). Polled |
+| `area_edit_dim` | 30 | Editor: how much the game is dimmed while editing, percent (0 to 90). 60 until the room showed through the game (`area_edit_see`): 0.55 x 0.7 leaves the game at about the 0.4 the handles read well over. Polled |
+| `area_edit_see` | 45 | Editor: how much the real room shows through the game outside the play area while editing, percent (0 to 100; 0: the game opaque there, as before). Inside the area the room shows fully as always; the lines of the editor stay opaque. Polled |
 | `area_edit_grace` | 8 | Editor: how long editing waits for a stopped stream (Passthrough = Depth) to come back before it ends, seconds (0 to 60). Polled |
 | `area_edit_hands_pc` | unset (0) | Editor: 1: the hands are sent to the PC also while editing; else no skeletons and no hand poses while editing. Polled |
 | `area_file` | unset (= 1) | 0: the layout files of the play area are neither read nor written: the box of the `marker_box_*` properties (and `area_test`) again, edits last until the app stops. Unset or another value: a layout file of the code replaces that box. A change reads the file again. Polled |
@@ -1300,8 +1301,10 @@ gesture, glyphs, undo, file name and text; unit tests). Only with a marker box a
   side moves, the opposite stays), a small triangle beside it (up the side, along the longer edge on
   top and bottom; 35 % of the half extent, 4-12 cm) for the dome (drag out: higher, up to the rim; below
   1.5 cm: flat), a diamond at the center (moves the box), a curved arrow beside the center (turns the
-  box, see "Turning"), "+" and a red "x" 9 cm above the center. The
-  other boxes show only a dim diamond; pinching any handle of a box selects it (cyan edges). Undo (an
+  box, see "Turning") and a red "x" 9 cm above the center ("+" beside it until the third build; a new
+  box is now a two-hand pinch, see "Play area editor (v1)"). The
+  other boxes show only a dim diamond; the first pinch on a handle of another box only selects it (cyan
+  edges; until the third build that pinch also dragged it). Undo (an
   arrow) beside done above the code while there is something to take back (20 steps, per editing
   session). Handle size max(1.5 cm, 0.012 x distance), 1.3x and amber when lit, cyan when grabbed, with a
   dashed guide line along the normal for side and dome drags. Cursors: a small plus, a square while
@@ -1315,8 +1318,8 @@ gesture, glyphs, undo, file name and text; unit tests). Only with a marker box a
   value of 0.12 s before the release was confirmed is kept (the fingers move the cursor while they
   open), the last one when the hand was lost. Buttons act on any release of a usable hand, however far
   it moved (until the first headset run they needed a tap under 2 cm: 14 of 15 presses were rejected,
-  the hand moved 22-186 mm between closing and opening the fingers). "+" adds a box on the
-  side of the selected box the line of sight goes through first (from inside the box: where it leaves,
+  the hand moved 22-186 mm between closing and opening the fingers). In the first two builds "+" added
+  a box on the side of the selected box the line of sight goes through first (from inside the box: where it leaves,
   from outside: where it enters), else the next side facing the eyes whose new box would not have its
   center in another box (in the frame of the box); `PlayArea::add_box` sizes it and gives it the yaw of
   the box it is added to. "x": held 0.8 s with the cursor within 8 cm of where the pinch closed removes
@@ -1335,8 +1338,12 @@ gesture, glyphs, undo, file name and text; unit tests). Only with a marker box a
   (green on a detent) and the arc between them (up to 6 segments). Release: `release turn of box #i:
   yaw <deg> deg (turned by <deg> deg{, on a detent}), ...`. A box added next to a turned one is turned
   like it; `describe_box` adds `, yaw <deg> deg` for a turned box.
-- A two-hand gesture while one hand grabs drops the grab (the layout as before it). Other ends of a grab
-  keep what it changed so far (as an undo step, saved): editing ends, the stream stops, the hands go
+- One hand or two (2026-11-24, after the third build; `PinchRoles` in area_edit.rs): the user's rule is
+  "pinch to resize is always with one hand. adding a new box or exiting edit mode is always with 2". A
+  grab in progress is therefore never dropped by the other hand or by the gesture (until then a gesture
+  pose while one hand grabbed dropped the grab and put the layout back; the leave gesture of the second
+  headset run won over a pinch on done that way). See "Gestures", Pinch. Ends of a grab other than its
+  pinch keep what it changed so far (as an undo step, saved): editing ends, the stream stops, the hands go
   (no input for 1.5 s), a STAGE change: `grab of <handle> of box #i ended (<reason>), kept as it was: ...`.
 - Stream interruptions: without a stream with Passthrough = Depth editing pauses (`editing paused: ...`,
   a grab kept, pinches reset) and goes on when it is back within `area_edit_grace` (8 s; `editing goes on
@@ -1352,6 +1359,14 @@ gesture, glyphs, undo, file name and text; unit tests). Only with a marker box a
 - Dimming: `DepthRenderInput.game_dim` goes to `lighting2.w` of the uniform block (unused before: no
   layout change, the block stayed 4016 bytes; 4144 since the box yaw); `depth_passthrough` in stream.wgsl multiplies the game color
   by 1 - dim in both the plain and the color key path. Tested on the PC GPU (`editing_dims_the_game`).
+  The room through the game (third build): `DepthRenderInput.game_see` goes to `area.y` (unused before,
+  the block stays 4144 bytes). Plain path: the room shown is max(mask, see), so rgb = game x (1 - dim)
+  x (1 - shown) and alpha = 1 - shown x brightness (premultiplied). Color key path: the packed alpha can
+  hold only one layer part way while the other is 0 or 1, so the lower layer gets min(1 - solid, 1 -
+  see) and the upper one opens (0); outside the rect of the lower layer the upper one alone shows 1 -
+  see; inside it (around the hands) colors the key keeps show fully instead of at `see`. The overlay is
+  drawn after the stream, opaque, so the outline and the handles stay fully visible. Tested on the PC
+  GPU (`editing_shows_the_room_through_the_game`: both paths, the mask, the overlay).
 - Layout file: one per code, `area-<payload, other than [A-Za-z0-9_-] as _, at most 40>-<FNV-1a of the
   payload, 8 hex>.txt` (`area-no-payload.txt` for a code without payload), in
   `/sdcard/Android/data/alvr.client.dev/files/areas/` and `/data/local/tmp/alvr-areas/`. Read once the
@@ -1382,9 +1397,40 @@ gesture, glyphs, undo, file name and text; unit tests). Only with a marker box a
 Summary of the two paragraphs above ("Play area: boxes and domes", "Play area editor"), written for the
 first headset test. Built 2026-11-24 (aafcbcd3, d98535d2), first run on the Quest the same morning (see
 "First headset run"); the second build of that day (box yaw, buttons, pinch at contact, pauses over
-stream interruptions, hands kept from the PC) is checked only on the PC (`cargo test -p alvr_graphics`,
-202 tests incl. GPU and shader parse; `cargo test` / `clippy -p alvr_client_openxr`, also for
-`aarch64-linux-android`).
+stream interruptions, hands kept from the PC) ran on the Quest at noon (bcfefe28, "Second headset
+run"); the third build (new box by a two-hand pinch, the room through the game, select first, hand
+rays) is checked only on the PC (`cargo test -p alvr_graphics`, 211 tests incl. GPU and shader parse;
+`cargo test` / `clippy -p alvr_client_openxr`, also `check` / `clippy` for `aarch64-linux-android`).
+
+**Second headset run (2026-11-24, build bcfefe28, log `alvr-20261124-1235-bcfefe28.log`).** Two editing
+sessions (12:47-12:50), both started and ended with the gesture; 19 grabs (center, turn, sides, domes),
+17 releases, no hand lost, no stream pause. The leave gesture twice began with one hand on the done
+handle (`grab done of box #0`, then `dropped (two-hand gesture)`): the gesture still won. The user:
+"overall, it works well, but i have 3 things 1. adding a new box should be a gesture, not a button,
+example pitch [pinch] and scale with your hands for initial position, then move around with the other
+controls 2. the real world should still be visible (say at 40-50% opasity) when editing. 3. first click
+on another box should just select it, not move it around. Optional: sometimes I want to extend an area
+beyond where my hand can reach. I think the meta variant with a pointer is a good approach (the meta
+pointer in XR space, their default one)". What the third build does for each:
+1. New box: the "+" handle is gone. Both hands pinched on empty space and pulled more than 20 cm apart:
+   a dashed ghost box spans the two pinch points (opposite corners, level, yaw 0 in the area frame, each
+   side at least 15 cm) and follows both hands; when a hand lets go it becomes a real, selected box
+   (undo removes it, saved). Within 20 cm the same two pinches may be the gesture that ends editing; once
+   the points were farther apart in this pinch the gesture's timer is cancelled until a pinch opens.
+   Points nearer than 10 cm on release, 8 boxes or a center over 3 m from the code along an axis of its
+   frame: no box (logged; the
+   ghost is dim / red). Details under "Gestures".
+2. The room through the game: outside the play area the real world shows through the game at 45 %
+   (`area_edit_see`), inside the area fully as before; the game dimmed by 30 % instead of 60 %
+   (`area_edit_dim`); the lines of the editor stay opaque.
+3. Select first: a pinch on a handle of a box that is not the selected one only selects it (`selected box
+   #i ...: the next pinch edits it`): no drag, no undo step, nothing saved. In this run selecting box #2
+   moved it by 3 mm (`release center of box #2: moved by 0.003 m`).
+4. Far reach: a ray from each hand like the system pointer (the aim pose of XR_FB_hand_tracking_aim, now
+   enabled; else from an estimated shoulder through the pinch point), drawn thin with a dot where it
+   meets the handle it would take. Handles within 8 cm of the pinch point keep priority; otherwise the
+   handle nearest to the ray within 5 deg is lit. A handle taken by the ray follows the ray, not the
+   small motion of the hand.
 
 **First headset run (2026-11-24, build d98535d2, log `alvr-20261124-1047-d98535d2.log`).** It worked end
 to end: 10 times into editing with the two-hand gesture, 130 grabs, sides, domes and moves, 3 boxes
@@ -1449,18 +1495,78 @@ copies the first into it before the uninstall). The newer file that reads wins. 
 **Gestures (numbers from the code).**
 - Start/end: both hands pinched, palms away from the eyes (cos at least 0.5), pinch points at most 20 cm
   apart, each 15-65 cm from the eyes and within 45 deg of the view, held 1.5 s (drops under 0.15 s ignored).
-  Also `area_edit` 1/0, the done handle, 120 s without a grab, loss of the play area.
+  While editing only with both pinches free (the two-hand pinch, see Pinch): a pinch on a handle, or one
+  that does nothing, never ends editing. Also `area_edit` 1/0, the done handle, 120 s without a grab, loss
+  of the play area.
 - Pinch: closes below a tip gap of 0 mm (2 updates; the tips pressed together), opens above 5 mm for
-  80 ms; a lost hand opens after 0.3 s, the hand that grabs after 1 s. A hand is used when both tips
-  are tracked and the cursor is within 50 deg of the view (75 deg for the hand that grabs).
-- Picking: nearest handle within 8 cm; line of sight (4 deg, ties 1.5 deg) when out of reach; hysteresis 1 cm / 10 cm / 6 deg.
+  80 ms; a lost hand opens after 0.3 s, the hand that grabs (and both hands while they pull a new box
+  open) after 1 s. A hand is used when both tips are tracked and the cursor is within 50 deg of the view
+  (75 deg for the hand that grabs and for both hands pulling a new box open: at 50 deg a box wider than
+  about 0.7 m took a hand out of view and was made 0.3 s later).
+  One hand or two (`PinchRoles`, `PinchStart`), because the user said "pinch to resize is always with one
+  hand. adding a new box or exiting edit mode is always with 2": a pinch works handles (grab, select,
+  undo, done, the hold of "x") only while the other hand is open; alone on empty space it is free and
+  does nothing (a single pinch never adds a box or ends editing). Whenever both hands are pinched it is
+  the two-hand pinch (a new box or the gesture that ends editing) or nothing, wherever the pinches closed
+  (empty space, a near handle, a far handle by the ray, a button, another box). Two hands never close in
+  the same update, so when a hand closes while the other is pinched: (a) the other pinch free: both are
+  the two-hand pinch, the new one free whatever it closed on (no grab, no selection, no button); (b) the
+  other pinch on a handle, near or by the ray, for at most 0.5 s (`GRAB_YIELD_S`, was `FAR_GRAB_YIELD_S`
+  for the ray only) and its grab not out of its dead zone nor done (the box not removed): it gives way
+  (the grab dropped, no change; a button does nothing on release; a selection made stays) and both are
+  the two-hand pinch; (c) else (a drag older than 0.5 s or already moving, a button or selection held
+  longer, a removed box, or the other pinch doing nothing itself) the new pinch does nothing until it
+  opens: no grab, no selection, no button, not free, and the grab of the other hand goes on undisturbed
+  (no handle lit, no ray drawn for that hand). Both closing in the same update count as (a) or (b). The
+  pinches closed when editing begins (the gesture that started it) do nothing until they open: no box,
+  editing does not end again.
+- New box (third build; `TwoHandPinch`, `new_box_between`, `new_box_refusal` in area_edit.rs): the
+  two-hand pinch, both pinches free (see Pinch: also a second pinch on a handle, and a first one on a
+  handle that gave way; not a pinch closed before editing began). While the
+  pinch points have stayed within 20 cm (`GESTURE_MAX_SPAN`, the span of the gesture) it is undecided:
+  the gesture that ends editing may run (amber square). Once they were more than 20 cm apart in this
+  pinch it is a new box: the gesture's timer is cancelled at once (its square goes) and does not run
+  again until a pinch opens, also if the hands come back together with the palms away. The ghost: dashed
+  box edges, the two pinch points at opposite corners, level and unturned in the area frame (the frame of
+  the code, mounted square on the rig; the yaw of the selected box was not taken because which box is
+  selected is mostly whichever was edited last), each side at least 15 cm (`NEW_BOX_MIN_SIZE`; a flat
+  pull gives a 15 cm thick box), green, dim while the points are nearer than 10 cm (`NEW_BOX_MIN_SPAN`),
+  red without room (8 boxes, or its center more than 3 m from the code along an axis of its frame). Made
+  when a hand lets go, from the points of 0.12 s before the release (the last ones when a hand was lost):
+  selected, an undo step, saved. Dropped without a box when editing pauses or ends. Pinched at two
+  corners more than 20 cm apart: a new box at once. Hands held up for a box often have a handle at a
+  pinch point or under a ray: the first pinch on a handle gives way within 0.5 s (see Pinch, (b)).
+- Select first: a pinch on any handle of a box other than the selected one selects it and does
+  nothing else in that pinch (`pinch_action`); the next pinch acts. Undo and done are always taken.
+- Picking: nearest handle within 8 cm of the pinch point (ties within 1.5 cm by the line of sight);
+  out of reach the handle nearest to the ray of the hand within 5 deg (ties 1.5 deg: nearer to the
+  hand), kept up to 8 deg (was the line of sight from the eyes, 4 / 6 deg: the ray of a hand shakes
+  more); hysteresis 1 cm / 10 cm.
+- Hand ray: the aim pose of XR_FB_hand_tracking_aim (COMPUTED and VALID, -Z of the pose), chained to
+  `xrLocateHandJointsEXT` (`extra_extensions/hand_tracking_aim_fb.rs`); without it (extension missing,
+  or not valid for that hand) from a shoulder 15 cm below, 18 cm to the side of and 8 cm behind the eyes
+  (level frame of the head) through the pinch point. Drawn only while editing, for a hand that is not
+  near a handle and not part of a two-hand pinch: white 1 m without a handle, amber to a dot where it
+  passes the handle it lights, cyan to the handle it holds; half the width of the outline.
+- Far drag (`FarDrag`): a side or a dome goes to where the ray passes nearest to its axis (the line
+  through the handle along the normal of the side), added up per update, relative to the grab; while the
+  ray is within 20 deg of parallel to that axis the hand's motion along the axis times the gain moves it
+  instead (so a far side can be pushed straight away; out of parallel again it goes on from there, no
+  jump). The center: on the sphere around the hand at the distance of the grab. The turn handle: where
+  the ray meets the level plane of the handle (ray at least 15 deg steep, within twice the grab
+  distance), else the point at the grab distance; a change between the two starts the sweep anew (no
+  jump). Its dead zone is measured from where the ray pointed at the grab (up to 5 deg beside the
+  handle), not from the handle. Gain: distance of the handle from the hand at the grab over 0.45 m, at
+  least 1; the dead zone and the ramp of the drag are that many times longer. Remove, undo and done
+  picked by the ray work as near ones (the hold of "x" counts the hand's motion).
 - Drag: 8 mm dead zone caught up over 3 cm; release keeps the value of 0.12 s earlier; dome under 1.5 cm
   snaps flat; side and dome drags along the turned normal.
 - Turn: the angle swept around the vertical axis of the box (3 cm dead radius), detents every 15 deg
   within 2 deg, guide lines while grabbed.
-- Handles: square per side, triangle for the dome, diamond for moving, curved arrow for turning, "+"
-  (any release), red "x" (held 0.8 s within 8 cm, not on the last box), undo (20 steps) and done above
-  the code (any release). Game dimmed 60 %.
+- Handles: square per side, triangle for the dome, diamond for moving, curved arrow for turning, red "x"
+  (held 0.8 s within 8 cm, not on the last box), undo (20 steps) and done above the code (any release).
+  "+" until the third build. Game dimmed 30 % (60 % before) and the room through it at 45 % outside the
+  area.
 - Stream interruptions: editing pauses up to 8 s (`area_edit_grace`), a grab is kept; the hands are not
   sent to the PC while editing.
 
@@ -1471,7 +1577,8 @@ copies the first into it before the uninstall). The newer file that reads wins. 
 | `area_edit` | value at app start | change to 1 starts editing, to 0 ends it and saves; set 0 then 1 |
 | `area_pinch_on` | 0 mm | tip gap below which a pinch closes, -30 to 100 (negative: tips pressed together; contact measured -2 to -16) |
 | `area_pinch_off` | 5 mm | tip gap above which a pinch opens, from `area_pinch_on` to 105 (may equal it) |
-| `area_edit_dim` | 60 % | dimming of the game while editing, 0 to 90 |
+| `area_edit_dim` | 30 % | dimming of the game while editing, 0 to 90 (60 until the third build) |
+| `area_edit_see` | 45 % | the real room through the game outside the area while editing, 0 to 100 (0: opaque, as before) |
 | `area_edit_grace` | 8 s | how long editing waits for a stopped stream to come back before it ends, 0 to 60 |
 | `area_edit_hands_pc` | unset (0) | 1: the hands are sent to the PC also while editing; else no skeletons and no hand poses while editing |
 | `area_file` | unset (on) | 0: no layout file read or written, the property box again |
@@ -1489,19 +1596,62 @@ copies the first into it before the uninstall). The newer file that reads wins. 
 | `area editor: no layout file for "<payload>"`, `loaded <path> (...)` | file looked for / read; says which of the two folders won |
 | `area editor: play area placed from the code`, `... from the anchor saved in the layout file` | placement; the second is drawn dashed |
 | `area editor: two-hand gesture held (1.5 s to start or end editing)`, `... let go after <s> s` | the gesture is recognised; at most every 2 s; the false-trigger check |
-| `area editor: editing (gesture or area_edit 1), game dimmed by <n> %` | edit mode on |
+| `area editor: editing (gesture or area_edit 1), game dimmed by <n> %, the room through it at <n> % outside the area, placed from ..` | edit mode on (the room part since the third build) |
+| `area editor: the room shows through the game at <n> % outside the play area while editing (area_edit_see)` | `area_edit_see` changed |
+| `area editor: selected box #i (left or right hand{, by the ray}): the next pinch edits it` | a pinch on another box only selected it |
+| `area editor: new box: both hands pinched on empty space, <n> cm apart (more than 20 cm: ...)` | a two-hand pinch became a new box (the ghost appears, the gesture's timer stops for this pinch) |
+| `area editor: added box #n (two-hand pinch{ (a hand lost)}, the pinch points <n> cm apart): #n at ..` | the new box was made when a hand let go |
+| `area editor: no new box{ (a hand lost)}: the pinch points were <mm> mm apart, a new box needs 100 mm` / `8 boxes already, at most 8` / `its center would be more than 3 m from the code along an axis of its frame` / `the hands were not seen while it was pulled open` / `editing ended` / `stream stopped` / `no hands` | no box made |
+| `area editor: grab of <handle> of box #i dropped (the left or right pinch{ by the ray} gives way: the right or left hand pinched too: both pinches are the two-hand pinch, ...)` | a young grab (near or by the ray, not out of its dead zone) gave way to the two-hand pinch; until the user's one-hand/two-hand rule only by the ray and only for a pinch on empty space (`... pinched on empty space: both pinches make a new box`) |
+| `area editor: the left or right pinch{ by the ray} gives way (the right or left hand pinched too: ...)` | a young selection gave way to the two-hand pinch (the box stays selected) |
+| `area editor: the left or right pinch does nothing until it opens: the right or left pinch holds <handle> of box #i (<s> s{, moved or done})` / `selected a box <s> s ago` / `does nothing either` (...) | a second pinch while the other hand works a handle that no longer gives way (one hand resizing is not disturbed) |
 | `area editor: editing ended (<reason>)`, with `, nothing changed` when so | edit mode off; reasons: gesture, done handle, area_edit 0, no grab for 120 s, marker box off, no play area, `no stream with Passthrough = Depth for <s> s, more than area_edit_grace <n> s`, another code, area_file changed |
 | `area editor: editing paused: no stream with Passthrough = Depth (...)`, `editing goes on after <s> s without the stream (it is back)` | a stream interruption while editing |
-| `area editor: pinch gap min/max over 5 s: left a/b mm, right ..` | measured gaps, every 5 s while editing |
-| `area editor: grab <handle> of box #i (left or right hand)` | a pinch took a handle (`side +x`, `dome +y`, `center`, `turn`, `add`, `remove`, `undo`, `done`) |
+| `area editor: pinch gap min/max over 5 s: left a/b mm, right .. (...); rays from the aim pose / estimated: left a/b, right c/d updates` | measured gaps, every 5 s while editing; the ray part (third build) says whether the runtime gives the aim pose |
+| `area editor: grab <handle> of box #i (left or right hand{, by the ray, <m> m away{, dead zone x<gain>}})` | a pinch took a handle (`side +x`, `dome +y`, `center`, `turn`, `remove`, `undo`, `done`; `add` until the third build); by the ray: out of reach, it follows the ray |
 | `area editor: release <handle> of box #i{ (hand lost: tips not tracked \| <n> deg from the view direction \| no pose)}: moved, dome, moved by <m> m, yaw <deg> deg (turned by <deg> deg{, on a detent})` or `no change` | drag or turn result; why a hand was lost |
-| `area editor: grab of <handle> of box #i ended (<reason>), kept as it was: ...` or `..., nothing changed`; `grab of .. dropped (two-hand gesture)` | a grab ended other than by its pinch (editing ended, stream stopped, no hands, stage space changed) |
+| `area editor: grab of <handle> of box #i ended (<reason>), kept as it was: ...` or `..., nothing changed`; `grab of .. dropped (two-hand gesture)` until the one-hand/two-hand rule | a grab ended other than by its pinch (editing ended, stream stopped, no hands, stage space changed) |
 | `area editor: release <button>{ (hand lost: ..)}: nothing done (...)` | a button released while the hand was lost |
-| `area editor: added box #n ...`, `removed box #i`, `remove .. not done (held <s> s, moved <mm> mm; it needs 0.8 s held within 80 mm)`, `undo (n more)`, `nothing to undo` | box buttons |
+| `area editor: removed box #i`, `remove .. not done (held <s> s, moved <mm> mm; it needs 0.8 s held within 80 mm)`, `undo (n more)`, `nothing to undo` | box buttons (`added box #n on side ..` / `no room for a box next to ..` of "+" until the third build) |
 | `area editor: stage space changed, coordinates of the saved anchor and the frozen pose kept (...){; <n> more such changes since the last line, not logged (...)}` | at most once a minute |
 | `area editor: editing waits <n> s for the stream to come back`, `the hands are (not) sent to the PC ... (area_edit_hands_pc ..)` | those properties changed |
 | `area editor: saved <path> (<why>, n boxes, ..)`, `could not save <path>: <err>` | per folder; a failure is logged once |
 | `area editor: can't edit (area_edit 1): ..` | no play area, or Passthrough is not Depth |
+
+**Headset checklist for the third build** (box on, code measured, Passthrough = Depth; property
+defaults; read the log after each step).
+1. Enter editing: outside the play area the room shows through the game at about half (the game a
+   little darker), inside it fully; the outline and the handles as crisp as before. `area_edit_see 0`
+   brings the opaque game back, `area_edit_see 70` more room. Log: `editing (gesture), game dimmed by 30
+   %, the room through it at 45 % outside the area`.
+2. Rays: with no handle near a hand, a thin white line from each hand along the pointer; the first `pinch
+   gap` line says `rays from the aim pose / estimated: left n/0` (aim pose used) or `0/n` (estimated:
+   tell). Point a ray at a far handle (the far side of a box): it turns amber with a dot on it; bring the
+   hand within 8 cm of a near handle: that one wins and the ray goes.
+3. Far drag: pinch while the ray lights a far side and sweep the ray: the side follows the ray
+   (`grab side .. by the ray, <m> m away, dead zone x<n>`), no jump at the pinch, the hand's tremble
+   not amplified much. Pull a far side straight away from you (ray along its axis): it moves with the
+   hand's push / pull. Far center: the box moves on a sphere at its distance; far turn: point around the
+   box. Release: `release ..` as before.
+4. Select first: with one box selected, pinch the diamond of another box: it turns cyan (`selected box
+   #i (...): the next pinch edits it`), does not move, no `release` / `saved` line; the next pinch moves
+   it.
+5. New box: pinch both hands on empty space close together, then pull them apart: past 20 cm a dashed
+   green box spans the hands (`new box: both hands pinched ...`), it follows both hands; let go: a real
+   box, selected (`added box #n (two-hand pinch, ...)`, `saved`); undo removes it. A flat pull gives a
+   15 cm thick box. Pinch at two corners far apart: the ghost at once.
+6. Leave gesture still works: hands together, palms away, held 1.5 s: amber square, `editing ended
+   (gesture)`, no ghost. Do the gesture, pull apart before 1.5 s, come back together: no leave in that
+   pinch, the square gone (a new box instead); release under 10 cm: `no new box: the pinch points were
+   <mm> mm apart ...`.
+7. At 8 boxes the ghost is red and release logs `no new box: 8 boxes already`.
+7b. One hand or two (the user's rule): drag a side with one hand and, while it moves, pinch with the
+   other hand (also on a handle, also palms away near the first): the drag goes on, no ghost, no amber
+   square, `the <hand> pinch does nothing until it opens: ...`; release: `release ..` with the change.
+   Pinch one hand on a handle (near or by the ray, also done) and the other within 0.5 s: `.. gives
+   way ..`, then a ghost when pulled apart or the leave gesture; done does nothing on release.
+8. Everything else of the second build: turn, remove hold, undo / done, a stream drop during a drag
+   (`editing paused`, `goes on`), restart restores the layout.
 
 **Headset checklist for the second build** (box on, code measured, Passthrough = Depth; property
 defaults; read the log after each step).
@@ -1549,14 +1699,18 @@ after each step).
 12. Cost: App GPU time with `area_test` unset, 1, 8; and editing against not editing (hands located every frame).
 
 **Not verified yet.** Verified by the first run: the gesture starts and ends editing, drags, domes,
-moves, add/remove, saving; the app can not write /data/local/tmp/alvr-areas. Not yet on the Quest:
-everything of the second build (turning, the button and pinch changes, the pause over stream
-interruptions, the hands kept from the PC, the wider cone of a grab); false triggers while driving; the
+moves, add/remove, saving; the app can not write /data/local/tmp/alvr-areas. By the second run: turning,
+the pinch at contact, sides / domes / centers on turned and unturned boxes, the gesture winning over a
+grab of done. Not yet on the Quest: everything of the third build (the new box gesture, the room through
+the game in both paths, select first, the hand rays: whether the runtime gives the aim pose with
+XR_FB_hand_tracking_aim enabled, the far drags and their gain); of the second build the button changes,
+the pause over stream interruptions, the hands kept from the PC; false triggers while driving; the
 dashed restore and the saved anchor in the right place; the dimming in the colour key path; GPU cost of
 the shader (area_test 1 and 8, now with the turn of each box) and the 16 KB overlay uniform block on
 Adreno; dashes on lines clipped at the near plane crawl. Known gaps: moved boxes are not snapped to
-overlap, the whole layout does not turn in the headset, undo is cleared on each entry, and the hands
-outside the area are seen over the dimmed game only through the colour key.
+overlap, the whole layout does not turn in the headset, undo is cleared on each entry; with the colour
+key the colours it keeps show fully (not at 45 %) around the hands while editing (the packed alpha of
+the two game layers can't hold both part way).
 
 **The printed codes** (2026-11-23). Three codes with the payloads `RIG1`, `RIG2` and `RIG3`, black edge on
 the paper 144.2, 95.6 and 67.4 mm. The printer scaled the page to 96 %: the 100 mm check bar measured
@@ -1688,12 +1842,19 @@ Log lines (`ALVR_CAM`, all start with `marker`):
   a code`; `can't list <dir>: <error>`; `can't
   edit (area_edit 1): no play area (...)`; `two-hand gesture held (1.5 s to start | end editing)` and
   `two-hand gesture let go after <s> s` (at most every 2 s); `grab <side +x | dome +y | center | turn |
-  add | remove | undo | done> of box #<i> (left | right hand)`; `release <handle> of box #<i>{ (hand
+  remove | undo | done> of box #<i> (left | right hand{, by the ray, <m> m away{, dead zone x<n>}})`
+  (`add` until the third build); `selected box #<i> (left | right hand{, by the ray}): the next pinch
+  edits it`; `new box: both hands pinched on empty space, <n> cm apart (...)`, `added box #<n>
+  (two-hand pinch{ (a hand lost)}, the pinch points <n> cm apart): <box>` or `no new box{ (a hand
+  lost)}: <reason>`; `the room shows through the game at <n> % outside the play area while editing
+  (area_edit_see)`; `release <handle> of box #<i>{ (hand
   lost: tips not tracked | <n> deg from the view direction | no pose)}: moved <m> m | dome <m> m | moved by
   <m> m | yaw <deg> deg (turned by <deg> deg{, on a detent}), #<i> at (x, y, z) m, w x h x d m{, yaw <deg>
   deg}{, dome ...}` or `...: no change`; `release <add | undo | done>{ (hand lost: ...)}: nothing done (a
   button acts only when the pinch opens with the hand in view)` (`not a tap (moved <mm> mm)` in the first
-  build); `grab of <handle> of box #<i> dropped (two-hand gesture)`; `grab of <handle> of box #<i> ended
+  build); `grab of <handle> of box #<i> dropped (two-hand gesture)` (until the one-hand/two-hand
+  rule; now `dropped (the <hand> pinch{ by the ray} gives way: ...)`, and `the <hand> pinch does nothing
+  until it opens: ...`); `grab of <handle> of box #<i> ended
   (editing ended | stream stopped | no hands | stage space changed), kept as it was: <box> | nothing
   changed`; `stage space changed, coordinates of the saved anchor and the frozen pose kept (marker_carry 0;
   ...){; <n> more such changes since the last line, not logged (at most one line per 60 s)}`; `added box #<n> on side

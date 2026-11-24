@@ -46,7 +46,9 @@ struct DepthUniforms {
     eyes: array<DepthEye, 2>,
     // Stage space to the frame of the play area (or of the box of the settings)
     world_to_area: mat4x4f,
-    // x: number of boxes in area_boxes (0 with the distance region)
+    // x: number of boxes in area_boxes (0 with the distance region), y: how much the real room shows
+    // through the game where the mask does not show it fully (0: not, 1: no game; while the play area
+    // is edited)
     area: vec4f,
     // x: region mode (0: distance, 1: volume), y: max distance, z: edge feathering, w: debug view
     region: vec4f,

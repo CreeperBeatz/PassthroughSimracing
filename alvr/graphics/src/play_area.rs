@@ -601,6 +601,37 @@ impl PlayArea {
         Some(self.count - 1)
     }
 
+    /// Adds a box as it is (area frame), its half extents within `MIN_BOX_HALF` and `MAX_BOX_HALF`, its
+    /// yaw wrapped, domes within their rims. Returns its index. None: already `MAX_AREA_BOXES`, or its
+    /// center is farther than `MAX_BOX_CENTER` or not finite
+    pub fn push_box(&mut self, area_box: AreaBox) -> Option<usize> {
+        if self.count >= MAX_AREA_BOXES
+            || !area_box.center.is_finite()
+            || area_box.center.abs().max_element() > MAX_BOX_CENTER
+        {
+            return None;
+        }
+        let half = if area_box.half.is_finite() {
+            area_box.half.abs()
+        } else {
+            Vec3::ZERO
+        };
+        let index = self.count;
+        self.boxes[index] = AreaBox {
+            yaw: wrap_angle(area_box.yaw),
+            domes: [0.0; 6],
+            ..AreaBox::new(
+                area_box.center,
+                half.clamp(Vec3::splat(MIN_BOX_HALF), Vec3::splat(MAX_BOX_HALF)),
+            )
+        };
+        self.count += 1;
+        for side in Side::ALL {
+            self.set_dome(index, side, area_box.domes[side.index()]);
+        }
+        Some(index)
+    }
+
     /// Removes a box. The last one is never removed (false)
     pub fn remove_box(&mut self, index: usize) -> bool {
         if index >= self.count || self.count <= 1 {
@@ -1770,5 +1801,33 @@ mod tests {
                 .all(|&v| v == 0.0)
         );
         assert!(area_uniforms(None).iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn pushed_box_is_kept_within_the_limits() {
+        let mut area = PlayArea::single(AreaBox::new(Vec3::ZERO, Vec3::splat(0.2)));
+        let mut new_box = AreaBox::new(Vec3::new(0.5, 0.1, -0.4), Vec3::new(0.001, 0.3, 9.0));
+        new_box.yaw = 7.0;
+        new_box.domes[0] = 5.0;
+        let index = area.push_box(new_box).unwrap();
+        assert_eq!(index, 1);
+        let pushed = area.boxes()[1];
+        assert_eq!(pushed.center, new_box.center);
+        assert_eq!(pushed.half, Vec3::new(MIN_BOX_HALF, 0.3, MAX_BOX_HALF));
+        assert!((pushed.yaw - wrap_angle(7.0)).abs() < 1e-6);
+        assert_eq!(
+            pushed.dome_height(Side::new(0, true)),
+            pushed.dome_rim(Side::new(0, true))
+        );
+        // Too far from the code, not finite, full
+        let far = AreaBox::new(Vec3::new(0.0, 0.0, MAX_BOX_CENTER + 0.1), Vec3::splat(0.1));
+        assert_eq!(area.push_box(far), None);
+        let nan = AreaBox::new(Vec3::NAN, Vec3::splat(0.1));
+        assert_eq!(area.push_box(nan), None);
+        while area.len() < MAX_AREA_BOXES {
+            area.push_box(AreaBox::new(Vec3::ZERO, Vec3::splat(0.1)))
+                .unwrap();
+        }
+        assert_eq!(area.push_box(new_box), None);
     }
 }

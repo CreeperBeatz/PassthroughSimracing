@@ -124,6 +124,9 @@ fn depth_passthrough(stream_color: vec3f, uv: vec2f) -> vec4f {
     let debug_view = u32(depth_u.region.w + 0.5);
     // Dimmed while the play area is edited
     let game_color = stream_color * (1.0 - depth_u.lighting2.w);
+    // While the play area is edited the real room shows through the game by this much where the mask
+    // does not show it fully (outside the area). The overlay is drawn after this, opaque
+    let see = depth_u.area.y;
 
     let mask_sample = textureSampleLevel(depth_mask, stream_sampler, uv, 0.0);
     let mask = smoothstep(MASK_EDGE_MIN, MASK_EDGE_MAX, mask_sample.r);
@@ -167,6 +170,14 @@ fn depth_passthrough(stream_color: vec3f, uv: vec2f) -> vec4f {
                 lower_alpha = max(lower_alpha, 0.5 * remembered);
             }
         }
+        if see > 0.0 {
+            // The room through the game: only the lower layer can be part way (the packed alpha holds
+            // one layer between 0 and 1 while the other is 0 or 1): the upper one opens. Colors the key
+            // keeps then show fully where the lower layer is used (around the hands); outside it the
+            // upper layer alone shows the same 1 - see below
+            lower_alpha = min(lower_alpha, 1.0 - see);
+            upper_alpha = 0.0;
+        }
         var alpha = 0.5 * (lower_alpha + upper_alpha);
         // Where the lower layer is cropped away or not used, the upper one shows what both would show
         // over colors that the key doesn't keep: upper + (1 - upper) * lower
@@ -179,18 +190,20 @@ fn depth_passthrough(stream_color: vec3f, uv: vec2f) -> vec4f {
         return vec4f(rgb, alpha);
     }
 
+    // The room shown: by the mask, at least `see` while editing
+    let shown = max(mask, see);
     var brightness = 1.0;
-    if mask > 0.0 && depth_u.lighting.x > 0.5 {
+    if shown > 0.0 && depth_u.lighting.x > 0.5 {
         brightness = passthrough_brightness(uv);
     }
 
     // Premultiplied: out = rgb + (1 - a) * passthrough
-    var rgb = game_color * (1.0 - mask);
+    var rgb = game_color * (1.0 - shown);
     if debug_view == DEBUG_VIEW_TINT_MASK {
         rgb = rgb + vec3f(0.0, 0.25, 0.0) * mask;
     }
 
-    return vec4f(rgb, 1.0 - mask * brightness);
+    return vec4f(rgb, 1.0 - shown * brightness);
 }
 
 // Brightness factor (0..1) applied to the passthrough, following the game lighting

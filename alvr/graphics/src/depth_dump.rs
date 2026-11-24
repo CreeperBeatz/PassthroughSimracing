@@ -656,6 +656,7 @@ mod tests {
             key_lower_rects: None,
             region_override: None,
             game_dim: 0.0,
+            game_see: 0.0,
         };
 
         for playzone in [None, Some(([view; 2], 2.5))] {
