@@ -389,11 +389,16 @@ impl StreamContext {
 
     pub fn set_color_key(&mut self, params: Option<ColorKeyParams>) {
         // The depth map shows the hands where they were a while ago. With the color key they are not
-        // needed there.
-        if self.color_key.is_some() != params.is_some()
+        // needed there (`debug.alvr.hand_removal 0` keeps them, live)
+        let removal = params.is_some_and(|params| params.hand_removal);
+        if self.color_key.is_some_and(|params| params.hand_removal) != removal
             && let Some(depth) = &self.environment_depth
         {
-            depth.set_hand_removal(params.is_some());
+            depth.set_hand_removal(removal);
+            crate::stream_log(&format!(
+                "hand removal from the depth map: {}",
+                if removal { "on" } else { "off" }
+            ));
         }
         self.color_key = params;
 
@@ -1075,7 +1080,10 @@ impl StreamContext {
         self.gfx_ctx.make_current();
 
         if self.environment_depth.is_none() && !self.environment_depth_failed {
-            match EnvironmentDepthMETA::new(&self.xr_session, self.color_key.is_some()) {
+            match EnvironmentDepthMETA::new(
+                &self.xr_session,
+                self.color_key.is_some_and(|params| params.hand_removal),
+            ) {
                 Ok(depth) => {
                     info!(
                         "Environment depth started: {} images, {}x{}",

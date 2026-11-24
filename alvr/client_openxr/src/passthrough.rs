@@ -180,6 +180,8 @@ pub struct ColorKeyParams {
     pub radius_scale: f32,
     /// Negative: predict ahead
     pub passthrough_delay_ms: i64,
+    /// Whether the runtime takes the hands out of the depth map, see `debug.alvr.hand_removal`
+    pub hand_removal: bool,
     /// Composition layers of the key, see `debug.alvr.key_layers`
     pub layers: i64,
     /// 0: the lower game layer is not cropped, 1: cropped, 2: cropped, y origin at the top
@@ -284,6 +286,9 @@ impl ColorKeyParams {
             passthrough_delay_ms: debug_property("debug.alvr.key_delay")
                 .unwrap_or(0)
                 .clamp(-100, 200),
+            // 0: the hands stay in the depth map with the key on. The runtime takes out an uneven zone
+            // of 3-15 cm around the hands with them (legs under resting hands, a held object)
+            hand_removal: debug_property("debug.alvr.hand_removal").unwrap_or(1) != 0,
             layers: debug_property("debug.alvr.key_layers").unwrap_or(4),
             crop: debug_property("debug.alvr.key_crop").unwrap_or(1),
             hands: debug_property("debug.alvr.key_hands").unwrap_or(1) != 0,

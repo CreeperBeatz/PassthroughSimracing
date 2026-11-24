@@ -177,6 +177,35 @@ independent re-measurement; where they differ, the numbers of the re-measurement
   - (c) The late depth cannot correct the key on the hand itself (it is not in it), only from about 4-5
     cm away from the hand surface outward.
 
+**The memory in the box frame, offline (same night, one analysis, not re-checked): it does not fix the
+lap.** Simulated on the 26 captures (`logs/analysis-20261123-edges/memory/results.md`): a 2 cm voxel grid
+in the box frame, occupied and free evidence from the depth, no updates within 15 cm of the hands, a
+place counts after two captures, used in the disc around the hands. Test set 605 / 622 / 623 / 625, both
+eyes, 31,731 trousers texels near the hands: cut today 26.8 % (with the copy's leak of 30.9 % of the
+should-be-game texels of the disc), live depth alone 45.5 % cut and 3.1 % leak, the memory as designed
+45.5 % and 3.1 %: it changes nothing, because it never holds the lap. Only one capture (624) sees the lap
+without hands, the legs move between captures (the best other capture has 18-56 % of a capture's thigh
+voxels), and the hands rest at the same place, so the thigh near them is never updated. Allowing a single
+capture to count gives 20.4 % cut and 5.8 % leak when 624 is learned beforehand, and about 40 % cut run in
+time order. While driving the hands stay on the wheel: what is under and next to them is never seen
+without them, so no memory can learn it. At static edges two memories built from different captures agree
+on 0.895 of the edge texels, two single frames on 0.772. Conclusion: a memory can steady static edges; for
+what is next to the hands it is the wrong tool.
+
+**Where the hole around the hands comes from (code, not a measurement).** The runtime does not remove the
+hands by itself: the client asks for it (`set_hand_removal`, XR_META_environment_depth) whenever the color
+key is on, because the depth shows the hands where they were 124 ms ago. The uneven 3-15 cm zone that
+goes with them (thigh, a held bottle, later the wheel rim under the hands) is the price of that choice.
+In the user's picture (the depth is the late truth, the key the instant signal) the other way round is
+worth a test: leave the hands in the depth map, so that a resting hand and everything next to it is
+simply shown by the depth (a resting hand moves 6 mm in 124 ms), and let the key and the hand tracking
+only correct a moving hand. `debug.alvr.hand_removal 0` does the first half live (not tested): expected
+are legs and held things back next to the hands, and a hand that moves fast shown twice or with the room
+where it was 124 ms ago. If the first half holds on the headset, the second half is: depth texels that
+lie on the hand's capsules as they were at the capture time of the depth are decided by the hand logic at
+the display time, everything else by the depth; that takes the hand out tightly (about 1 cm) instead of
+by 3-15 cm.
+
 **Open for the user.** Way A or way B first (below)? Does "no arm extension" also mean `arm_shift 0` (the
 depth is shifted along a 45 cm arm from the wrist) and dropping the 50 cm forearm that the learner
 excludes from its samples? How many QR codes, and the size to keep after the first measurement? When can
@@ -759,6 +788,7 @@ Measured in the SteamVR home, 72 Hz, with color key on unless noted:
 | `key_layers` | 4 | 4: extra layers only with hands in view, 2: never, 5: always, 30 / 31: always three (no upper game layer / no keyed passthrough). Not tested |
 | `key_crop` | 1 | Lower game layer only around the hands. 0: full, 2: y origin at the top (if 1 is upside down). Not tested |
 | `key_hands` | 1 | 0: no hands in the GPU passes. Not tested |
+| `hand_removal` | 1 | 1: with the key on the runtime takes the hands out of the depth map, and an uneven 3-15 cm around them (measured). 0: the hands stay in the depth map, live; log line `hand removal from the depth map: on / off`. Not tested |
 | `arm_shift` | 1 | 1: the depth around each arm is shifted by the motion of the wrist (with the key only up to the wrist, the hands are removed from the depth map; plain depth for a wrist that moved more than 25 cm or has no valid position), 0: plain depth. Also without the key. 1 runs on the headset, 0 not tested |
 | `key_leak` | 0 % | Narrower rim where the background around a hand looks like it, 0: off, 100: on. Needs `auto_key`. Not tested |
 | `key_leak_lo` / `key_leak_hi` | 5 / 20 % | Share of the colors around the hand that the key keeps: where the narrowing starts / is complete |
