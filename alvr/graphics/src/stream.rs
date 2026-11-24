@@ -1222,6 +1222,7 @@ impl StreamRenderer {
                 arms: [None; 2],
                 arm_gaps: [None; 2],
                 edge_cut: 0.0,
+                lever_windows: [None; depth_mask::MAX_LEVER_WINDOWS],
                 capture_playzone: false,
                 playzone_view: false,
                 key_lower_rects: None,

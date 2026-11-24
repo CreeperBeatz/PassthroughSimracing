@@ -518,6 +518,86 @@ pub fn edge_cut_centre(percent: i64) -> f32 {
     }
 }
 
+/// The coverage at which the mask edge is full (`mask_edge` of stream.wgsl) for the centre of the cut
+/// of `DepthRenderInput::edge_cut` (0: today's, `MASK_EDGE_MAX` 0.35). The fade of a lever window starts
+/// here, so that all of it is seen whatever `debug.alvr.edge_cut` says
+pub fn mask_edge_top(edge_cut: f32) -> f32 {
+    if edge_cut.is_finite() && edge_cut > 0.0 {
+        (edge_cut.clamp(0.17, 0.84) - 0.15).clamp(0.02, 0.69) + 0.3
+    } else {
+        0.35
+    }
+}
+
+/// Most lever windows drawn at once (`debug.alvr.lever_boxes`, U2 of design/universal/final.md)
+pub const MAX_LEVER_WINDOWS: usize = 4;
+/// Floats of one lever window in the uniform block (`LeverWindow` in depth_common.wgsl): the transform
+/// from stage space into the frame of the window, its half extents and how open it is
+pub(crate) const LEVER_WINDOW_FLOAT_COUNT: usize = 16 + 4;
+pub(crate) const LEVER_FLOAT_COUNT: usize = MAX_LEVER_WINDOWS * LEVER_WINDOW_FLOAT_COUNT;
+
+/// A lever window (U2 of design/universal/final.md, `debug.alvr.lever_boxes`): while a hand is near the
+/// box of a lever, every view ray that crosses this box shows the real room, whatever the depth says.
+/// A held lever is removed from the depth with the hand (measured with the bottle), so the depth test
+/// alone draws the game over it. The box is the lever's play-area box, or the part of it the palm went
+/// through (`debug.alvr.lever_shrink`). No soft edge: the mask is drawn at a low resolution and
+/// filtered, which softens it by a mask texel
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LeverWindow {
+    /// The box in stage space (rigid transform from its frame, half extents)
+    pub region: RegionOverride,
+    /// How much the window shows (0..1): 1 while open, falling to 0 over a moment after the close
+    pub open: f32,
+}
+
+impl LeverWindow {
+    /// None unless it can be drawn: open above 0, finite half extents above 0 and a finite transform
+    fn checked(self) -> Option<Self> {
+        let half = self.region.half_extents;
+        (self.open.is_finite()
+            && self.open > 0.0
+            && half.is_finite()
+            && half.min_element() > 0.0
+            && self.region.volume_to_world.is_finite())
+        .then(|| Self {
+            open: self.open.min(1.0),
+            ..self
+        })
+    }
+
+    /// How much the window shows along a ray (`direction`: unit vector): `open` if the ray crosses the
+    /// box in front of the origin (or starts inside it), else 0. Same as `lever_coverage` in
+    /// depth_mask.wgsl
+    pub fn ray_coverage(&self, origin: Vec3, direction: Vec3) -> f32 {
+        let Some(window) = self.checked() else {
+            return 0.0;
+        };
+        let world_to_window = window.region.volume_to_world.inverse();
+        let o = world_to_window.transform_point3(origin);
+        let d = world_to_window.transform_vector3(direction);
+        if ray_crosses_box(o, d, window.region.half_extents) {
+            window.open
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Whether a ray from `origin` along `direction` crosses the box of these half extents centered at the
+/// origin of the frame (slab test). A component of the direction near 0 is replaced by a tiny positive
+/// one, as in the shader: inside that pair of sides the ray crosses it at every distance, outside of
+/// them never near
+fn ray_crosses_box(origin: Vec3, direction: Vec3, half: Vec3) -> bool {
+    let tiny = Vec3::splat(1e-6);
+    let d = Vec3::select(direction.abs().cmplt(tiny), tiny, direction);
+    let t1 = (-half - origin) / d;
+    let t2 = (half - origin) / d;
+    let near = t1.min(t2).max_element();
+    let far = t1.max(t2).min_element();
+
+    far >= near.max(0.0)
+}
+
 /// Not used since step 1b of the arm plan (the client's `arm_history.rs`): the runtime doesn't answer
 /// lookups in the past (any earlier time returns its newest sample), so the premise below was wrong. Kept
 /// with its test as the record of step 1.
@@ -562,6 +642,9 @@ pub struct DepthRenderInput {
     /// Centre of the cut of the mask edge (`debug.alvr.edge_cut` / 100), 0: today's (0.2). See
     /// `edge_cut_centre`
     pub edge_cut: f32,
+    /// Lever windows (`debug.alvr.lever_boxes`): every ray through an open one shows the real room.
+    /// None: no window (the default; the mask is then today's)
+    pub lever_windows: [Option<LeverWindow>; MAX_LEVER_WINDOWS],
     /// Remember the current depth image as the playzone. There must be no hands in it
     pub capture_playzone: bool,
     /// Debug view (with "Tint mask" and the color key): what only the playzone shows is blue
@@ -693,7 +776,8 @@ pub const DEPTH_UNIFORMS_FLOAT_COUNT: usize = 2 * EYE_FLOAT_COUNT
         + 2
         + 2 * 2
         + 1)
-    + AREA_FLOAT_COUNT;
+    + AREA_FLOAT_COUNT
+    + LEVER_FLOAT_COUNT;
 pub const DEPTH_UNIFORMS_SIZE: usize = DEPTH_UNIFORMS_FLOAT_COUNT * size_of::<f32>();
 
 pub(crate) fn pose_to_mat4(pose: Pose) -> Mat4 {
@@ -779,7 +863,24 @@ pub fn depth_uniforms(
     } else {
         0.0
     };
-    data.extend([area.map_or(0, |area| area.len()) as f32, see, edge_cut, 0.0]);
+    // The lever windows that are drawn, packed at the start of their array (the rest zeros). A fixed
+    // array: nothing is allocated per frame
+    let mut levers = [None; MAX_LEVER_WINDOWS];
+    let mut lever_count = 0;
+    for window in input
+        .lever_windows
+        .iter()
+        .filter_map(|window| window.and_then(LeverWindow::checked))
+    {
+        levers[lever_count] = Some(window);
+        lever_count += 1;
+    }
+    data.extend([
+        area.map_or(0, |area| area.len()) as f32,
+        see,
+        edge_cut,
+        lever_count as f32,
+    ]);
 
     let debug_view = match config.debug_view {
         DepthPassthroughDebugView::Off => 0.0,
@@ -926,6 +1027,14 @@ pub fn depth_uniforms(
     let has_bridge = bridges.map(|bridge| if bridge.is_some() { 1.0 } else { 0.0 });
     data.extend([end_radius[0], end_radius[1], has_bridge[0], has_bridge[1]]);
     data.extend(area_uniforms(area.as_ref()));
+    for window in levers {
+        if let Some(window) = window {
+            data.extend(window.region.volume_to_world.inverse().to_cols_array());
+            data.extend(window.region.half_extents.extend(window.open).to_array());
+        } else {
+            data.extend([0.0; LEVER_WINDOW_FLOAT_COUNT]);
+        }
+    }
 
     data.try_into().unwrap()
 }
@@ -1263,9 +1372,12 @@ mod tests {
                 // The bounds of the play area, and its 8 boxes of 7 vectors
                 + 16 * 2
                 + 8 * 7 * 16
+                // The 4 lever windows: a matrix and a vector each
+                + 4 * 5 * 16
         );
-        // 28 capsules per hand, the wrist gaps, the bridges from the wrists, the boxes of the play area
-        assert_eq!(DEPTH_UNIFORMS_SIZE, 4176);
+        // 28 capsules per hand, the wrist gaps, the bridges from the wrists, the boxes of the play area,
+        // the lever windows
+        assert_eq!(DEPTH_UNIFORMS_SIZE, 4496);
     }
 
     // Steps 1 and 2 of docs/mask-v2-design.md in the uniform block: off is all zeros, as before
@@ -1279,6 +1391,7 @@ mod tests {
             arms: [None; 2],
             arm_gaps: [None; 2],
             edge_cut: 0.0,
+            lever_windows: [None; MAX_LEVER_WINDOWS],
             capture_playzone: false,
             playzone_view: false,
             key_lower_rects: None,
@@ -1315,6 +1428,16 @@ mod tests {
         assert_eq!(edge_cut_centre(0), 0.0);
         assert_eq!(edge_cut_centre(65), 0.65);
         assert_eq!(edge_cut_centre(100), 0.84);
+        // Where the edge is full (the start of a lever window's fade): stream.wgsl's mask_edge
+        for (centre, top) in [
+            (0.0, 0.35),
+            (f32::NAN, 0.35),
+            (0.17, 0.32),
+            (0.5, 0.65),
+            (0.84, 0.99),
+        ] {
+            assert!((mask_edge_top(centre) - top).abs() < 1e-6, "{centre}");
+        }
         input.edge_cut = 0.0;
 
         // A gap on the right arm without a motion (arm_shift 0): its wrist goes into the wrist slot, the
@@ -1372,6 +1495,166 @@ mod tests {
                 data[arms..gaps + 8].iter().all(|&value| value == 0.0),
                 "{gap:?}"
             );
+        }
+    }
+
+    // A lever window: open along every ray that crosses its box in front of the eye, whatever lies there
+    #[test]
+    fn lever_window_covers_the_rays_through_its_box() {
+        // A box 20 x 30 x 10 cm, 60 cm ahead and 40 cm down, turned by 30 degrees
+        let window = LeverWindow {
+            region: RegionOverride {
+                volume_to_world: Mat4::from_rotation_translation(
+                    Quat::from_rotation_y(30_f32.to_radians()),
+                    Vec3::new(0.0, 0.6, -0.6),
+                ),
+                half_extents: Vec3::new(0.1, 0.15, 0.05),
+            },
+            open: 1.0,
+        };
+        let eye = Vec3::new(0.0, 1.0, 0.0);
+        let towards = |point: Vec3| (point - eye).normalize();
+        let center = Vec3::new(0.0, 0.6, -0.6);
+        assert_eq!(window.ray_coverage(eye, towards(center)), 1.0);
+        // Level with the box: inside the turned side along its own x axis, and outside it (the ray
+        // crosses the box at a slant: 13 cm from the centre it still clips a corner)
+        let level_eye = Vec3::new(0.0, 0.6, 0.0);
+        let x_axis = Quat::from_rotation_y(30_f32.to_radians()) * Vec3::X;
+        let level_ray = |point: Vec3| (point - level_eye).normalize();
+        assert_eq!(
+            window.ray_coverage(level_eye, level_ray(center + x_axis * 0.09)),
+            1.0
+        );
+        assert_eq!(
+            window.ray_coverage(level_eye, level_ray(center + x_axis * 0.25)),
+            0.0
+        );
+        // Behind the eye: not crossed
+        assert_eq!(window.ray_coverage(eye, -towards(center)), 0.0);
+        // From inside the box every ray crosses it
+        assert_eq!(window.ray_coverage(center, Vec3::Y), 1.0);
+        // Parallel to a pair of sides: crossed only between them
+        let level = Vec3::new(0.0, 0.6, 0.5);
+        assert_eq!(window.ray_coverage(level, Vec3::NEG_Z), 1.0);
+        assert_eq!(window.ray_coverage(level + Vec3::Y * 0.2, Vec3::NEG_Z), 0.0);
+        // Half closed, closed, not drawable
+        let fading = LeverWindow {
+            open: 0.4,
+            ..window
+        };
+        assert_eq!(fading.ray_coverage(eye, towards(center)), 0.4);
+        for broken in [
+            LeverWindow {
+                open: 0.0,
+                ..window
+            },
+            LeverWindow {
+                open: f32::NAN,
+                ..window
+            },
+            LeverWindow {
+                region: RegionOverride {
+                    half_extents: Vec3::new(0.1, 0.0, 0.05),
+                    ..window.region
+                },
+                ..window
+            },
+        ] {
+            assert_eq!(broken.ray_coverage(eye, towards(center)), 0.0, "{broken:?}");
+        }
+
+        // Against brute force: points along each ray tested against the box
+        let mut random = Random(0x1e7e);
+        let inverse = window.region.volume_to_world.inverse();
+        for _ in 0..500 {
+            let origin = Vec3::new(0.0, 1.0, 0.0) + random.vec3(0.3);
+            let direction = (center + random.vec3(0.4) - origin).normalize();
+            let crossed = (0..4000).any(|step| {
+                let local = inverse.transform_point3(origin + direction * (step as f32 * 0.0005));
+                local.abs().cmple(window.region.half_extents).all()
+            });
+            let near_edge = (0..4000).any(|step| {
+                let local = inverse.transform_point3(origin + direction * (step as f32 * 0.0005));
+                let outside = (local.abs() - window.region.half_extents).max_element();
+                outside.abs() < 0.002
+            });
+            if !near_edge {
+                assert_eq!(
+                    window.ray_coverage(origin, direction) > 0.0,
+                    crossed,
+                    "{origin} {direction}"
+                );
+            }
+        }
+    }
+
+    // The lever windows in the uniform block: off is all zeros (area.w 0, as before); drawn windows are
+    // packed at the start, closed ones left out
+    #[test]
+    fn lever_windows_in_the_uniforms() {
+        let cfg = config(DepthMaskRegion::Distance { max_distance: 0.9 });
+        let mut input = DepthRenderInput {
+            frame: None,
+            eye_positions: [Vec3::ZERO; 2],
+            color_key: None,
+            arms: [None; 2],
+            arm_gaps: [None; 2],
+            edge_cut: 0.0,
+            lever_windows: [None; MAX_LEVER_WINDOWS],
+            capture_playzone: false,
+            playzone_view: false,
+            key_lower_rects: None,
+            region_override: None,
+            game_dim: 0.0,
+            game_see: 0.0,
+        };
+        let area_w = 2 * EYE_FLOAT_COUNT + 16 + 3;
+        let levers = DEPTH_UNIFORMS_FLOAT_COUNT - LEVER_FLOAT_COUNT;
+        let uniforms =
+            |input: &DepthRenderInput| depth_uniforms(&cfg, &[view(), view()], input, None, false);
+
+        let off = uniforms(&input);
+        assert_eq!(off[area_w], 0.0);
+        assert!(off[levers..].iter().all(|&value| value == 0.0));
+
+        let volume_to_world =
+            Mat4::from_rotation_translation(Quat::from_rotation_y(0.5), Vec3::new(0.3, 0.6, -0.5));
+        let window = LeverWindow {
+            region: RegionOverride {
+                volume_to_world,
+                half_extents: Vec3::new(0.1, 0.2, 0.15),
+            },
+            open: 0.75,
+        };
+        input.lever_windows = [
+            None,
+            Some(LeverWindow {
+                open: 0.0,
+                ..window
+            }),
+            Some(window),
+            None,
+        ];
+        let data = uniforms(&input);
+        assert_eq!(data[area_w], 1.0);
+        let world_to_window = Mat4::from_cols_slice(&data[levers..levers + 16]);
+        assert!(world_to_window.abs_diff_eq(volume_to_world.inverse(), 1e-6));
+        assert_eq!(&data[levers + 16..levers + 20], &[0.1, 0.2, 0.15, 0.75]);
+        assert!(data[levers + 20..].iter().all(|&value| value == 0.0));
+        // The rest of the block is as without the windows
+        assert_eq!(&data[..area_w], &off[..area_w]);
+        assert_eq!(&data[area_w + 1..levers], &off[area_w + 1..levers]);
+
+        // All four, more open than 1 is 1
+        input.lever_windows = [Some(LeverWindow {
+            open: 3.0,
+            ..window
+        }); MAX_LEVER_WINDOWS];
+        let data = uniforms(&input);
+        assert_eq!(data[area_w], 4.0);
+        for index in 0..MAX_LEVER_WINDOWS {
+            let base = levers + index * LEVER_WINDOW_FLOAT_COUNT;
+            assert_eq!(data[base + 19], 1.0);
         }
     }
 
@@ -1582,6 +1865,7 @@ mod tests {
             arms: [None; 2],
             arm_gaps: [None; 2],
             edge_cut: 0.0,
+            lever_windows: [None; MAX_LEVER_WINDOWS],
             capture_playzone: false,
             playzone_view: false,
             key_lower_rects: None,
@@ -1606,7 +1890,7 @@ mod tests {
 
         // One box, centered in that frame
         assert_eq!(&data[base + 16..base + 20], &[1.0, 0.0, 0.0, 0.0]);
-        let boxes = DEPTH_UNIFORMS_FLOAT_COUNT - AREA_FLOAT_COUNT + 8;
+        let boxes = DEPTH_UNIFORMS_FLOAT_COUNT - LEVER_FLOAT_COUNT - AREA_FLOAT_COUNT + 8;
         assert_eq!(
             &data[boxes..boxes + 8],
             &[0.0, 0.0, 0.0, 0.0, 0.5, 0.5, 1.0, 0.0]
@@ -1649,6 +1933,7 @@ mod tests {
                 arms: [None; 2],
                 arm_gaps: [None; 2],
                 edge_cut: 0.0,
+                lever_windows: [None; MAX_LEVER_WINDOWS],
                 capture_playzone: false,
                 playzone_view: false,
                 key_lower_rects: None,
@@ -1663,7 +1948,7 @@ mod tests {
                 "{world_to_volume}"
             );
             assert_eq!(data[base + 16], 1.0);
-            let boxes = DEPTH_UNIFORMS_FLOAT_COUNT - AREA_FLOAT_COUNT + 8;
+            let boxes = DEPTH_UNIFORMS_FLOAT_COUNT - LEVER_FLOAT_COUNT - AREA_FLOAT_COUNT + 8;
             assert_eq!(&data[boxes + 4..boxes + 7], &[0.6, 0.45, 0.5]);
             assert_eq!(data[base + 20], 1.0);
             assert_eq!(data[base + 21], 0.0);
@@ -1732,6 +2017,7 @@ mod tests {
             arms: [None; 2],
             arm_gaps: [None; 2],
             edge_cut: 0.0,
+            lever_windows: [None; MAX_LEVER_WINDOWS],
             capture_playzone: false,
             playzone_view: false,
             key_lower_rects: None,

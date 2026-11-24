@@ -6,6 +6,7 @@ use crate::{
     extra_extensions::EnvironmentDepthMETA,
     graphics::{self, ProjectionLayerAlphaConfig, ProjectionLayerBuilder},
     interaction::{self, InteractionContext, InteractionSourcesConfig},
+    lever::{LeverHand, LeverParams, LeverWindows},
     passthrough::{self, ColorKeyParams, debug_property},
 };
 use alvr_client_core::{
@@ -25,8 +26,8 @@ use alvr_graphics::{
     ArmGap, ArmMotion, BridgeChoice, BurstArmSample, BurstArmSamples, BurstHand, BurstLut,
     ColorKeyInput, DepthDumpFiles, DepthDumpRequest, DepthFrame, DepthRenderInput, DumpJoint,
     EditorHand, EditorInput, GraphicsContext, HAND_SEGMENTS, HandRay, HandShape, HandZones,
-    LeakGains, OverlaySegment, PlacedArea, SEGMENT_JOINTS, StreamRenderer, StreamViewParams,
-    WristBridge,
+    LeakGains, LeverWindow, MAX_LEVER_WINDOWS, OverlaySegment, PlacedArea, SEGMENT_JOINTS,
+    StreamRenderer, StreamViewParams, WristBridge,
 };
 use alvr_packets::{ClientStreamConfig, RealTimeConfig, TrackingData};
 use alvr_session::{
@@ -86,6 +87,8 @@ const ARM_SAMPLE_LOOKUP_AGE: Duration = Duration::from_millis(100);
 // The `arm:` line is logged this often while an arm uses `arm_shift 2`, and on each change of the
 // properties
 const ARM_LOG_INTERVAL: Duration = Duration::from_secs(2);
+// The `lever:` line is logged this often while a box is a lever (`debug.alvr.lever_boxes`)
+const LEVER_LOG_INTERVAL: Duration = Duration::from_secs(2);
 
 /// `debug.alvr.arm_shift` and the properties of its mode 2 (steps 1 and 1b of
 /// `docs/arm-mask-build-plan.md`)
@@ -435,6 +438,11 @@ pub struct StreamContext {
     arm_log: [ArmHandLog; 2],
     // `debug.alvr.edge_cut` and the wrist gap. None until the first poll, which logs them
     mask_params: Option<MaskParams>,
+    // `debug.alvr.lever_*` (U2 of design/universal/final.md, lever.rs): the play-area boxes that are levers,
+    // their windows, the `lever:` line. Off by default: no hand lookup, no window, no line
+    lever_params: LeverParams,
+    levers: LeverWindows,
+    last_lever_log: Instant,
     // The wrists of the hand capsules of the key in this frame (display time minus `key_delay`), for
     // the distance to the wrist of the arm
     key_wrists: Cell<[Option<Vec3>; 2]>,
@@ -654,6 +662,9 @@ impl StreamContext {
             arm_samples: Default::default(),
             arm_samples_recording: false,
             mask_params: None,
+            lever_params: LeverParams::default(),
+            levers: LeverWindows::default(),
+            last_lever_log: Instant::now(),
             key_wrists: Cell::new([None; 2]),
             published_lut: None,
             lut_uploads: 0,
@@ -969,6 +980,14 @@ impl StreamContext {
         if self.mask_params != Some(mask_params) {
             self.mask_params = Some(mask_params);
             crate::stream_log(&mask_params.text());
+        }
+        // Logged on each change (unset: never, as before). A change shuts every window: one open when
+        // switched off would otherwise show again, with no hand, when switched on
+        let lever_params = LeverParams::read();
+        if lever_params != self.lever_params {
+            crate::stream_log(&lever_params.text());
+            self.lever_params = lever_params;
+            self.levers.shut_all();
         }
         self.playzone_auto = debug_property("debug.alvr.playzone_auto").unwrap_or(1) > 0;
 
@@ -1937,6 +1956,60 @@ impl StreamContext {
         self.config.clientside_post_processing = config.clientside_post_processing.clone();
     }
 
+    // The lever windows of this frame (`debug.alvr.lever_boxes`, lever.rs) and the `lever:` line every 2 s.
+    // Off (the default): nothing is located, no window. The hands at the display time (the key's are
+    // earlier, by `passthrough_delay_ms`: the gate opens a little sooner, the safe side), in the frame of
+    // the play area placed from the marker (without one: no window). `edge_cut`: the centre of the cut
+    // of the mask edge in use, for the start of the fade
+    fn lever_windows(
+        &mut self,
+        display_time: xr::Time,
+        edge_cut: f32,
+    ) -> [Option<LeverWindow>; MAX_LEVER_WINDOWS] {
+        if !self.lever_params.is_on() {
+            return [None; MAX_LEVER_WINDOWS];
+        }
+        let area = self.region_override;
+        let hands = area.map_or([None; 2], |area| {
+            let world_to_area = area.area_to_world.inverse();
+            let int_ctx = self.interaction_context.read();
+            [0, 1].map(|i| {
+                let tracker = int_ctx.hands_interaction[i].skeleton_tracker.as_ref()?;
+                let (joints, _) = self
+                    .stage_reference_space
+                    .relate_hand_joints(tracker, display_time)
+                    .ok()
+                    .flatten()?;
+
+                Some(LeverHand {
+                    joints: std::array::from_fn(|j| {
+                        joints[j]
+                            .location_flags
+                            .contains(xr::SpaceLocationFlags::POSITION_VALID)
+                            .then(|| {
+                                world_to_area
+                                    .transform_point3(crate::from_xr_vec3(joints[j].pose.position))
+                            })
+                    }),
+                })
+            })
+        });
+        let windows = self.levers.update(
+            &self.lever_params,
+            area.as_ref(),
+            &hands,
+            display_time.as_nanos(),
+            self.depth_capture_time.map(|time| time.as_nanos()),
+            alvr_graphics::mask_edge_top(edge_cut),
+        );
+        if self.last_lever_log.elapsed() >= LEVER_LOG_INTERVAL {
+            self.last_lever_log = Instant::now();
+            crate::stream_log(&self.levers.log_text(&self.lever_params, area.as_ref()));
+        }
+
+        windows
+    }
+
     // Start or stop the environment depth provider depending on the passthrough mode, and get the
     // depth image for this frame
     fn update_environment_depth(
@@ -1985,6 +2058,7 @@ impl StreamContext {
                         arms: [None; 2],
                         arm_gaps: [None; 2],
                         edge_cut: 0.0,
+                        lever_windows: [None; MAX_LEVER_WINDOWS],
                         capture_playzone: false,
                         playzone_view: false,
                         key_lower_rects: None,
@@ -2030,6 +2104,7 @@ impl StreamContext {
             alvr_graphics::edge_cut_centre(params.edge_cut)
         });
         let capture_playzone = self.should_capture_playzone(frame.as_ref());
+        let lever_windows = self.lever_windows(display_time, edge_cut);
 
         Some(DepthRenderInput {
             frame,
@@ -2038,6 +2113,7 @@ impl StreamContext {
             arms,
             arm_gaps,
             edge_cut,
+            lever_windows,
             capture_playzone,
             playzone_view: self.color_key.is_some_and(|params| params.playzone_view),
             key_lower_rects: None,

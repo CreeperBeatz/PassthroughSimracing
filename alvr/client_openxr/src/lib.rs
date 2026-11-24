@@ -10,6 +10,7 @@ mod camera;
 mod extra_extensions;
 mod graphics;
 mod interaction;
+mod lever;
 mod lobby;
 mod marker_region;
 mod passthrough;

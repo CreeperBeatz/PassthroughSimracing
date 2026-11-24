@@ -142,6 +142,17 @@ impl PassthroughLayer<'_> {
 /// - `setprop debug.alvr.arm_gap_mm <mm>`: the strip the runtime removes behind the wrist is filled with the
 ///   forearm's depth from this far up the arm (0: off, default, ..80); `arm_gap_hands <n>`: on which arms
 ///   (1 left, 2 right, 3 both, default)
+/// - `setprop debug.alvr.lever_boxes <n,n>`: play-area boxes that are levers (shifter, handbrake), by their
+///   `#<index>` in the area editor's log (from 0, at most 4, separated by commas: `1` or `1,2`; unset or
+///   empty: off, the default). While a joint of a tracked hand is within `lever_gate_mm` (130, 0..500) of
+///   such a box, every view ray that crosses the box shows the room, whatever the depth says: a held lever
+///   is removed from the depth with the hand. The window closes once the depth shown was captured
+///   `lever_close_ms` (300, 0..3000) after the hand left (1 s later at most without newer depth), then
+///   fades over 150 ms. Needs the play area placed from the marker. `lever_shrink 1`: the window is the
+///   palm's path inside the box plus 2 cm in x and z, the whole height of the box, learned for the session
+///   (0, the default: the whole box); `lever_forget <n>`: another value forgets the learned paths. Box
+///   indices follow the editor's order: removing a box shifts them. A `lever:` line every 2 s (U2 of
+///   design/universal/final.md, see lever.rs)
 /// - `setprop debug.alvr.playzone -1`: forget the remembered playzone
 /// - `setprop debug.alvr.key_leak <percent>`: narrow the rim where the background around a hand looks like
 ///   the hand (needs `auto_key`), 0: off, 100: on

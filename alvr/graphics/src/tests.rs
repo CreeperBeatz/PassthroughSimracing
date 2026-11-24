@@ -6,7 +6,8 @@ use crate::{
     depth_dump::{DumpReadback, DumpSource},
     depth_mask::{
         self, ArmGap, ArmMotion, ColorKeyInput, DepthFrame, DepthRenderInput, HAND_SEGMENTS,
-        HandShape, HandSweep, HandZones, RegionOverride, SweepParams, WristBridge,
+        HandShape, HandSweep, HandZones, LeverWindow, MAX_LEVER_WINDOWS, RegionOverride,
+        SweepParams, WristBridge,
     },
     overlay::{self, OVERLAY_AMBER, OVERLAY_SLOTS, OverlayEye, OverlaySegment},
     play_area::{self, AreaBox, PlacedArea, PlayArea, Side},
@@ -155,7 +156,12 @@ fn depth_uniforms_layout_matches_the_shader() {
     };
     let (_, box_size) = struct_of("AreaBox");
     assert_eq!(box_size, 4 * play_area::AREA_BOX_FLOAT_COUNT);
-    let area_start = depth_mask::DEPTH_UNIFORMS_SIZE - 4 * play_area::AREA_FLOAT_COUNT;
+    // The lever windows last, after the play area
+    let (_, lever_size) = struct_of("LeverWindow");
+    assert_eq!(lever_size, 4 * depth_mask::LEVER_WINDOW_FLOAT_COUNT);
+    let levers_start = depth_mask::DEPTH_UNIFORMS_SIZE - 4 * depth_mask::LEVER_FLOAT_COUNT;
+    assert_eq!(offset("lever_windows"), levers_start);
+    let area_start = levers_start - 4 * play_area::AREA_FLOAT_COUNT;
     assert_eq!(offset("area_bounds"), area_start);
     assert_eq!(offset("area_boxes"), area_start + 32);
     assert_eq!(offset("hand_bridge_end"), area_start - 16);
@@ -583,6 +589,8 @@ struct MaskV2 {
     /// The depth camera turned about +y by this (radians). With the eye at its position nothing moves
     /// by parallax: the depth texels only slide under the pixels, by a part of a texel
     depth_yaw: f32,
+    /// The lever windows (U2 of design/universal/final.md). Default: none
+    lever_windows: [Option<LeverWindow>; MAX_LEVER_WINDOWS],
 }
 
 /// `render_with_area` with the edge cut and the wrist gaps
@@ -779,6 +787,7 @@ fn render_v2(
         arms,
         arm_gaps: mask_v2.arm_gaps,
         edge_cut: mask_v2.edge_cut,
+        lever_windows: mask_v2.lever_windows,
         capture_playzone: false,
         playzone_view,
         key_lower_rects,
@@ -2128,6 +2137,99 @@ fn mask_v2_switches_off_are_today() {
     }
 }
 
+// `debug.alvr.lever_boxes`: an open lever window shows the room along every ray through its box, also
+// where the depth sees only the far background (a held lever is removed from the depth with the hand),
+// pixel for pixel as `LeverWindow::ray_coverage` says. Off, closed or behind the eye: today's mask
+#[test]
+fn lever_window_shows_the_room_through_its_box() {
+    let (device, queue) = gpu_or_skip!();
+    let config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
+    // Only the far wall: the game everywhere today
+    let scene = Scene::new(3.0, [0.0, 0.0, 0.0, 0.0], 3.0);
+    let render = |lever_windows| {
+        render_mask_v2(
+            &device,
+            &queue,
+            &config,
+            &scene,
+            [None; 2],
+            MaskV2 {
+                lever_windows,
+                ..Default::default()
+            },
+        )
+    };
+    let off = render([None; MAX_LEVER_WINDOWS]);
+    assert!(off.pixels.iter().all(|pixel| pixel[3] == 255));
+
+    // A box 20 x 16 x 10 cm, 60 cm ahead, to the lower right, turned by 25 degrees
+    let window = LeverWindow {
+        region: RegionOverride {
+            volume_to_world: Mat4::from_rotation_translation(
+                Quat::from_rotation_y(25_f32.to_radians()),
+                Vec3::new(0.15, -0.1, -0.6),
+            ),
+            half_extents: Vec3::new(0.1, 0.08, 0.05),
+        },
+        open: 1.0,
+    };
+    let mut windows = [None; MAX_LEVER_WINDOWS];
+    windows[2] = Some(window);
+    let open = render(windows);
+    // Pixel for pixel against the Rust copy, except within a pixel of the outline (the mask is filtered)
+    let ray = |x: f32, y: f32| {
+        let (u, v) = (x / TARGET_SIZE as f32, y / TARGET_SIZE as f32);
+        Vec3::new(2.0 * u - 1.0, 1.0 - 2.0 * v, -1.0).normalize()
+    };
+    let mut inside = 0;
+    for y in 0..TARGET_SIZE {
+        for x in 0..TARGET_SIZE {
+            let (cx, cy) = (x as f32 + 0.5, y as f32 + 0.5);
+            let covered = |dx: f32, dy: f32| window.ray_coverage(Vec3::ZERO, ray(cx + dx, cy + dy));
+            let centre = covered(0.0, 0.0);
+            let near_outline = [(-1.5, 0.0), (1.5, 0.0), (0.0, -1.5), (0.0, 1.5)]
+                .iter()
+                .any(|&(dx, dy)| covered(dx, dy) != centre);
+            if near_outline {
+                continue;
+            }
+            let alpha = open.pixels[(y * TARGET_SIZE + x) as usize][3];
+            if centre > 0.0 {
+                inside += 1;
+                assert_eq!(alpha, 0, "{x} {y}");
+            } else {
+                assert_eq!(alpha, 255, "{x} {y}");
+            }
+        }
+    }
+    assert!(inside > 40, "{inside}");
+
+    // Closed (open 0), or behind the eye: today's mask
+    windows[2] = Some(LeverWindow {
+        open: 0.0,
+        ..window
+    });
+    assert_eq!(render(windows).pixels, off.pixels);
+    windows[2] = Some(LeverWindow {
+        region: RegionOverride {
+            volume_to_world: Mat4::from_translation(Vec3::new(0.0, 0.0, 0.6)),
+            ..window.region
+        },
+        ..window
+    });
+    assert_eq!(render(windows).pixels, off.pixels);
+
+    // Fading after the close: the room shows less than fully (coverage 0.15 is inside the cut of the
+    // mask edge, 0.05..0.35)
+    windows[2] = Some(LeverWindow {
+        open: 0.15,
+        ..window
+    });
+    let fading = render(windows);
+    let middle = fading.alpha(0.5 + 0.5 * 0.25, 0.5 + 0.5 * 0.1 / 0.6);
+    assert!(middle > 0.0 && middle < 1.0, "{middle}");
+}
+
 fn arm_motion(wrist: Vec3, displacement: Vec3, weight_len: f32) -> ArmMotion {
     ArmMotion {
         wrist,
@@ -2484,6 +2586,7 @@ fn depth_dump_reads_back_meters_and_masks() {
         arms: [None; 2],
         arm_gaps: [None; 2],
         edge_cut: 0.0,
+        lever_windows: [None; MAX_LEVER_WINDOWS],
         capture_playzone: false,
         playzone_view: false,
         key_lower_rects: None,

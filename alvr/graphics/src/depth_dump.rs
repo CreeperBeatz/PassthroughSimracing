@@ -574,7 +574,7 @@ impl DumpFrame<'_> {
             ("flip_y", config.flip_depth_y.to_string()),
         ]);
 
-        object([
+        let mut fields = vec![
             ("n", n.to_string()),
             ("display_ns", self.request.display_ns.to_string()),
             ("depth_capture_ns", optional(self.request.depth_capture_ns)),
@@ -596,8 +596,32 @@ impl DumpFrame<'_> {
             // Steps 1 and 2 of docs/mask-v2-design.md
             ("edge_cut", number(edge_cut_percent(self.input.edge_cut))),
             ("arm_gaps", array(arm_gaps)),
-        ])
+        ];
+        // U2 (`debug.alvr.lever_boxes`): only when a window is drawn, so that other dumps stay as they
+        // were
+        if self.input.lever_windows.iter().any(Option::is_some) {
+            fields.push((
+                "lever_windows",
+                array(self.input.lever_windows.each_ref().map(lever_window)),
+            ));
+        }
+
+        object(fields)
     }
+}
+
+/// A lever window of the mask (stage space: the centre, the half extents in the frame of the box, its
+/// yaw about +y, how open it is), null: none
+fn lever_window(window: &Option<depth_mask::LeverWindow>) -> String {
+    window.map_or("null".into(), |window| {
+        object([
+            ("center", numbers(&window.region.center().to_array())),
+            ("half", numbers(&window.region.half_extents.to_array())),
+            // + 0: an unturned box gives -0
+            ("yaw_deg", number(window.region.yaw().to_degrees() + 0.0)),
+            ("open", number(window.open)),
+        ])
+    })
 }
 
 #[cfg(test)]
@@ -714,6 +738,7 @@ mod tests {
                 }),
             ],
             edge_cut: 0.65,
+            lever_windows: [None; depth_mask::MAX_LEVER_WINDOWS],
             capture_playzone: false,
             playzone_view: false,
             key_lower_rects: None,
@@ -767,6 +792,46 @@ mod tests {
         }
         // Today's edge reads as 20
         assert_eq!(edge_cut_percent(0.0), 20.0);
+
+        // Without a lever window nothing is written; with one its box and how open it is
+        let dump = |input: &DepthRenderInput| {
+            DumpFrame {
+                request: DepthDumpRequest {
+                    n: 9,
+                    display_ns: 1,
+                    depth_capture_ns: None,
+                    now_ns: None,
+                },
+                config: &config,
+                stream_views: &[view; 2],
+                input,
+                frame: &frame,
+                playzone: None,
+                depth_size: UVec2::new(320, 320),
+                mask_size: UVec2::new(412, 441),
+                focus_size: UVec2::new(412, 441),
+            }
+            .to_json()
+        };
+        assert!(!dump(&input).contains("lever_windows"));
+        let mut lever_input = input;
+        lever_input.lever_windows[1] = Some(depth_mask::LeverWindow {
+            region: depth_mask::RegionOverride {
+                volume_to_world: alvr_common::glam::Mat4::from_translation(Vec3::new(
+                    0.25, 0.5, -0.5,
+                )),
+                half_extents: Vec3::new(0.1, 0.15, 0.1),
+            },
+            open: 0.5,
+        });
+        let json = dump(&lever_input);
+        assert!(is_valid_json(&json), "{json}");
+        assert!(
+            json.contains(
+                r#""lever_windows":[null,{"center":[0.25,0.5,-0.5],"half":[0.1,0.15,0.1],"yaw_deg":0,"open":0.5},null,null]"#
+            ),
+            "{json}"
+        );
 
         // A box placed from a marker is written instead of the region of the settings
         let input = DepthRenderInput {

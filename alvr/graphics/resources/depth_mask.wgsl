@@ -72,7 +72,48 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         }
     }
 
+    // The windows of the levers a hand is near (`debug.alvr.lever_boxes`, U2 of
+    // design/universal/final.md). Only adds, and without a window (the default) nothing is done. The
+    // part only the remembered playzone adds (a, for the debug tint) shrinks by what the window shows
+    if depth_u.area.w > 0.0 && result.r < 1.0 {
+        let eye = depth_u.eyes[imm.view_idx];
+        let origin = eye.eye_position.xyz;
+        let dir = normalize((eye.uv_to_world_dir * vec4f(uv, 1.0, 0.0)).xyz);
+        let lever = lever_coverage(origin, dir);
+        let coverage = max(result.r, lever);
+        result.a = coverage - max(result.r - result.a, lever);
+        result.r = coverage;
+    }
+
     return result;
+}
+
+// How much the lever windows show along a view ray: the most open of those it crosses in front of the
+// eye (or starts inside), whatever the depth says. Slab test in the frame of each box. A component of
+// the direction near 0 is replaced by a tiny positive one (no division by 0): inside that pair of sides
+// the ray then crosses it at every distance, outside of them never near. Same as
+// `LeverWindow::ray_coverage` in depth_mask.rs
+fn lever_coverage(origin: vec3f, dir: vec3f) -> f32 {
+    var coverage = 0.0;
+    let count = min(u32(depth_u.area.w), LEVER_WINDOWS);
+    for (var i = 0u; i < count; i++) {
+        let window = depth_u.lever_windows[i];
+        let o = (window.world_to_window * vec4f(origin, 1.0)).xyz;
+        let d = (window.world_to_window * vec4f(dir, 0.0)).xyz;
+        let tiny = vec3f(1e-6);
+        let safe = select(d, tiny, abs(d) < tiny);
+        let half = window.half.xyz;
+        let t1 = (-half - o) / safe;
+        let t2 = (half - o) / safe;
+        let t_min = min(t1, t2);
+        let t_max = max(t1, t2);
+        let near = max(max(t_min.x, t_min.y), t_min.z);
+        let far = min(min(t_max.x, t_max.y), t_max.z);
+        if far >= max(near, 0.0) {
+            coverage = max(coverage, window.half.w);
+        }
+    }
+    return coverage;
 }
 
 // Coverage of the region in the remembered playzone

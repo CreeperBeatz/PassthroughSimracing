@@ -6,6 +6,8 @@
 const HAND_SEGMENTS: u32 = 28u;
 // Boxes of the play area, see play_area.rs
 const AREA_BOXES: u32 = 8u;
+// Lever windows, see `LeverWindow` in depth_mask.rs
+const LEVER_WINDOWS: u32 = 4u;
 
 // All positions/poses are in the stage reference space
 struct DepthEye {
@@ -42,6 +44,13 @@ struct AreaBox {
     // x: cosine, y: sine of the yaw of the box (counter-clockwise seen from above)
     turn: vec4f,
 }
+// A lever window (`debug.alvr.lever_boxes`): every view ray that crosses this box shows the real room
+struct LeverWindow {
+    // Stage space to the frame of the box (rigid), the box centered at its origin
+    world_to_window: mat4x4f,
+    // xyz: half extents, w: how much it shows (0..1)
+    half: vec4f,
+}
 struct DepthUniforms {
     eyes: array<DepthEye, 2>,
     // Stage space to the frame of the play area (or of the box of the settings)
@@ -49,7 +58,7 @@ struct DepthUniforms {
     // x: number of boxes in area_boxes (0 with the distance region), y: how much the real room shows
     // through the game where the mask does not show it fully (0: not, 1: no game; while the play area
     // is edited), z: centre of the cut of the mask edge in stream.wgsl (`debug.alvr.edge_cut`, 0:
-    // today's)
+    // today's), w: number of lever windows in lever_windows (0: none, the default)
     area: vec4f,
     // x: region mode (0: distance, 1: volume), y: max distance, z: edge feathering, w: debug view
     region: vec4f,
@@ -97,4 +106,6 @@ struct DepthUniforms {
     area_bounds: array<vec4f, 2>,
     // Only the first area.x are used
     area_boxes: array<AreaBox, AREA_BOXES>,
+    // Only the first area.w are used
+    lever_windows: array<LeverWindow, LEVER_WINDOWS>,
 }
