@@ -191,6 +191,52 @@ pub struct BurstRegion {
     pub json: String,
 }
 
+/// Three clocks of the headset read back to back, at the start and at the end of a burst, so that logs
+/// written on other machines (the laptop's logcat in wall time, a rig PC's input log on its own wall clock,
+/// NTP: its error against the headset is not covered) can be put on the time of the burst records
+/// (XrTime). Read in this order:
+/// `CLOCK_MONOTONIC`, `CLOCK_REALTIME`, the runtime's XrTime now, `CLOCK_MONOTONIC` again; `read_ns` is
+/// the time between the two monotonic reads, so every value lies within it of the others. The client's
+/// XrTime "now" is the runtime's conversion of a `CLOCK_MONOTONIC` read (openxr crate,
+/// `xrConvertTimespecTimeToTimeKHR`): on Quest XrTime is expected to equal `CLOCK_MONOTONIC` [assumed,
+/// the pair shows it]. `CLOCK_REALTIME` is the headset's wall clock as NTP sets it, not the PC's
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BurstClocks {
+    /// `CLOCK_REALTIME`: ns since 1970-01-01 UTC
+    pub realtime_ns: i64,
+    /// `CLOCK_MONOTONIC` (None: not readable on this platform, the PC builds of the tests)
+    pub monotonic_ns: Option<i64>,
+    /// XrTime now, the clock of every `*_ns` of the burst (None: the runtime gave no time, or the stream
+    /// stopped before the end: no session to ask)
+    pub xr_ns: Option<i64>,
+    /// ns between the first and the last read (None without `CLOCK_MONOTONIC`)
+    pub read_ns: Option<i64>,
+}
+
+impl BurstClocks {
+    fn to_json(self) -> String {
+        let optional = |value: Option<i64>| value.map_or("null".into(), |value| value.to_string());
+        object([
+            ("realtime_ns", self.realtime_ns.to_string()),
+            ("monotonic_ns", optional(self.monotonic_ns)),
+            ("xr_ns", optional(self.xr_ns)),
+            ("read_ns", optional(self.read_ns)),
+        ])
+    }
+
+    /// For log lines: `realtime_ns=<n> monotonic_ns=<n> xr_ns=<n> read_ns=<n>` (`null`: not read)
+    pub fn text(&self) -> String {
+        let optional = |value: Option<i64>| value.map_or("null".into(), |value| value.to_string());
+        format!(
+            "realtime_ns={} monotonic_ns={} xr_ns={} read_ns={}",
+            self.realtime_ns,
+            optional(self.monotonic_ns),
+            optional(self.xr_ns),
+            optional(self.read_ns)
+        )
+    }
+}
+
 /// The camera images of a burst, filled by the key learner on its own thread
 pub struct CameraBurstSink {
     until: Instant,
@@ -230,6 +276,9 @@ pub struct Burst {
     pub duration_ms: i64,
     pub start_ns: i64,
     pub end_ns: i64,
+    /// The clocks at the start (read with `start_ns`: its `xr_ns` is `start_ns`) and at the end (with
+    /// `end_ns`), None: not read
+    pub clocks: [Option<BurstClocks>; 2],
     pub depth_size: UVec2,
     pub flip_y: bool,
     /// The depth dump written at the start of the burst (its JSON), None: none
@@ -492,14 +541,24 @@ impl Burst {
         // `key_lut` is new. Version 3: the display records have `edge_cut`, `arm_gaps` and `arm_gap_set_mm` (steps 1 and 2
         // of docs/mask-v2-design.md). Version 4: the display records have `arm_samples` (step 1b of the arm
         // plan: the arm's own sample history; `history_ns` / `wrist_history` of an arm in mode 2 are its
-        // newest sample)
+        // newest sample). Version 5: `clocks`, the headset's wall clock, monotonic clock and XrTime read
+        // back to back at the start and at the end (`BurstClocks`)
+        let clocks =
+            |clocks: Option<BurstClocks>| clocks.map_or("null".into(), BurstClocks::to_json);
         object([
             ("format", string("alvr_burst")),
-            ("version", "4".into()),
+            ("version", "5".into()),
             ("n", n.to_string()),
             ("duration_ms", self.duration_ms.to_string()),
             ("start_ns", self.start_ns.to_string()),
             ("end_ns", self.end_ns.to_string()),
+            (
+                "clocks",
+                object([
+                    ("start", clocks(self.clocks[0])),
+                    ("end", clocks(self.clocks[1])),
+                ]),
+            ),
             (
                 "depth",
                 object([
@@ -951,6 +1010,21 @@ mod tests {
             duration_ms: 3000,
             start_ns,
             end_ns: start_ns + frames as i64 * depth_period,
+            clocks: [
+                Some(BurstClocks {
+                    realtime_ns: 1_795_000_000_123_456_789,
+                    monotonic_ns: Some(start_ns - 1_500),
+                    xr_ns: Some(start_ns),
+                    read_ns: Some(3_000),
+                }),
+                // The stream stopped before the end, on a PC build
+                Some(BurstClocks {
+                    realtime_ns: 1_795_000_003_123_456_789,
+                    monotonic_ns: None,
+                    xr_ns: None,
+                    read_ns: None,
+                }),
+            ],
             depth_size: size,
             flip_y: false,
             dump: Some(format!("alvr_dump_{n}_depth.json")),
@@ -1019,11 +1093,33 @@ mod tests {
     }
 
     #[test]
+    fn clocks_text_is_one_key_value_per_clock() {
+        let clocks = BurstClocks {
+            realtime_ns: 1_795_000_000_000_000_001,
+            monotonic_ns: Some(42),
+            xr_ns: None,
+            read_ns: Some(700),
+        };
+        assert_eq!(
+            clocks.text(),
+            "realtime_ns=1795000000000000001 monotonic_ns=42 xr_ns=null read_ns=700"
+        );
+        assert!(is_valid_json(&clocks.to_json()));
+    }
+
+    #[test]
     fn index_is_valid_json_in_time_order() {
         let burst = synthetic_burst(7, UVec2::new(4, 3), 4);
         let json = burst.index_json();
         assert!(is_valid_json(&json), "{json}");
-        assert!(json.starts_with(r#"{"format":"alvr_burst","version":4,"n":7,"#));
+        assert!(json.starts_with(r#"{"format":"alvr_burst","version":5,"n":7,"#));
+        // The clock pairs of version 5, right after the times they go with
+        assert!(
+            json.contains(
+                r#""end_ns":1000133333332,"clocks":{"start":{"realtime_ns":1795000000123456789,"monotonic_ns":999999998500,"xr_ns":1000000000000,"read_ns":3000},"end":{"realtime_ns":1795000003123456789,"monotonic_ns":null,"xr_ns":null,"read_ns":null}},"depth":"#
+            ),
+            "{json}"
+        );
         assert!(
             json.contains(
                 r#""key_lut":{"file":"alvr_dump_7_key.lut","version":3,"published_ns":999600000000,"bytes":131072}"#

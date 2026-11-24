@@ -988,10 +988,12 @@ impl StreamContext {
             .map_or(UVec2::ZERO, |depth| depth.resolution());
         let flip_y = alvr_graphics::depth_passthrough_config(self.config.passthrough.as_ref())
             .is_some_and(|config| config.flip_depth_y);
-        if let Some(n) = self
-            .burst
-            .poll(runtime_now_ns(&self.xr_session), depth_size, flip_y)
-        {
+        let xr_session = &self.xr_session;
+        if let Some(n) = self.burst.poll(
+            || crate::xr_runtime_now(xr_session.instance()).map(|time| time.as_nanos()),
+            depth_size,
+            flip_y,
+        ) {
             if let Some((replaced, _)) = self.pending_dump.replace((n, Instant::now())) {
                 crate::stream_log(&format!("depth dump {replaced}: replaced by burst {n}"));
             }
@@ -2275,7 +2277,10 @@ impl StreamContext {
             self.burst.depth_images(burst_images);
         }
         if self.burst.is_active() {
-            self.burst.update(runtime_now_ns(&self.xr_session));
+            let xr_session = &self.xr_session;
+            self.burst.update(|| {
+                crate::xr_runtime_now(xr_session.instance()).map(|time| time.as_nanos())
+            });
         }
 
         self.swapchains[0].release_image().unwrap();

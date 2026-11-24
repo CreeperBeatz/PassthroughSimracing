@@ -44,6 +44,15 @@
 # regions: list of the region JSON objects; index: the whole index JSON
 # key_lut: the learned colour table of the key last uploaded before the start (version 2), None: none (or a
 #          version 1 burst): version, published_ns, rgba (32, 32, 32, 4) uint8 indexed [b][g][r]
+# clocks:  {"start": ..., "end": ...} (burst version 5; None for older bursts): the headset's clocks read back
+#          to back (CLOCK_MONOTONIC, CLOCK_REALTIME, XrTime, CLOCK_MONOTONIC again) when the burst started
+#          (its xr_ns is start_ns) and ended: dicts of realtime_ns (Unix time, ns), monotonic_ns, xr_ns (None:
+#          not read: the stream stopped before the end), read_ns (time between the two monotonic reads: the
+#          pair is good to that). Every *_ns of the records is XrTime. xr_to_realtime(burst, t_ns) puts XrTime
+#          on the headset's wall clock (Unix ns, int64); for older bursts use the epoch time of the
+#          "burst: <n> started" logcat line (about +-10 ms [assumed, not measured]). realtime_ns (~1.8e18)
+#          is above 2^53: parse the index with Python's json (ints exact), not a float-based JSON reader
+import datetime
 import json
 import os
 import sys
@@ -256,7 +265,73 @@ def load_burst(path, images=True):
         "regions": [r["region"] for r in by_kind["region"]],
         "key_lut": key_lut,
         "samples": samples,
+        # Version 5
+        "clocks": {
+            "start": (index.get("clocks") or {}).get("start"),
+            "end": (index.get("clocks") or {}).get("end"),
+        },
     }
+
+
+def _clock_pairs(burst):
+    pairs = [c for c in (burst["clocks"]["start"], burst["clocks"]["end"]) if c is not None and c["xr_ns"] is not None]
+    if not pairs:
+        raise ValueError("burst %d has no clock pair (burst version %d, 5 has them)" % (burst["index"]["n"], burst["index"].get("version", 1)))
+    return pairs
+
+
+def xr_to_realtime(burst, t_ns):
+    """XrTime (any *_ns of a burst) to the headset's CLOCK_REALTIME, Unix ns (int64). Linear between the
+    start and the end pair (NTP may slew the wall clock), constant outside them (the offset of the nearer
+    pair: a step of the wall clock during the burst is not carried past it), the start pair alone when the
+    end has no XrTime. Good to the pairs' read_ns plus the headset's NTP error against the other machine's
+    clock."""
+    t = np.asarray(t_ns, np.int64)
+    pairs = _clock_pairs(burst)
+    x0, offset0 = pairs[0]["xr_ns"], pairs[0]["realtime_ns"] - pairs[0]["xr_ns"]
+    if len(pairs) == 1 or pairs[1]["xr_ns"] == x0:
+        return t + np.int64(offset0)
+    x1, offset1 = pairs[1]["xr_ns"], pairs[1]["realtime_ns"] - pairs[1]["xr_ns"]
+    # Integers around the start: ns of Unix time do not fit a float64 exactly
+    since = np.clip(t - x0, 0, x1 - x0)
+    change = np.rint(since.astype(np.float64) * ((offset1 - offset0) / (x1 - x0))).astype(np.int64)
+    return t + np.int64(offset0) + change
+
+
+def _utc(realtime_ns):
+    time = datetime.datetime.fromtimestamp(realtime_ns // 1_000_000_000, datetime.timezone.utc)
+    return "%s.%06d" % (time.strftime("%Y-%m-%d %H:%M:%S"), (realtime_ns % 1_000_000_000) // 1000)
+
+
+def _clocks_summary(burst):
+    clocks = burst["clocks"]
+    start, end = clocks["start"], clocks["end"]
+    if start is None and end is None:
+        return 'clocks: none recorded (burst version %d, 5 has them): use the epoch time of the "burst: %d started" logcat line' % (
+            burst["index"].get("version", 1),
+            burst["index"]["n"],
+        )
+    parts = []
+    for name, c in (("start", start), ("end", end)):
+        if c is None:
+            parts.append("%s none" % name)
+            continue
+        part = "%s %s UTC" % (name, _utc(c["realtime_ns"]))
+        if c["xr_ns"] is not None:
+            part += ", realtime - XrTime %d ns" % (c["realtime_ns"] - c["xr_ns"])
+            if c["monotonic_ns"] is not None:
+                part += ", XrTime - monotonic %d ns" % (c["xr_ns"] - c["monotonic_ns"])
+        else:
+            part += ", no XrTime (the stream stopped)"
+        if c["read_ns"] is not None:
+            part += ", read in %.1f us" % (c["read_ns"] / 1e3)
+        parts.append(part)
+    if start is not None and end is not None and start["xr_ns"] is not None and end["xr_ns"] is not None:
+        drift = (end["realtime_ns"] - end["xr_ns"]) - (start["realtime_ns"] - start["xr_ns"])
+        parts.append("offset change %.1f us over %.2f s" % (drift / 1e3, (end["xr_ns"] - start["xr_ns"]) / 1e9))
+        if abs(drift) > 1_000_000:
+            parts.append("WARNING: the wall clock moved by over 1 ms against XrTime during the burst (an NTP step?): xr_to_realtime spreads it over the burst")
+    return "clocks: " + "; ".join(parts)
 
 
 def _stats(values, unit="ms"):
@@ -292,6 +367,7 @@ def summary(burst):
         "records: %d depth frames (%d read back, %d not recorded), %d display frames, %d camera images, %d regions"
         % (counts["depth"], counts["depth_read"], counts["depth_skipped"], counts["display"], counts["camera"], counts["region"]),
     ]
+    lines.append(_clocks_summary(burst))
     errors = sorted({e for e in depth["error"] if e})
     if errors:
         lines.append("readback errors: " + "; ".join(errors))

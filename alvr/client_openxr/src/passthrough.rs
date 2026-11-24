@@ -173,7 +173,10 @@ impl PassthroughLayer<'_> {
 /// - `setprop debug.alvr.burst <n>`: another value other than 0 records `debug.alvr.burst_ms` (3000, 100 to
 ///   6000) of consecutive frames into the folder `alvr_burst_<n>` of the files folder: every new depth frame
 ///   (both eyes), one record per display frame (poses, hands, the depth frame the mask used), the camera
-///   images of the learner, and one depth dump at the start (see burst.rs). Written after the burst
+///   images of the learner, and one depth dump at the start (see burst.rs). Written after the burst. The
+///   index (version 5) and the "burst: <n> started" / "ended" log lines carry the headset's wall clock,
+///   monotonic clock and XrTime read back to back at the start and the end (`clocks`), to line up logs of
+///   other machines
 /// - `setprop debug.alvr.hand_removal 0`: asks the runtime to keep the hands in the depth map with the key on.
 ///   It does not: on 2026-11-24 the hands were still removed with 0 (a probe; the answer is logged)
 /// - `setprop debug.alvr.key_wrist_len <mm>`: length of the key zone from the wrist towards the forearm, its

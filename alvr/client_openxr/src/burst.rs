@@ -13,6 +13,9 @@
 //!   learner, about every 60 ms), with their time, the camera pose and intrinsics
 //! - one depth dump (`alvr_dump_<n>_depth*`) at the start, in the folder of the burst, and the learned
 //!   colour table of the key last uploaded before the start (`alvr_dump_<n>_key.lut`, if there is one)
+//! - the headset's `CLOCK_REALTIME`, `CLOCK_MONOTONIC` and XrTime read back to back at the start and at
+//!   the end (`clocks` of the index, also on the "burst: <n> started" and "ended" log lines), to put logs
+//!   of the laptop or of a separate rig PC (wall clock) on the time of the records
 //!
 //! Everything is kept in RAM (about 0.4 MB per depth frame, 0.23 MB per camera image) and written by a
 //! thread after the burst to `<files>/alvr_burst_<n>/`: `alvr_burst_<n>.json` (the index, every
@@ -28,8 +31,8 @@ use alvr_common::{
 };
 use alvr_graphics::{
     ArmGap, ArmMotion, BURST_DEFAULT_MS, BURST_MAX_DEPTH, BURST_MAX_DISPLAY, BURST_MAX_MS,
-    BURST_MIN_MS, Burst, BurstArmSamples, BurstDepth, BurstDisplay, BurstHand, BurstLut,
-    BurstRegion, CameraBurstSink, ColorKeyInput, DepthFrame, SharedCameraBurst,
+    BURST_MIN_MS, Burst, BurstArmSamples, BurstClocks, BurstDepth, BurstDisplay, BurstHand,
+    BurstLut, BurstRegion, CameraBurstSink, ColorKeyInput, DepthFrame, SharedCameraBurst,
 };
 use std::{
     path::PathBuf,
@@ -122,8 +125,14 @@ impl BurstRecorder {
     }
 
     /// Reads `debug.alvr.burst` (the caller calls it about twice a second). Some(n) when burst n
-    /// starts: the caller asks for a depth dump with the same n (written into the folder of the burst)
-    pub fn poll(&mut self, now_ns: i64, depth_size: UVec2, flip_y: bool) -> Option<i64> {
+    /// starts: the caller asks for a depth dump with the same n (written into the folder of the burst).
+    /// `xr_now`: the runtime's XrTime now (None: it gave none), asked only when a burst starts
+    pub fn poll(
+        &mut self,
+        xr_now: impl FnOnce() -> Option<i64>,
+        depth_size: UVec2,
+        flip_y: bool,
+    ) -> Option<i64> {
         let value = debug_property("debug.alvr.burst").unwrap_or(0);
         let is_new = self.last_value.is_some_and(|last| last != value) && value != 0;
         self.last_value = Some(value);
@@ -131,12 +140,15 @@ impl BurstRecorder {
             return None;
         }
 
+        // The start of this burst, and the end of one that still runs
+        let clocks = read_clocks(xr_now);
+        let now_ns = clocks.xr_ns.unwrap_or(0);
         if let Some(active) = &self.active {
             crate::stream_log(&format!(
                 "burst: {} ended early by burst {value}",
                 active.burst.n
             ));
-            self.finish(now_ns);
+            self.finish(Some((now_ns, clocks)));
         }
 
         let duration_ms = debug_property("debug.alvr.burst_ms")
@@ -150,6 +162,7 @@ impl BurstRecorder {
                 duration_ms,
                 start_ns: now_ns,
                 end_ns: now_ns,
+                clocks: [Some(clocks), None],
                 depth_size,
                 flip_y,
                 dump: None,
@@ -172,7 +185,8 @@ impl BurstRecorder {
         });
         crate::stream_log(&format!(
             "burst: {value} started, {duration_ms} ms: every new depth frame, every display frame, the \
-             camera images of the key learner if it runs"
+             camera images of the key learner if it runs; clocks {}",
+            clocks.text()
         ));
 
         Some(value)
@@ -312,29 +326,35 @@ impl BurstRecorder {
     }
 
     /// Call every frame: ends the burst after its time once every readback is answered (or after a
-    /// timeout) and writes it on a thread
-    pub fn update(&mut self, now_ns: i64) {
+    /// timeout) and writes it on a thread. `xr_now`: as for `poll`, asked only at the end of the time
+    pub fn update(&mut self, xr_now: impl FnOnce() -> Option<i64>) {
         let Some(active) = &mut self.active else {
             return;
         };
         if active.closing.is_none() && active.start.elapsed() >= active.duration {
+            let clocks = read_clocks(xr_now);
             active.closing = Some(Instant::now());
-            active.burst.end_ns = now_ns;
+            active.burst.end_ns = clocks.xr_ns.unwrap_or(0);
+            active.burst.clocks[1] = Some(clocks);
         }
         if let Some(closing) = active.closing
             && (active.waiting == 0 || closing.elapsed() > FINISH_TIMEOUT)
         {
-            self.finish(now_ns);
+            self.finish(None);
         }
     }
 
-    // Takes the camera images and writes the burst on a thread
-    fn finish(&mut self, now_ns: i64) {
+    // Takes the camera images and writes the burst on a thread. `end`: the time and the clocks of the
+    // end of a burst whose time is not over (ended early, the stream stopped)
+    fn finish(&mut self, end: Option<(i64, BurstClocks)>) {
         let Some(mut active) = self.active.take() else {
             return;
         };
-        if active.closing.is_none() {
+        if active.closing.is_none()
+            && let Some((now_ns, clocks)) = end
+        {
             active.burst.end_ns = now_ns;
+            active.burst.clocks[1] = Some(clocks);
         }
         // Readbacks that never came
         for depth in &mut active.burst.depth {
@@ -349,7 +369,8 @@ impl BurstRecorder {
         let dir = burst_dir(burst.n);
         crate::stream_log(&format!(
             "burst: {} ended after {:.2} s: {} depth frames ({} read back, {} not recorded), {} \
-             display frames, {} camera images, {} regions, {} failed readbacks; writing {:.1} MB to {}",
+             display frames, {} camera images, {} regions, {} failed readbacks; writing {:.1} MB to {}; \
+             clocks {}",
             burst.n,
             active.start.elapsed().as_secs_f32(),
             burst.depth.len(),
@@ -361,6 +382,7 @@ impl BurstRecorder {
             active.failures,
             burst.image_bytes() as f32 / 1e6,
             dir.display(),
+            burst.clocks[1].map_or("null".into(), |clocks| clocks.text()),
         ));
         thread::spawn(move || {
             let start = Instant::now();
@@ -393,9 +415,81 @@ impl Drop for BurstRecorder {
             "burst: {} cut short: the stream stopped",
             active.burst.n
         ));
-        // No session left to ask for the time: the start plus the time since
+        // No session left to ask for the time: the start plus the time since (the clocks without
+        // XrTime)
         let now_ns = active.burst.start_ns + active.start.elapsed().as_nanos() as i64;
-        self.finish(now_ns);
+        self.finish(Some((now_ns, read_clocks(|| None))));
+    }
+}
+
+/// The headset's clocks back to back (see `BurstClocks`): `CLOCK_MONOTONIC`, `CLOCK_REALTIME`, `xr_now`,
+/// `CLOCK_MONOTONIC` again. A few microseconds; read twice per burst
+pub fn read_clocks(xr_now: impl FnOnce() -> Option<i64>) -> BurstClocks {
+    let first = monotonic_ns();
+    let realtime_ns = realtime_ns();
+    let xr_ns = xr_now();
+    let last = monotonic_ns();
+
+    BurstClocks {
+        realtime_ns,
+        monotonic_ns: first,
+        xr_ns,
+        read_ns: first.zip(last).map(|(first, last)| last - first),
+    }
+}
+
+// `time_t` and `c_long` are i64 on the Quest (aarch64), i32 on 32-bit Android
+#[cfg(target_os = "android")]
+#[allow(clippy::useless_conversion)]
+fn clock_ns(clock: libc::clockid_t) -> Option<i64> {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `time` is a valid timespec to write into
+    (unsafe { libc::clock_gettime(clock, &mut time) } == 0)
+        .then(|| i64::from(time.tv_sec) * 1_000_000_000 + i64::from(time.tv_nsec))
+}
+
+#[cfg(target_os = "android")]
+fn monotonic_ns() -> Option<i64> {
+    clock_ns(libc::CLOCK_MONOTONIC)
+}
+
+// The PC builds (tests) have no `CLOCK_MONOTONIC` to read
+#[cfg(not(target_os = "android"))]
+fn monotonic_ns() -> Option<i64> {
+    None
+}
+
+#[cfg(target_os = "android")]
+fn realtime_ns() -> i64 {
+    clock_ns(libc::CLOCK_REALTIME).unwrap_or(0)
+}
+
+// Same clock as `CLOCK_REALTIME` (Unix time)
+#[cfg(not(target_os = "android"))]
+fn realtime_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |time| time.as_nanos() as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_clocks_passes_xr_and_reads_wall_clock() {
+        let before = realtime_ns();
+        let clocks = read_clocks(|| Some(1_234));
+        assert_eq!(clocks.xr_ns, Some(1_234));
+        // Unix time after 2026-01-01
+        assert!(clocks.realtime_ns >= before && before > 1_767_225_600_000_000_000);
+        assert_eq!(clocks.monotonic_ns.is_some(), cfg!(target_os = "android"));
+        assert_eq!(clocks.read_ns.is_some(), clocks.monotonic_ns.is_some());
+        assert!(clocks.read_ns.is_none_or(|read| read >= 0));
+        assert_eq!(read_clocks(|| None).xr_ns, None);
     }
 }
 
