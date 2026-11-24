@@ -8,6 +8,7 @@ use crate::{
     interaction::{self, InteractionContext, InteractionSourcesConfig},
     lever::{LeverHand, LeverParams, LeverWindows},
     passthrough::{self, ColorKeyParams, debug_property},
+    room_memory::{self, MemoryLog},
 };
 use alvr_client_core::{
     ClientCoreContext, VideoFrameMetadata,
@@ -26,8 +27,8 @@ use alvr_graphics::{
     ArmGap, ArmMotion, BridgeChoice, BurstArmSample, BurstArmSamples, BurstHand, BurstLut,
     ColorKeyInput, DepthDumpFiles, DepthDumpRequest, DepthFrame, DepthRenderInput, DumpJoint,
     EditorHand, EditorInput, GraphicsContext, HAND_SEGMENTS, HandRay, HandShape, HandZones,
-    LeakGains, LeverWindow, MAX_LEVER_WINDOWS, OverlaySegment, PlacedArea, SEGMENT_JOINTS,
-    StreamRenderer, StreamViewParams, WristBridge,
+    LeakGains, LeverWindow, MAX_LEVER_WINDOWS, MemoryInput, MemoryParams, MemoryRecord,
+    OverlaySegment, PlacedArea, SEGMENT_JOINTS, StreamRenderer, StreamViewParams, WristBridge,
 };
 use alvr_packets::{ClientStreamConfig, RealTimeConfig, TrackingData};
 use alvr_session::{
@@ -89,6 +90,8 @@ const ARM_SAMPLE_LOOKUP_AGE: Duration = Duration::from_millis(100);
 const ARM_LOG_INTERVAL: Duration = Duration::from_secs(2);
 // The `lever:` line is logged this often while a box is a lever (`debug.alvr.lever_boxes`)
 const LEVER_LOG_INTERVAL: Duration = Duration::from_secs(2);
+// The `memory:` line is logged this often while the room memory is on (`debug.alvr.mem_roll`)
+const MEMORY_LOG_INTERVAL: Duration = Duration::from_secs(2);
 
 /// `debug.alvr.arm_shift` and the properties of its mode 2 (steps 1 and 1b of
 /// `docs/arm-mask-build-plan.md`)
@@ -443,6 +446,13 @@ pub struct StreamContext {
     lever_params: LeverParams,
     levers: LeverWindows,
     last_lever_log: Instant,
+    // `debug.alvr.mem_*` (U3 of design/universal/final.md, room_memory.rs): the room memory's properties
+    // (None: off, the default: nothing is kept or drawn, today's playzone copy), the last known joints of
+    // each hand (time, joints), the `memory:` line
+    memory_params: Option<MemoryParams>,
+    last_known_joints: [Option<(i64, [Vec4; 26])>; 2],
+    memory_log: MemoryLog,
+    last_memory_log: Instant,
     // The wrists of the hand capsules of the key in this frame (display time minus `key_delay`), for
     // the distance to the wrist of the arm
     key_wrists: Cell<[Option<Vec3>; 2]>,
@@ -665,6 +675,10 @@ impl StreamContext {
             lever_params: LeverParams::default(),
             levers: LeverWindows::default(),
             last_lever_log: Instant::now(),
+            memory_params: None,
+            last_known_joints: [None; 2],
+            memory_log: MemoryLog::default(),
+            last_memory_log: Instant::now(),
             key_wrists: Cell::new([None; 2]),
             published_lut: None,
             lut_uploads: 0,
@@ -889,7 +903,10 @@ impl StreamContext {
                 crate::stream_log("playzone: forgotten (requested)");
             }
         }
-        let is_requested = is_new_request && request > 0;
+        // The room memory (`debug.alvr.mem_roll`) replaces the copy while it is on: no copy is asked for and
+        // no `playzone:` line written (the hands near the depth view are still followed: it anchors by them)
+        let memory_on = self.memory_params.is_some();
+        let is_requested = is_new_request && request > 0 && !memory_on;
 
         let Some(frame) = frame else {
             if is_requested {
@@ -912,7 +929,7 @@ impl StreamContext {
             self.playzone_auto_series = false;
         }
 
-        let is_auto_on = self.color_key.is_some() && self.playzone_auto;
+        let is_auto_on = self.color_key.is_some() && self.playzone_auto && !memory_on;
         let is_automatic = is_auto_on
             && self.last_hands_seen.elapsed() > PLAYZONE_HANDS_TIMEOUT
             && self.last_playzone_capture.elapsed() > PLAYZONE_INTERVAL;
@@ -988,6 +1005,13 @@ impl StreamContext {
             crate::stream_log(&lever_params.text());
             self.lever_params = lever_params;
             self.levers.shut_all();
+        }
+        // Logged on each change (unset: never, as before). Off, the samples keep no joints
+        let memory_params = room_memory::read_params();
+        if memory_params != self.memory_params {
+            crate::stream_log(&room_memory::params_text(memory_params.as_ref()));
+            self.memory_params = memory_params;
+            self.last_memory_log = Instant::now();
         }
         self.playzone_auto = debug_property("debug.alvr.playzone_auto").unwrap_or(1) > 0;
 
@@ -1129,6 +1153,8 @@ impl StreamContext {
         let recording = self.burst.is_recording();
         let records_history = recording && !self.arm_samples_recording;
         self.arm_samples_recording = recording;
+        // The room memory needs the capsules at the depth's capture time
+        let keeps_joints = self.memory_params.is_some();
         let int_ctx = self.interaction_context.read();
 
         for i in 0..2 {
@@ -1165,13 +1191,32 @@ impl StreamContext {
                         .then(|| crate::from_xr_vec3(joint.pose.position))
                 };
 
+                // All of them or none
+                let all_joints = keeps_joints
+                    .then(|| {
+                        let mut all = [Vec4::ZERO; 26];
+                        for (joint, location) in all.iter_mut().zip(joints.iter()) {
+                            if !location
+                                .location_flags
+                                .contains(xr::SpaceLocationFlags::POSITION_VALID)
+                            {
+                                return None;
+                            }
+                            *joint =
+                                crate::from_xr_vec3(location.pose.position).extend(location.radius);
+                        }
+                        Some(all)
+                    })
+                    .flatten();
+
                 Some((
                     position(xr::HandJointEXT::WRIST)?,
                     position(xr::HandJointEXT::MIDDLE_PROXIMAL)?,
                     capture_time.map(|time| time.as_nanos()),
+                    all_joints,
                 ))
             });
-            let Some((wrist, knuckle, capture_ns)) = sample else {
+            let Some((wrist, knuckle, capture_ns, all_joints)) = sample else {
                 if history.clear() {
                     samples.reset = true;
                     if let Some(log) = log {
@@ -1182,7 +1227,9 @@ impl StreamContext {
             };
 
             let previous_ns = history.newest().map(|sample| sample.time_ns);
-            let Some(sample) = history.push(now_ns, wrist, knuckle, capture_ns, age_ns) else {
+            let Some(sample) =
+                history.push_joints(now_ns, wrist, knuckle, capture_ns, age_ns, all_joints)
+            else {
                 continue;
             };
             if recording {
@@ -1956,6 +2003,69 @@ impl StreamContext {
         self.config.clientside_post_processing = config.clientside_post_processing.clone();
     }
 
+    // The room memory of this frame (`debug.alvr.mem_roll`, room_memory.rs). None: off, or without the color
+    // key (the mask reads the playzone only with it, so the memory would be work for nothing). The hand
+    // capsules at the depth's capture time come from the arm's sample history, else the last known ones
+    // grown by 3 cm. The zone near each hand reaches farther by the wrist's travel since the capture
+    // (`arms`)
+    fn memory_input(&mut self, arms: &[Option<ArmMotion>; 2]) -> Option<MemoryInput> {
+        let params = self.memory_params.filter(|_| self.color_key.is_some())?;
+        let capture_ns = self.depth_capture_time.map(|time| time.as_nanos());
+        let mut hands = [None; 2];
+        let mut sources = [alvr_graphics::CaptureHand::None; 2];
+        for i in 0..2 {
+            let history = &self.arm_histories[i];
+            if let Some(newest) = history.newest()
+                && let Some(joints) = newest.joints
+            {
+                self.last_known_joints[i] = Some((newest.time_ns, joints));
+            }
+            (hands[i], sources[i]) =
+                room_memory::capture_hand(history, self.last_known_joints[i], capture_ns);
+        }
+        self.memory_log.count(sources);
+
+        Some(MemoryInput {
+            params,
+            capture_ns,
+            hands,
+            hand_sources: sources,
+            reach: [0, 1].map(|i| {
+                let travel = arms[i].map_or(0.0, |arm| arm.displacement.length());
+                room_memory::near_reach(&params, travel)
+            }),
+            hands_away: self.last_hands_seen.elapsed() > PLAYZONE_HANDS_TIMEOUT,
+        })
+    }
+
+    // The `memory:` line every 2 s while the room memory is on, and its part of the display record of a
+    // burst, both after the renderer ran this frame
+    fn report_memory(&mut self, display_time: xr::Time, input: Option<&DepthRenderInput>) {
+        let Some(params) = self.memory_params else {
+            return;
+        };
+        let status = self.renderer.memory_status();
+        if self.burst.is_recording()
+            && let Some(memory) = input.and_then(|input| input.memory)
+            && let Some(status) = status
+        {
+            self.burst.set_display_memory(
+                display_time.as_nanos(),
+                MemoryRecord {
+                    status,
+                    params,
+                    hands: memory.hand_sources,
+                },
+            );
+        }
+        let elapsed = self.last_memory_log.elapsed();
+        if elapsed >= MEMORY_LOG_INTERVAL {
+            self.last_memory_log = Instant::now();
+            let text = self.memory_log.text(status.as_ref(), elapsed.as_secs_f32());
+            crate::stream_log(&text);
+        }
+    }
+
     // The lever windows of this frame (`debug.alvr.lever_boxes`, lever.rs) and the `lever:` line every 2 s.
     // Off (the default): nothing is located, no window. The hands at the display time (the key's are
     // earlier, by `passthrough_delay_ms`: the gate opens a little sooner, the safe side), in the frame of
@@ -2061,6 +2171,7 @@ impl StreamContext {
                         lever_windows: [None; MAX_LEVER_WINDOWS],
                         capture_playzone: false,
                         playzone_view: false,
+                        memory: None,
                         key_lower_rects: None,
                         region_override: self.region_override,
                         game_dim: self.game_dim,
@@ -2105,6 +2216,10 @@ impl StreamContext {
         });
         let capture_playzone = self.should_capture_playzone(frame.as_ref());
         let lever_windows = self.lever_windows(display_time, edge_cut);
+        let memory = self.memory_input(&arms);
+        // `mem_view` shows what only the memory draws with the playzone's debug view
+        let playzone_view = self.color_key.is_some_and(|params| params.playzone_view)
+            || memory.is_some_and(|memory| memory.params.view > 0);
 
         Some(DepthRenderInput {
             frame,
@@ -2115,7 +2230,8 @@ impl StreamContext {
             edge_cut,
             lever_windows,
             capture_playzone,
-            playzone_view: self.color_key.is_some_and(|params| params.playzone_view),
+            playzone_view,
+            memory,
             key_lower_rects: None,
             region_override: self.region_override,
             game_dim: self.game_dim,
@@ -2224,11 +2340,13 @@ impl StreamContext {
             .as_ref()
             .and_then(|input| Some((input, input.color_key?)))
             .map_or([None; 2], |(input, key)| {
+                let reach = input.memory.map_or([0.0; 2], |memory| memory.reach);
                 [0, 1].map(|i| {
-                    alvr_graphics::hands_view_rect(
+                    alvr_graphics::hands_view_rect_reach(
                         &input_view_params[i],
                         input.eye_positions[i],
                         &key,
+                        reach,
                     )
                 })
             });
@@ -2337,6 +2455,7 @@ impl StreamContext {
             depth_input.as_ref(),
             &self.area_overlay,
         );
+        self.report_memory(xr_vsync_time, depth_input.as_ref());
 
         if let Some((n, result)) = self.renderer.poll_depth_dump() {
             // The dump of the start of a burst goes into its folder

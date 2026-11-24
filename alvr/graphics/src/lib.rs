@@ -9,6 +9,8 @@ mod lobby;
 mod marker_box;
 mod overlay;
 mod play_area;
+mod room_memory;
+mod room_memory_gpu;
 mod staging;
 mod stream;
 
@@ -30,6 +32,7 @@ pub use lobby::*;
 pub use marker_box::*;
 pub use overlay::*;
 pub use play_area::*;
+pub use room_memory::*;
 pub use stream::*;
 
 use alvr_common::{

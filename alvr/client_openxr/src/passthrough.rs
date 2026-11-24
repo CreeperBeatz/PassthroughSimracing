@@ -153,6 +153,18 @@ impl PassthroughLayer<'_> {
 ///   (0, the default: the whole box); `lever_forget <n>`: another value forgets the learned paths. Box
 ///   indices follow the editor's order: removing a box shifts them. A `lever:` line every 2 s (U2 of
 ///   design/universal/final.md, see lever.rs)
+/// - `setprop debug.alvr.mem_roll 1`: the room memory (U3 of design/universal/final.md, room_memory.rs) instead
+///   of today's playzone copy (0 or unset: today's, the default). A depth map in a wide camera fixed in the
+///   room (120 x 120 degrees, at the head when anchored, along its yaw, `mem_pitch_deg` (35, 0..80) below
+///   the horizon), written from the live depth on every new depth image, kept ("frozen") within
+///   `mem_margin_mm` (60, 20..150) of the hand capsules at the depth's capture time. The mask reads only
+///   frozen texels: a moved bottle, legs or the chair leave no ghost; a held object stays whole. Needs the
+///   color key. `mem_outer_mm <mm>` (0: off, ..250): beyond the margin up to this distance a texel is also
+///   kept if the live depth there is the far fill (8 cm or more behind it). `mem_size 384`: smaller
+///   textures (512 default, read when they are created). `mem_view 1`: with the "Tint mask" debug view
+///   what only the memory shows is blue; 2: paler the older it is. `mem_moving 1`: texels marked moving (the
+///   live depth changed by 3 cm with no hand within 20 cm, in the last 5 s) are not read either. A
+///   `memory:` line every 2 s; `debug.alvr.playzone -1` forgets it too
 /// - `setprop debug.alvr.playzone -1`: forget the remembered playzone
 /// - `setprop debug.alvr.key_leak <percent>`: narrow the rim where the background around a hand looks like
 ///   the hand (needs `auto_key`), 0: off, 100: on
@@ -179,15 +191,16 @@ impl PassthroughLayer<'_> {
 ///   The render thread writes the depth of the next frame with a depth image once per new value (also without
 ///   `auto_key`): `alvr_dump_<n>_depth.json`, the depth and the remembered playzone of each eye in meters
 ///   (`_depth_left.f32`, `_playzone_left.f32`, ...), the depth mask and the focus area (`_mask_left.rgba`,
-///   `_focus_left.rgba`, ...)
+///   `_focus_left.rgba`, ...). With `mem_roll 1` also the room memory of each eye (`_memory_left.f32`, 4
+///   floats per texel: distance, moving, frozen, age in s) and its camera (`memory` in the JSON)
 /// - `setprop debug.alvr.key_dump_burst <n>`: that many consecutive passes (1..30)
 /// - `setprop debug.alvr.burst <n>`: another value other than 0 records `debug.alvr.burst_ms` (3000, 100 to
 ///   6000) of consecutive frames into the folder `alvr_burst_<n>` of the files folder: every new depth frame
 ///   (both eyes), one record per display frame (poses, hands, the depth frame the mask used), the camera
 ///   images of the learner, and one depth dump at the start (see burst.rs). Written after the burst. The
-///   index (version 5) and the "burst: <n> started" / "ended" log lines carry the headset's wall clock,
+///   index (version 5 on) and the "burst: <n> started" / "ended" log lines carry the headset's wall clock,
 ///   monotonic clock and XrTime read back to back at the start and the end (`clocks`), to line up logs of
-///   other machines
+///   other machines. Version 6: the display records have `memory` (`mem_roll`, null when off)
 /// - `setprop debug.alvr.hand_removal 0`: asks the runtime to keep the hands in the depth map with the key on.
 ///   It does not: on 2026-11-24 the hands were still removed with 0 (a probe; the answer is logged)
 /// - `setprop debug.alvr.key_wrist_len <mm>`: length of the key zone from the wrist towards the forearm, its

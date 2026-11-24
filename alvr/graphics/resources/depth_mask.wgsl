@@ -23,7 +23,8 @@ var<immediate> imm: Immediate;
 // float instead of a depth texture: naga would otherwise emit a shadow sampler, which cannot be
 // used with texelFetch in GLSL ES.
 @group(0) @binding(1) var depth_texture: texture_2d_array<f32>;
-// Remembered depth map without hands, in meters (0: no data). See playzone_copy.wgsl
+// Remembered depth map without hands, in meters (0: no data). See playzone_copy.wgsl, or with
+// `debug.alvr.mem_roll` the room memory of room_memory.wgsl
 @group(1) @binding(0) var playzone_texture: texture_2d<f32>;
 @group(1) @binding(1) var focus_area: texture_2d<f32>;
 @group(1) @binding(2) var linear_sampler: sampler;
@@ -66,8 +67,13 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     if depth_u.lighting2.z > 0.5 && depth_u.playzone.x > 0.5 && result.r < 1.0 {
         let near_hand = textureSampleLevel(focus_area, linear_sampler, uv, 0.0).b;
         if near_hand > 0.0 {
-            let coverage = max(result.r, near_hand * playzone_coverage(uv));
+            let remembered = playzone_coverage(uv);
+            let coverage = max(result.r, near_hand * remembered.x);
             result.a = coverage - result.r;
+            // `mem_view 2`: the debug tint of what only the memory shows is paler the older it is
+            if depth_u.memory.y > 1.5 && remembered.x > 0.0 {
+                result.a *= remembered.y / remembered.x;
+            }
             result.r = coverage;
         }
     }
@@ -116,8 +122,16 @@ fn lever_coverage(origin: vec3f, dir: vec3f) -> f32 {
     return coverage;
 }
 
-// Coverage of the region in the remembered playzone
-fn playzone_coverage(uv: vec2f) -> f32 {
+// The tint of `mem_view 2` falls from full to this over MEMORY_VIEW_AGE seconds
+const MEMORY_VIEW_FADED: f32 = 0.3;
+const MEMORY_VIEW_AGE: f32 = 5.0;
+
+// Coverage of the region in the remembered playzone. x: the coverage, y: the same with each texel weighted
+// by its age for `mem_view 2` (equal to x otherwise). With the room memory (`debug.alvr.mem_roll`,
+// depth_u.memory.x above 0) only texels it kept near a hand count (b, frozen): the others equal the live
+// depth, so nothing is lost, and the arm (written outside the margin) is never drawn twice. With
+// `mem_moving 1` (2) not those marked moving either (g)
+fn playzone_coverage(uv: vec2f) -> vec2f {
     let view_idx = imm.view_idx;
     let origin = depth_u.eyes[view_idx].eye_position.xyz;
     let dir = normalize((depth_u.eyes[view_idx].uv_to_world_dir * vec4f(uv, 1.0, 0.0)).xyz);
@@ -126,34 +140,48 @@ fn playzone_coverage(uv: vec2f) -> f32 {
     for (var i = 0u; i < 2u; i++) {
         let guess = project_to_playzone(origin + dir * t, view_idx);
         if !guess.valid {
-            return 0.0;
+            return vec2f(0.0);
         }
         let z = load_playzone(vec2i(floor(guess.texel)));
         if z <= 0.0 {
-            return 0.0;
+            return vec2f(0.0);
         }
         t = max(dot(playzone_to_world(guess, z, view_idx) - origin, dir), 0.05);
     }
 
     let lookup = project_to_playzone(origin + dir * t, view_idx);
     if !lookup.valid {
-        return 0.0;
+        return vec2f(0.0);
     }
 
+    let read = depth_u.memory.x;
+    let ages = depth_u.memory.y > 1.5;
     // 2x2 neighborhood, blend the results
     let corner = floor(lookup.texel - 0.5);
     let f = lookup.texel - 0.5 - corner;
     var coverage = 0.0;
+    var faded = 0.0;
     for (var y = 0; y < 2; y++) {
         for (var x = 0; x < 2; x++) {
-            let z = load_playzone(vec2i(corner) + vec2i(x, y));
-            if z > 0.0 {
+            let texel = load_playzone_texel(vec2i(corner) + vec2i(x, y));
+            let z = texel.r;
+            let counts = read < 0.5
+                || (texel.b > 0.5 && (read < 1.5 || texel.g <= 0.0));
+            if z > 0.0 && counts {
                 let weight = mix(1.0 - f.x, f.x, f32(x)) * mix(1.0 - f.y, f.y, f32(y));
-                coverage += weight * region_mask(playzone_to_world(lookup, z, view_idx), view_idx);
+                let part = weight * region_mask(playzone_to_world(lookup, z, view_idx), view_idx);
+                coverage += part;
+                if ages {
+                    faded += part
+                        * mix(1.0, MEMORY_VIEW_FADED, clamp(texel.a / MEMORY_VIEW_AGE, 0.0, 1.0));
+                }
             }
         }
     }
-    return coverage;
+    if !ages {
+        faded = coverage;
+    }
+    return vec2f(coverage, faded);
 }
 
 fn current_mask(uv: vec2f) -> vec4f {
@@ -475,8 +503,13 @@ fn project_to_playzone(world_point: vec3f, view_idx: u32) -> DepthLookup {
 }
 
 fn load_playzone(coord: vec2i) -> f32 {
+    return load_playzone_texel(coord).r;
+}
+
+// Every channel (today's copy: r only; the room memory: see room_memory.wgsl)
+fn load_playzone_texel(coord: vec2i) -> vec4f {
     let dims = vec2i(textureDimensions(playzone_texture));
-    return textureLoad(playzone_texture, clamp(coord, vec2i(0), dims - 1), 0).r;
+    return textureLoad(playzone_texture, clamp(coord, vec2i(0), dims - 1), 0);
 }
 
 fn playzone_to_world(lookup: DepthLookup, z: f32, view_idx: u32) -> vec3f {

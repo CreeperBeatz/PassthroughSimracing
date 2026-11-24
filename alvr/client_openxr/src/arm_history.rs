@@ -5,9 +5,11 @@
 //! XR_META_hand_tracking_unextrapolated_poses, or the time it was first seen minus
 //! `debug.alvr.arm_sample_age_ms` (35: the depth's forearm lines up with the samples 32-38 ms after they
 //! were first seen). From it come the wrist at the depth's capture time (where the arm is in the depth)
-//! and the wrist the arm is placed with (`ArmEstimator`). Pure maths, so it can be tested on the PC
+//! and the wrist the arm is placed with (`ArmEstimator`). While the room memory is on (`debug.alvr.mem_roll`)
+//! each sample also keeps all 26 joints, for the hand capsules at the depth's capture time (`joints_at`).
+//! Pure maths, so it can be tested on the PC
 
-use alvr_common::glam::Vec3;
+use alvr_common::glam::{Vec3, Vec4};
 use std::collections::VecDeque;
 
 /// Samples are kept this long before the newest one (ns). The depth is 50-130 ms old when shown
@@ -78,6 +80,8 @@ pub struct HandSample {
     pub knuckle: Vec3,
     /// `time_ns` is the runtime's capture time, else the time seen minus the sample age
     pub from_capture_time: bool,
+    /// All 26 joints (xyz: position, w: radius), kept only while the room memory is on
+    pub joints: Option<[Vec4; 26]>,
 }
 
 /// The wrist the arm is placed with
@@ -125,9 +129,8 @@ impl HandHistory {
         self.samples.iter()
     }
 
-    /// The hand as located in a frame rendered at `seen_ns`, with the runtime's capture time if it gave
-    /// one. A new sample is kept and returned: with a capture time a new capture time, without one other
-    /// joints than the newest sample's (its time is then `seen_ns - age_ns`)
+    /// `push_joints` without the joints: the tests' shorthand
+    #[cfg(test)]
     pub fn push(
         &mut self,
         seen_ns: i64,
@@ -136,9 +139,26 @@ impl HandHistory {
         capture_ns: Option<i64>,
         age_ns: i64,
     ) -> Option<HandSample> {
+        self.push_joints(seen_ns, wrist, knuckle, capture_ns, age_ns, None)
+    }
+
+    /// The hand as located in a frame rendered at `seen_ns`, with the runtime's capture time if it gave
+    /// one. A new sample is kept and returned: with a capture time a new capture time, without one other
+    /// joints than the newest sample's (its time is then `seen_ns - age_ns`). `joints`: all 26 joints,
+    /// kept with it while the room memory is on (None, or not all finite: none kept)
+    pub fn push_joints(
+        &mut self,
+        seen_ns: i64,
+        wrist: Vec3,
+        knuckle: Vec3,
+        capture_ns: Option<i64>,
+        age_ns: i64,
+        joints: Option<[Vec4; 26]>,
+    ) -> Option<HandSample> {
         if !wrist.is_finite() || !knuckle.is_finite() {
             return None;
         }
+        let joints = joints.filter(|joints| joints.iter().all(|joint| joint.is_finite()));
         let capture_ns =
             capture_ns.filter(|&time| time <= seen_ns && seen_ns - time <= MAX_CAPTURE_AGE_NS);
         let newest = self.samples.back();
@@ -156,6 +176,7 @@ impl HandHistory {
             wrist,
             knuckle,
             from_capture_time: capture_ns.is_some(),
+            joints,
         };
         // Times only go forward. A sample that would go back (a capture time before the time guessed
         // for the one before) is left out
@@ -200,6 +221,29 @@ impl HandHistory {
             before.wrist.lerp(after.wrist, f),
             before.knuckle.lerp(after.knuckle, f),
         ))
+    }
+
+    /// All 26 joints at `time_ns`, by the rule of `at` (between two samples: each joint and radius
+    /// interpolated). None: a miss of `at`, or a sample without joints
+    pub fn joints_at(&self, time_ns: i64) -> Option<[Vec4; 26]> {
+        let newest = self.samples.back()?;
+        if time_ns >= newest.time_ns {
+            return newest.joints;
+        }
+        let after = self
+            .samples
+            .iter()
+            .position(|sample| sample.time_ns > time_ns)?;
+        let before = &self.samples[after.checked_sub(1)?];
+        let after = &self.samples[after];
+        let gap_ns = after.time_ns - before.time_ns;
+        if gap_ns > MAX_VELOCITY_GAP_NS && time_ns != before.time_ns {
+            return None;
+        }
+        let f = (time_ns - before.time_ns) as f32 / gap_ns as f32;
+        let (before, after) = (before.joints?, after.joints?);
+
+        Some(std::array::from_fn(|j| before[j].lerp(after[j], f)))
     }
 
     /// The wrist the arm is placed with for `target_ns`, at most `cap` (meters) from the newest sample.
@@ -658,6 +702,38 @@ mod tests {
         // A depth image captured before the hand came back: a miss (plain depth), no displacement
         // from the old place
         assert_eq!(history.at(seen_ns - 100 * MS), None);
+    }
+
+    #[test]
+    fn joints_follow_the_samples() {
+        let joints =
+            |x: f32| std::array::from_fn(|j| Vec4::new(x, 1.0, -0.4 - j as f32 * 0.01, 0.01));
+        let mut history = HandHistory::default();
+        let a = Vec3::new(0.0, 1.0, -0.4);
+        let b = Vec3::new(0.02, 1.0, -0.4);
+        history
+            .push_joints(1000 * MS, a, knuckle(a), None, AGE, Some(joints(0.0)))
+            .unwrap();
+        history
+            .push_joints(1020 * MS, b, knuckle(b), None, AGE, Some(joints(0.02)))
+            .unwrap();
+        // Halfway: every joint halfway; after the newest: the newest; before the oldest: a miss
+        let half = history.joints_at(1010 * MS - AGE).unwrap();
+        assert!((half[25].x - 0.01).abs() < 1e-6 && (half[25].z + 0.65).abs() < 1e-6);
+        assert_eq!(history.joints_at(2000 * MS).unwrap(), joints(0.02));
+        assert_eq!(history.joints_at(900 * MS), None);
+        // A sample without joints (pushed while the memory was off) gives none
+        let c = Vec3::new(0.04, 1.0, -0.4);
+        history.push(1040 * MS, c, knuckle(c), None, AGE).unwrap();
+        assert_eq!(history.joints_at(1030 * MS - AGE), None);
+        // Not finite joints are not kept
+        let mut bad = joints(0.0);
+        bad[3].x = f32::NAN;
+        let d = Vec3::new(0.06, 1.0, -0.4);
+        let sample = history
+            .push_joints(1060 * MS, d, knuckle(d), None, AGE, Some(bad))
+            .unwrap();
+        assert_eq!(sample.joints, None);
     }
 
     #[test]

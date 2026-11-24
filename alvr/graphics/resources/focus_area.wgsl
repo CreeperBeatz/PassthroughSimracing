@@ -232,10 +232,13 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
             }
         }
 
-        // The bounding sphere is good enough here
+        // The bounding sphere is good enough here. With the room memory (`debug.alvr.mem_roll`) it reaches
+        // farther by the wrist's travel since the depth capture, so that it still covers where the runtime
+        // removed things then, and by the margin beyond 6 cm (0 when it is off: today's)
+        let range = PLAYZONE_RANGE + depth_u.memory[2u + hand];
         near = max(
             near,
-            1.0 - smoothstep(bounds.w + 0.5 * PLAYZONE_RANGE, bounds.w + PLAYZONE_RANGE, center_distance),
+            1.0 - smoothstep(bounds.w + 0.5 * range, bounds.w + range, center_distance),
         );
 
         // The further from the hand, the less likely that it is there: fade out, so that leaks of the

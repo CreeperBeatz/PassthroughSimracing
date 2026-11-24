@@ -32,7 +32,15 @@
 #          arm's place in the depth; NaN: not mode 2, a buffer miss, or plain depth for a displacement over
 #          25 cm), arm_estimator (K, 2) (-1: not mode 2, or an older burst), arm_reset (K, 2) (the history was emptied in this frame: the hand was lost). In mode 2
 #          arm_history_ns / arm_wrist_history are the newest sample and arm_target_ns the time the placed
-#          wrist stands for
+#          wrist stands for. The room memory (`debug.alvr.mem_roll`, U3; burst version 6, older bursts and
+#          frames with it off: mem_on False, NaN, -1): mem_on (K,) bool, mem_position (K, 3), mem_yaw_deg,
+#          mem_pitch_deg (K,) (its camera, 120 x 120 degrees, fixed in stage space), mem_world_to_view (K, 4,
+#          4) (row major), mem_size (K,), mem_anchors (K, 2) (anchored cleanly / with hands since it was
+#          created), mem_updates (K, 2) per eye, mem_frozen / mem_no_live / mem_empty / mem_moving (K,) (shares
+#          of the left eye's texels from its last stats, NaN: none yet), mem_stats_age_ms (K,),
+#          mem_oldest_frozen_s (K,), mem_hands (K, 2) (where the capsules at the depth's capture time came
+#          from: 0 none, 1 the arm's history, 2 the last known ones grown 3 cm; -1 off), mem_margin_mm (K,).
+#          The state is the renderer's after the frame
 # samples: the arm's own hand samples (burst version 4; empty for older bursts), a list per hand (0 left,
 #          1 right) of dicts of arrays in time order: time_ns (when the sample shows the hand), seen_ns (when
 #          the app got it first), wrist (N, 3), capture_time (N,) bool (time_ns is the runtime's capture
@@ -52,6 +60,12 @@
 #          on the headset's wall clock (Unix ns, int64); for older bursts use the epoch time of the
 #          "burst: <n> started" logcat line (about +-10 ms [assumed, not measured]). realtime_ns (~1.8e18)
 #          is above 2^53: parse the index with Python's json (ints exact), not a float-based JSON reader
+# load_memory_dump(dump_json_path): the room memory of a depth dump (`debug.alvr.key_dump`, or the dump at the
+#          start of a burst) taken with `mem_roll 1`, None without: texels (2, S, S, 4) float32 per eye (r:
+#          distance from the camera plane, 0 nothing; g: moving 0..1; b: frozen 0/1; a: seconds since the
+#          last live write), rows in the order of the texture (row 0 = the down side of the camera unless
+#          flip_y), status (the JSON), world_to_view / view_to_world (4, 4) row major, tangents (left, right,
+#          down, up)
 import datetime
 import json
 import os
@@ -173,6 +187,22 @@ def load_burst(path, images=True):
         "arm_capture_wrist": np.full((k, 2, 3), np.nan),
         "arm_estimator": np.full((k, 2), -1, np.int64),
         "arm_reset": np.zeros((k, 2), bool),
+        "mem_on": np.zeros(k, bool),
+        "mem_position": np.full((k, 3), np.nan),
+        "mem_yaw_deg": np.full(k, np.nan),
+        "mem_pitch_deg": np.full(k, np.nan),
+        "mem_world_to_view": np.full((k, 4, 4), np.nan),
+        "mem_size": np.full(k, -1, np.int64),
+        "mem_anchors": np.full((k, 2), -1, np.int64),
+        "mem_updates": np.full((k, 2), -1, np.int64),
+        "mem_frozen": np.full(k, np.nan),
+        "mem_no_live": np.full(k, np.nan),
+        "mem_empty": np.full(k, np.nan),
+        "mem_moving": np.full(k, np.nan),
+        "mem_stats_age_ms": np.full(k, np.nan),
+        "mem_oldest_frozen_s": np.full(k, np.nan),
+        "mem_hands": np.full((k, 2), -1, np.int64),
+        "mem_margin_mm": np.full(k, np.nan),
     }
     new_samples = [[], []]
     for i, r in enumerate(display_records):
@@ -211,6 +241,26 @@ def load_burst(path, images=True):
                 display["arm_capture_wrist"][i, side] = _floats(hand["capture_wrist"], 3)
             for sample in hand["new"]:
                 new_samples[side].append((sample["time_ns"], sample["seen_ns"], _floats(sample["wrist"], 3), sample["capture_time"], i))
+        # Version 6: the room memory
+        memory = r.get("memory")
+        if memory is not None:
+            display["mem_on"][i] = True
+            if memory["camera"] is not None:
+                display["mem_position"][i] = _floats(memory["camera"]["position"], 3)
+                display["mem_yaw_deg"][i] = _float(memory["camera"]["yaw_deg"])
+                display["mem_pitch_deg"][i] = _float(memory["camera"]["pitch_deg"])
+                display["mem_world_to_view"][i] = np.reshape(memory["camera"]["view"]["world_to_view"], (4, 4)).T
+            display["mem_size"][i] = memory["size"]
+            display["mem_anchors"][i] = [memory["anchors_clean"], memory["anchors_with_hands"]]
+            display["mem_updates"][i] = memory["updates"]
+            stats = memory["stats"]
+            if stats is not None:
+                for key in ("frozen", "no_live", "empty", "moving"):
+                    display["mem_" + key][i] = _float(stats[key])
+                display["mem_stats_age_ms"][i] = _float(stats["age_ms"])
+                display["mem_oldest_frozen_s"][i] = _float(stats["oldest_frozen_s"])
+            display["mem_hands"][i] = [{"none": 0, "exact": 1, "fallback": 2}[h] for h in memory.get("hands", ["none", "none"])]
+            display["mem_margin_mm"][i] = _float(memory.get("margin_mm"))
     # A reset in a record comes before its new samples
     resets = np.cumsum(display["arm_reset"], axis=0)
     samples = [
@@ -350,6 +400,29 @@ def _stats(values, unit="ms"):
     )
 
 
+def load_memory_dump(path):
+    """The room memory of a depth dump (its alvr_dump_<n>_depth.json), None if it has none (mem_roll off)"""
+    with open(path, encoding="utf-8") as f:
+        dump = json.load(f)
+    memory = dump.get("memory")
+    if memory is None:
+        return None
+    status = memory["status"]
+    size = status["size"]
+    folder = os.path.dirname(path)
+    texels = np.stack(
+        [np.fromfile(os.path.join(folder, name), dtype="<f4").reshape(size, size, 4) for name in memory["files"]]
+    )
+    view = status["camera"]["view"]
+    return {
+        "status": status,
+        "texels": texels,
+        "world_to_view": np.reshape(view["world_to_view"], (4, 4)).T,
+        "view_to_world": np.reshape(view["view_to_world"], (4, 4)).T,
+        "tangents": np.array(view["tangents"], np.float64),
+    }
+
+
 def summary(burst):
     index, depth, display, camera = burst["index"], burst["depth"], burst["display"], burst["camera"]
     counts = index["counts"]
@@ -455,6 +528,34 @@ def summary(burst):
         "mask: edge cut %s %%; wrist gap %s"
         % ("/".join("%.0f" % c for c in cuts) if len(cuts) else "-", ", ".join(gap_parts))
     )
+    on = display["mem_on"]
+    if on.any():
+        last = np.flatnonzero(on)[-1]
+        anchors = display["mem_anchors"][last]
+        part = "room memory (mem_roll 1) in %d of %d display frames, %d x %d, margin %.0f mm, anchors %d clean / %d with hands" % (
+            int(on.sum()),
+            len(on),
+            display["mem_size"][last],
+            display["mem_size"][last],
+            display["mem_margin_mm"][last],
+            anchors[0],
+            anchors[1],
+        )
+        frozen = display["mem_frozen"][on]
+        if np.isfinite(frozen).any():
+            part += ", left eye frozen share %s, no live value median %.0f %%, moving median %.1f %%" % (
+                _stats(100.0 * frozen[np.isfinite(frozen)], "%"),
+                100.0 * np.nanmedian(display["mem_no_live"][on]),
+                100.0 * np.nanmedian(display["mem_moving"][on]),
+            )
+        hands = display["mem_hands"][on]
+        part += "; capsules at the capture time (history / last known / none): " + ", ".join(
+            "%s %d/%d/%d" % (name, (hands[:, side] == 1).sum(), (hands[:, side] == 2).sum(), (hands[:, side] == 0).sum())
+            for side, name in enumerate(("left", "right"))
+        )
+        lines.append(part)
+    elif index.get("version", 1) >= 6:
+        lines.append("room memory: off")
     key_lut = burst.get("key_lut")
     if key_lut is None:
         lines.append("key table: none recorded")

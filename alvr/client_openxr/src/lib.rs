@@ -14,6 +14,7 @@ mod lever;
 mod lobby;
 mod marker_region;
 mod passthrough;
+mod room_memory;
 mod stream;
 
 use crate::stream::ParsedStreamConfig;

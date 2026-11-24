@@ -9,6 +9,7 @@ use crate::{
     depth_dump::{self, DEPTH_DUMP_TIMEOUT},
     depth_mask::{self, DepthFrame},
     key_dump::{array, number, numbers, object, pose, string},
+    room_memory::MemoryRecord,
     stream,
 };
 use alvr_common::{
@@ -98,6 +99,9 @@ pub struct BurstDisplay {
     pub edge_cut: f32,
     /// The arm's own sample history of each hand (step 1b of the arm plan)
     pub arm_samples: [BurstArmSamples; 2],
+    /// The room memory (`debug.alvr.mem_roll`, U3 of design/universal/final.md): its camera, anchors and
+    /// last shares as the renderer left them after this frame. None: off
+    pub memory: Option<MemoryRecord>,
 }
 
 /// A hand sample of the arm's own history (step 1b of the arm plan)
@@ -449,6 +453,12 @@ impl BurstDisplay {
                 "arm_samples",
                 array(self.arm_samples.iter().map(BurstArmSamples::to_json)),
             ),
+            (
+                "memory",
+                self.memory
+                    .as_ref()
+                    .map_or("null".into(), MemoryRecord::to_json),
+            ),
         ])
     }
 }
@@ -542,12 +552,13 @@ impl Burst {
         // of docs/mask-v2-design.md). Version 4: the display records have `arm_samples` (step 1b of the arm
         // plan: the arm's own sample history; `history_ns` / `wrist_history` of an arm in mode 2 are its
         // newest sample). Version 5: `clocks`, the headset's wall clock, monotonic clock and XrTime read
-        // back to back at the start and at the end (`BurstClocks`)
+        // back to back at the start and at the end (`BurstClocks`). Version 6: the display records have
+        // `memory` (U3 of design/universal/final.md, `debug.alvr.mem_roll`; null when it is off)
         let clocks =
             |clocks: Option<BurstClocks>| clocks.map_or("null".into(), BurstClocks::to_json);
         object([
             ("format", string("alvr_burst")),
-            ("version", "5".into()),
+            ("version", "6".into()),
             ("n", n.to_string()),
             ("duration_ms", self.duration_ms.to_string()),
             ("start_ns", self.start_ns.to_string()),
@@ -985,6 +996,25 @@ mod tests {
                             estimator: 2,
                         },
                     ],
+                    // The room memory in the second frame only
+                    memory: (k == 1).then(|| MemoryRecord {
+                        status: crate::MemoryStatus {
+                            anchor: crate::MemoryAnchor {
+                                camera: Some(crate::MemoryCamera {
+                                    position: Vec3::new(0.0, 1.2, 0.0),
+                                    yaw: 0.0,
+                                    pitch: 0.5,
+                                }),
+                                clean: 1,
+                                with_hands: 0,
+                            },
+                            size: 512,
+                            updates: [3, 2],
+                            stats: None,
+                        },
+                        params: Default::default(),
+                        hands: [crate::CaptureHand::None, crate::CaptureHand::Exact],
+                    }),
                 }
             })
             .collect();
@@ -1112,7 +1142,7 @@ mod tests {
         let burst = synthetic_burst(7, UVec2::new(4, 3), 4);
         let json = burst.index_json();
         assert!(is_valid_json(&json), "{json}");
-        assert!(json.starts_with(r#"{"format":"alvr_burst","version":5,"n":7,"#));
+        assert!(json.starts_with(r#"{"format":"alvr_burst","version":6,"n":7,"#));
         // The clock pairs of version 5, right after the times they go with
         assert!(
             json.contains(
@@ -1152,10 +1182,16 @@ mod tests {
         );
         assert!(
             json.contains(
-                r#","wrist":[0.09,1,-0.4],"capture_time":true}],"capture_wrist":[0.08,1,-0.4],"estimator":2}]}"#
+                r#","wrist":[0.09,1,-0.4],"capture_time":true}],"capture_wrist":[0.08,1,-0.4],"estimator":2}],"memory":null}"#
             ),
             "{json}"
         );
+        // The room memory (version 6)
+        assert!(
+            json.contains(r#""memory":{"camera":{"position":[0,1.2,0],"yaw_deg":0,"#),
+            "{json}"
+        );
+        assert!(json.contains(r#""hands":["none","exact"]}}"#), "{json}");
         assert!(
             json.contains(
                 r#""counts":{"depth":4,"depth_read":3,"depth_skipped":1,"display":9,"camera":2,"region":1}"#

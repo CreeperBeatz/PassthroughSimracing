@@ -32,7 +32,8 @@ use alvr_common::{
 use alvr_graphics::{
     ArmGap, ArmMotion, BURST_DEFAULT_MS, BURST_MAX_DEPTH, BURST_MAX_DISPLAY, BURST_MAX_MS,
     BURST_MIN_MS, Burst, BurstArmSamples, BurstClocks, BurstDepth, BurstDisplay, BurstHand,
-    BurstLut, BurstRegion, CameraBurstSink, ColorKeyInput, DepthFrame, SharedCameraBurst,
+    BurstLut, BurstRegion, CameraBurstSink, ColorKeyInput, DepthFrame, MemoryRecord,
+    SharedCameraBurst,
 };
 use std::{
     path::PathBuf,
@@ -288,7 +289,22 @@ impl BurstRecorder {
             arm_gap_set_mm: input.arm_gap_set_mm,
             edge_cut: input.edge_cut,
             arm_samples: input.arm_samples,
+            memory: None,
         });
+    }
+
+    /// The room memory (`debug.alvr.mem_roll`) of the display record of this frame, after the renderer ran.
+    /// Nothing if no record was added in this frame (none is recording, or the display limit was reached)
+    pub fn set_display_memory(&mut self, display_ns: i64, memory: MemoryRecord) {
+        if let Some(record) = self
+            .active
+            .as_mut()
+            .filter(|active| active.closing.is_none())
+            .and_then(|active| active.burst.display.last_mut())
+            .filter(|record| record.display_ns == display_ns)
+        {
+            record.memory = Some(memory);
+        }
     }
 
     /// Answers of the renderer (`StreamRenderer::poll_burst_depth`)

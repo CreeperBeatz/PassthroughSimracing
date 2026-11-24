@@ -58,9 +58,10 @@ impl DepthDumpFiles {
     }
 }
 
-/// `kind`: depth, playzone (little-endian f32), mask, focus (RGBA8)
+/// `kind`: depth, playzone (little-endian f32), memory (4 little-endian f32 per texel), mask, focus
+/// (RGBA8)
 pub(crate) fn file_name(n: i64, kind: &str, eye: usize) -> String {
-    let extension = if matches!(kind, "depth" | "playzone") {
+    let extension = if matches!(kind, "depth" | "playzone" | "memory") {
         "f32"
     } else {
         "rgba"
@@ -113,6 +114,16 @@ pub(crate) enum DumpSource<'a> {
     },
     /// A Rgba8Unorm texture with COPY_SRC, as it is
     Rgba { texture: Texture, file: String },
+    /// One eye of the room memory (`debug.alvr.mem_roll`), through `dump_main` of room_memory.wgsl
+    Memory {
+        eye: u32,
+        pipeline: &'a RenderPipeline,
+        depth_bind_group: &'a BindGroup,
+        memory_bind_group: &'a BindGroup,
+        /// Texels per side of the memory
+        size: u32,
+        file: String,
+    },
 }
 
 #[derive(Clone)]
@@ -122,6 +133,10 @@ enum Content {
         playzone_file: Option<String>,
     },
     Rgba {
+        file: String,
+    },
+    /// Two RGBA8 texels per memory texel: its four channels as 16 bit floats
+    Memory {
         file: String,
     },
 }
@@ -202,6 +217,39 @@ impl DumpReadback {
                     )
                 }
                 DumpSource::Rgba { texture, file } => (texture, Content::Rgba { file }),
+                DumpSource::Memory {
+                    eye,
+                    pipeline,
+                    depth_bind_group,
+                    memory_bind_group,
+                    size,
+                    file,
+                } => {
+                    let target = device.create_texture(&TextureDescriptor {
+                        label: Some("room memory dump"),
+                        size: Extent3d {
+                            width: 2 * size,
+                            height: size,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: TextureDimension::D2,
+                        format: TextureFormat::Rgba8Unorm,
+                        usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+                        view_formats: &[],
+                    });
+                    crate::room_memory_gpu::encode_memory_pass(
+                        encoder,
+                        pipeline,
+                        &target.create_view(&TextureViewDescriptor::default()),
+                        depth_bind_group,
+                        memory_bind_group,
+                        eye,
+                        crate::room_memory_gpu::MODE_UPDATE,
+                    );
+                    (target, Content::Memory { file })
+                }
             };
             let extent = texture.size();
             let bytes_per_row = (extent.width * 4).next_multiple_of(COPY_BYTES_PER_ROW_ALIGNMENT);
@@ -325,10 +373,23 @@ fn decode(data: &[u8], sections: &[Section], near: f32, far: f32) -> Vec<(String
                 }
             }
             Content::Rgba { file } => files.push((file.clone(), rows.flatten().copied().collect())),
+            Content::Memory { file } => files.push((file.clone(), decode_memory(rows))),
         }
     }
 
     files
+}
+
+/// The rows of the memory dump target as little-endian f32, 4 per memory texel (r, g, b, a of
+/// room_memory.wgsl), rows in the order of the memory texture
+fn decode_memory<'a>(rows: impl Iterator<Item = &'a [u8]>) -> Vec<u8> {
+    let mut values = vec![];
+    for half in rows.flat_map(|row| row.chunks_exact(2)) {
+        let value = f16_to_f32(u16::from_le_bytes([half[0], half[1]]));
+        values.extend(value.to_le_bytes());
+    }
+
+    values
 }
 
 /// Everything about the frame of a dump, for its JSON
@@ -344,6 +405,9 @@ pub(crate) struct DumpFrame<'a> {
     pub depth_size: UVec2,
     pub mask_size: UVec2,
     pub focus_size: UVec2,
+    /// The room memory (`debug.alvr.mem_roll`) as JSON (`MemoryRecord::to_json`), with its files. None:
+    /// off, or not anchored yet
+    pub memory: Option<String>,
 }
 
 /// A depth camera: `pose`, `tangents` (left, right, down, up), `world_to_view`, `view_to_world`
@@ -605,6 +669,10 @@ impl DumpFrame<'_> {
                 array(self.input.lever_windows.each_ref().map(lever_window)),
             ));
         }
+        // U3 (`debug.alvr.mem_roll`): only with the memory, so that other dumps stay as they were
+        if let Some(memory) = &self.memory {
+            fields.push(("memory", memory.clone()));
+        }
 
         object(fields)
     }
@@ -649,6 +717,25 @@ mod tests {
         }
         assert_eq!(f16_to_f32(0x7c00), f32::INFINITY);
         assert!(f16_to_f32(0x7e00).is_nan());
+    }
+
+    #[test]
+    fn memory_dump_is_decoded() {
+        // Two texels in a row: (0.5, 0, 1, 2.5) and (1.25, 1, 0, 0), as dump_main packs them: r, g in
+        // the first output texel, b, a in the second
+        let halves: [u16; 8] = [
+            0x3800, 0x0000, 0x3c00, 0x4100, 0x3d00, 0x3c00, 0x0000, 0x0000,
+        ];
+        let row = halves
+            .iter()
+            .flat_map(|half| half.to_le_bytes())
+            .collect::<Vec<_>>();
+        let values = decode_memory([row.as_slice()].into_iter())
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect::<Vec<_>>();
+        assert_eq!(values, [0.5, 0.0, 1.0, 2.5, 1.25, 1.0, 0.0, 0.0]);
+        assert_eq!(file_name(7, "memory", 1), "alvr_dump_7_memory_right.f32");
     }
 
     #[test]
@@ -741,6 +828,7 @@ mod tests {
             lever_windows: [None; depth_mask::MAX_LEVER_WINDOWS],
             capture_playzone: false,
             playzone_view: false,
+            memory: None,
             key_lower_rects: None,
             region_override: None,
             game_dim: 0.0,
@@ -763,6 +851,7 @@ mod tests {
                 depth_size: UVec2::new(320, 320),
                 mask_size: UVec2::new(412, 441),
                 focus_size: UVec2::new(412, 441),
+                memory: None,
             }
             .to_json();
             assert!(is_valid_json(&json), "{json}");
@@ -810,10 +899,13 @@ mod tests {
                 depth_size: UVec2::new(320, 320),
                 mask_size: UVec2::new(412, 441),
                 focus_size: UVec2::new(412, 441),
+                memory: None,
             }
             .to_json()
         };
         assert!(!dump(&input).contains("lever_windows"));
+        // Without the room memory neither
+        assert!(!dump(&input).contains(r#""memory""#));
         let mut lever_input = input;
         lever_input.lever_windows[1] = Some(depth_mask::LeverWindow {
             region: depth_mask::RegionOverride {
@@ -859,6 +951,7 @@ mod tests {
             depth_size: UVec2::new(320, 320),
             mask_size: UVec2::new(412, 441),
             focus_size: UVec2::new(412, 441),
+            memory: None,
         }
         .to_json();
         assert!(is_valid_json(&json), "{json}");

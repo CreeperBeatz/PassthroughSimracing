@@ -11,6 +11,14 @@ use crate::{
     },
     overlay::{self, OVERLAY_AMBER, OVERLAY_SLOTS, OverlayEye, OverlaySegment},
     play_area::{self, AreaBox, PlacedArea, PlayArea, Side},
+    room_memory::{
+        CaptureHand, MEMORY_UNIFORMS_SIZE, MemoryCamera, MemoryInput, MemoryParams, MemoryStats,
+        memory_uniforms,
+    },
+    room_memory_gpu::{
+        MODE_REPROJECT, MODE_UPDATE, MemoryPipelines, create_memory_bind_group,
+        create_memory_texture, create_memory_uniform_buffer, encode_memory_pass,
+    },
     stream::{self, FOVEATION_UNIFORM_SIZE, LIGHT_PROBE_SIZE, StreamPipelines, floats_to_bytes},
 };
 use alvr_common::{
@@ -168,6 +176,9 @@ fn depth_uniforms_layout_matches_the_shader() {
     // The wrist gaps right after the 6 vectors of the arms, where `depth_uniforms` writes them
     assert_eq!(offset("arm_gap"), offset("arms") + 6 * 16);
     assert_eq!(offset("playzone_eyes"), offset("arm_gap") + 2 * 16);
+    // The room memory's vector right after the playzone's, where `depth_uniforms` writes it
+    assert_eq!(offset("memory"), offset("playzone") + 16);
+    assert_eq!(offset("key_lower"), offset("memory") + 16);
     // Where the box of the settings was: 2 eyes, then the transform and the number of boxes
     let eyes = 2 * 4 * (16 + 4 + 16 + 16 + 4);
     assert_eq!(offset("world_to_area"), eyes);
@@ -178,6 +189,42 @@ fn depth_uniforms_layout_matches_the_shader() {
 #[test]
 fn playzone_copy_shader_translates_to_gles() {
     translate_to_gles("playzone copy", &stream::playzone_copy_shader_source(), &[]);
+}
+
+#[test]
+fn room_memory_shader_translates_to_gles() {
+    translate_to_gles("room memory", &stream::room_memory_shader_source(), &[]);
+}
+
+// The uniform block of room_memory.wgsl is the one `memory_uniforms` fills
+#[test]
+fn memory_uniforms_layout_matches_the_shader() {
+    let source = stream::room_memory_shader_source();
+    let module = naga::front::wgsl::parse_str(&source).unwrap();
+    let (members, span) = module
+        .types
+        .iter()
+        .find_map(|(_, ty)| match &ty.inner {
+            naga::TypeInner::Struct { members, span }
+                if ty.name.as_deref() == Some("MemoryUniforms") =>
+            {
+                Some((members.clone(), *span as usize))
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(span, MEMORY_UNIFORMS_SIZE);
+    let offset = |name: &str| {
+        members
+            .iter()
+            .find(|member| member.name.as_deref() == Some(name))
+            .unwrap()
+            .offset as usize
+    };
+    assert_eq!(offset("source"), 4 * 36);
+    assert_eq!(offset("params"), 4 * 72);
+    assert_eq!(offset("hand_bounds"), 4 * 76);
+    assert_eq!(offset("hand_points"), 4 * 84);
 }
 
 #[test]
@@ -591,6 +638,8 @@ struct MaskV2 {
     depth_yaw: f32,
     /// The lever windows (U2 of design/universal/final.md). Default: none
     lever_windows: [Option<LeverWindow>; MAX_LEVER_WINDOWS],
+    /// The room memory's input (U3). Default: none, today's playzone
+    memory: Option<MemoryInput>,
 }
 
 /// `render_with_area` with the edge cut and the wrist gaps
@@ -790,6 +839,7 @@ fn render_v2(
         lever_windows: mask_v2.lever_windows,
         capture_playzone: false,
         playzone_view,
+        memory: mask_v2.memory,
         key_lower_rects,
         region_override,
         game_dim,
@@ -2589,6 +2639,7 @@ fn depth_dump_reads_back_meters_and_masks() {
         lever_windows: [None; MAX_LEVER_WINDOWS],
         capture_playzone: false,
         playzone_view: false,
+        memory: None,
         key_lower_rects: None,
         region_override: None,
         game_dim: 0.0,
@@ -3449,4 +3500,853 @@ fn overlay_draws_dashed_lines() {
     let fraction = drawn as f32 / (drawn + gaps) as f32;
     assert!((fraction - overlay::DASH_ON).abs() < 0.15, "{drawn} {gaps}");
     assert!((4..=6).contains(&runs), "{runs}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Room memory (`debug.alvr.mem_roll`, U3 of design/universal/final.md, room_memory.wgsl)
+// ---------------------------------------------------------------------------------------------
+
+const MEMORY_SIZE: u32 = 128;
+// About one depth image every 70 ms
+const MEMORY_DT: f32 = 0.07;
+
+/// Level, at the origin, looking at -z like the depth camera of the scenes
+fn level_memory_camera() -> MemoryCamera {
+    MemoryCamera {
+        position: Vec3::ZERO,
+        yaw: 0.0,
+        pitch: 0.0,
+    }
+}
+
+/// A hand of 28 copies of one capsule (xyz: position, w: radius)
+fn memory_hand(start: Vec3, end: Vec3, radius: f32) -> HandShape {
+    HandShape {
+        segments: [[start.extend(radius), end.extend(radius)]; HAND_SEGMENTS],
+    }
+}
+
+/// The same hand for the color key, so that the zone near it is drawn
+fn memory_key(shape: HandShape) -> ColorKeyInput {
+    ColorKeyInput {
+        hands: [
+            Some((
+                shape,
+                HandZones {
+                    core: 0.0,
+                    falloff: 0.004,
+                    rim: 0.0,
+                    solid: [0.0; HAND_SEGMENTS],
+                    sweep: HandSweep::NONE,
+                },
+            )),
+            None,
+        ],
+        leak: [0.0; 2],
+        bridges: [None; 2],
+    }
+}
+
+fn memory_input(hand: Option<HandShape>, reach: f32) -> MemoryInput {
+    MemoryInput {
+        params: MemoryParams {
+            size: MEMORY_SIZE,
+            ..Default::default()
+        },
+        capture_ns: None,
+        hands: [hand, None],
+        hand_sources: [CaptureHand::Exact, CaptureHand::None],
+        reach: [reach, 0.0],
+        hands_away: false,
+    }
+}
+
+/// The texel of the memory camera that sees a world point (rows in the order of the texture, flip_y
+/// off), and the point's distance from the camera plane
+fn memory_texel(camera: &MemoryCamera, point: Vec3) -> (usize, usize, f32) {
+    let view = camera.view_params();
+    let local = view.pose.orientation.inverse() * (point - view.pose.position);
+    let tangents = depth_mask::fov_tangents(view.fov);
+    let tan = Vec2::new(local.x, local.y) / -local.z;
+    let uv = (tan - Vec2::new(tangents.x, tangents.z))
+        / (Vec2::new(tangents.y, tangents.w) - Vec2::new(tangents.x, tangents.z));
+    let texel = (uv * MEMORY_SIZE as f32).floor();
+    (texel.x as usize, texel.y as usize, -local.z)
+}
+
+/// The world point of a memory texel at its remembered distance
+fn memory_point(camera: &MemoryCamera, x: usize, y: usize, z: f32) -> Vec3 {
+    let view = camera.view_params();
+    let tangents = depth_mask::fov_tangents(view.fov);
+    let uv = (Vec2::new(x as f32, y as f32) + 0.5) / MEMORY_SIZE as f32;
+    let tan_min = Vec2::new(tangents.x, tangents.z);
+    let tan = tan_min + (Vec2::new(tangents.y, tangents.w) - tan_min) * uv;
+    view.pose.position + view.pose.orientation * Vec3::new(tan.x * z, tan.y * z, -z)
+}
+
+/// The room memory of one eye (the left) on the desktop GPU, with the passes of the renderer
+struct MemoryRig {
+    pipelines: StreamPipelines,
+    memory: MemoryPipelines,
+    textures: [wgpu::TextureView; 2],
+    current: usize,
+    memory_uniforms: wgpu::Buffer,
+    depth_uniforms: wgpu::Buffer,
+}
+
+impl MemoryRig {
+    fn new(device: &Device) -> Self {
+        let constants = [
+            ("ENABLE_SRGB_CORRECTION", 0.0),
+            ("ENCODING_GAMMA", 0.0),
+            ("ENABLE_FFE", 0.0),
+        ];
+        let pipelines = StreamPipelines::new(device, TextureFormat::Rgba8Unorm, &constants, false);
+        let memory = MemoryPipelines::new(device, &pipelines);
+        let textures = [0, 1].map(|_| {
+            create_memory_texture(device, MEMORY_SIZE)
+                .create_view(&TextureViewDescriptor::default())
+        });
+
+        Self {
+            pipelines,
+            memory,
+            textures,
+            current: 0,
+            memory_uniforms: create_memory_uniform_buffer(device),
+            depth_uniforms: stream::create_depth_uniform_buffer(device),
+        }
+    }
+
+    // The depth uniforms of a frame whose depth image was taken from `depth_view`, the eye at the
+    // origin, the memory read with `memory` through `camera`
+    fn write_depth_uniforms(
+        &self,
+        queue: &Queue,
+        depth_view: ViewParams,
+        key: Option<ColorKeyInput>,
+        arms: [Option<ArmMotion>; 2],
+        memory: Option<MemoryInput>,
+        camera: Option<&MemoryCamera>,
+    ) {
+        let input = DepthRenderInput {
+            frame: Some(DepthFrame {
+                swapchain_index: 0,
+                near: NEAR,
+                far: f32::INFINITY,
+                depth_views: [depth_view; 2],
+            }),
+            eye_positions: [Vec3::ZERO; 2],
+            color_key: key,
+            arms,
+            arm_gaps: [None; 2],
+            edge_cut: 0.0,
+            lever_windows: [None; MAX_LEVER_WINDOWS],
+            capture_playzone: false,
+            playzone_view: false,
+            memory,
+            key_lower_rects: None,
+            region_override: None,
+            game_dim: 0.0,
+            game_see: 0.0,
+        };
+        let config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
+        let playzone = camera.map(|camera| [camera.view_params(); 2]);
+        let uniforms = depth_mask::depth_uniforms(
+            &config,
+            &[view(Vec3::ZERO); 2],
+            &input,
+            playzone.as_ref(),
+            false,
+        );
+        queue.write_buffer(&self.depth_uniforms, 0, &floats_to_bytes(&uniforms));
+    }
+
+    /// One update (or re-projection) of the left eye with the depth image `scene` seen from `depth_view`
+    #[expect(clippy::too_many_arguments)]
+    fn step(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        scene: &Scene,
+        depth_view: ViewParams,
+        camera: &MemoryCamera,
+        source: Option<&MemoryCamera>,
+        hand: Option<HandShape>,
+        mode: u32,
+    ) {
+        self.write_depth_uniforms(queue, depth_view, None, [None; 2], None, None);
+        let params = MemoryParams {
+            size: MEMORY_SIZE,
+            ..Default::default()
+        };
+        queue.write_buffer(
+            &self.memory_uniforms,
+            0,
+            &floats_to_bytes(&memory_uniforms(
+                camera,
+                source,
+                &params,
+                &[hand, None],
+                MEMORY_DT,
+            )),
+        );
+        let depth_texture = depth_array(device, queue, [scene, scene]);
+        let depth_bind_group = stream::create_depth_bind_group(
+            device,
+            &self.pipelines,
+            &self.depth_uniforms,
+            &stream::depth_array_view(&depth_texture),
+        );
+        let source_group = create_memory_bind_group(
+            device,
+            &self.memory,
+            &self.textures[self.current],
+            &self.memory_uniforms,
+        );
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encode_memory_pass(
+            &mut encoder,
+            &self.memory.update,
+            &self.textures[1 - self.current],
+            &depth_bind_group,
+            &source_group,
+            0,
+            mode,
+        );
+        queue.submit([encoder.finish()]);
+        self.current = 1 - self.current;
+    }
+
+    fn update(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        scene: &Scene,
+        camera: &MemoryCamera,
+        hand: Option<HandShape>,
+    ) {
+        self.step(
+            device,
+            queue,
+            scene,
+            view(Vec3::ZERO),
+            camera,
+            None,
+            hand,
+            MODE_UPDATE,
+        );
+    }
+
+    fn read_target(
+        &self,
+        device: &Device,
+        queue: &Queue,
+        pipeline: &wgpu::RenderPipeline,
+        size: UVec2,
+    ) -> Vec<u8> {
+        let target = device.create_texture(&TextureDescriptor {
+            label: None,
+            size: Extent3d {
+                width: size.x,
+                height: size.y,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8Unorm,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        // Any depth image: these passes don't read it
+        let depth_texture = depth_array(device, queue, [&hand_scene(), &hand_scene()]);
+        let depth_bind_group = stream::create_depth_bind_group(
+            device,
+            &self.pipelines,
+            &self.depth_uniforms,
+            &stream::depth_array_view(&depth_texture),
+        );
+        let memory_group = create_memory_bind_group(
+            device,
+            &self.memory,
+            &self.textures[self.current],
+            &self.memory_uniforms,
+        );
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encode_memory_pass(
+            &mut encoder,
+            pipeline,
+            &target.create_view(&TextureViewDescriptor::default()),
+            &depth_bind_group,
+            &memory_group,
+            0,
+            MODE_UPDATE,
+        );
+        read_rgba(device, queue, encoder, &target, size)
+    }
+
+    /// Every texel (r, g, b, a), through the pass of the depth dump. Rows in the order of the texture
+    fn read(&self, device: &Device, queue: &Queue) -> Vec<[f32; 4]> {
+        let bytes = self.read_target(
+            device,
+            queue,
+            &self.memory.dump,
+            UVec2::new(2 * MEMORY_SIZE, MEMORY_SIZE),
+        );
+        bytes
+            .chunks_exact(8)
+            .map(|texel| {
+                std::array::from_fn(|i| {
+                    crate::depth_dump::f16_to_f32(u16::from_le_bytes([
+                        texel[2 * i],
+                        texel[2 * i + 1],
+                    ]))
+                })
+            })
+            .collect()
+    }
+
+    fn stats(&self, device: &Device, queue: &Queue) -> MemoryStats {
+        let cells = crate::room_memory::MEMORY_STATS_CELLS;
+        let bytes = self.read_target(
+            device,
+            queue,
+            &self.memory.stats,
+            UVec2::new(2 * cells, cells),
+        );
+        MemoryStats::decode(&bytes, (2 * cells * 4) as usize).unwrap()
+    }
+
+    /// The depth mask of the left eye (r: coverage) over the live depth `live`, with the zone near the
+    /// key's hand, the memory read with `memory` (None: every texel, as today's playzone) through
+    /// `camera`. Rows from the top of the view
+    #[expect(clippy::too_many_arguments)]
+    fn mask(
+        &self,
+        device: &Device,
+        queue: &Queue,
+        live: &Scene,
+        key: ColorKeyInput,
+        arms: [Option<ArmMotion>; 2],
+        memory: Option<MemoryInput>,
+        camera: &MemoryCamera,
+        reach: f32,
+    ) -> Vec<[u8; 4]> {
+        self.write_depth_uniforms(
+            queue,
+            view(Vec3::ZERO),
+            Some(key),
+            arms,
+            memory,
+            Some(camera),
+        );
+        // With no memory input the zone is not grown in the shader: the rect is today's then
+        let resolution = UVec2::splat(TARGET_SIZE * 5);
+        let mask = stream::create_depth_mask_texture(device, resolution);
+        let focus_area = stream::create_focus_area_texture(device, resolution)
+            .create_view(&TextureViewDescriptor::default());
+        let sampler = device.create_sampler(&SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let read_group = stream::create_playzone_bind_group(
+            device,
+            &self.pipelines,
+            &self.textures[self.current],
+            &focus_area,
+            &sampler,
+        );
+        let depth_texture = depth_array(device, queue, [live, live]);
+        let depth_bind_group = stream::create_depth_bind_group(
+            device,
+            &self.pipelines,
+            &self.depth_uniforms,
+            &stream::depth_array_view(&depth_texture),
+        );
+        let focus_group =
+            stream::create_focus_area_bind_group(device, &self.pipelines, &self.depth_uniforms);
+        let rect = depth_mask::hands_view_rect_reach(
+            &view(Vec3::ZERO),
+            Vec3::ZERO,
+            &key,
+            [if memory.is_some() { reach } else { 0.0 }, 0.0],
+        );
+        let mut encoder = device.create_command_encoder(&Default::default());
+        stream::encode_focus_area(
+            &mut encoder,
+            &self.pipelines,
+            &focus_area,
+            &focus_group,
+            0,
+            stream::focus_area_resolution(resolution),
+            rect,
+        );
+        stream::encode_depth_mask(
+            &mut encoder,
+            &self.pipelines,
+            &mask.create_view(&TextureViewDescriptor::default()),
+            &depth_bind_group,
+            &read_group,
+            0,
+        );
+        read_rgba(device, queue, encoder, &mask, UVec2::splat(TARGET_SIZE))
+            .chunks_exact(4)
+            .map(|c| [c[0], c[1], c[2], c[3]])
+            .collect()
+    }
+}
+
+// Copies an RGBA8 texture into a buffer after `encoder` and reads it, rows without padding
+fn read_rgba(
+    device: &Device,
+    queue: &Queue,
+    mut encoder: wgpu::CommandEncoder,
+    texture: &wgpu::Texture,
+    size: UVec2,
+) -> Vec<u8> {
+    let row = (size.x * 4) as usize;
+    let bytes_per_row = (size.x * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+    let readback = device.create_buffer(&BufferDescriptor {
+        label: None,
+        size: u64::from(bytes_per_row * size.y),
+        usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    encoder.copy_texture_to_buffer(
+        texture.as_image_copy(),
+        TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(size.y),
+            },
+        },
+        Extent3d {
+            width: size.x,
+            height: size.y,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit([encoder.finish()]);
+    readback
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, |r| r.unwrap());
+    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    readback
+        .slice(..)
+        .get_mapped_range()
+        .chunks_exact(bytes_per_row as usize)
+        .flat_map(|padded| padded[..row].to_vec())
+        .collect()
+}
+
+/// Coverage of the mask at view uv (origin top-left)
+fn mask_at(mask: &[[u8; 4]], u: f32, v: f32) -> u8 {
+    let x = ((u * TARGET_SIZE as f32) as usize).min(TARGET_SIZE as usize - 1);
+    let y = ((v * TARGET_SIZE as f32) as usize).min(TARGET_SIZE as usize - 1);
+    mask[y * TARGET_SIZE as usize + x][0]
+}
+
+// The point of the scenes at depth-view ndc uv (origin bottom-left) and distance `z` from the plane of
+// the camera at the origin
+fn scene_point(u: f32, v: f32, z: f32) -> Vec3 {
+    Vec3::new((2.0 * u - 1.0) * z, (2.0 * v - 1.0) * z, -z)
+}
+
+// The user's ghost: a bottle (the shifter) moved while the hand stays 15 cm away. After one update its
+// old place is the game and its new place the room. Today's copy (taken while no hand was near) would
+// still have the bottle at the old place
+#[test]
+fn memory_drops_a_moved_object_away_from_the_hand() {
+    let (device, queue) = gpu_or_skip!();
+    let mut rig = MemoryRig::new(&device);
+    let camera = level_memory_camera();
+
+    // At 0.6 m: x -0.36..-0.18 before, 0.12..0.30 after
+    let before = Scene::new(3.0, [0.2, 0.4, 0.35, 0.6], 0.6);
+    let after = Scene::new(3.0, [0.6, 0.4, 0.75, 0.6], 0.6);
+    // The hand 15 cm from the old place, 11 cm from the new one, beyond the margin of 6 cm
+    let hand = memory_hand(Vec3::new(-0.02, 0.0, -0.6), Vec3::new(0.0, 0.0, -0.6), 0.01);
+    rig.update(&device, &queue, &before, &camera, None);
+    let old_place = scene_point(0.275, 0.5, 0.6);
+    let new_place = scene_point(0.675, 0.5, 0.6);
+    let texel = |memory: &[[f32; 4]], point: Vec3| {
+        let (x, y, _) = memory_texel(&camera, point);
+        memory[y * MEMORY_SIZE as usize + x]
+    };
+    let memory = rig.read(&device, &queue);
+    assert!(
+        (texel(&memory, old_place)[0] - 0.6).abs() < 0.01,
+        "{:?}",
+        texel(&memory, old_place)
+    );
+
+    rig.update(&device, &queue, &after, &camera, Some(hand));
+    let memory = rig.read(&device, &queue);
+    let [z, _, frozen, age] = texel(&memory, old_place);
+    assert!(
+        (z - 3.0).abs() < 0.05 && frozen == 0.0 && age == 0.0,
+        "{z} {frozen} {age}"
+    );
+    let [z, _, frozen, _] = texel(&memory, new_place);
+    assert!((z - 0.6).abs() < 0.01 && frozen == 0.0, "{z} {frozen}");
+    // Frozen only where the depth camera looks past the hand: the background behind it, never the bottle
+    let frozen = memory
+        .iter()
+        .filter(|texel| texel[2] == 1.0)
+        .collect::<Vec<_>>();
+    assert!(!frozen.is_empty());
+    assert!(frozen.iter().all(|texel| (texel[0] - 3.0).abs() < 0.05));
+
+    // The mask, with the zone near the hand grown over both places: the old place is the game, the new
+    // one the room. Mask rows start at the top of the view (ndc v 0.5 is the middle)
+    let input = memory_input(Some(hand), 0.4);
+    let mask = rig.mask(
+        &device,
+        &queue,
+        &after,
+        memory_key(hand),
+        [None; 2],
+        Some(input),
+        &camera,
+        0.4,
+    );
+    assert_eq!(mask_at(&mask, 0.275, 0.5), 0);
+    assert_eq!(mask_at(&mask, 0.675, 0.5), 255);
+}
+
+// The held bottle: the runtime removes it with the hand (the far background in its place). Within the
+// margin of the hand it stays whole in the memory over 50 updates and is drawn
+#[test]
+fn memory_keeps_a_held_object_whole() {
+    let (device, queue) = gpu_or_skip!();
+    let mut rig = MemoryRig::new(&device);
+    let camera = level_memory_camera();
+
+    // At 0.5 m: x -0.05..0.05, y -0.15..0.15
+    let bottle = Scene::new(3.0, [0.45, 0.35, 0.55, 0.65], 0.5);
+    let removed = Scene::new(3.0, [2.0, 2.0, 2.0, 2.0], 0.5);
+    // The hand round the bottle: every point of it within 5 cm of the capsule
+    let hand = memory_hand(
+        Vec3::new(0.0, -0.12, -0.47),
+        Vec3::new(0.0, 0.12, -0.47),
+        0.02,
+    );
+    rig.update(&device, &queue, &bottle, &camera, None);
+    let bottle_texels = |memory: &[[f32; 4]]| {
+        memory
+            .iter()
+            .filter(|texel| (texel[0] - 0.5).abs() < 0.01)
+            .count()
+    };
+    let whole = bottle_texels(&rig.read(&device, &queue));
+    // 0.1 x 0.3 m at 0.5 m: 0.2 x 0.6 in tangents of 3.46 / 128
+    assert!((whole as f32 - 7.4 * 22.2).abs() < 40.0, "{whole}");
+
+    for _ in 0..50 {
+        rig.update(&device, &queue, &removed, &camera, Some(hand));
+    }
+    let memory = rig.read(&device, &queue);
+    assert_eq!(bottle_texels(&memory), whole);
+    let held = memory
+        .iter()
+        .filter(|texel| (texel[0] - 0.5).abs() < 0.01)
+        .collect::<Vec<_>>();
+    assert!(held.iter().all(|texel| texel[2] == 1.0));
+    // 50 updates of 70 ms since the last live write
+    assert!(
+        held.iter().all(|texel| (texel[3] - 3.5).abs() < 0.1),
+        "{:?}",
+        held[0]
+    );
+
+    // The left eye's stats: the frozen share (the bottle and the background just behind the hand)
+    let stats = rig.stats(&device, &queue);
+    let frozen = memory.iter().filter(|texel| texel[2] == 1.0).count();
+    let share = frozen as f32 / (MEMORY_SIZE * MEMORY_SIZE) as f32;
+    assert!(
+        (stats.frozen - share).abs() < 0.002,
+        "{} {share}",
+        stats.frozen
+    );
+    assert!(
+        (stats.oldest_frozen_s.unwrap() - 3.5).abs() < 0.3,
+        "{stats:?}"
+    );
+
+    // Drawn: the whole bottle, also towards its ends and sides (2 memory texels from its edges)
+    let input = memory_input(Some(hand), 0.0);
+    let mask = rig.mask(
+        &device,
+        &queue,
+        &removed,
+        memory_key(hand),
+        [None; 2],
+        Some(input),
+        &camera,
+        0.0,
+    );
+    for v in [0.5, 0.4, 0.62] {
+        assert_eq!(mask_at(&mask, 0.5, v), 255, "{v}");
+        assert!(mask_at(&mask, 0.52, v) > 250, "{v}");
+    }
+    // Beside it the game
+    assert_eq!(mask_at(&mask, 0.6, 0.5), 0);
+}
+
+// The arm (here the depth's forearm below the wrist) is written outside the margin, never frozen: when
+// the mask moves the live arm by the wrist's motion (step 1 of the arm plan), the memory doesn't draw
+// it a second time at its old place. Read like today's copy (every texel) it would
+#[test]
+fn memory_never_draws_the_arm_twice() {
+    let (device, queue) = gpu_or_skip!();
+    let mut rig = MemoryRig::new(&device);
+    let camera = level_memory_camera();
+
+    // A forearm at 0.5 m, x -0.05..0.05, from the bottom of the view up to the wrist at y -0.05
+    let arm = Scene::new(3.0, [0.45, 0.0, 0.55, 0.45], 0.5);
+    let hand = memory_hand(
+        Vec3::new(0.0, -0.04, -0.5),
+        Vec3::new(0.0, 0.04, -0.5),
+        0.01,
+    );
+    for _ in 0..5 {
+        rig.update(&device, &queue, &arm, &camera, Some(hand));
+    }
+    let memory = rig.read(&device, &queue);
+    // 15 cm and more below the wrist: never frozen. Next to the hand a stub may be
+    for v in [0.05, 0.15, 0.25, 0.3] {
+        let (x, y, _) = memory_texel(&camera, scene_point(0.5, v, 0.5));
+        let texel = memory[y * MEMORY_SIZE as usize + x];
+        assert!(
+            (texel[0] - 0.5).abs() < 0.01 && texel[2] == 0.0,
+            "{v}: {texel:?}"
+        );
+    }
+    let (x, y, _) = memory_texel(&camera, scene_point(0.5, 0.44, 0.5));
+    assert_eq!(memory[y * MEMORY_SIZE as usize + x][2], 1.0);
+
+    // The arm moved 10 cm to the right since the depth was captured
+    let motion = ArmMotion {
+        wrist: Vec3::new(0.1, -0.05, -0.5),
+        direction: Vec3::NEG_Y,
+        displacement: Vec3::new(0.1, 0.0, 0.0),
+        weight_len: 1.0,
+        mode: 2,
+        target_ns: 0,
+        history_ns: 0,
+        wrist_history: Vec3::ZERO,
+        extrapolated: 0.0,
+    };
+    let moved_hand = memory_hand(
+        Vec3::new(0.1, -0.04, -0.5),
+        Vec3::new(0.1, 0.04, -0.5),
+        0.01,
+    );
+    let input = memory_input(Some(hand), 0.3);
+    let render = |memory| {
+        rig.mask(
+            &device,
+            &queue,
+            &arm,
+            memory_key(moved_hand),
+            [Some(motion), None],
+            memory,
+            &camera,
+            0.3,
+        )
+    };
+    // 15 cm below the wrist (ndc v 0.3): the moved arm is drawn (moved 8.5 cm at that weight), its old
+    // place is the game
+    let mask = render(Some(input));
+    assert_eq!(mask_at(&mask, 0.5, 0.7), 0);
+    assert_eq!(mask_at(&mask, 0.585, 0.7), 255);
+    // Every texel read: the old arm too (the zone near the hand reaches it with the reach of the input,
+    // which the rect of today's read doesn't have, so it is given here as the grown key)
+    let grown = memory_key(memory_hand(
+        Vec3::new(0.1, -0.35, -0.5),
+        Vec3::new(0.1, 0.04, -0.5),
+        0.15,
+    ));
+    let mask = rig.mask(
+        &device,
+        &queue,
+        &arm,
+        grown,
+        [Some(motion), None],
+        None,
+        &camera,
+        0.0,
+    );
+    assert_eq!(mask_at(&mask, 0.5, 0.7), 255);
+}
+
+// With `mem_roll` off (no memory input) the playzone is read as before: every texel, the zone near the
+// hand as before, no other uniform. Today's copy (frozen 0 in every texel) shows the wheel next to the
+// hand; read as the memory (only frozen texels) it would not
+#[test]
+fn memory_off_reads_the_playzone_as_today() {
+    let (device, queue) = gpu_or_skip!();
+    let config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
+    let remembered = Scene::new(3.0, [0.1, 0.4, 0.9, 0.6], 0.6);
+    let current = Scene::new(3.0, [2.0, 2.0, 2.0, 2.0], 0.6);
+    let shape = memory_hand(
+        Vec3::new(-0.02, 0.0, -0.55),
+        Vec3::new(0.02, 0.0, -0.55),
+        0.02,
+    );
+    let render = |memory| {
+        render_v2(
+            &device,
+            &queue,
+            &config,
+            &current,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            true,
+            Some(memory_key(shape)),
+            [None; 2],
+            Some(&remembered),
+            None,
+            false,
+            &[],
+            None,
+            0.0,
+            0.0,
+            MaskV2 {
+                memory,
+                ..Default::default()
+            },
+        )
+    };
+    let off = render(None);
+    // As in playzone_fills_objects_removed_near_the_hand
+    assert!(off.alpha(0.555, 0.5) < 0.1);
+    assert_eq!(off.alpha(0.8, 0.5), 1.0);
+    let on = render(Some(memory_input(Some(shape), 0.0)));
+    assert_eq!(on.alpha(0.555, 0.5), 1.0);
+    // Away from the hand both are the same, pixel for pixel
+    for u in [0.1, 0.3, 0.8] {
+        assert_eq!(off.at(u, 0.2), on.at(u, 0.2));
+    }
+
+    // The uniforms: without the memory its vector is zeros and nothing else differs from with it
+    let input = |memory| DepthRenderInput {
+        frame: None,
+        eye_positions: [Vec3::ZERO; 2],
+        color_key: Some(memory_key(shape)),
+        arms: [None; 2],
+        arm_gaps: [None; 2],
+        edge_cut: 0.0,
+        lever_windows: [None; MAX_LEVER_WINDOWS],
+        capture_playzone: false,
+        playzone_view: false,
+        memory,
+        key_lower_rects: None,
+        region_override: None,
+        game_dim: 0.0,
+        game_see: 0.0,
+    };
+    let uniforms = |memory| {
+        depth_mask::depth_uniforms(&config, &[view(Vec3::ZERO); 2], &input(memory), None, false)
+    };
+    let off = uniforms(None);
+    let on = uniforms(Some(memory_input(Some(shape), 0.05)));
+    let differ = (0..off.len())
+        .filter(|&i| off[i] != on[i])
+        .collect::<Vec<_>>();
+    // `memory` is the 4 floats after the playzone's vector: x and z are set
+    assert_eq!(differ.len(), 2, "{differ:?}");
+    let slot = differ[0];
+    assert_eq!(&off[slot..slot + 4], &[0.0; 4]);
+    assert_eq!(&on[slot..slot + 4], &[1.0, 0.0, 0.05, 0.0]);
+}
+
+// The memory camera: a point seen by a depth camera turned 30 degrees and moved 10 cm from the anchor
+// lands on the texel of its direction, and that texel gives the point back. A re-projection into another
+// camera keeps it, and its frozen flag and age
+#[test]
+fn memory_camera_maps_points_both_ways() {
+    let (device, queue) = gpu_or_skip!();
+    let mut rig = MemoryRig::new(&device);
+    // Aimed 35 degrees down, as by default
+    let camera = MemoryCamera {
+        position: Vec3::ZERO,
+        yaw: 0.0,
+        pitch: 35_f32.to_radians(),
+    };
+    let depth_view = ViewParams {
+        pose: Pose {
+            orientation: Quat::from_rotation_y(30_f32.to_radians()),
+            position: Vec3::new(0.1, 0.0, 0.0),
+        },
+        fov: fov(),
+    };
+    // An object at 0.5 m in the depth view, a little left and down
+    let scene = Scene::new(3.0, [0.4, 0.3, 0.5, 0.4], 0.5);
+    let local = scene_point(0.45, 0.35, 0.5);
+    let point = depth_view.pose.position + depth_view.pose.orientation * local;
+
+    rig.step(
+        &device,
+        &queue,
+        &scene,
+        depth_view,
+        &camera,
+        None,
+        None,
+        MODE_UPDATE,
+    );
+    let memory = rig.read(&device, &queue);
+    let (x, y, z) = memory_texel(&camera, point);
+    let texel = memory[y * MEMORY_SIZE as usize + x];
+    // The point lies in the plane of the object, the texel's ray passes within half a texel of it (3.46
+    // / 128 at 0.5 m: 7 mm), and the plane is turned against the memory camera
+    assert!((texel[0] - z).abs() < 0.015, "{texel:?} {z}");
+    let back = memory_point(&camera, x, y, texel[0]);
+    assert!(back.distance(point) < 0.02, "{back} {point}");
+
+    // A hand at the object: frozen at the next update, then re-projected into a camera moved 13 cm and
+    // turned 23 degrees
+    let hand = memory_hand(
+        point + Vec3::new(-0.01, 0.0, 0.03),
+        point + Vec3::new(0.01, 0.0, 0.03),
+        0.01,
+    );
+    rig.step(
+        &device,
+        &queue,
+        &scene,
+        depth_view,
+        &camera,
+        None,
+        Some(hand),
+        MODE_UPDATE,
+    );
+    let moved = MemoryCamera {
+        position: Vec3::new(0.13, 0.0, 0.0),
+        yaw: 0.4,
+        pitch: 35_f32.to_radians(),
+    };
+    rig.step(
+        &device,
+        &queue,
+        &scene,
+        depth_view,
+        &moved,
+        Some(&camera),
+        None,
+        MODE_REPROJECT,
+    );
+    let memory = rig.read(&device, &queue);
+    let (x, y, z) = memory_texel(&moved, point);
+    let texel = memory[y * MEMORY_SIZE as usize + x];
+    assert!((texel[0] - z).abs() < 0.025, "{texel:?} {z}");
+    assert_eq!(texel[2], 1.0, "{texel:?}");
+    assert!((texel[3] - MEMORY_DT).abs() < 1e-3, "{texel:?}");
+    let back = memory_point(&moved, x, y, texel[0]);
+    assert!(back.distance(point) < 0.025, "{back} {point}");
 }

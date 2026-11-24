@@ -10,6 +10,7 @@ use alvr_session::{DepthMaskRegion, DepthPassthroughConfig, DepthPassthroughDebu
 use crate::{
     AreaBox, PlacedArea, PlayArea,
     play_area::{AREA_FLOAT_COUNT, area_uniforms},
+    room_memory::{MemoryInput, memory_read_uniform},
 };
 
 /// One environment depth image, as returned by `xrAcquireEnvironmentDepthImageMETA`
@@ -649,6 +650,9 @@ pub struct DepthRenderInput {
     pub capture_playzone: bool,
     /// Debug view (with "Tint mask" and the color key): what only the playzone shows is blue
     pub playzone_view: bool,
+    /// The room memory (`debug.alvr.mem_roll`, U3 of design/universal/final.md, room_memory.rs) instead of
+    /// today's playzone copy. None: off (the default; the mask is then today's)
+    pub memory: Option<MemoryInput>,
     /// With the color key: the part of each view (min and max view uv) where the lower game layer is
     /// shown. Outside of it the upper layer shows what both would. None: the whole view
     pub key_lower_rects: Option<[(Vec2, Vec2); 2]>,
@@ -771,6 +775,7 @@ pub const DEPTH_UNIFORMS_FLOAT_COUNT: usize = 2 * EYE_FLOAT_COUNT
         + 6
         + 2
         + 2 * 9
+        + 1
         + 1
         + 2
         + 2
@@ -997,6 +1002,8 @@ pub fn depth_uniforms(
         leak[1],
         f32::from(u8::from(input.playzone_view)),
     ]);
+    // Zeros without the room memory: today's
+    data.extend(memory_read_uniform(input.memory.as_ref()));
     for (min, max) in input
         .key_lower_rects
         .unwrap_or([(Vec2::ZERO, Vec2::ONE); 2])
@@ -1069,6 +1076,17 @@ pub fn hands_view_rect(
     eye_position: Vec3,
     color_key: &ColorKeyInput,
 ) -> Option<(Vec2, Vec2)> {
+    hands_view_rect_reach(view, eye_position, color_key, [0.0; 2])
+}
+
+/// `hands_view_rect` with the zone near each hand reaching farther by `reach` (m, the room memory's
+/// `MemoryInput::reach`; 0: today's)
+pub fn hands_view_rect_reach(
+    view: &ViewParams,
+    eye_position: Vec3,
+    color_key: &ColorKeyInput,
+    reach: [f32; 2],
+) -> Option<(Vec2, Vec2)> {
     const MARGIN: f32 = 0.01;
     // See focus_area.wgsl
     const PLAYZONE_RANGE: f32 = 0.06;
@@ -1082,8 +1100,15 @@ pub fn hands_view_rect(
         .hands
         .iter()
         .zip(color_key.bridges)
-        .filter_map(|(hand, bridge)| Some((hand.as_ref()?, bridge)))
-        .flat_map(|((shape, zones), bridge)| {
+        .zip(reach)
+        .filter_map(|((hand, bridge), reach)| Some((hand.as_ref()?, bridge, reach)))
+        .flat_map(|((shape, zones), bridge, reach)| {
+            let range = PLAYZONE_RANGE
+                + if reach.is_finite() {
+                    reach.max(0.0)
+                } else {
+                    0.0
+                };
             let rim = zones.rim.max(0.0) + MARGIN;
             // Both ends of the sweep: the moved capsules lie in between
             let shifts = [0.0, zones.sweep.forward, -zones.sweep.backward]
@@ -1099,7 +1124,7 @@ pub fn hands_view_rect(
                     shifts.map(|shift| (point.truncate() + shift, point.w + rim))
                 })
                 // Where the playzone is used
-                .chain([(shape.bounds().truncate(), shape.bounds().w + PLAYZONE_RANGE)])
+                .chain([(shape.bounds().truncate(), shape.bounds().w + range)])
                 .collect::<Vec<_>>()
         })
         .filter_map(|(position, radius)| {
@@ -1374,10 +1399,12 @@ mod tests {
                 + 8 * 7 * 16
                 // The 4 lever windows: a matrix and a vector each
                 + 4 * 5 * 16
+                // The room memory's vector
+                + 16
         );
         // 28 capsules per hand, the wrist gaps, the bridges from the wrists, the boxes of the play area,
-        // the lever windows
-        assert_eq!(DEPTH_UNIFORMS_SIZE, 4496);
+        // the lever windows, the room memory
+        assert_eq!(DEPTH_UNIFORMS_SIZE, 4512);
     }
 
     // Steps 1 and 2 of docs/mask-v2-design.md in the uniform block: off is all zeros, as before
@@ -1394,6 +1421,7 @@ mod tests {
             lever_windows: [None; MAX_LEVER_WINDOWS],
             capture_playzone: false,
             playzone_view: false,
+            memory: None,
             key_lower_rects: None,
             region_override: None,
             game_dim: 0.0,
@@ -1603,6 +1631,7 @@ mod tests {
             lever_windows: [None; MAX_LEVER_WINDOWS],
             capture_playzone: false,
             playzone_view: false,
+            memory: None,
             key_lower_rects: None,
             region_override: None,
             game_dim: 0.0,
@@ -1868,6 +1897,7 @@ mod tests {
             lever_windows: [None; MAX_LEVER_WINDOWS],
             capture_playzone: false,
             playzone_view: false,
+            memory: None,
             key_lower_rects: None,
             region_override: None,
             game_dim: 0.0,
@@ -1936,6 +1966,7 @@ mod tests {
                 lever_windows: [None; MAX_LEVER_WINDOWS],
                 capture_playzone: false,
                 playzone_view: false,
+                memory: None,
                 key_lower_rects: None,
                 region_override: Some(PlacedArea::from(region)),
                 game_dim: 0.0,
@@ -2020,6 +2051,7 @@ mod tests {
             lever_windows: [None; MAX_LEVER_WINDOWS],
             capture_playzone: false,
             playzone_view: false,
+            memory: None,
             key_lower_rects: None,
             region_override: None,
             game_dim: 0.0,

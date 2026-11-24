@@ -3,7 +3,10 @@ use crate::{
     depth_burst::BurstReadbacks,
     depth_dump::{self, DEPTH_DUMP_TIMEOUT, DepthDumpFiles, DepthDumpRequest, DumpReadback},
     depth_mask::{self, DEPTH_UNIFORMS_SIZE, DepthRenderInput},
+    key_dump::{array, object, string},
     overlay::{self, OVERLAY_UNIFORMS_SIZE, OverlayEye, OverlaySegment, SEGMENT_FLOAT_COUNT},
+    room_memory::MemoryStatus,
+    room_memory_gpu::{MemoryPasses, MemoryPipelines, RoomMemory},
 };
 use alvr_common::{
     AlvrFoveatedEncodingParams, ViewParams,
@@ -82,6 +85,7 @@ const DEPTH_COMMON_WGSL: &str = include_str!("../resources/depth_common.wgsl");
 const DEPTH_MASK_WGSL: &str = include_str!("../resources/depth_mask.wgsl");
 const FOCUS_AREA_WGSL: &str = include_str!("../resources/focus_area.wgsl");
 const PLAYZONE_COPY_WGSL: &str = include_str!("../resources/playzone_copy.wgsl");
+const ROOM_MEMORY_WGSL: &str = include_str!("../resources/room_memory.wgsl");
 const DEPTH_DUMP_WGSL: &str = include_str!("../resources/depth_dump.wgsl");
 const STREAM_WGSL: &str = include_str!("../resources/stream.wgsl");
 const LIGHT_PROBE_LOCAL_WGSL: &str = include_str!("../resources/light_probe_local.wgsl");
@@ -100,6 +104,10 @@ pub(crate) fn depth_mask_shader_source() -> String {
 
 pub(crate) fn playzone_copy_shader_source() -> String {
     format!("{PLAYZONE_COPY_WGSL}\n{DEPTH_COMMON_WGSL}")
+}
+
+pub(crate) fn room_memory_shader_source() -> String {
+    format!("{ROOM_MEMORY_WGSL}\n{DEPTH_COMMON_WGSL}")
 }
 
 pub(crate) fn depth_dump_shader_source() -> String {
@@ -122,14 +130,14 @@ pub(crate) fn overlay_shader_source() -> String {
     OVERLAY_WGSL.to_owned()
 }
 
-fn shader_module(device: &Device, label: &str, source: String) -> ShaderModule {
+pub(crate) fn shader_module(device: &Device, label: &str, source: String) -> ShaderModule {
     device.create_shader_module(ShaderModuleDescriptor {
         label: Some(label),
         source: ShaderSource::Wgsl(Cow::Owned(source)),
     })
 }
 
-fn texture_entry(
+pub(crate) fn texture_entry(
     binding: u32,
     filterable: bool,
     dimension: TextureViewDimension,
@@ -155,7 +163,7 @@ fn sampler_entry(binding: u32) -> BindGroupLayoutEntry {
     }
 }
 
-fn uniform_entry(binding: u32) -> BindGroupLayoutEntry {
+pub(crate) fn uniform_entry(binding: u32) -> BindGroupLayoutEntry {
     BindGroupLayoutEntry {
         binding,
         visibility: ShaderStages::FRAGMENT,
@@ -843,6 +851,10 @@ pub struct StreamRenderer {
     overlay_buffer: Buffer,
     overlay_bind_group: BindGroup,
     target_view_resolution: UVec2,
+    // `debug.alvr.mem_roll` (room_memory.rs): the pipelines from its first use, the textures while it is
+    // on (dropped when it is off)
+    memory_pipelines: OnceCell<MemoryPipelines>,
+    memory: RefCell<Option<RoomMemory>>,
 }
 
 impl StreamRenderer {
@@ -1044,6 +1056,8 @@ impl StreamRenderer {
             overlay_buffer,
             overlay_bind_group,
             target_view_resolution,
+            memory_pipelines: OnceCell::new(),
+            memory: RefCell::new(None),
         }
     }
 
@@ -1088,9 +1102,50 @@ impl StreamRenderer {
         self.clear_playzone();
     }
 
-    /// Forget the playzone, e.g. if the reference space changed
+    /// Forget the playzone, e.g. if the reference space changed. The room memory too: the next depth
+    /// image anchors it cleanly
     pub fn clear_playzone(&self) {
         self.playzone.set(None);
+        if let Some(memory) = self.memory.borrow_mut().as_mut() {
+            memory.forget();
+        }
+    }
+
+    /// The room memory (`debug.alvr.mem_roll`) as the last frame left it. None: off
+    pub fn memory_status(&self) -> Option<MemoryStatus> {
+        self.memory.borrow().as_ref().map(RoomMemory::status)
+    }
+
+    // The room memory of this frame: created (or created again for another `mem_size`) while it is on,
+    // dropped when it is off. Its passes, None: off
+    fn plan_memory(&self, input: &DepthRenderInput) -> Option<MemoryPasses> {
+        let mut memory = self.memory.borrow_mut();
+        let Some(memory_input) = &input.memory else {
+            *memory = None;
+            return None;
+        };
+        let size = memory_input.params.size;
+        if memory.as_ref().is_none_or(|memory| memory.size != size) {
+            let device = &self.context.device;
+            let memory_pipelines = self
+                .memory_pipelines
+                .get_or_init(|| MemoryPipelines::new(device, &self.pipelines));
+            *memory = Some(RoomMemory::new(
+                device,
+                &self.pipelines,
+                memory_pipelines,
+                [
+                    &self.views_objects[0].focus_area,
+                    &self.views_objects[1].focus_area,
+                ],
+                &self.sampler,
+                size,
+            ));
+        }
+
+        memory
+            .as_mut()
+            .map(|memory| memory.plan(&self.context.queue, memory_input, input.frame.as_ref()))
     }
 
     /// How long ago the playzone was remembered. None: there is none
@@ -1199,12 +1254,16 @@ impl StreamRenderer {
         let mut depth_bind_group = &self.dummy_depth_bind_group;
         let mut capture_playzone = false;
         // Only the part of the view with the hands is rendered
+        let reach = depth
+            .and_then(|d| d.memory)
+            .map_or([0.0; 2], |memory| memory.reach);
         let hand_rects = depth.and_then(|d| d.color_key).map(|key| {
             [0, 1].map(|i| {
-                depth_mask::hands_view_rect(
+                depth_mask::hands_view_rect_reach(
                     &view_params[i].input_view_params,
                     depth.map_or(Vec3::ZERO, |d| d.eye_positions[i]),
                     &key,
+                    reach,
                 )
             })
         });
@@ -1214,6 +1273,8 @@ impl StreamRenderer {
         // `debug.alvr.burst`: the depth of this frame is read back if there is one
         let burst_token = self.burst_request.take();
         let mut has_depth_frame = false;
+        // `debug.alvr.mem_roll`: the passes of the room memory, None: off
+        let mut memory_passes = None;
         if let Some(config) = depth_config {
             let input = depth.copied().unwrap_or(DepthRenderInput {
                 frame: None,
@@ -1225,6 +1286,7 @@ impl StreamRenderer {
                 lever_windows: [None; depth_mask::MAX_LEVER_WINDOWS],
                 capture_playzone: false,
                 playzone_view: false,
+                memory: None,
                 key_lower_rects: None,
                 region_override: None,
                 game_dim: 0.0,
@@ -1243,7 +1305,10 @@ impl StreamRenderer {
                 has_depth_frame = true;
             }
 
+            memory_passes = self.plan_memory(&input);
+            // The room memory replaces today's copy while it is on
             if input.capture_playzone
+                && input.memory.is_none()
                 && let Some(frame) = &input.frame
             {
                 self.playzone.set(Some((frame.depth_views, Instant::now())));
@@ -1256,11 +1321,22 @@ impl StreamRenderer {
                 view_params[0].input_view_params,
                 view_params[1].input_view_params,
             ];
+            // With the room memory its camera (both eyes, each with its own texture), none before it is
+            // anchored
+            let playzone_views = if input.memory.is_some() {
+                self.memory
+                    .borrow()
+                    .as_ref()
+                    .and_then(RoomMemory::camera)
+                    .map(|camera| [camera.view_params(); 2])
+            } else {
+                self.playzone.get().map(|(views, _)| views)
+            };
             let uniforms = depth_mask::depth_uniforms(
                 config,
                 &stream_views,
                 &input,
-                self.playzone.get().map(|(views, _)| views).as_ref(),
+                playzone_views.as_ref(),
                 lighting_response.is_some(),
             );
             self.context.queue.write_buffer(
@@ -1286,6 +1362,7 @@ impl StreamRenderer {
                     depth_size: self.depth_resolution,
                     mask_size: self.depth_mask_resolution,
                     focus_size: self.focus_area_resolution,
+                    memory: self.memory_dump_json(&input, request.n),
                 }
                 .to_json();
                 dump = Some((request.n, *frame, json));
@@ -1296,6 +1373,20 @@ impl StreamRenderer {
             .context
             .device
             .create_command_encoder(&Default::default());
+
+        // Before the mask, which reads the memory
+        if let Some(passes) = &memory_passes
+            && let Some(memory) = self.memory.borrow_mut().as_mut()
+            && let Some(pipelines) = self.memory_pipelines.get()
+        {
+            memory.encode(&mut encoder, pipelines, depth_bind_group, passes);
+        }
+        let memory = self.memory.borrow();
+        // The memory is read once it has a camera; while it is on today's playzone is not read
+        let memory_read = memory
+            .as_ref()
+            .filter(|memory| memory_passes.is_some() && memory.camera().is_some());
+        let stats_encoded = memory.as_ref().is_some_and(RoomMemory::has_encoded_stats);
 
         if let Some(response_speed) = lighting_response
             && new_frame
@@ -1349,13 +1440,15 @@ impl StreamRenderer {
                     &self.pipelines,
                     &objects.depth_mask,
                     depth_bind_group,
-                    &self.playzone_bind_groups[view_idx],
+                    memory_read.map_or(&self.playzone_bind_groups[view_idx], |memory| {
+                        memory.read_bind_group(view_idx)
+                    }),
                     view_idx as u32,
                 );
             }
         }
         let dump = dump.map(|(n, frame, json)| {
-            self.encode_depth_dump(&mut encoder, depth_bind_group, n, &frame, json)
+            self.encode_depth_dump(&mut encoder, depth_bind_group, memory_read, n, &frame, json)
         });
         let burst_encoded = match burst_token {
             Some(token) if has_depth_frame => {
@@ -1431,11 +1524,16 @@ impl StreamRenderer {
 
         // wgpu doesn't look at the GL errors (of an unsupported copy), and the next `check_error` would
         // abort
-        let gl_error = if dump.is_some() || burst_encoded {
+        drop(memory);
+        let gl_error = if dump.is_some() || burst_encoded || stats_encoded {
             self.context.take_gl_error()
         } else {
             None
         };
+        if let Some(memory) = self.memory.borrow_mut().as_mut() {
+            memory.submitted(gl_error.map(|error| format!("{error:#x}")).as_deref());
+            memory.poll(&self.context.device);
+        }
         if let Some(dump) = dump {
             let dump = match gl_error {
                 Some(error) => dump.fail(format!("GL error {error:#x}")),
@@ -1492,10 +1590,30 @@ impl StreamRenderer {
         draws
     }
 
+    // `debug.alvr.mem_roll`: the memory in the JSON of a depth dump, with its files. None: off or not
+    // anchored yet (then it has no files either)
+    fn memory_dump_json(&self, input: &DepthRenderInput, n: i64) -> Option<String> {
+        let memory_input = input.memory?;
+        let memory = self.memory.borrow();
+        let memory = memory.as_ref().filter(|memory| memory.camera().is_some())?;
+        let status = memory
+            .status()
+            .to_json(Some(&memory_input.params), Some(memory_input.hand_sources));
+
+        Some(object([
+            ("status", status),
+            (
+                "files",
+                array([0, 1].map(|eye| string(&depth_dump::file_name(n, "memory", eye)))),
+            ),
+        ]))
+    }
+
     fn encode_depth_dump(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         depth_bind_group: &BindGroup,
+        memory: Option<&RoomMemory>,
         n: i64,
         frame: &depth_mask::DepthFrame,
         json: String,
@@ -1526,6 +1644,16 @@ impl StreamRenderer {
                     file: depth_dump::file_name(n, "focus", eye),
                 },
             ]);
+            if let Some(memory) = memory
+                && let Some(pipelines) = self.memory_pipelines.get()
+            {
+                sources.push(memory.dump_source(
+                    pipelines,
+                    depth_bind_group,
+                    eye,
+                    depth_dump::file_name(n, "memory", eye),
+                ));
+            }
         }
 
         DumpReadback::encode(

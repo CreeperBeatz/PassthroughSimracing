@@ -90,6 +90,12 @@ struct DepthUniforms {
     // x: available (0/1), y, z: debug view, how much the rim of each hand is narrowed (0..1), w: debug
     // view of the playzone (0/1)
     playzone: vec4f,
+    // The room memory (`debug.alvr.mem_roll`, U3 of design/universal/final.md, room_memory.rs), all 0
+    // when it is off: today's. x: which texels of the playzone count, 0 all (today's), 1 only frozen
+    // ones, 2 only frozen ones not marked moving (`mem_moving 1`); y: `mem_view` (2: what only the
+    // memory shows is paler the older it is); z, w: how much farther the zone near the left / right hand
+    // reaches than today's 6 cm (m)
+    memory: vec4f,
     // Color key: part of each view where the lower game layer is shown, xy: min, zw: max view uv
     key_lower: array<vec4f, 2>,
     // Rim of a moving hand: the capsules moved anywhere along the motion, from hand_zones.w back to w
