@@ -124,12 +124,18 @@ impl PassthroughLayer<'_> {
 /// - `setprop debug.alvr.key_hands 0`: no hands in the GPU passes (to measure them)
 /// - `setprop debug.alvr.arm_shift 0`: plain depth for the arms, not shifted by the motion of the wrist (also
 ///   without the key, see `StreamContext`). 1 (default): shifted with the display-time wrist, a smoothstep to
-///   45 cm. 2: with a wrist looked up in the past and extrapolated to a target time, a linear weight
+///   45 cm. 2: from the arm's own history of hand samples (`arm_history.rs`): moved from the wrist at the
+///   depth's capture time to the wrist of `arm_estimator`, a linear weight
 /// - `setprop debug.alvr.arm_hands <n>`: arms that use `arm_shift 2` (1 left, 2 right, 3 both), the others 1
-/// - `setprop debug.alvr.arm_target_ms <ms>` / `arm_history_ms <ms>` / `arm_weight_mm <mm>`: with
-///   `arm_shift 2`, the arm is placed for the display time minus `arm_target_ms` (0..150, 40), from the wrist
-///   at the display time minus `arm_history_ms` (0..200, 80, at least `arm_target_ms`); the weight falls
-///   linearly to 0 over `arm_weight_mm` (100..600, 300)
+/// - `setprop debug.alvr.arm_estimator <n>`: with `arm_shift 2`, 0 (default): the newest hand sample as it
+///   is; 1: the line through the two newest samples at the display time minus `arm_target_ms`; 2: the
+///   velocity of a parabola over 120 ms, to the same time. At most 6 cm from the newest sample
+/// - `setprop debug.alvr.arm_target_ms <ms>` / `arm_weight_mm <mm>`: with `arm_shift 2` and estimator 1 or
+///   2 the arm is placed for the display time minus `arm_target_ms` (0..150, 40); the weight falls linearly
+///   to 0 over `arm_weight_mm` (100..600, 300). `arm_history_ms` is no longer used
+/// - `setprop debug.alvr.arm_sample_age_ms <ms>`: how old a hand sample is when the app first gets it
+///   (0..150, 35), its time when the runtime gives no capture time; `arm_capture_time 0`: never use the
+///   runtime's capture time (XR_META_hand_tracking_unextrapolated_poses)
 /// - `setprop debug.alvr.edge_cut <percent>`: where the mask edge is cut, 20 (default, also 0): today's, a
 ///   rim of room around still objects; 50 / 65 / 80 draw the edge further on the object (17..84). Also
 ///   without the key

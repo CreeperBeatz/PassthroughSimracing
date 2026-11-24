@@ -19,8 +19,8 @@ pub use area_edit::*;
 pub use color_model::*;
 pub use depth_burst::{
     BURST_DEFAULT_MS, BURST_MAX_DEPTH, BURST_MAX_DISPLAY, BURST_MAX_MS, BURST_MIN_MS, Burst,
-    BurstCamera, BurstDepth, BurstDisplay, BurstHand, BurstLut, BurstRegion, CameraBurstSink,
-    SharedCameraBurst, burst_dir_name,
+    BurstArmSample, BurstArmSamples, BurstCamera, BurstDepth, BurstDisplay, BurstHand, BurstLut,
+    BurstRegion, CameraBurstSink, SharedCameraBurst, burst_dir_name,
 };
 pub use depth_dump::{DEPTH_DUMP_TIMEOUT, DepthDumpFiles, DepthDumpRequest, region_json};
 pub use depth_mask::*;

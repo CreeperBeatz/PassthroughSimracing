@@ -26,7 +26,19 @@
 #          read as 20), gap_length_mm (K, 2) (wrist gap, NaN: off or an older burst), gap_axis (K, 2, 3)
 #          (unit vector from the middle knuckle to the wrist, up the arm), gap_wrist (K, 2, 3) (where the
 #          gap starts: the arm's wrist when the arm has a motion), gap_set_mm (K, 2) (the gap each arm was
-#          set to, 0: off or an older burst; set while gap_length_mm is NaN: the joints were not located)
+#          set to, 0: off or an older burst; set while gap_length_mm is NaN: the joints were not located).
+#          Step 1b of the arm plan, the arm's own sample history (burst version 4; older bursts: NaN / -1 /
+#          False): arm_capture_wrist (K, 2, 3) (the wrist the history gave for the depth's capture time, the
+#          arm's place in the depth; NaN: not mode 2, a buffer miss, or plain depth for a displacement over
+#          25 cm), arm_estimator (K, 2) (-1: not mode 2, or an older burst), arm_reset (K, 2) (the history was emptied in this frame: the hand was lost). In mode 2
+#          arm_history_ns / arm_wrist_history are the newest sample and arm_target_ns the time the placed
+#          wrist stands for
+# samples: the arm's own hand samples (burst version 4; empty for older bursts), a list per hand (0 left,
+#          1 right) of dicts of arrays in time order: time_ns (when the sample shows the hand), seen_ns (when
+#          the app got it first), wrist (N, 3), capture_time (N,) bool (time_ns is the runtime's capture
+#          time, else seen_ns - arm_sample_age_ms), display (N,) index of the display frame that got it
+#          (0 also for the samples the history held when the burst started: the first record has them all),
+#          segment (N,) count of arm_reset up to that frame (no interval across a reset)
 # camera:  image_ns, now_ns (C,), intrinsics (C, 4) fx fy cx cy, position (C, 3), orientation (C, 4),
 #          head_position, head_orientation, joints (C, 2, 26, 4), rgb (C, H, W, 3) uint8
 # regions: list of the region JSON objects; index: the whole index JSON
@@ -149,7 +161,11 @@ def load_burst(path, images=True):
         "gap_axis": np.full((k, 2, 3), np.nan),
         "gap_wrist": np.full((k, 2, 3), np.nan),
         "gap_set_mm": np.zeros((k, 2)),
+        "arm_capture_wrist": np.full((k, 2, 3), np.nan),
+        "arm_estimator": np.full((k, 2), -1, np.int64),
+        "arm_reset": np.zeros((k, 2), bool),
     }
+    new_samples = [[], []]
     for i, r in enumerate(display_records):
         _hands(r["hands"], display["joints"], display["tracked"], display["velocities"], i)
         for side, hand in enumerate(r["capsules"]):
@@ -176,6 +192,29 @@ def load_burst(path, images=True):
                 display["gap_axis"][i, side] = _floats(gap["axis"], 3)
                 display["gap_wrist"][i, side] = _floats(gap["wrist"], 3)
         display["gap_set_mm"][i] = _floats(r.get("arm_gap_set_mm", [0.0, 0.0]), 2)
+        # Version 4: the arm's own sample history
+        for side, hand in enumerate(r.get("arm_samples") or [None, None]):
+            if hand is None:
+                continue
+            display["arm_reset"][i, side] = hand["reset"]
+            display["arm_estimator"][i, side] = hand["estimator"]
+            if hand["capture_wrist"] is not None:
+                display["arm_capture_wrist"][i, side] = _floats(hand["capture_wrist"], 3)
+            for sample in hand["new"]:
+                new_samples[side].append((sample["time_ns"], sample["seen_ns"], _floats(sample["wrist"], 3), sample["capture_time"], i))
+    # A reset in a record comes before its new samples
+    resets = np.cumsum(display["arm_reset"], axis=0)
+    samples = [
+        {
+            "time_ns": np.array([s[0] for s in side], np.int64),
+            "seen_ns": np.array([s[1] for s in side], np.int64),
+            "wrist": np.array([s[2] for s in side], np.float64).reshape(len(side), 3),
+            "capture_time": np.array([s[3] for s in side], bool),
+            "display": np.array([s[4] for s in side], np.int64),
+            "segment": np.array([resets[s[4], hand] for s in side], np.int64),
+        }
+        for hand, side in enumerate(new_samples)
+    ]
 
     camera_records = by_kind["camera"]
     c = len(camera_records)
@@ -216,6 +255,7 @@ def load_burst(path, images=True):
         "camera": camera,
         "regions": [r["region"] for r in by_kind["region"]],
         "key_lut": key_lut,
+        "samples": samples,
     }
 
 
@@ -298,6 +338,28 @@ def summary(burst):
             )
         arm_parts.append(part)
     lines.append("display frames per arm mode (burst version %d): %s" % (index.get("version", 1), "; ".join(arm_parts)))
+    sample_parts = []
+    for side, name in enumerate(("left", "right")):
+        hand = burst["samples"][side]
+        if not len(hand["time_ns"]):
+            continue
+        # Intervals within a segment only: none across a reset (the hand lost in between)
+        same = np.diff(hand["segment"]) == 0
+        part = "%s %d, interval %s" % (name, len(hand["time_ns"]), _stats((np.diff(hand["time_ns"]) / 1e6)[same]))
+        timed = hand["capture_time"]
+        if timed.any():
+            part += ", age when first seen (captureTime, %d samples) %s" % (
+                int(timed.sum()),
+                _stats((hand["seen_ns"] - hand["time_ns"])[timed] / 1e6),
+            )
+        part += ", resets %d" % int(display["arm_reset"][:, side].sum())
+        sample_parts.append(part)
+    if sample_parts:
+        estimators = np.unique(display["arm_estimator"][display["arm_estimator"] >= 0])
+        lines.append(
+            "arm's own hand samples (estimator %s): %s"
+            % ("/".join(str(e) for e in estimators), "; ".join(sample_parts))
+        )
     cuts = np.unique(display["edge_cut"])
     gap_parts = []
     for side, name in enumerate(("left", "right")):

@@ -1,6 +1,7 @@
 #[cfg(target_os = "android")]
 use crate::auto_color_key::AutoColorKey;
 use crate::{
+    arm_history::{ArmEstimator, HandHistory, HandSample},
     burst::{self, BurstRecorder},
     extra_extensions::EnvironmentDepthMETA,
     graphics::{self, ProjectionLayerAlphaConfig, ProjectionLayerBuilder},
@@ -21,10 +22,11 @@ use alvr_common::{
     parking_lot::RwLock,
 };
 use alvr_graphics::{
-    ArmGap, ArmMotion, BridgeChoice, BurstHand, BurstLut, ColorKeyInput, DepthDumpFiles,
-    DepthDumpRequest, DepthFrame, DepthRenderInput, DumpJoint, EditorHand, EditorInput,
-    GraphicsContext, HAND_SEGMENTS, HandRay, HandShape, HandZones, LeakGains, OverlaySegment,
-    PlacedArea, SEGMENT_JOINTS, StreamRenderer, StreamViewParams, WristBridge,
+    ArmGap, ArmMotion, BridgeChoice, BurstArmSample, BurstArmSamples, BurstHand, BurstLut,
+    ColorKeyInput, DepthDumpFiles, DepthDumpRequest, DepthFrame, DepthRenderInput, DumpJoint,
+    EditorHand, EditorInput, GraphicsContext, HAND_SEGMENTS, HandRay, HandShape, HandZones,
+    LeakGains, OverlaySegment, PlacedArea, SEGMENT_JOINTS, StreamRenderer, StreamViewParams,
+    WristBridge,
 };
 use alvr_packets::{ClientStreamConfig, RealTimeConfig, TrackingData};
 use alvr_session::{
@@ -75,32 +77,40 @@ const KEY_CROP_MARGIN: f32 = 0.03;
 // Per hand for the log: ring, map, known share of the map, leak, rim
 type LeakLog = Option<(f32, Option<f32>, f32, f32, f32)>;
 
-// `debug.alvr.arm_shift 2`: the wrist is looked up this long before the history time too, for a
-// velocity by finite difference
-const ARM_VELOCITY_GAP: Duration = Duration::from_millis(30);
-// Longest step of the wrist from the history time to the target time (m)
+// Longest step of the placed wrist from the newest hand sample (m)
 const MAX_ARM_EXTRAPOLATION: f32 = 0.06;
+// Without XR_META_hand_tracking_unextrapolated_poses the newest hand sample is read with a lookup this
+// long before now: the runtime returns its newest sample for any time before it (the sample is 35-65 ms
+// old), never the hand at that time. Only the sample is used, the time asked for is not
+const ARM_SAMPLE_LOOKUP_AGE: Duration = Duration::from_millis(100);
 // The `arm:` line is logged this often while an arm uses `arm_shift 2`, and on each change of the
 // properties
 const ARM_LOG_INTERVAL: Duration = Duration::from_secs(2);
 
-/// `debug.alvr.arm_shift` and the properties of its mode 2 (step 1 of `docs/arm-mask-build-plan.md`)
+/// `debug.alvr.arm_shift` and the properties of its mode 2 (steps 1 and 1b of
+/// `docs/arm-mask-build-plan.md`)
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ArmParams {
     /// 0: plain depth. 1: the depth around each arm moves with the display-time wrist, weighted by a
-    /// smoothstep to 45 cm. 2: with a wrist looked up in the past and extrapolated to a target time,
-    /// weighted linearly
+    /// smoothstep to 45 cm. 2: moved from the wrist of the arm's own sample history at the depth's
+    /// capture time to the wrist of `estimator`, weighted linearly
     shift: i64,
     /// Arms that use mode 2 when `shift` is 2 (1 left, 2 right, 3 both). The others use mode 1, to
     /// compare them side by side
     hands: i64,
-    /// The arm is placed for the display time minus this (the passthrough latency)
+    /// The arm is placed for the display time minus this (the passthrough latency), with the line or
+    /// the parabola. The held sample stands for its own time
     target_ms: i64,
-    /// The wrist is looked up at the display time minus this (at least `target_ms`): the newest
-    /// estimate of the runtime is late, the past is accurate
-    history_ms: i64,
     /// Length of the linear weight
     weight_mm: i64,
+    /// `debug.alvr.arm_estimator`: how the placed wrist comes from the history (0 hold, the default)
+    estimator: ArmEstimator,
+    /// `debug.alvr.arm_sample_age_ms`: how old a hand sample is when the app first gets it, for its time
+    /// when the runtime gives no capture time (or `capture_time` is off)
+    sample_age_ms: i64,
+    /// `debug.alvr.arm_capture_time`: the times of the hand samples are the runtime's capture times if it
+    /// gives them (1, default), or always the time seen minus `sample_age_ms` (0)
+    capture_time: bool,
 }
 
 impl ArmParams {
@@ -113,12 +123,16 @@ impl ArmParams {
             target_ms: debug_property("debug.alvr.arm_target_ms")
                 .unwrap_or(40)
                 .clamp(0, 150),
-            history_ms: debug_property("debug.alvr.arm_history_ms")
-                .unwrap_or(80)
-                .clamp(0, 200),
             weight_mm: debug_property("debug.alvr.arm_weight_mm")
                 .unwrap_or(300)
                 .clamp(100, 600),
+            estimator: ArmEstimator::from_value(
+                debug_property("debug.alvr.arm_estimator").unwrap_or(0),
+            ),
+            sample_age_ms: debug_property("debug.alvr.arm_sample_age_ms")
+                .unwrap_or(35)
+                .clamp(0, 150),
+            capture_time: debug_property("debug.alvr.arm_capture_time").unwrap_or(1) != 0,
         }
     }
 
@@ -127,17 +141,14 @@ impl ArmParams {
         self.shift == 2 && self.hands & (1 << hand) != 0
     }
 
-    // Mode 2 at the display time `display_ns`: the target time T, the history time H (ns) and how far
-    // the wrist is moved ahead from H to T (s, never negative)
-    fn times(&self, display_ns: i64) -> (i64, i64, f32) {
-        let target_ns = display_ns - self.target_ms * 1_000_000;
-        let history_ns = display_ns - self.history_ms.max(self.target_ms) * 1_000_000;
+    // Mode 2 at the display time `display_ns`: the target time T of the line and the parabola
+    fn target_ns(&self, display_ns: i64) -> i64 {
+        display_ns - self.target_ms * 1_000_000
+    }
 
-        (
-            target_ns,
-            history_ns,
-            (target_ns - history_ns) as f32 * 1e-9,
-        )
+    // The samples kept so far have times of another rule: the histories start again
+    fn changes_sample_times(&self, other: &Self) -> bool {
+        self.sample_age_ms != other.sample_age_ms || self.capture_time != other.capture_time
     }
 }
 
@@ -213,13 +224,11 @@ fn arm_shift_mode(value: i64) -> i64 {
     }
 }
 
-// The joint lookups of an arm, counted apart for the `arm:` line
+// The joint lookups of an arm in mode 1, counted apart for the `arm:` line
 #[derive(Clone, Copy)]
 enum Lookup {
-    // The wrist the arm is placed from: at H in mode 2, at the display time minus `key_delay` in mode 1
+    // The wrist the arm is placed from: at the display time minus `key_delay`
     Place,
-    // Mode 2: 30 ms before H, for the velocity
-    Velocity,
     // At the capture time of the depth image
     Capture,
 }
@@ -227,16 +236,25 @@ enum Lookup {
 // What the `arm:` line reports of one arm since the last one
 #[derive(Default)]
 struct ArmHandLog {
-    // Mode 2, frames with a velocity only: how far the wrist was extrapolated (mm), the speed of the
-    // finite difference (m/s). The distance between the wrist of the hand capsules and the wrist the arm
+    // Mode 2 with the line or the parabola: how far the wrist was placed from the newest sample (mm:
+    // ahead, or back for a target inside the history), the speed it was extrapolated with (m/s, 0 back).
+    // The distance between the wrist of the hand capsules and the wrist the arm
     // is placed with (mm)
     extrapolated_mm: Vec<f32>,
     speeds: Vec<f32>,
     gaps_mm: Vec<f32>,
-    // Frames with a hand tracker, and the failed lookups per `Lookup`. A failed `Place` lookup skips the
-    // `Capture` one
+    // Frames with a hand tracker, and the failed lookups of mode 1 per `Lookup`. A failed `Place` lookup
+    // skips the `Capture` one
     frames: u32,
-    failed: [u32; 3],
+    failed: [u32; 2],
+    // The arm's own sample history: new samples, the time between them (ms), the age of those with a
+    // capture time when first seen (ms), how often it was emptied (the hand lost), and mode 2's frames
+    // without a sample at the depth's capture time (plain depth for the arm)
+    samples: u32,
+    intervals_ms: Vec<f32>,
+    ages_ms: Vec<f32>,
+    resets: u32,
+    misses: u32,
 }
 
 impl ArmHandLog {
@@ -249,20 +267,47 @@ impl ArmHandLog {
         result
     }
 
-    // For the `arm:` line
-    fn lookups_text(&self, is_new: bool) -> String {
-        let [place, velocity, capture] = self.failed;
-        if is_new {
-            format!(
-                "lookups failed H {place}, H-30 {velocity}, capture {capture} of {} frames",
-                self.frames
-            )
-        } else {
-            format!(
-                "lookups failed display {place}, capture {capture} of {} frames",
-                self.frames
-            )
-        }
+    // For the `arm:` line, mode 1
+    fn lookups_text(&self) -> String {
+        let [place, capture] = self.failed;
+        format!(
+            "lookups failed display {place}, capture {capture} of {} frames",
+            self.frames
+        )
+    }
+
+    // For the `arm:` line, mode 2: the sample history. `sample_age_ms` is the age used for samples
+    // without a capture time
+    fn samples_text(&mut self, sample_age_ms: i64) -> String {
+        let interval = median_p90(&mut self.intervals_ms)
+            .map_or(format!("{} samples", self.samples), |(median, p90)| {
+                format!("{} samples every {median:.1} ms p90 {p90:.1}", self.samples)
+            });
+        let timed = self.ages_ms.len();
+        let age = match median_p90(&mut self.ages_ms) {
+            Some((median, p90)) if timed as u32 == self.samples => {
+                format!("age {median:.0} ms p90 {p90:.0} (captureTime)")
+            }
+            Some((median, p90)) => format!(
+                "age {median:.0} ms p90 {p90:.0} (captureTime, {timed} samples), else {sample_age_ms} ms"
+            ),
+            None => format!("age {sample_age_ms} ms (arm_sample_age_ms)"),
+        };
+
+        format!(
+            "{interval}, {age}, buffer misses {} of {} frames, resets {}",
+            self.misses, self.frames, self.resets
+        )
+    }
+}
+
+// A sample of the arm's history as bursts record it
+fn burst_arm_sample(sample: &HandSample) -> BurstArmSample {
+    BurstArmSample {
+        time_ns: sample.time_ns,
+        seen_ns: sample.seen_ns,
+        wrist: sample.wrist,
+        from_capture_time: sample.from_capture_time,
     }
 }
 
@@ -372,8 +417,18 @@ pub struct StreamContext {
     #[cfg(target_os = "android")]
     auto_color_key: Option<AutoColorKey>,
     // The depth of the arms is shifted by the motion of the wrist since the depth image was captured.
-    // `setprop debug.alvr.arm_shift 0`: plain depth, 2: the past-time wrist and the linear weight
+    // `setprop debug.alvr.arm_shift 0`: plain depth, 2: from the arm's own sample history, the linear
+    // weight
     arm_params: ArmParams,
+    // The hand samples of each arm (`arm_history.rs`), filled every frame with a depth mask. With
+    // XR_META_hand_tracking_unextrapolated_poses enabled the samples come with their capture time
+    arm_histories: [HandHistory; 2],
+    unextrapolated_poses: bool,
+    // Of this frame, for bursts: per hand the new samples, whether the history was emptied, the
+    // capture-time wrist of mode 2. Filled only while a burst records; its first record gets every sample
+    // kept (`arm_samples_recording`: the last frame was recorded)
+    arm_samples: [BurstArmSamples; 2],
+    arm_samples_recording: bool,
     // For the `arm:` line: since when, whether the properties changed, per arm
     last_arm_log: Instant,
     arm_params_changed: bool,
@@ -534,7 +589,7 @@ impl StreamContext {
             config.upscaling.clone(),
         );
 
-        {
+        let unextrapolated_poses = {
             let int_ctx = interaction_ctx.read();
             core_ctx.send_active_interaction_profile(
                 *HAND_LEFT_ID,
@@ -546,7 +601,11 @@ impl StreamContext {
                 int_ctx.hands_interaction[1].controllers_profile_id,
                 int_ctx.hands_interaction[1].input_ids.clone(),
             );
-        }
+
+            int_ctx.has_extra_extension(
+                crate::extra_extensions::META_HAND_TRACKING_UNEXTRAPOLATED_POSES_EXTENSION_NAME,
+            )
+        };
 
         let input_thread_running = Arc::new(RelaxedAtomic::new(false));
         let hands_withheld = Arc::new(RelaxedAtomic::new(false));
@@ -590,6 +649,10 @@ impl StreamContext {
             // The settings at the start are logged once
             arm_params_changed: true,
             arm_log: Default::default(),
+            arm_histories: Default::default(),
+            unextrapolated_poses,
+            arm_samples: Default::default(),
+            arm_samples_recording: false,
             mask_params: None,
             key_wrists: Cell::new([None; 2]),
             published_lut: None,
@@ -894,6 +957,11 @@ impl StreamContext {
 
         let arm_params = ArmParams::read();
         if arm_params != self.arm_params {
+            if arm_params.changes_sample_times(&self.arm_params) {
+                for (history, samples) in self.arm_histories.iter_mut().zip(&mut self.arm_samples) {
+                    samples.reset |= history.clear();
+                }
+            }
             self.arm_params = arm_params;
             self.arm_params_changed = true;
         }
@@ -1014,8 +1082,109 @@ impl StreamContext {
                     .map_or(0.0, |params| params.gap_mm as f32)
             }),
             edge_cut: depth_input.edge_cut,
+            arm_samples: std::mem::take(&mut self.arm_samples),
             region,
         });
+    }
+
+    // The arm's own sample history (`arm_history.rs`): the newest hand sample of each hand, kept if it is
+    // new. With XR_META_hand_tracking_unextrapolated_poses a lookup at now asks for the sample as it is and
+    // its capture time. Without it a lookup `ARM_SAMPLE_LOOKUP_AGE` before now returns the sample (the
+    // runtime gives its newest sample for any time before it), timed by `arm_sample_age_ms`. The runtime is
+    // never asked for the hand at a past time. A hand that is not located empties its history: where it
+    // comes back the arm starts again, with no velocity from the old place
+    fn update_arm_histories(&mut self) {
+        let params = self.arm_params;
+        let now_ns = runtime_now_ns(&self.xr_session);
+        let unextrapolated = self.unextrapolated_poses && params.capture_time;
+        let lookup_ns = if unextrapolated {
+            now_ns
+        } else {
+            now_ns - ARM_SAMPLE_LOOKUP_AGE.as_nanos() as i64
+        };
+        let age_ns = params.sample_age_ms * 1_000_000;
+        // Samples for bursts only while one records (no allocation otherwise). Its first record gets every
+        // sample kept, so that the capture-time wrists of its first frames can be rebuilt
+        let recording = self.burst.is_recording();
+        let records_history = recording && !self.arm_samples_recording;
+        self.arm_samples_recording = recording;
+        let int_ctx = self.interaction_context.read();
+
+        for i in 0..2 {
+            let history = &mut self.arm_histories[i];
+            let samples = &mut self.arm_samples[i];
+            samples.estimator = if params.is_new(i) {
+                params.estimator.value()
+            } else {
+                -1
+            };
+            // Counted only while the `arm:` line reports this arm, which empties the counts
+            let log = params.is_new(i).then_some(&mut self.arm_log[i]);
+
+            let located = int_ctx.hands_interaction[i]
+                .skeleton_tracker
+                .as_ref()
+                .and_then(|tracker| {
+                    crate::extra_extensions::locate_hand_sample(
+                        &self.xr_session,
+                        tracker,
+                        &self.stage_reference_space,
+                        xr::Time::from_nanos(lookup_ns),
+                        unextrapolated,
+                    )
+                    .ok()
+                    .flatten()
+                });
+            let sample = located.and_then(|(joints, capture_time)| {
+                let position = |joint: xr::HandJointEXT| {
+                    let joint = joints[joint];
+                    joint
+                        .location_flags
+                        .contains(xr::SpaceLocationFlags::POSITION_VALID)
+                        .then(|| crate::from_xr_vec3(joint.pose.position))
+                };
+
+                Some((
+                    position(xr::HandJointEXT::WRIST)?,
+                    position(xr::HandJointEXT::MIDDLE_PROXIMAL)?,
+                    capture_time.map(|time| time.as_nanos()),
+                ))
+            });
+            let Some((wrist, knuckle, capture_ns)) = sample else {
+                if history.clear() {
+                    samples.reset = true;
+                    if let Some(log) = log {
+                        log.resets += 1;
+                    }
+                }
+                continue;
+            };
+
+            let previous_ns = history.newest().map(|sample| sample.time_ns);
+            let Some(sample) = history.push(now_ns, wrist, knuckle, capture_ns, age_ns) else {
+                continue;
+            };
+            if recording {
+                samples.new.push(burst_arm_sample(&sample));
+            }
+            if let Some(log) = log {
+                log.samples += 1;
+                if let Some(previous_ns) = previous_ns {
+                    log.intervals_ms
+                        .push((sample.time_ns - previous_ns) as f32 * 1e-6);
+                }
+                if sample.from_capture_time {
+                    log.ages_ms
+                        .push((sample.seen_ns - sample.time_ns) as f32 * 1e-6);
+                }
+            }
+        }
+
+        if records_history {
+            for (history, samples) in self.arm_histories.iter().zip(&mut self.arm_samples) {
+                samples.new = history.samples().map(burst_arm_sample).collect();
+            }
+        }
     }
 
     // How the arms moved since the depth image was captured. None if `debug.alvr.arm_shift` is 0
@@ -1036,16 +1205,15 @@ impl StreamContext {
         }
 
         let display_ns = display_time.as_nanos();
+        let capture_ns = capture_time.as_nanos();
         // Mode 1: the wrist for the moment the passthrough image shows, the newest estimate of the
         // runtime (late while the arm moves)
         let delay = self
             .color_key
             .map_or(0, |params| params.passthrough_delay_ms * 1_000_000);
         let now_ns = display_ns - delay;
-        // Mode 2: the arm is placed for the target time T, from the wrist at the history time H (accurate,
-        // it is in the past) moved ahead to T
-        let (target_ns, history_ns, ahead_s) = params.times(display_ns);
-        let gap_s = ARM_VELOCITY_GAP.as_secs_f32();
+        // Mode 2: the line and the parabola place the arm for the target time T
+        let target_ns = params.target_ns(display_ns);
         let weight_len = params.weight_mm as f32 / 1000.0;
         let int_ctx = self.interaction_context.read();
 
@@ -1058,56 +1226,68 @@ impl StreamContext {
         [0, 1].map(|i| {
             let tracker = int_ctx.hands_interaction[i].skeleton_tracker.as_ref()?;
             let log = &mut self.arm_log[i];
-            let wrist = |time_ns: i64| {
-                let joints = self
-                    .stage_reference_space
-                    .locate_hand_joints(tracker, xr::Time::from_nanos(time_ns))
-                    .ok()
-                    .flatten()?;
-                let wrist = joints[xr::HandJointEXT::WRIST];
-
-                wrist
-                    .location_flags
-                    .contains(xr::SpaceLocationFlags::POSITION_VALID)
-                    .then(|| crate::from_xr_vec3(wrist.pose.position))
-            };
-
             let is_new = params.is_new(i);
             log.frames += 1;
-            // The wrist the arm is placed with, when it was looked up and from where, how far it was
-            // extrapolated, the speed of the finite difference
-            let (wrist_now, arm_target_ns, arm_history_ns, wrist_history, extrapolated, speed) =
+
+            // The wrist the arm is placed with, the one in the depth, and for bursts the time placed for,
+            // the newest sample's time and wrist, how far the wrist was extrapolated
+            let (wrist_now, wrist_capture, arm_target_ns, sample_ns, wrist_sample, extrapolated) =
                 if is_new {
-                    let w_h = log.count(Lookup::Place, wrist(history_ns))?;
-                    let w_p = log.count(
-                        Lookup::Velocity,
-                        wrist(history_ns - ARM_VELOCITY_GAP.as_nanos() as i64),
-                    );
-                    let (wrist_t, extrapolated) = alvr_graphics::arm_target_wrist(
-                        w_h,
-                        w_p,
-                        gap_s,
-                        ahead_s,
-                        MAX_ARM_EXTRAPOLATION,
-                    );
-                    let speed = w_p.map(|w_p| w_h.distance(w_p) / gap_s);
+                    // Mode 2, from the arm's own history: the depth's arm is where the history was at
+                    // the capture time. No sample that early (the hand came back, or mode 2 just
+                    // started): plain depth for this arm, counted as a miss
+                    let history = &self.arm_histories[i];
+                    let newest = history.newest().copied();
+                    let placed = history.place(params.estimator, target_ns, MAX_ARM_EXTRAPOLATION);
+                    let capture = history.at(capture_ns);
+                    let (Some(newest), Some(placed), Some((wrist_capture, _))) =
+                        (newest, placed, capture)
+                    else {
+                        log.misses += 1;
+                        return None;
+                    };
+                    if params.estimator != ArmEstimator::Hold {
+                        log.extrapolated_mm.push(placed.extrapolated * 1000.0);
+                        log.speeds.push(placed.speed);
+                    }
 
-                    (wrist_t, target_ns, history_ns, w_h, extrapolated, speed)
+                    (
+                        placed.wrist,
+                        wrist_capture,
+                        placed.time_ns,
+                        newest.time_ns,
+                        newest.wrist,
+                        placed.extrapolated,
+                    )
                 } else {
-                    let wrist_now = log.count(Lookup::Place, wrist(now_ns))?;
+                    // Mode 1, as before step 1: two lookups of the runtime. The one at the capture time
+                    // returns the runtime's newest sample, not the wrist at that time (the runtime
+                    // doesn't answer past lookups, `arm_history.rs`): kept as it was, as the comparison
+                    // for mode 2
+                    let wrist = |time_ns: i64| {
+                        let joints = self
+                            .stage_reference_space
+                            .locate_hand_joints(tracker, xr::Time::from_nanos(time_ns))
+                            .ok()
+                            .flatten()?;
+                        let wrist = joints[xr::HandJointEXT::WRIST];
 
-                    (wrist_now, now_ns, now_ns, wrist_now, 0.0, None)
+                        wrist
+                            .location_flags
+                            .contains(xr::SpaceLocationFlags::POSITION_VALID)
+                            .then(|| crate::from_xr_vec3(wrist.pose.position))
+                    };
+                    let wrist_now = log.count(Lookup::Place, wrist(now_ns))?;
+                    let wrist_capture = log.count(Lookup::Capture, wrist(capture_ns))?;
+
+                    (wrist_now, wrist_capture, now_ns, now_ns, wrist_now, 0.0)
                 };
-            let displacement =
-                wrist_now - log.count(Lookup::Capture, wrist(capture_time.as_nanos()))?;
+            let displacement = wrist_now - wrist_capture;
             if displacement.length() > MAX_DISPLACEMENT {
                 return None;
             }
-            // Only frames with a velocity: without the wrist 30 ms before H there is no step, and the
-            // `Velocity` failures count those frames
-            if let Some(speed) = speed {
-                log.extrapolated_mm.push(extrapolated * 1000.0);
-                log.speeds.push(speed);
+            if is_new {
+                self.arm_samples[i].capture_wrist = Some(wrist_capture);
             }
 
             let side = if i == 0 { -1.0 } else { 1.0 };
@@ -1120,19 +1300,21 @@ impl StreamContext {
                 weight_len: if is_new { weight_len } else { 0.0 },
                 mode: if is_new { 2 } else { 1 },
                 target_ns: arm_target_ns,
-                history_ns: arm_history_ns,
-                wrist_history,
+                history_ns: sample_ns,
+                wrist_history: wrist_sample,
                 extrapolated,
             })
         })
     }
 
     // The wrist gap of each arm (`debug.alvr.arm_gap_mm`), with the joints of the time the arm is placed
-    // for: the arm's target time with a motion (`arm_shift 2`: T, `arm_shift 1`: the display time minus
-    // `key_delay`). Without a motion (`arm_shift 0`, or the arm's lookup failed) the depth's own arm is
-    // drawn, so the joints of the depth's capture time (the display time minus `key_delay` while there is
-    // none). With a motion the gap starts at the arm's wrist, so that it continues the moved arm. None:
-    // off, or the wrist or the middle knuckle not located
+    // for. `arm_shift 2`: the gap starts at the arm's wrist, along the newest sample of the arm's history.
+    // `arm_shift 1`: the joints of the display time minus `key_delay`, the gap at the arm's wrist. Without
+    // a motion (`arm_shift 0`, or no motion for this arm) the depth's own arm is drawn, so the joints of the
+    // depth's capture time, from the history (its oldest sample if the capture time is earlier, none in a
+    // gap of the history; the joints
+    // of the display time minus `key_delay` while there is no depth image). None: off, or the wrist or the
+    // middle knuckle not located
     fn arm_gaps(
         &self,
         display_time: xr::Time,
@@ -1144,30 +1326,47 @@ impl StreamContext {
         let delay = self
             .color_key
             .map_or(0, |params| params.passthrough_delay_ms * 1_000_000);
-        let still_ns = self
-            .depth_capture_time
-            .map_or(display_time.as_nanos() - delay, |time| time.as_nanos());
         let int_ctx = self.interaction_context.read();
 
         [0, 1].map(|i| {
             let length = params.gap(i)?;
             let tracker = int_ctx.hands_interaction[i].skeleton_tracker.as_ref()?;
+            let history = &self.arm_histories[i];
             let arm = arms[i];
-            let time_ns = arm.map_or(still_ns, |arm| arm.target_ns);
-            let joints = self
-                .stage_reference_space
-                .locate_hand_joints(tracker, xr::Time::from_nanos(time_ns))
-                .ok()
-                .flatten()?;
-            let position = |joint: xr::HandJointEXT| {
-                let joint = joints[joint];
-                joint
-                    .location_flags
-                    .contains(xr::SpaceLocationFlags::POSITION_VALID)
-                    .then(|| crate::from_xr_vec3(joint.pose.position))
+            let (wrist, knuckle) = match (arm, self.depth_capture_time) {
+                (Some(arm), _) if arm.mode == 2 => {
+                    let newest = history.newest()?;
+                    (newest.wrist, newest.knuckle)
+                }
+                (None, Some(capture_time)) => {
+                    let capture_ns = capture_time.as_nanos();
+                    history.at(capture_ns).or_else(|| {
+                        history
+                            .oldest()
+                            .filter(|sample| sample.time_ns > capture_ns)
+                            .map(|sample| (sample.wrist, sample.knuckle))
+                    })?
+                }
+                _ => {
+                    let time_ns = arm.map_or(display_time.as_nanos() - delay, |arm| arm.target_ns);
+                    let joints = self
+                        .stage_reference_space
+                        .locate_hand_joints(tracker, xr::Time::from_nanos(time_ns))
+                        .ok()
+                        .flatten()?;
+                    let position = |joint: xr::HandJointEXT| {
+                        let joint = joints[joint];
+                        joint
+                            .location_flags
+                            .contains(xr::SpaceLocationFlags::POSITION_VALID)
+                            .then(|| crate::from_xr_vec3(joint.pose.position))
+                    };
+                    (
+                        position(xr::HandJointEXT::WRIST)?,
+                        position(xr::HandJointEXT::MIDDLE_PROXIMAL)?,
+                    )
+                }
             };
-            let wrist = position(xr::HandJointEXT::WRIST)?;
-            let knuckle = position(xr::HandJointEXT::MIDDLE_PROXIMAL)?;
 
             Some(ArmGap {
                 wrist: arm.map_or(wrist, |arm| arm.wrist),
@@ -1179,8 +1378,8 @@ impl StreamContext {
 
     // The `arm:` line on `ALVR_CAM`: on each change of the `arm_*` properties (the settings only), and
     // every `ARM_LOG_INTERVAL` while an arm uses mode 2. `key_wrists` and `arms` are of this frame: the
-    // hand-to-arm wrist gap tells whether the hand capsules (display-time joints) and the arm (the
-    // target time) part during fast moves
+    // hand-to-arm wrist gap tells whether the hand capsules (display-time joints) and the arm (the placed
+    // wrist) part during fast moves
     fn log_arms(&mut self, arms: &[Option<ArmMotion>; 2]) {
         let key_wrists = self.key_wrists.get();
         for ((log, arm), key_wrist) in self.arm_log.iter_mut().zip(arms).zip(key_wrists) {
@@ -1203,18 +1402,37 @@ impl StreamContext {
         let mut text = match (params.shift, params.hands) {
             (0, _) => "mode 0 (plain depth)".to_string(),
             (1, _) => "mode 1 (display-time wrist, smoothstep to 45 cm)".to_string(),
-            (_, hands) => format!(
-                "mode 2 ({}), target display-{} ms from history -{} ms, weight {} mm",
-                match hands {
-                    3 => "both",
-                    1 => "left; right 1",
-                    2 => "right; left 1",
-                    _ => "no arm; both 1",
-                },
-                params.target_ms,
-                params.history_ms.max(params.target_ms),
-                params.weight_mm,
-            ),
+            (_, hands) => {
+                let target = if params.estimator == ArmEstimator::Hold {
+                    String::new()
+                } else {
+                    format!(" to display-{} ms", params.target_ms)
+                };
+                format!(
+                    "mode 2 ({}), estimator {} ({}{target}), weight {} mm, sample times {}",
+                    match hands {
+                        3 => "both",
+                        1 => "left; right 1",
+                        2 => "right; left 1",
+                        _ => "no arm; both 1",
+                    },
+                    params.estimator.value(),
+                    params.estimator.name(),
+                    params.weight_mm,
+                    match (params.capture_time, self.unextrapolated_poses) {
+                        (true, true) =>
+                            format!("from captureTime, else seen-{} ms", params.sample_age_ms),
+                        (false, _) => format!(
+                            "seen-{} ms (captureTime off by arm_capture_time 0)",
+                            params.sample_age_ms
+                        ),
+                        (true, false) => format!(
+                            "seen-{} ms (the runtime has no captureTime)",
+                            params.sample_age_ms
+                        ),
+                    },
+                )
+            }
         };
         // The counts since the last line belong to the old settings
         if self.arm_params_changed {
@@ -1225,24 +1443,28 @@ impl StreamContext {
 
         for (i, mut log) in logs.into_iter().enumerate() {
             let name = if i == 0 { "L" } else { "R" };
-            let lookups = log.lookups_text(params.is_new(i));
             if !params.is_new(i) {
-                text += &format!("; {name} mode 1, {lookups}");
+                text += &format!("; {name} mode 1, {}", log.lookups_text());
                 continue;
             }
-            let extrapolated = median_p90(&mut log.extrapolated_mm).map_or(
-                "no velocity".to_string(),
-                |(median, p90)| {
-                    let speed = median_p90(&mut log.speeds)
-                        .map_or("-".to_string(), |(median, _)| format!("{median:.2}"));
-                    format!("extrapolated {median:.0} mm p90 {p90:.0} at {speed} m/s")
-                },
-            );
+            let samples = log.samples_text(params.sample_age_ms);
+            let extrapolated = if params.estimator == ArmEstimator::Hold {
+                String::new()
+            } else {
+                median_p90(&mut log.extrapolated_mm).map_or(
+                    ", not placed".to_string(),
+                    |(median, p90)| {
+                        let speed = median_p90(&mut log.speeds)
+                            .map_or("-".to_string(), |(median, _)| format!("{median:.2}"));
+                        format!(", placed {median:.0} mm p90 {p90:.0} from the newest sample at {speed} m/s")
+                    },
+                )
+            };
             let gap = median_p90(&mut log.gaps_mm)
                 .map_or("- (no hand capsules)".to_string(), |(median, p90)| {
                     format!("{median:.0} mm p90 {p90:.0}")
                 });
-            text += &format!("; {name} {extrapolated}, {lookups}, hand-to-arm wrist gap {gap}");
+            text += &format!("; {name} {samples}{extrapolated}, hand-to-arm wrist gap {gap}");
         }
         crate::stream_log(&format!("arm: {text}"));
     }
@@ -1788,7 +2010,9 @@ impl StreamContext {
 
         let (frame, capture_time) = frame.unzip();
         self.depth_capture_time = capture_time.flatten();
+        self.arm_samples = Default::default();
         self.poll_properties();
+        self.update_arm_histories();
         let arms = self.depth_capture_time.map_or([None; 2], |time| {
             self.arm_motions(display_time, time, current_headset_views)
         });
@@ -2355,13 +2579,15 @@ fn stream_input_loop(
 mod tests {
     use super::*;
 
-    fn params(shift: i64, hands: i64, target_ms: i64, history_ms: i64) -> ArmParams {
+    fn params(shift: i64, hands: i64, target_ms: i64) -> ArmParams {
         ArmParams {
             shift,
             hands,
             target_ms,
-            history_ms,
             weight_mm: 300,
+            estimator: ArmEstimator::Hold,
+            sample_age_ms: 35,
+            capture_time: true,
         }
     }
 
@@ -2416,30 +2642,49 @@ mod tests {
     #[test]
     fn arm_hands_select_mode_2() {
         // Bit 1: left (hand 0), bit 2: right (hand 1)
-        let both = params(2, 3, 40, 80);
+        let both = params(2, 3, 40);
         assert!(both.is_new(0) && both.is_new(1));
-        let left = params(2, 1, 40, 80);
+        let left = params(2, 1, 40);
         assert!(left.is_new(0) && !left.is_new(1));
-        let right = params(2, 2, 40, 80);
+        let right = params(2, 2, 40);
         assert!(!right.is_new(0) && right.is_new(1));
-        assert!(!params(2, 0, 40, 80).is_new(0));
+        assert!(!params(2, 0, 40).is_new(0));
         // Only with `arm_shift 2`
-        assert!(!params(1, 3, 40, 80).is_new(0));
+        assert!(!params(1, 3, 40).is_new(0));
     }
 
     #[test]
-    fn arm_times_are_before_the_display() {
+    fn arm_target_is_before_the_display() {
         let display_ns = 10_000_000_000;
-        let (target_ns, history_ns, ahead_s) = params(2, 3, 40, 80).times(display_ns);
-        assert_eq!(target_ns, display_ns - 40_000_000);
-        assert_eq!(history_ns, display_ns - 80_000_000);
-        assert!((ahead_s - 0.04).abs() < 1e-6, "{ahead_s}");
+        assert_eq!(
+            params(2, 3, 40).target_ns(display_ns),
+            display_ns - 40_000_000
+        );
+        assert_eq!(params(2, 3, 0).target_ns(display_ns), display_ns);
+    }
 
-        // The history is never after the target: no step back
-        let (target_ns, history_ns, ahead_s) = params(2, 3, 60, 20).times(display_ns);
-        assert_eq!(target_ns, display_ns - 60_000_000);
-        assert_eq!(history_ns, target_ns);
-        assert_eq!(ahead_s, 0.0);
+    #[test]
+    fn sample_times_change_with_the_age_or_the_capture_time() {
+        let base = params(2, 3, 40);
+        // The estimator, the target, the arms: the samples stay
+        for other in [
+            ArmParams {
+                estimator: ArmEstimator::Parabola,
+                ..base
+            },
+            params(2, 1, 60),
+            params(1, 3, 40),
+        ] {
+            assert!(!base.changes_sample_times(&other));
+        }
+        assert!(base.changes_sample_times(&ArmParams {
+            sample_age_ms: 40,
+            ..base
+        }));
+        assert!(base.changes_sample_times(&ArmParams {
+            capture_time: false,
+            ..base
+        }));
     }
 
     #[test]
@@ -2449,17 +2694,52 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(log.count(Lookup::Place, Some(1)), Some(1));
-        assert_eq!(log.count::<i32>(Lookup::Velocity, None), None);
-        log.count::<i32>(Lookup::Velocity, None);
+        assert_eq!(log.count::<i32>(Lookup::Place, None), None);
         log.count::<i32>(Lookup::Capture, None);
-        assert_eq!(log.failed, [0, 2, 1]);
+        log.count::<i32>(Lookup::Capture, None);
+        assert_eq!(log.failed, [1, 2]);
         assert_eq!(
-            log.lookups_text(true),
-            "lookups failed H 0, H-30 2, capture 1 of 3 frames"
+            log.lookups_text(),
+            "lookups failed display 1, capture 2 of 3 frames"
         );
+    }
+
+    #[test]
+    fn arm_samples_are_reported() {
+        // No sample yet: the age set
+        let mut log = ArmHandLog {
+            frames: 144,
+            misses: 3,
+            resets: 1,
+            ..Default::default()
+        };
         assert_eq!(
-            log.lookups_text(false),
-            "lookups failed display 0, capture 1 of 3 frames"
+            log.samples_text(35),
+            "0 samples, age 35 ms (arm_sample_age_ms), buffer misses 3 of 144 frames, resets 1"
+        );
+
+        // Every sample with a capture time
+        let mut log = ArmHandLog {
+            frames: 144,
+            samples: 3,
+            intervals_ms: vec![14.6, 14.4, 29.0],
+            ages_ms: vec![36.0, 34.0, 35.0],
+            ..Default::default()
+        };
+        assert_eq!(
+            log.samples_text(35),
+            "3 samples every 14.6 ms p90 29.0, age 35 ms p90 36 (captureTime), buffer misses 0 of 144 frames, resets 0"
+        );
+
+        // Some without
+        let mut log = ArmHandLog {
+            samples: 4,
+            ages_ms: vec![36.0],
+            ..Default::default()
+        };
+        assert!(
+            log.samples_text(40)
+                .starts_with("4 samples, age 36 ms p90 36 (captureTime, 1 samples), else 40 ms,")
         );
     }
 

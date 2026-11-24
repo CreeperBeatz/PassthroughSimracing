@@ -7,7 +7,8 @@
 //!   the pose and fov of each depth view, near / far, and when the app got it
 //! - one record per display frame: display time, the eyes, the views of the stream, both hands (26
 //!   joints with radii, located at the time the key uses), the capsules the mask used, the shift of the
-//!   arms, which depth frame the mask used, the region (a record each time it changes)
+//!   arms, which depth frame the mask used, the region (a record each time it changes), and the arm's own
+//!   hand samples (the ones new in this frame, with their times) and the capture-time wrist it used
 //! - the camera images of the key learner (only with `auto_key` and the key on: one per pass of the
 //!   learner, about every 60 ms), with their time, the camera pose and intrinsics
 //! - one depth dump (`alvr_dump_<n>_depth*`) at the start, in the folder of the burst, and the learned
@@ -27,8 +28,8 @@ use alvr_common::{
 };
 use alvr_graphics::{
     ArmGap, ArmMotion, BURST_DEFAULT_MS, BURST_MAX_DEPTH, BURST_MAX_DISPLAY, BURST_MAX_MS,
-    BURST_MIN_MS, Burst, BurstDepth, BurstDisplay, BurstHand, BurstLut, BurstRegion,
-    CameraBurstSink, ColorKeyInput, DepthFrame, SharedCameraBurst,
+    BURST_MIN_MS, Burst, BurstArmSamples, BurstDepth, BurstDisplay, BurstHand, BurstLut,
+    BurstRegion, CameraBurstSink, ColorKeyInput, DepthFrame, SharedCameraBurst,
 };
 use std::{
     path::PathBuf,
@@ -60,6 +61,8 @@ pub struct DisplayInput<'a> {
     /// The wrist gap each arm was set to (mm, 0: off), see `BurstDisplay::arm_gap_set_mm`
     pub arm_gap_set_mm: [f32; 2],
     pub edge_cut: f32,
+    /// The arm's own sample history of each hand in this frame (`arm_history.rs`)
+    pub arm_samples: [BurstArmSamples; 2],
     /// See `alvr_graphics::region_json`
     pub region: String,
 }
@@ -270,6 +273,7 @@ impl BurstRecorder {
             arm_gaps: input.arm_gaps,
             arm_gap_set_mm: input.arm_gap_set_mm,
             edge_cut: input.edge_cut,
+            arm_samples: input.arm_samples,
         });
     }
 

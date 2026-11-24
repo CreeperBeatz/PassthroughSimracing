@@ -186,6 +186,13 @@ pub struct InteractionContext {
 }
 
 impl InteractionContext {
+    /// Whether the instance was created with the extension `name`, one the `openxr` crate doesn't know
+    pub fn has_extra_extension(&self, name: &str) -> bool {
+        self.extra_extensions
+            .iter()
+            .any(|extension| extension == name)
+    }
+
     pub fn new(
         xr_session: xr::Session<xr::OpenGlEs>,
         extra_extensions: Vec<String>,

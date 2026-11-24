@@ -1,5 +1,6 @@
 mod area_editor;
 mod area_overlay;
+mod arm_history;
 #[cfg(target_os = "android")]
 mod auto_color_key;
 mod burst;
@@ -29,8 +30,8 @@ use area_editor::AreaEditor;
 use area_overlay::AreaOverlay;
 use extra_extensions::{
     BD_MOTION_TRACKING_EXTENSION_NAME, META_BODY_TRACKING_FIDELITY_EXTENSION_NAME,
-    PICO_CONFIGURATION_EXTENSION_NAME, SPATIAL_MARKER_EXTENSION_NAMES, SpatialMarkerFns,
-    SpatialMarkerTracker,
+    META_HAND_TRACKING_UNEXTRAPOLATED_POSES_EXTENSION_NAME, PICO_CONFIGURATION_EXTENSION_NAME,
+    SPATIAL_MARKER_EXTENSION_NAMES, SpatialMarkerFns, SpatialMarkerTracker,
 };
 use interaction::{InteractionContext, InteractionSourcesConfig};
 use lobby::Lobby;
@@ -272,6 +273,26 @@ pub fn entry_point() {
     .collect();
 
     selected_exts = selected_exts.intersection(&available_exts);
+
+    // The capture time of each hand sample, for the arm's own sample history (`arm_history.rs`). By
+    // name: `openxr` lists the extensions it doesn't know in `other`, with their nul
+    let unextrapolated_name = [
+        META_HAND_TRACKING_UNEXTRAPOLATED_POSES_EXTENSION_NAME.as_bytes(),
+        b"\0",
+    ]
+    .concat();
+    let unextrapolated_listed = available_exts.other.contains(&unextrapolated_name);
+    if unextrapolated_listed {
+        selected_exts.other.push(unextrapolated_name);
+    }
+    stream_log(&format!(
+        "arm: the runtime lists {META_HAND_TRACKING_UNEXTRAPOLATED_POSES_EXTENSION_NAME}: {}",
+        if unextrapolated_listed {
+            "yes, enabled (hand sample times from captureTime)"
+        } else {
+            "no (hand sample times from debug.alvr.arm_sample_age_ms)"
+        }
+    ));
 
     // QR code markers (`debug.alvr.marker`, read at the start of the app, see `SpatialMarkerTracker`).
     // Enabled by name, so that the `openxr` crate doesn't load their functions in `create_instance`,

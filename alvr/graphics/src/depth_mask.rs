@@ -518,6 +518,10 @@ pub fn edge_cut_centre(percent: i64) -> f32 {
     }
 }
 
+/// Not used since step 1b of the arm plan (the client's `arm_history.rs`): the runtime doesn't answer
+/// lookups in the past (any earlier time returns its newest sample), so the premise below was wrong. Kept
+/// with its test as the record of step 1.
+///
 /// Step 1 of the arm plan: the wrist at the target time T, from the wrist at an earlier time H (`w_h`)
 /// and the wrist `gap_s` before H (`w_p`, None: not located). `ahead_s` is T - H. Lookups in the past
 /// are accurate, the newest estimate of the runtime is late, so the arm is placed from the past and

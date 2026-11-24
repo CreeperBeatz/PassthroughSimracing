@@ -96,6 +96,62 @@ pub struct BurstDisplay {
     pub arm_gap_set_mm: [f32; 2],
     /// `DepthRenderInput::edge_cut` (0: today's)
     pub edge_cut: f32,
+    /// The arm's own sample history of each hand (step 1b of the arm plan)
+    pub arm_samples: [BurstArmSamples; 2],
+}
+
+/// A hand sample of the arm's own history (step 1b of the arm plan)
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BurstArmSample {
+    /// When it shows the hand (XrTime)
+    pub time_ns: i64,
+    /// When the app got it first
+    pub seen_ns: i64,
+    pub wrist: Vec3,
+    /// `time_ns` is the runtime's capture time (XR_META_hand_tracking_unextrapolated_poses), else the time
+    /// seen minus `debug.alvr.arm_sample_age_ms`
+    pub from_capture_time: bool,
+}
+
+/// The arm's own sample history of a hand in a display frame
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BurstArmSamples {
+    /// The history was emptied in this frame (the hand was lost)
+    pub reset: bool,
+    /// The samples first seen in this frame (each sample is in one record only). The first record of a
+    /// burst has every sample the history held then (the samples kept when the burst started)
+    pub new: Vec<BurstArmSample>,
+    /// The wrist the history gave for the depth's capture time, where the arm is in the depth. None: the
+    /// arm doesn't use `arm_shift 2`, the history had no wrist at that time (a buffer miss), or the arm fell
+    /// back to plain depth (a displacement over 25 cm)
+    pub capture_wrist: Option<Vec3>,
+    /// `debug.alvr.arm_estimator` (0 hold, 1 line, 2 parabola) of an arm in mode 2, else -1
+    pub estimator: i64,
+}
+
+impl BurstArmSamples {
+    fn to_json(&self) -> String {
+        object([
+            ("reset", self.reset.to_string()),
+            (
+                "new",
+                array(self.new.iter().map(|sample| {
+                    object([
+                        ("time_ns", sample.time_ns.to_string()),
+                        ("seen_ns", sample.seen_ns.to_string()),
+                        ("wrist", numbers(&sample.wrist.to_array())),
+                        ("capture_time", sample.from_capture_time.to_string()),
+                    ])
+                })),
+            ),
+            (
+                "capture_wrist",
+                self.capture_wrist
+                    .map_or("null".into(), |wrist| numbers(&wrist.to_array())),
+            ),
+            ("estimator", self.estimator.to_string()),
+        ])
+    }
 }
 
 /// One camera image of the key learner
@@ -340,6 +396,10 @@ impl BurstDisplay {
             ),
             ("arm_gaps", array(arm_gaps)),
             ("arm_gap_set_mm", numbers(&self.arm_gap_set_mm)),
+            (
+                "arm_samples",
+                array(self.arm_samples.iter().map(BurstArmSamples::to_json)),
+            ),
         ])
     }
 }
@@ -430,10 +490,12 @@ impl Burst {
         });
         // Version 2: the arms of the display records have the fields of step 1 of the arm plan, and
         // `key_lut` is new. Version 3: the display records have `edge_cut`, `arm_gaps` and `arm_gap_set_mm` (steps 1 and 2
-        // of docs/mask-v2-design.md)
+        // of docs/mask-v2-design.md). Version 4: the display records have `arm_samples` (step 1b of the arm
+        // plan: the arm's own sample history; `history_ns` / `wrist_history` of an arm in mode 2 are its
+        // newest sample)
         object([
             ("format", string("alvr_burst")),
-            ("version", "3".into()),
+            ("version", "4".into()),
             ("n", n.to_string()),
             ("duration_ms", self.duration_ms.to_string()),
             ("start_ns", self.start_ns.to_string()),
@@ -845,6 +907,25 @@ mod tests {
                     ],
                     arm_gap_set_mm: [0.0, 30.0],
                     edge_cut: 0.5,
+                    // The right arm in mode 2 with the parabola: one new sample per frame, the
+                    // capture-time wrist; the left one was lost in the first frame
+                    arm_samples: [
+                        BurstArmSamples {
+                            reset: k == 0,
+                            ..Default::default()
+                        },
+                        BurstArmSamples {
+                            reset: false,
+                            new: vec![BurstArmSample {
+                                time_ns: now_ns - 35_000_000,
+                                seen_ns: now_ns,
+                                wrist: Vec3::new(0.09, 1.0, -0.4),
+                                from_capture_time: true,
+                            }],
+                            capture_wrist: Some(Vec3::new(0.08, 1.0, -0.4)),
+                            estimator: 2,
+                        },
+                    ],
                 }
             })
             .collect();
@@ -942,7 +1023,7 @@ mod tests {
         let burst = synthetic_burst(7, UVec2::new(4, 3), 4);
         let json = burst.index_json();
         assert!(is_valid_json(&json), "{json}");
-        assert!(json.starts_with(r#"{"format":"alvr_burst","version":3,"n":7,"#));
+        assert!(json.starts_with(r#"{"format":"alvr_burst","version":4,"n":7,"#));
         assert!(
             json.contains(
                 r#""key_lut":{"file":"alvr_dump_7_key.lut","version":3,"published_ns":999600000000,"bytes":131072}"#
@@ -962,7 +1043,20 @@ mod tests {
         // The fields of steps 1 and 2 of the mask design
         assert!(
             json.contains(
-                r#""edge_cut":50,"arm_gaps":[null,{"wrist":[0.1,1,-0.4],"axis":[0,-1,0],"length_mm":30}],"arm_gap_set_mm":[0,30]}"#
+                r#""edge_cut":50,"arm_gaps":[null,{"wrist":[0.1,1,-0.4],"axis":[0,-1,0],"length_mm":30}],"arm_gap_set_mm":[0,30],"#
+            ),
+            "{json}"
+        );
+        // The arm's own sample history (step 1b of the arm plan)
+        assert!(
+            json.contains(
+                r#""arm_samples":[{"reset":true,"new":[],"capture_wrist":null,"estimator":0},{"reset":false,"new":[{"time_ns":"#
+            ),
+            "{json}"
+        );
+        assert!(
+            json.contains(
+                r#","wrist":[0.09,1,-0.4],"capture_time":true}],"capture_wrist":[0.08,1,-0.4],"estimator":2}]}"#
             ),
             "{json}"
         );

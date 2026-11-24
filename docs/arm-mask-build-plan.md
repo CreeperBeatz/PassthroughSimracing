@@ -174,6 +174,100 @@ The `hand-to-arm wrist gap` is the distance between the display-time wrist (the 
 - Possible: during fast moves the arm may now be ahead of the hand capsules (watch the `hand-to-arm gap`).
 - λ check: `arm_target_ms 20 / 40 / 60` while waving. The user says whether the edge leads or trails.
 
+### Step 1b: the arm's own sample history (built 2026-11-24, not yet run on the headset)
+
+**Why.** The wave bursts 14 and 15 (`logs/analysis-20261125-wave/report.md`) showed that the runtime doesn't
+answer `xrLocateHandJointsEXT` for past times. Any time before its newest sample S returns S; any later time
+returns its prediction. Step 1 took `wrist(H) − wrist(H − 30 ms)` and `wrist(capture)`: the difference was 0
+in about 90 % of frames, and the rest jumped 11-16 cm (the 60 mm cap in a random direction). The real wrist
+is about S 35 ms later (32-38 ms measured).
+
+**What changed** (`client_openxr/src/arm_history.rs`, `stream.rs` `update_arm_histories`, `arm_motions`,
+`arm_gaps`):
+- Each hand keeps its own history of samples (300 ms): time, time first seen, wrist, middle knuckle. It is
+  filled every frame that has a depth mask. A sample is new when its capture time changes, or without one
+  when the joints change.
+- **Sample time.** The runtime lists `XR_META_hand_tracking_unextrapolated_poses`, so it is enabled (by name
+  in `lib.rs`, logged as `arm: the runtime lists ...`). One lookup at now, with its request chained, returns
+  the sample as it is and its `captureTime`. The structures are defined in
+  `extra_extensions/hand_tracking_unextrapolated_meta.rs` (`openxr` 0.21 has no bindings; type numbers
+  1000693000 / 1000693001 from the registry). A capture time is used only if the sample was 0-300 ms old
+  when first seen. Otherwise, or without the extension, the time is the time first seen minus
+  `arm_sample_age_ms`. The sample is then read with a lookup 100 ms before now: the runtime returns its
+  newest sample there, and the time asked for is not used.
+- **The arm in the depth** = the history interpolated at the depth's capture time. If the history has no
+  sample that early (the hand just came back, or mode 2 just started), or the capture time falls in a gap
+  of more than 100 ms between two samples (the hand stayed active but was not sampled), the arm gets plain
+  depth for that frame: no blend of the old and the new place. This counts as a buffer miss.
+- **The placed wrist** = `arm_estimator`, at most 6 cm from the newest sample (the old cap):
+  - 0 (default) hold: the newest sample;
+  - 1 line: through the two newest samples, at display − `arm_target_ms`;
+  - 2 parabola: the newest sample moved with the slope at that sample of a least-squares parabola over the last
+    120 ms (with 3 samples a line), to the same time.
+  - 1 and 2 extrapolate for 150 ms at most, and use no velocity across a gap of more than 100 ms between
+    samples, nor before the history holds 3 samples (the first samples after a hand comes back are often off).
+- **Loss.** A hand that is not located, or has no valid wrist or middle knuckle, empties its history. When it
+  comes back, the first frames are misses (plain depth), then a held sample with no velocity. So a hand that
+  comes back gives no jump from its old place. Changing `arm_sample_age_ms` or `arm_capture_time` also
+  empties both histories.
+- **Wrist gap.** In mode 2 it starts at the placed wrist, along the newest sample's wrist → knuckle axis.
+  Without a motion it uses the history at the capture time (the oldest sample if the capture time is
+  earlier; no wrist gap when it falls in a gap of the history). Mode 1 and the case without a depth image
+  are as before.
+- Mode 1 (`arm_shift 1`, still the default) is unchanged and still uses its two lookups: it stays the
+  comparison. Its capture-time lookup still returns the runtime's newest sample, not the wrist at the
+  capture time (13 / 35 mm off at p50 / p90 in burst 14, 46 / 103 mm in burst 15). Moving mode 1 onto the
+  history too is one line (`arm_histories[i].at(capture_ns)`), left for the user to decide: it changes the
+  default and removes the old reference. The linear weight was already in mode 2 on both arms with `arm_hands 3` (the default).
+
+**Properties** (new or changed):
+
+| Property | Default | Meaning |
+|---|---|---|
+| `arm_estimator` | 0 | 0 hold, 1 line, 2 parabola (above) |
+| `arm_sample_age_ms` | 35 | Age of a sample when first seen, for its time without a capture time (0..150) |
+| `arm_capture_time` | 1 | 0: never use the runtime's `captureTime` |
+| `arm_target_ms` | 40 | Only for estimators 1 and 2 now |
+| `arm_history_ms` | - | No longer read |
+
+**Log** (`ALVR_CAM`, every 2 s while an arm uses mode 2):
+```
+arm: mode 2 (both), estimator 0 (hold the newest sample), weight 300 mm, sample times from captureTime, else seen-35 ms; L 137 samples every 14.6 ms p90 28.9, age 36 ms p90 41 (captureTime), buffer misses 0 of 143 frames, resets 0, hand-to-arm wrist gap 30 mm p90 52; R ...
+```
+Estimators 1 and 2 add `placed <mm> p90 <mm> from the newest sample at <m/s>` (ahead, or back when the
+target is inside the history; the burst field `extrapolated_mm` is the same distance).
+
+**Bursts** (version 4, `graphics/src/depth_burst.rs`): each display record has `arm_samples`, one per hand:
+- `reset`;
+- `new`: the samples first seen in this frame, each with `time_ns`, `seen_ns`, `wrist` and `capture_time`.
+  The first record of a burst holds every sample the history had then, so the capture-time wrist of its
+  first frames can be rebuilt;
+- `capture_wrist`: the wrist used for the capture time (null: not mode 2, a miss, or plain depth for a
+  displacement over 25 cm);
+- `estimator`: -1 for an arm not in mode 2.
+
+Samples are only collected while a burst records.
+
+In mode 2, `history_ns` / `wrist_history` of the arm are the newest sample, and `target_ns` is the time the
+placed wrist stands for. `read_burst.py` reads all of this as `burst["samples"][hand]` and the display arrays
+`arm_capture_wrist`, `arm_estimator` and `arm_reset`; the sample intervals of its summary don't span a
+reset. Older bursts still read.
+
+**Tests:** `arm_history.rs` (12: new samples, 300 ms, interpolation at the capture time, no wrist inside a
+gap, each estimator, the cap and the horizon, no velocity over gaps or from the first two samples, reset
+without a jump), `stream.rs` (the `arm:` texts, which
+property changes empty the histories), `depth_burst.rs` (the version 4 record).
+
+**Headset (user):** `arm_shift 2`, `arm_hands 1` (left new, right mode 1), one wave burst. First check the log:
+- the sample age is about 35 ms;
+- there are no misses after the first frames.
+
+Then judge by eye: hold (0), then 1 and 2 with `arm_target_ms` 40 / 60. The offline scores (`fix_drawn.txt`)
+expect hold to beat plain depth at every λ, and the parabola to be better at λ about 40 ms. Those scores
+capped the step at 15 cm; the build caps it at 6 cm. In a fast wave (burst 15: 1.6 m/s, about 50 ms ahead
+is 8 cm) estimators 1 and 2 will often stop at the cap, so they can trail more than the scores say (the
+`placed` p90 of the `arm:` line shows it: 60 mm means capped).
+
 ### Step 2-pre: measure the cost of the grown rect with no code (adb by the main session or the user)
 
 The existing bridge grows the rect like an arm zone would (F5):
