@@ -443,6 +443,40 @@ setting per arm, so that "set but the joints not located" can be told from "off"
   still there: leave it off. Then ask gate G1 again: is the arm's edge still too coarse or too late?
 - Each value: a progress screenshot, one burst on and one off, and the GPU load (`vrstat`) on and off.
 
+*First headset verdict on arm step 1 (2026-11-24, about 18:05, build c8907c93, `arm_hands 1`: left arm
+mode 2, right arm mode 1).* The user, after a fast wave:
+- Defaults (`arm_target_ms 40`, `arm_history_ms 80`, so the wrist is pushed 40 ms ahead by its speed):
+  "left arm is very jiterry, while the right is just lagging".
+- `arm_history_ms 40` with `arm_target_ms 40` (the wrist of 40 ms ago, no push ahead): "no difference
+  between left and right".
+
+What follows, and what does not:
+- The jitter comes from the push ahead: the speed is a difference of two wrist samples 30 ms apart, moved
+  ahead 40 ms, so the wrist's noise is amplified every frame. Likely, not measured.
+- With no push the new mode looks like the old one. The offline numbers above (edge error 10-31 mm ->
+  4-8 mm from the past-time wrist alone) do **not** show on the headset. Why is unknown. Do not tune
+  `arm_target_ms` blind: first record a burst of a fast wave with `arm_shift 2`, `arm_hands 1` (bursts are
+  version 3 and carry mode, target, history, wrist and displacement per arm) and measure the drawn arm edge
+  against the camera's arm, per frame, for both arms. Suspects to check with it: the elbow guess for a
+  raised arm (`ELBOW_OFFSET`, head-relative), the weight far from the wrist when the whole arm moves from
+  the shoulder, which depth frame's capture time the displacement uses against the frame the mask
+  really samples, and the passthrough delay (assumed 49.5 ms offline, never measured).
+- Seen in the log: when a hand comes back into view, the first frames give a nonsense speed (2.64 m/s)
+  and the arm jumps by the full 6 cm cap. Needs a guard (no step for the first frames after a failed
+  lookup, or a speed limit) before mode 2 can be a default.
+- Seen in the log: with the left hand in view and mode 2, 116-132 frames were counted per 2 s instead of
+  144; with it out of view, 144. Not checked whether that is a real frame rate drop from the extra lookups.
+- Both lookups work in the past: `xrLocateHandJointsEXT` answered at display - 80 / 110 / 140 ms with no
+  failure while the hand was in view. `lookups failed H 144 of 144` means the hand is not tracked.
+- A controller lying on its grip button (the system logs `onGripButtonDown` every 50 ms) keeps the headset
+  in controller mode: no hands are tracked, so no colour key and no arm correction at all. The `key:` line
+  still prints `tracked hands [true, true]` at times; trust the zones (`rim 0 sweep 0/0`) and the `arm:`
+  line instead.
+- `edge_cut` and `arm_gap_mm` were not tried yet.
+- The user also asked for the ghost at the old place of a moved bottle to go ("when I hover over a region
+  where ive moved my bottle, there is still a transparent ghost"): that is step 3 of
+  `docs/mask-v2-design.md` (room memory, `mem_roll`), not built.
+
 *Next steps as of the evening of 2026-11-24.*
 1. Build step 1 of the arm plan, with the live switch; the user judges on the headset. (Built, not yet
    installed or judged.)
