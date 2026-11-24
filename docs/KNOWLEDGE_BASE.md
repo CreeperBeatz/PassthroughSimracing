@@ -1,7 +1,8 @@
 # Passthrough for sim racing: knowledge base
 
 What was tried on a Quest 3, what works, what doesn't, and why. Status: 2026-11-23, branch
-`auto-color-key`. Everything after "Depth passthrough" is experimental and controlled with adb.
+`auto-color-key`; newest findings and next steps (2026-11-24 evening) in "Day of 2026-11-24: bursts, what
+the depth can and cannot do". Everything after "Depth passthrough" is experimental and controlled with adb.
 **Start with "Where it stands and how to continue"**, the rest is the detailed record.
 
 Words used here:
@@ -66,6 +67,360 @@ new value other than 0 at any time. Everything else is a default.
   to control with pinch, scale and placing different objects what the rig / play area looks like, "tools
   similar to Virtual Desktop"; QR codes can be printed. "We still need better edge precision on arms and
   wheel".
+
+**Day of 2026-11-24: bursts, what the depth can and cannot do.** Eight recorded bursts (3 s each, build
+d98535d2), an independent check of the first three analyses, the lap analysis of the morning, the verdicts
+of the user, and the plan for the arm. Labels: *measured* = on the headset or offline on recorded data (the
+bursts), *inferred*, *not tested*. Where an analysis and its independent check differ, the check is used
+and this is said. What other jobs wrote today is not repeated: see "Play area editor (v1)" (first and
+second headset run), the `hand_removal` row and "Where the hole around the hands comes from" above, and
+the `marker_carry` / `burst` entries in "Settings".
+- **The bursts** (`debug.alvr.burst`, folders in `logs/bursts-20261124`, analyses in
+  `logs/analysis-20261124-bursts/`; never committed, they show a private room). 1: head moving; 2: arm
+  moving slowly; 3: head still, then pitching down, cardboard wheel at rest; 4: hands still on the wheel,
+  head turning 3-6 deg; 5: wheel turned slowly; 6: wheel turned fast (138 deg/s median, camera); 7: hands
+  still on the lap, head still (the stillest); 8: a fast wave of the arm (up to 2.6 m/s). The wheel is a
+  cardboard stand-in with four holes, octagon 36 x 29 cm (measured from camera images). The user races a
+  Moza or Simucube wheel that is not at the test desk.
+- **Analyses and checks:** (1) arm, (2) stacking, (3) wheel and fill tiles, (4) the check of 1-3 with its
+  own scripts. Files of the check: `logs/analysis-20261124-bursts/check/`.
+
+*Depth cadence and age (measured, offline).*
+- Capture times lie on a 33.333 ms grid (largest residual 0.009 ms), steps of 1x or 2x, rarely 3x: 15.2-21.0
+  depth frames per second. The runtime makes it so: the depth swapchain index (4 images) steps by exactly 1
+  for every frame the app got, so the app drops nothing (a missed frame would be a jump of 2). Bursts 2, 3
+  and 7 have no display hitches and still 75-84 % double steps. The mask always used the newest frame that
+  had arrived (1645 of 1645 display frames). The mask's depth input changes every 4.4 display frames
+  (burst 7).
+- Age at display: 124-152 ms (median per burst; the arm table gives p50 129-140, p90 159-172). Display is
+  about 49.5 ms after render time in all 8 bursts. `hand_ns` equals `display_ns` in every frame, so
+  `key_delay` was 0.
+- Is the capture time right? Yes, within about 10-15 ms for the arm. Report 1: forearm test -16 ms (burst
+  8), +2 ms (burst 2); the check with its own test: -8 ms (-12..-4) and +4 ms (-4..+16); burst 6 cannot be
+  decided by either (the wheel gets into the arm piece). Not resolved: the pose reported with a depth
+  frame looks 24-28 ms later than its content (pose stamped later than the image, or a clock offset
+  between head and hand); the passthrough latency itself cannot be measured from this data and it decides
+  the right target time of an arm correction.
+
+*Stacking static depth does not pay (measured offline; the check wins).*
+- Report 2 said that 8-16 frames halve or quarter the edge wobble of the lap in burst 7. Not confirmed:
+  its stack was the first k even frames compared with all odd frames, so the curve falls because the time
+  spans match. Against the later half of the burst: 1.24 / 1.16 / 1.13 / 1.07 texels at k = 1 / 4 / 8 /
+  16 (no gain). In the causal test, the case a live mask meets (a vote of the last k frames against the
+  next frame), stacking is worse: burst 7, 33 positions, 0.19 / 0.23 / 0.29 / 0.40 / 0.57 texels at k = 1 /
+  2 / 4 / 8 / 16; burst 3 still part, 0.38 / 0.46 / 0.47 at k = 1 / 2 / 4.
+- Why: a single frame is already steady (the edge moves 0.25 texel between frames in burst 7, 0.37 in the
+  still part of burst 3; consecutive frames differ by a median 0.46 mm and 9.5 % of the texels, range
+  3.3-18.3 %, are bit-identical). The runtime depth is already smoothed in time. A causal stack lags real
+  change. Report 2 also found: registration after reprojecting with the reported poses is only 0.39 texel
+  (burst 7, p90 0.72) and 0.6-0.7 texel elsewhere, sub-texel refinement needs about 1/4; other viewpoints
+  disagree by 1.4-4.3 texels and the outline grows from +4 mm to +15-20 mm; 2x and 4x grids land within
+  0.04 texel of 1x. A voxel grid of the play area (1.6 M voxels at 1 cm) would cost 19-100 M reads per
+  frame, 6-28 times today's mask (inferred). Verdict: do not build a stack, a finer grid or a voxel grid.
+- Objects come out about one texel too big: the wheel's upper edge lies 3.5-5.5 mm outside the camera
+  outline (+4-5 mm growth, measured; the camera reference itself is good to only 3-5 mm). Eroding the
+  in-area decision inward at depth edges is the cheaper fix (idea, not tested).
+- The runtime's fill next to the hands would be learned by a stack as room; and a "static" test (within 2 cm
+  over 4 frames, 12 cm from the joints) fails exactly at depth edges: 1.2-28 % of such texels at edges
+  change in the next frame (burst 7: 1.2 %, burst 8: 28 %).
+
+*The holes of the wheel (measured; the check agrees on the depth, and wins on what is behind).*
+- Holes of 6-11 cm (17-30 texels across at 0.52 m) are never in the depth, neither in a frame nor in a
+  stack: the depth lies on the cardboard plane over them, with a median dent of +4 to +34 mm, 0 % of samples
+  more than 10 cm behind (check: 25 / 34 / 28 / 7 mm for upper left, upper right, lower left, lower
+  right). The wheel is 100 % inside the play area, so all four holes show the room.
+- The upper holes leak: behind them the play area extends only 11.5 cm, the desk top (0.728 m high) is
+  244 mm behind the wheel along those rays and 0 % of it is inside the area, so the room shows where the
+  game belongs. The upper right is partly a mug 4 cm behind it that is inside the area. The lower holes are
+  fine: the area extends 53-55 cm behind them (under the desk), so the room is right either way.
+- Report 3 said the background behind the holes is inside the area (upper left 83-100 % of rays). Wrong:
+  its ray march hit the wheel's own smeared depth at exactly 0.05 m. The stacking report and the check hold.
+- Only a model of the object (shape from the camera, a measured template or the editor) or the colour key
+  can open such holes.
+- Outline growth: see the stacking paragraph. Whether the user would notice a 1-3 mm steadier edge is not
+  known.
+
+*The arm is a timing problem (measured offline, bursts 8 / 2 / 6; ranking confirmed by the check, its
+absolute numbers are 1.5-3 mm higher because its measure is coarser).* Median edge distance between the arm
+of an earlier depth frame, moved, and the arm in the later frame, frame pairs about 100-133 ms apart, left
+eye, with the real wrist (camera-record joints) as target; report 1 / check:
+
+| variant | burst 8 | burst 2 | burst 6 |
+|---|---|---|---|
+| plain depth | 29.0 / 34.2 mm | 20.1 / 18.7 | 16.6 |
+| translation by the wrist | 15.9 / 17.6 | 7.9 / 10.0 | 8.3 |
+| rotation about an elbow 26 cm back, wrist pinned to the target | 7.6 / 9.5 | 4.4 / 7.5 | 7.0 |
+| linear weight 1 to 0 over 30 cm | 7.6 / 9.4 | 4.1 / 7.3 | 6.5 |
+| rotation, display-time joints as the target | 27.9 / 32.3 | 10.5 / 15.5 | 11.9 |
+
+- Today's weight (smoothstep to 45 cm): 12.4 / 6.1 / 7.6 mm (report 1 only). Overlap in burst 8: 0.56 plain,
+  0.80 corrected (check). The measure's floor on still pairs is 3.4-4.5 mm (report 1), the check's reads
+  7-10 mm there.
+- A pure rotation about a fixed elbow fails when the arm reaches forward (check: burst 2, 44.5 mm when the
+  wrist moved 10-20 cm), the linear weight held in both bursts. Where the elbow is (direction and
+  distance 26 vs 35 cm) matters little; 20 cm is worse. The elbow is not visible in the depth (the arm is
+  seen 25 cm behind the wrist in 1 of 50 frames).
+- How far the real wrist moved since the depth the mask used (every display frame, p50/p90/max, mm; report
+  1): burst 8 plain 71/126/168, today's shift 54/92/131; burst 2 42/88/136 and 19/45/64; burst 6 36/60/78
+  and 16/35/63; burst 5 21/38/54 and 9/18/27; burst 7 (still) 0-1/1/2. The recorded `arm_wrist` equals the
+  display-time joint exactly (0.00 mm), so the shift can never be better than those joints.
+- **The display-time joints trail the real wrist by 40-76 ms** (confirmed by the check; moving hands:
+  burst 1 +44 / +46, burst 2 +40 / +50, burst 5 +48 / +52, burst 6 +54 / +58, burst 8 +74 / +76 ms; burst 8
+  right: wrist error 61.8 mm rms with no lag, 31.3 mm at the best lag). They overshoot at reversals: burst 8
+  typically +4-5 cm (range -0.2..+6.7, 9 reversals), burst 2 0-1.7 cm, burst 6 0-3.4 cm. By eye (burst 8,
+  1.1-1.5 m/s) the camera-record joints sit on the hand, the display joints interpolated to the image time
+  are about 10 cm off. Inferred: with `key_delay` 0 the runtime hands back about its newest estimate with
+  no forward prediction. This contradicts "The pose at display time is already predicted" under "Hand
+  tracking as the truth" in the pitfalls (note added there). Hands at rest (burst 7): step 0.02 / 0.17 /
+  0.48 mm (p50 / p90 / max), 2 mm range in 3 s, no jitter.
+- What moving the depth cannot fix: the runtime removes the forearm 0.6-2.6 cm behind the wrist (median;
+  far fill takes 44-98 % of the samples 0-1 cm behind it, and 19-47 % still show far values at 5-8 cm with
+  the hands on the wheel), sleeves and the upper arm (not in the test). No temporal smearing (the
+  silhouette is 76 mm wide above 0.5 m/s, 78 mm below 0.15 m/s) and resolution is not the arm's problem
+  (the forearm is 19-26 texels wide at 40-50 cm, inferred; outline noise 1-1.5 texels).
+- Rests on 2 bursts for the check's numbers, left eye; the ground truth and the prediction share a
+  segmentation and a wrist reference. In burst 8 the arm was 0.25-0.3 m from the eye.
+
+*The wheel and the hands (measured offline).*
+- Hands predict the wheel's rotation (both hands as one rigid body, in-plane error against keeping the old
+  pose; truth is a camera template of the wheel): 124 ms pairs in burst 5, wheel turned 3.5 deg: 1.3 vs 3.6
+  deg, rim 12 vs 25 mm; burst 6 consecutive pairs (69 ms, 10 deg): 1.5 vs 10.0 deg, 16 vs 38 mm; burst 6 at
+  139 ms (19.9 deg): 3.0 (p90 6.6) vs 19.8 deg, 25 vs 74 mm; held still (burst 4): 0.8 vs 0.5 deg (noise).
+  Turn in burst 6 by hands 0 / +98 / -94 / -38 deg against the wheel's 0 / +98 / -91 / -37. The check
+  confirms the coarse turn (its hand angle 0 / +92 / -85 / -39 and the text on the wheel by eye) and did not
+  reproduce the 1.3-3 deg figures (they need the camera template). Not independently checked in degrees.
+- Rotation from the depth alone fails when the wheel is held: plane rms 3.8-4.3 mm is fine, rotation in
+  the plane is 0.5 deg at rest without hands, 10.7 deg median (p90 19.6) held still, 18.4 deg in burst 5,
+  lost in burst 6 (no holes in the depth, hands and fill cover the top, the octagon is nearly symmetric).
+- Arithmetic for a turning wheel (not measured): 1.75 mm per degree at 100 mm, 2.9 mm at 165 mm; one depth
+  texel (3.6 mm at 0.5 m) needs the angle to 1.3-2.1 deg; 124 ms of stale depth is about 17 deg at 138 deg/s.
+  Hand joints are 50-55 ms old for the wheel too (angle rms between hands and wheel 8.0 -> 2.7-2.9 deg when
+  the joints are shifted by +50-60 ms, burst 6); the camera-record joints equal the display joints 50 / 50
+  / 70 ms later in bursts 5 / 6 / 8. Report 3 suggests trying `key_delay -50` on the headset (not tried).
+- **The fill around the hands** (what the runtime puts where it removed the hands): share of wheel texels
+  that show the far surface instead of the wheel, by distance from the hand capsules, bursts 4 / 5 / 6:
+  87 / 69 / 73 % at 0-1 cm, 74 / 69 / 61 % at 1-2 cm, 62 / 62 / 47 % at 2-3, 49 / 49 / 33 % at 3-4, 18 / 28
+  / 19 % at 4-5, 4 / 12 / 9 % at 5-6 cm, baseline without hands 1-3 %. On the lap (burst 7): 93 % from 0.5
+  cm, 71 % at 1-2, 33-43 % at 2-3, 9-16 % at 3-4, 4-5 % at 4-5 cm. Reach: median 2.0-2.3 cm from the
+  capsules on the wheel (p90 4.2-5.0, max 11-13), on the lap median 1.5 cm (p90 3.1-3.6). The check
+  confirms 0-2 cm (88-92 % / 79-84 % / 68-72 % on the lap, its own profile) but with a per-texel reference
+  (burst 5, left eye) finds 67 / 46 / 27 / 13 / 11 % at 0-1 ... 4-5 cm: the fill reaches several cm and
+  its exact profile beyond 2 cm is not pinned down (beyond 2 cm it cannot tell the fill from the real
+  floor beyond the knee). Value: the far surface behind (0.11-0.13 m behind the wheel, the desk top at
+  0.75-0.79 m; on the lap the floor at 1.0-1.7 m, in blocks with smooth gradients), not an interpolation of
+  the border. Shape: straight horizontal and vertical edge pieces (median run 8-10 texels, up to 79). No
+  per-texel flag marks the fill and it is not on a fixed grid of the 320 x 320 texture (period-8 residue
+  14-19 % against 12.5 % uniform; the edge rows still move with head and hands perfectly still).
+- **The detector's precision claim is circular.** Report 3: within 6 cm of the hands, depth behind the
+  plane and the outline placed by the hands covering the texel: precision 0.94-0.98, recall 0.87-0.92. The
+  check: its truth is the outline placed from the camera plus depth more than 4 cm behind the plane; the
+  detector is the same test with the outline placed by the hands. Even the row without a hand-distance rule
+  scores 0.87-0.95 / 0.94-0.97. So the number measures how well the hands place the outline, not fill
+  detection. The real precision needs a truth independent of the outline. Distance alone is weak (4 cm on
+  the wheel: precision 0.32-0.38, recall 0.78-0.86).
+- Stacking cannot open the holes (stack IoU with the true outline 0.80 at rest; hole cores open 0.21 / 0.54
+  / 0.44 / 0.00 only at rest, 0.00-0.01 with the held wheel). Draw test with the later depth as the truth
+  (favours plain depth): wheel IoU in the edge band, burst 4 / 5 / 6: plain 0.72 / 0.86 / 0.62, stack moved
+  by the hands 0.75 / 0.84 / 0.70, stack at the true pose 0.77 / 0.84 / 0.75; whole wheel: plain wins.
+- Rule of thumb for design: use the depth for the object's plane and position (rms about 4 mm), the hands
+  (or later the PC's wheel angle) for its rotation, a model for its holes, and treat "within 6 cm of a hand
+  and behind the hand" as unknown, not as background.
+
+*The lap in burst 7 (measured offline).* The depth is steady: about 80 texels per eye per frame pair flip in
+or out, of 16,400 within 8 cm of the hands (0.5 %); 32-34 blobs of median 1 texel; they sit median 0.3 cm
+from the capsules and only 8-13 % within 3 cm of a fingertip. Flip rate per texel per frame pair: inside a
+capsule 2.0-2.4 %, 0-1 cm 1.2-1.6 %, 1-3 cm 0.3-0.8 %, beyond 3 cm 0.2-0.3 %, far away 0.05-0.12 %. Depth
+change between frames median 0.5 mm, joints step 0.01 mm. Around the fingertips the depth is constantly the
+floor fill (inside the area in 8-9 % of the texel-frames, 0.5 % flips): steadily shown as game, not
+flickering. Inferred: the flicker the user sees on the legs does not come from the depth or the capsules;
+it is not explained yet (other mask inputs cannot be tested on this data).
+
+*The lap analysis of the morning, what the KB did not have (build bd0dc0f7, captures 626 / 627, offline;
+the first analysis and its independent check agree on the diagnosis).* The numpy copy of the mask shader
+matches the dumped mask (r differs by more than 2/255 in 0 of 191,744 texels, 1 texel in one case). Which
+mask term decided the legs shown as game (CUT = real knee skin or shorts drawn as game; texels 0.5-15 cm
+from the render-time capsules):
+
+| term | 626 | 627 | old laps 605, 620-623, 625 |
+|---|---|---|---|
+| CUT / LEAK (first analysis) | 2603 / 52 | 1526 / 229 | 11819 / 23505 (mostly the stale copy) |
+| live depth: surface more than 12 cm behind the hand and outside the box (the fill) | 2598 | 1526 | 11754 |
+| live depth: surface at the hand's distance, outside the box (box face) | 0 | 0 | 0 |
+| live depth: lost by the 3x3 blend or feathering | 0 | 0 | 0 |
+| solid fill (focus g) | 0 | 0 | 0 |
+| hand zone (focus r) and key rejects | 0 | 0 | 17 |
+| fill share of the 0.5-5 cm ring | 56-57 % | 5-6 % | 25-47 % |
+
+- Deciding term: the live-depth fill. The check traced 20 texels by hand with a texel-by-texel copy of the
+  shader: all have focus r = 0 and g = 0, the 3x3 surfaces lie 0.6-1.9 m behind the hand. Neither the hand
+  zone (rim 0-3 mm) nor the key is asked there (where it could be asked it would accept bare knee skin:
+  K >= 0.5 for 42-53 % of leg texels in the first analysis, 86-93 % of skin-coloured texels in the check).
+  Knee skin in 626: 1574 of 10495 texels cut (15 %), 1556 within 3 cm of the capsules.
+- Correction by the check: the remembered copy does have a surface on the ray (it is 100 % valid), but it
+  was taken looking 92 deg away from the current view, so 97-100 % of the cut texels lie outside its view
+  (626 left 2164 of 2164). Same result (coverage 0) but for design it means a copy taken at another heading
+  can never cover the lap. The copy was 82 / 95 s old.
+- Why 626 and 627 differ (two dumps 12 s apart): in 626 the fill covers the ring with the floor at
+  1.2-1.6 m beyond the fingertips (knees gone); in 627 the tile holds the lap and knees show. Fits "only
+  when behind my hands are my feet and behind them the VR area". Depth images still looked like removal on
+  although the log said "off" (see the `hand_removal` row; the runtime ignores false, as the pitfalls say).
+- Candidate rules, CUT / LEAK, both eyes summed, first analysis (check in brackets where it re-ran it):
+
+| rule | 626 | 627 | 605 | 622 | 607 (phone at the desk edge) |
+|---|---|---|---|---|---|
+| today | 2603 / 52 [5165 / 59] | 1526 / 229 [2556 / 231] | 6216 / 510 [5530 / 1581] | 1265 / 5716 [1088 / 9562] | 0 / 1000 |
+| live depth only (no copy) | 2607 / 51 | 1542 / 226 | 6221 / 507 | 3422 / 162 | 0 / 987 |
+| B' (fill takes the nearest surface at the hand's distance) | 980 / 3500 | 1465 / 229 | 1178 / 1614 | 514 / 6092 | 0 / 1825 |
+| D (fill decided by the existing colour key) | 1071 / 57 | 1520 / 229 | 6084 / 536 | 1119 / 5726 | 0 / 1218 |
+| G (fill decided by colours learned from the live depth) | 1006 / 57 | 986 / 229 | 2409 / 890 | 1194 / 5735 | 0 / 1492 |
+| recommended: live + G + D, R = 8 cm, support >= 0.3 | 931 / 77 [3518 / 127] | 870 / 233 [2003 / 234] | 2332 / 941 [1873 / 2131] | 2669 / 259 [1975 / 517] | 0 / 2167 [LEAK 405 -> 728] |
+
+  Rule A (decide the hand's key zone widened by 1-3 cm) cannot be tested: the depth has no hands in it.
+  Rule B literal changes nothing (no cut texel is in a zone). C (memory of other captures) helps but leaks
+  old leg positions (legs move more than the tolerance in 12 s).
+- **Verdict of the check: no rule to ship.** The gain of the recommended rule on the new laps is about half
+  of what was reported (626 CUT -32 % against -64 %, 627 -22 % against -43 %). It makes things worse in
+  three cases: (1) the phone at the desk edge (607): a room halo, about 600 texels per eye turn real at a
+  median 4 cm from the hand, 94 % of them covered by static surfaces outside the box (median 21-23 cm
+  out); the gate opens because support is 0.35 / 0.44, barely above 0.3, and the dismissal "the depth-only
+  reference is probably wrong there" is not supported. (In the first analysis rule B' also shows a room
+  halo around a raised hand; the support gate keeps the raised hand unchanged.) (2) Dropping the copy makes the old laps worse: CUT rises 1.5-2.8x on 622, 623 and 625. (3)
+  The desk view (604, 608-619): support is 0.00 so the rule never acts, but without the copy 1000-1700 texels
+  per eye next to resting hands turn from real to game (93-97 % were real only because of the copy). A hand
+  on the thin wheel rim probably has support below 0.3 (estimate): nothing would change while driving.
+  Keeping the copy ("today + G + D") avoids 2 and 3 but keeps the halo of 1. Any fill rule needs a
+  direction-aware gate, not one per hand, and must be re-run on 607. Not tested: putting G into the learned
+  key table (one table for every keyed texel) is a different design.
+- Not measured: hand on the desk inside the camera view, a held bottle, the wheel (no captures); the
+  colour reference is hand-made on the 320 x 240 image (knee/floor edge off by about 2 cm); G is learned and
+  scored on the same frame.
+
+*Verdicts and decisions of the user, 2026-11-24 (his words quoted).*
+- Edge feathering 8 / 3 / 2 cm: "there isn't a massive difference where it matters - it matters when there
+  is an object in the play area, and the zone behind it should be cut off - here the depth mask resolution
+  is the problem. The other problem is for the arms - the depth mask moves at 30fps (with my whole length
+  arm), but my hands move at 72fps." Left at 0.03, set with `tools/feather.sh`.
+- `arm_shift 1` (the existing arm compensation): "no noticable difference at a glance, since the main issue
+  is the low quality cutout, and the 30fps".
+- The stacking idea: "Since background depth is constant, we could utilize a dlss type approach for the
+  depth mask, stacking images, until we have a pretty precise idea of where static objects are". Tested
+  offline: does not pay (above).
+- The arm as a mask: "For the arm or other objects, why not a mask, like we did with the hand?" and then
+  "or actually, if we can interpolate the depth updates to be 72FPS, it might be good enough". Agreed
+  order: first only the arm's depth predicted forward every display frame with the wrist (step 1 of the arm
+  plan below), the user judges it on the headset, the colour edge only if that is not enough.
+- The wheel: the user races a Moza or Simucube wheel that is not at the test desk; the cardboard wheel with
+  four holes is the stand-in.
+- The remembered copy: "i notice that the depth mask doesn't quickly update for things that aren't actually
+  static (like my chair, legs, or the bottle (gear shifter). This might be part of the reason for the leg
+  bug, as I reproduced it by moving my bottle 10cm in another direction, and my hand dissaperared from the
+  shifter again". Looking at the bottle with the hands out of view repaired it ("it seems like the depth
+  mask updated, so it didnt reproduce"); "if I move it now 10cm to the left, it will break". Hypothesis of
+  the session (not proven when this was written): the remembered copy is only refreshed when no hand is
+  near the depth cameras' view for 1.5 s, so it is frozen while hands are in view. Captures 642 (before the
+  move) / 643 (broken) and bursts 12 / 13 in `logs/dumps-20261124-bottle`, `logs/bursts-20261124`;
+  analysis in `logs/analysis-20261124-bottle/`. Result of the bottle analysis (measured offline on captures 636-643 and bursts 10-13, with an
+  independent check that confirmed the diagnosis; `logs/analysis-20261124-bottle/agent-report-1.md`,
+  `agent-report-2.md` = the check, `results.md`, `verify/`). The rebuilt mask equals the captured one
+  (the numpy shader copy now has the box layout and the arm motion). The hypothesis holds, with two more
+  causes:
+  - **The frozen copy.** The copies of 642 and 643 are byte-identical: taken before the move, with the
+    bottle at its old place 12 cm away. The old place is drawn as room from the copy (LEAK), the new
+    place has no copy surface.
+  - **The runtime removes the held bottle with the hand.** In bursts 12 / 13 the live depth keeps only the
+    bottom 3.6-5.5 cm of the 19.3 cm bottle while it is held; the cut cap and body texels are the
+    runtime's fill (a surface 0.8-1.07 m away where the bottle is at 0.63-0.66 m). So "the cap disappears
+    the moment I grab it" is the removal, hidden only while the copy has the bottle at the right place
+    (639-642: 2-39 cap texels cut, 643: 348-401). The dark cap is rejected by the colour key, but only
+    10-23 % of it lies in the hand zone.
+  - **The box edge.** After the move the bottle stands about 2 cm past a side of the small shifter box:
+    about 20 % of its silhouette is outside the area even with a perfect copy.
+  - Fill reach for surfaces that did not move, across the depth ray from the capsules: 0-1 cm 80-87 %
+    filled, 1-2 cm 56-66 %, 2-3 cm 12-44 %, beyond 4 cm about 0.
+  - Rules tested offline (CUT / LEAK texels in 643; today 1309 / 2188): a rolling refresh of the copy
+    beyond 6 cm from the hands ("A6") does not bring the bottle back (the cap stays cut for every margin:
+    the live depth never contains it) but removes stale legs (lap captures: LEAK 2580 -> 977 and 1742 ->
+    1241; the check: 1400-3700 texels per eye fixed in 620-625); a refresh at 0 cm destroys the held,
+    unmoved bottle. Dropping copy surfaces that the live depth contradicts, and a band at the hand's
+    depth, are rejected (they delete the held bottle, or make halos). Carrying what the runtime removed
+    at the grab with the hand's rigid motion ("CR") fixes the moved bottle (cap cut 348 -> 9, old-place
+    leak 1399 -> 163; the check's own version: 401 -> 24, 789 -> 1; fitted motion 8.9 cm, 17.8 deg,
+    residual 0.94 cm).
+  - Recommended order, nothing built: (1) the user widens the shifter box by 6-8 cm around every position
+    of the shifter (adds a little desk clutter to the area); (2) A6 with the capsules at the depth's
+    capture time, and never overwriting a nearer copy surface with a farther live value near a hand on
+    the across-ray distance alone (from a lower or sideways head pose 11-27 % of a held bottle's rays lie
+    beyond 6 cm: the removal would be written into the copy; not proven, needs a headset test); (3) CR,
+    which needs real grab detection and a fresh copy at the grab (with a stale copy its "removed by the
+    runtime" test marks thousands of points; a hand going from the lap to the bottle carried a patch of
+    thigh along). Tested on ONE move only.
+
+*The arm mask plan (design pass of the day, not built).* The plan and the design will be in the repo as
+`docs/arm-mask-build-plan.md` and `docs/arm-mask-design.md` (the main session copies them). Step 1 is NOT
+built yet. Where plan and offline simulation (`logs/analysis-20261124-arm-mask/`) disagree, the simulation
+wins.
+- **Decision: build smaller. Step 1 now, the keyed zone later, in a reduced form, behind gates.**
+- The numbers (offline, wrong pixels as % of the true arm area, bursts 8 / 2 / 6, passthrough latency
+  assumed 49.5 ms):
+
+| mask | cut + leak | cut + halo (visible errors) |
+|---|---|---|
+| today (`arm_shift`, display-time joints, smoothstep to 45 cm) | 58 / 32 / 27 | 51 / 25 / 12 |
+| moved depth, past-time wrist, linear 30 cm weight (step 1) | 35 / 20 / 19 | 28 / 14 / 8 |
+| + keyed zone 2 cm, skin + learned sleeve table, key only adds outside the moved depth (steps 2 + 3) | 33 / 14 / 17 | 23 / 7 / 4 |
+| + keyed zone, key decides a band both ways (the design's core/band) | 32 / 15 / 17 | 25 / 14 / 12 |
+| keyed zone with the skin table only | 88 / 100 / 63 | 85 / 100 / 61 |
+| reference: depth with no delay | 16 / 18 / 12 | 11 / 11 / 5 |
+
+- Step 1 carries most of the gain: past-time joints plus the linear weight cut the wrong pixels 1.4-1.7x
+  and the edge error from 10-31 mm to 4-8 mm (offline). Choosing past-time over display-time joints
+  matters more than the key (57 -> 35, 31 -> 20, 26 -> 19). The key adds only 2-5 points of cut + leak
+  (the noise between variants is 2-3 points; the truth was built partly from colour, which favours colour
+  methods), and can make things worse (b8: halo from 4 to 10 % over a bright wall and dark screens).
+- **The user's arm wears a long plaid sleeve in all three bursts** (burst 8: pushed up, 26 % of the arm
+  pixels bare skin). The skin table alone is useless for a keyed arm (cut + leak 88 / 100 / 63); a learned
+  sleeve table is needed (step 3).
+- Dropped from the design: the core/band split, the fitted tube for the depth correction, any layout change,
+  the sweep of the zone. Do not build: a temporal stack, a geometric solid fill on the arm, choosing the
+  arm's direction by colour, a flood-fill zone, a second keyed layer for sleeves, key-only arm edges.
+- Gates before the keyed zone is drawn: G1 after step 1 the user still sees a fault the zone could fix
+  (arm cut next to the wrist, or a coarse or late edge); G2 a proxy measurement with no new code adds at
+  most 4 points of median GPU load with hands in view and no drops below 72 fps; G3 the arm fitter rejects
+  at most 30 % of the frames with the hands on a wheel; G4 new bursts carrying the live colour table still
+  show a lower cut + halo for the zone than for step 1 alone. The zone's likely main benefit (the 0.6-2.6
+  cm gap next to the wrist, 5-8 cm on a wheel) was never scored offline.
+- Properties of step 1 (planned, `debug.alvr.`): `arm_shift` 0 / 1 / 2 (2 = new; the default stays 1 until
+  the user's verdict), `arm_hands` 3 (which arms use mode 2: for a side-by-side check), `arm_target_ms` 40,
+  `arm_history_ms` 80, `arm_weight_mm` 300. The wrist is looked up in the past (display - 80 ms) and
+  extrapolated by finite difference, at most 6 cm; the weight is linear 1 to 0 over 30 cm. Costs no GPU
+  time, one more joint lookup per hand and frame, no uniform layout change. Expected: the edge stays with
+  the arm instead of trailing, no 4-5 cm overshoot at reversals, little change when slow; the gap next to
+  the wrist stays. Unknown: the passthrough latency (try `arm_target_ms` 20 / 40 / 60 while waving).
+
+*Two facts from the day's sessions.*
+- The stream between PC and headset dropped 9 times between 11:02 and 11:38 (4 network stalls of 1-2 s
+  while the headset was worn, 4 session pauses), also seen in the streamer's log. The cause of the stalls is
+  not investigated.
+- The streamer's settings interface hung once after SteamVR had run for 17 hours (118 dead connections on
+  port 8082) and needed a SteamVR restart.
+
+*Next steps as of the evening of 2026-11-24.*
+1. Build step 1 of the arm plan, with the live switch; the user judges on the headset.
+2. A design pass on the session's top model for the mask around hands, arms and held objects, before the
+   keyed zone or the change to the remembered copy is built (the user asked why design work was not given
+   to it).
+3. The remembered copy and held objects: as the bottle analysis above says (the user widens the shifter
+   box; then the rolling refresh away from the hands; then carrying what the hand holds). The leg ghosts
+   are expected to go with the rolling refresh.
+4. The wheel model turned by the steering angle: on hold until a wheelbase is connected.
+5. The play area editor is finished. The user after trying build fbe68b1b (two-hand add gesture, the
+   room through the game while editing, select-only first pinch, hand ray): "ok space builder is perfect
+   now, nothign to iterate. Next improvements would be outside of the area definition and always on how
+   we display things inside it." By the user's eye the room now shows at 25 % and the game is dimmed by
+   10 % while editing ("good enough"; the defaults since the commit after fbe68b1b). After an install the
+   client has to be started by hand; the saved layout came back without scanning the code.
+6. The user's leg flicker with still hands is not explained: it needs a recording of the drawn picture
+   frame by frame.
 
 **Night of 2026-11-23: which way the mask is wrong, measured on 26 captures.** Offline, on captures taken
 the same evening with the box placed from a QR code active (build 34a0ea96). An analysis, then an
@@ -681,7 +1036,9 @@ LINEAR_VALID (`nv`). With `key_confirm` also `confirm kept` of the skin and of t
   fingers of the model were too long because of the round ends of the capsules.
 - **Hand tracking as the truth.** It is an estimate. Road to VR measured it 31 ms behind the passthrough
   image (2024). Shifting the pose 35 ms into the past made it as late as the depth map. The pose at display
-  time is already predicted; 0 ms is the current setting.
+  time is already predicted; 0 ms is the current setting. (2026-11-24, measured offline in bursts: the
+  joints asked for the display time trail the real wrist by 40-76 ms, so they are not predicted; see "Day
+  of 2026-11-24".)
 - **Filtering the camera image directly** (noise, connectivity). Estimated 60-75 ms late, so it would
   cut moving hands. It is fine for colors, and for checks of slow hands.
 - **Shifting the late depth of the arm by the motion of the wrist.** Jitters, and the edge stays coarse
@@ -1072,8 +1429,8 @@ shows the pose as last reported, with ` (size not trusted)` when it is not trust
 | `area_dashed` | unset | 1: the play area in the outline is dashed (4 cm period, 60 % drawn, fixed in the room). It is dashed anyway while it is placed from the anchor saved in the layout file, before the code is seen in this run (the editor). Polled |
 | `area_edit` | value at app start | Play area editor (see "Play area editor"). A change to 1 starts editing, a change to 0 ends it (and saves). The value at the start of the app is not a request: set 0, then 1. Only with a marker box, a play area placed and Passthrough = Depth (else logged: `area editor: can't edit`). Polled |
 | `area_pinch_on` / `area_pinch_off` | 0 / 5 | Editor: gap in mm between the surfaces of the thumb and index tips (joint distance minus the two joint radii) below which a pinch closes (2 updates in a row) / above which it opens (for 80 ms). On -30 to 100 (negative: tips pressed together; contact measured -2 to -16 mm on 2026-11-24), off from on to 105 (may equal it). The editor logs the min/max gap every 5 s while editing. Polled |
-| `area_edit_dim` | 30 | Editor: how much the game is dimmed while editing, percent (0 to 90). 60 until the room showed through the game (`area_edit_see`): 0.55 x 0.7 leaves the game at about the 0.4 the handles read well over. Polled |
-| `area_edit_see` | 45 | Editor: how much the real room shows through the game outside the play area while editing, percent (0 to 100; 0: the game opaque there, as before). Inside the area the room shows fully as always; the lines of the editor stay opaque. Polled |
+| `area_edit_dim` | 10 | Editor: how much the game is dimmed while editing, percent (0 to 90). 60 until the room showed through the game (`area_edit_see`): 0.55 x 0.7 leaves the game at about the 0.4 the handles read well over. Polled |
+| `area_edit_see` | 25 | Editor: how much the real room shows through the game outside the play area while editing, percent (0 to 100; 0: the game opaque there, as before). Inside the area the room shows fully as always; the lines of the editor stay opaque. Polled |
 | `area_edit_grace` | 8 | Editor: how long editing waits for a stopped stream (Passthrough = Depth) to come back before it ends, seconds (0 to 60). Polled |
 | `area_edit_hands_pc` | unset (0) | Editor: 1: the hands are sent to the PC also while editing; else no skeletons and no hand poses while editing. Polled |
 | `area_file` | unset (= 1) | 0: the layout files of the play area are neither read nor written: the box of the `marker_box_*` properties (and `area_test`) again, edits last until the app stops. Unset or another value: a layout file of the code replaces that box. A change reads the file again. Polled |
@@ -1577,8 +1934,8 @@ copies the first into it before the uninstall). The newer file that reads wins. 
 | `area_edit` | value at app start | change to 1 starts editing, to 0 ends it and saves; set 0 then 1 |
 | `area_pinch_on` | 0 mm | tip gap below which a pinch closes, -30 to 100 (negative: tips pressed together; contact measured -2 to -16) |
 | `area_pinch_off` | 5 mm | tip gap above which a pinch opens, from `area_pinch_on` to 105 (may equal it) |
-| `area_edit_dim` | 30 % | dimming of the game while editing, 0 to 90 (60 until the third build) |
-| `area_edit_see` | 45 % | the real room through the game outside the area while editing, 0 to 100 (0: opaque, as before) |
+| `area_edit_dim` | 10 % | dimming of the game while editing, 0 to 90 (60 until the third build, 30 in it; 10 chosen by the user's eye on 2026-11-24) |
+| `area_edit_see` | 25 % | the real room through the game outside the area while editing, 0 to 100 (0: opaque, as before; 45 in the third build, the user then chose 25: "good enough") |
 | `area_edit_grace` | 8 s | how long editing waits for a stopped stream to come back before it ends, 0 to 60 |
 | `area_edit_hands_pc` | unset (0) | 1: the hands are sent to the PC also while editing; else no skeletons and no hand poses while editing |
 | `area_file` | unset (on) | 0: no layout file read or written, the property box again |
@@ -2005,13 +2362,17 @@ Testing (`adb logcat -s ALVR_CAM` running):
 
 The order of the user on 2026-11-23; how to go on with each is in "Where it stands and how to continue".
 
-1. The forearm and held objects are cut out near the hand. Nothing works yet. Measured on the lap: the
+1. The forearm and held objects are cut out near the hand. Nothing works yet (2026-11-24: the arm is a
+   timing problem, step 1 of the arm plan is next, not built; no fill rule to ship; see "Day of
+   2026-11-24"). Measured on the lap: the
    runtime removes the depth on the hand and 3-5 cm of thigh around it (uneven, up to 8-15 cm towards
    the knees), the key zone is mm wide and keeps 0.1-1.6 % of the trousers colour, so the hole comes
    from the depth removal.
 2. Jagged edges of what the depth mask shows (sleeve, bottle, later the rig). Measured: at the box
    region's edges 80 % of the surfaces shown real that the depth puts outside come from the 0.08 m
-   feathering (median 1.3 cm outside), 20 % from the 3x3 blend; feathering 0.08 not judged yet.
+   feathering (median 1.3 cm outside), 20 % from the 3x3 blend; feathering 0.08 not judged yet
+   (2026-11-24: 8 / 3 / 2 cm judged "no massive difference", left at 0.03; the limit is the depth
+   resolution; the holes of a wheel are never in the depth).
 3. The room next to the hand: thin lines and patches. Roughly 40-50 % of it from the solid fill. In the
    box captures on the lap, 87 % of the real shown around the hands beyond 6 cm comes from the stale
    remembered copy (old legs where the floor under the desk is).

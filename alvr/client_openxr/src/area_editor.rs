@@ -45,10 +45,10 @@
 //!   thumb and index tips (distance of the joints minus their radii) below which a pinch closes /
 //!   above which it opens (0 / 5; on -30 to 100, off from on to 105: negative is the tips pressed into
 //!   each other, which measured -2 to -16 mm at contact on the Quest)
-//! - `debug.alvr.area_edit_dim <percent>`: how much the game is dimmed while editing (30, 0 to 90; 60
-//!   until the room showed through the game)
+//! - `debug.alvr.area_edit_dim <percent>`: how much the game is dimmed while editing (10, 0 to 90; 60
+//!   until the room showed through the game, then 30)
 //! - `debug.alvr.area_edit_see <percent>`: how much the real room shows through the game outside the
-//!   play area while editing (45, 0 to 100; 0: the game opaque there, as before)
+//!   play area while editing (25, 0 to 100; 0: the game opaque there, as before)
 //! - `debug.alvr.area_edit_grace <s>`: how long editing waits for the stream to come back (8, 0 to 60)
 //! - `debug.alvr.area_edit_hands_pc 1`: the hands are sent to the PC also while editing (unset or 0:
 //!   not sent while editing)
@@ -101,12 +101,13 @@ const VIEW_HOLD_S: f64 = 1.5;
 // See `DEFAULT_PINCH_ON` of area_edit.rs
 const DEFAULT_PINCH_ON_MM: i64 = 0;
 const DEFAULT_PINCH_OFF_MM: i64 = 5;
-// With the room at 45 % through the game, a dim of 30 % leaves the game at 0.55 x 0.7 = 0.39 of its
-// brightness, about the 0.4 of the dim of 60 % the handles read well over in the first two headset runs
-const DEFAULT_DIM_PERCENT: i64 = 30;
+// Chosen by the user's eye on the headset (2026-11-24, third run: first 30 with the room at 45 %, then
+// "make the game more visible"): 10 with the room at 25 % leaves the game at 0.75 x 0.9 = 0.68 of its
+// brightness
+const DEFAULT_DIM_PERCENT: i64 = 10;
 // How much the room shows through the game outside the play area while editing (the user asked for
-// 40-50 % after the second headset run)
-const DEFAULT_SEE_PERCENT: i64 = 45;
+// 40-50 % after the second headset run, and on seeing 45 % for less: 30, then 25: "good enough")
+const DEFAULT_SEE_PERCENT: i64 = 25;
 // How long editing waits for the stream to come back (seconds): on 2026-11-24 the stream stopped and
 // came back within 2.9-3.4 s four times without the session pausing, and 7-13 s with the headset
 // taken off for 5-10 s
