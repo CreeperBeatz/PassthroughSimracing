@@ -7,7 +7,7 @@ use crate::{
     graphics::{self, ProjectionLayerAlphaConfig, ProjectionLayerBuilder},
     interaction::{self, InteractionContext, InteractionSourcesConfig},
     lever::{LeverHand, LeverParams, LeverWindows},
-    passthrough::{self, ColorKeyParams, debug_property},
+    passthrough::{self, ColorKeyParams, ProblemViewParams, debug_property},
     room_memory::{self, MemoryLog},
 };
 use alvr_client_core::{
@@ -504,6 +504,16 @@ pub struct StreamContext {
     game_dim: f32,
     // How much the room shows through the game outside the mask (0..1), while the play area is edited
     game_see: f32,
+    // `debug.alvr.problem_view` (U4): false while the play area is edited, the parameters (polled every
+    // 500 ms, None: off) and the leak map that was uploaded last
+    problem_view_allowed: bool,
+    problem_view: (Instant, Option<ProblemViewParams>),
+    #[cfg(target_os = "android")]
+    problem_view_shown: Option<(
+        std::sync::Arc<crate::auto_color_key::LeakMapState>,
+        ProblemViewParams,
+    )>,
+    problem_view_on: bool,
 }
 
 impl StreamContext {
@@ -710,6 +720,11 @@ impl StreamContext {
             area_overlay: Vec::new(),
             game_dim: 0.0,
             game_see: 0.0,
+            problem_view_allowed: true,
+            problem_view: (Instant::now(), None),
+            #[cfg(target_os = "android")]
+            problem_view_shown: None,
+            problem_view_on: false,
         };
 
         this.update_reference_space(None);
@@ -783,6 +798,75 @@ impl StreamContext {
     /// game), while the play area is edited. Only with Passthrough = Depth
     pub fn set_game_see(&mut self, see: f32) {
         self.game_see = see;
+    }
+
+    /// `debug.alvr.problem_view` is never shown while the play area is edited
+    pub fn allow_problem_view(&mut self, allowed: bool) {
+        self.problem_view_allowed = allowed;
+    }
+
+    // `debug.alvr.problem_view`: upload the leak map when it changes (all unknown until it has one),
+    // turn the view off once when it stops. Nothing is written while it stays off
+    fn update_problem_view(&mut self) {
+        if self.problem_view.0.elapsed() > Duration::from_millis(500) {
+            self.problem_view = (Instant::now(), ProblemViewParams::load());
+        }
+        let Some(params) = self.problem_view.1.filter(|_| self.problem_view_allowed) else {
+            if self.problem_view_on {
+                self.problem_view_on = false;
+                #[cfg(target_os = "android")]
+                {
+                    self.problem_view_shown = None;
+                }
+                self.renderer.set_problem_view(None);
+            }
+            return;
+        };
+
+        #[cfg(target_os = "android")]
+        let state = self.auto_color_key.as_ref().and_then(|key| key.leak_map());
+        #[cfg(target_os = "android")]
+        let is_new = match (&state, &self.problem_view_shown) {
+            (Some(state), Some((shown, shown_params))) => {
+                !std::sync::Arc::ptr_eq(shown, state) || *shown_params != params
+            }
+            (None, None) => !self.problem_view_on,
+            _ => true,
+        };
+        #[cfg(not(target_os = "android"))]
+        let is_new = !self.problem_view_on;
+        if !is_new {
+            return;
+        }
+
+        #[cfg(target_os = "android")]
+        let (anchor, cells) = match &state {
+            Some(state) => (
+                state.snapshot.anchor,
+                alvr_graphics::problem_cells(&state.snapshot, params.lo, params.hi),
+            ),
+            None => (
+                Vec3::ZERO,
+                vec![alvr_graphics::LEAK_UNKNOWN; alvr_graphics::LEAK_MAP_CELLS],
+            ),
+        };
+        #[cfg(not(target_os = "android"))]
+        let (anchor, cells) = (
+            Vec3::ZERO,
+            vec![alvr_graphics::LEAK_UNKNOWN; alvr_graphics::LEAK_MAP_CELLS],
+        );
+        self.renderer
+            .set_problem_view(Some(alvr_graphics::ProblemViewData {
+                anchor,
+                cells: &cells,
+                room: params.room,
+                dim: params.dim,
+            }));
+        #[cfg(target_os = "android")]
+        {
+            self.problem_view_shown = state.map(|state| (state, params));
+        }
+        self.problem_view_on = true;
     }
 
     /// While true the tracked hands are not sent to the PC: no hand skeletons, and no hand pose of a
@@ -2434,6 +2518,7 @@ impl StreamContext {
             );
         }
 
+        self.update_problem_view();
         self.renderer.render(
             buffer_ptr,
             [

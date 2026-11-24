@@ -183,6 +183,17 @@ impl PassthroughLayer<'_> {
 /// - `setprop debug.alvr.key_leak_dump <n>`: another value logs the leak map of the camera view (`ALVR_CAM`),
 ///   a value other than 0 also learns the map
 /// - `setprop debug.alvr.key_leak_probe <cm>`: distance of the spheres of `key_leak_view 2`
+/// - `setprop debug.alvr.problem_view 1` (U4): the problem view, 0 (default): off, the picture is unchanged.
+///   The room shows through the dimmed game and each direction around the head is tinted from the leak
+///   map: nothing under `problem_view_lo`, amber hatching up to `problem_view_hi`, red cross-hatching
+///   above, grey dots where the map doesn't know the direction. Depth passthrough only, never while the
+///   play area is edited. It also learns the leak map (without narrowing the rim like `key_leak_map`).
+///   Also logged every 2 s as `sep:` (`ALVR_CAM`, with the key learner): recall of the hand labels, the
+///   leak of each hand, the known cells and the 10 leakiest cells (yaw/pitch in degrees @ leak)
+/// - `setprop debug.alvr.problem_view_lo <percent>` / `problem_view_hi`: the thresholds of the tint (cell
+///   leak), default `key_leak_map_lo` / `key_leak_map_hi` (3 / 15)
+/// - `setprop debug.alvr.problem_view_room <percent>` / `problem_view_dim`: how much the room shows through
+///   the game (default 85) and how much the game is dimmed (default 50) in the problem view
 /// - `setprop debug.alvr.key_lut_dump <n>`: another value writes the learned LUT to the files folder of the app
 /// - `setprop debug.alvr.key_dump <n>`: another value other than 0 writes the next learning passes to the files
 ///   folder of the app, `alvr_dump_<n>_<index>`: the camera image as the learner reads it (`.rgb`), the hands,
@@ -297,6 +308,50 @@ fn millimeters(property: &str, default: i64) -> f32 {
 // 0..1
 fn percent(property: &str, default: i64) -> f32 {
     debug_property(property).unwrap_or(default).clamp(0, 100) as f32 / 100.0
+}
+
+/// `debug.alvr.problem_view`, see the properties above
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ProblemViewParams {
+    /// Cell leak (0..1) where the amber and the red tint start
+    pub lo: f32,
+    pub hi: f32,
+    /// How much the room shows through the game and how much the game is dimmed (0..1)
+    pub room: f32,
+    pub dim: f32,
+}
+
+impl ProblemViewParams {
+    /// None while it is off (the default)
+    pub fn load() -> Option<Self> {
+        (debug_property("debug.alvr.problem_view").unwrap_or(0) > 0).then(|| {
+            Self::from_values(
+                debug_property("debug.alvr.problem_view_lo")
+                    .or_else(|| debug_property("debug.alvr.key_leak_map_lo")),
+                debug_property("debug.alvr.problem_view_hi")
+                    .or_else(|| debug_property("debug.alvr.key_leak_map_hi")),
+                debug_property("debug.alvr.problem_view_room"),
+                debug_property("debug.alvr.problem_view_dim"),
+            )
+        })
+    }
+
+    /// From the property values in percent, None: unset
+    pub fn from_values(
+        lo: Option<i64>,
+        hi: Option<i64>,
+        room: Option<i64>,
+        dim: Option<i64>,
+    ) -> Self {
+        let percent =
+            |value: Option<i64>, default| value.unwrap_or(default).clamp(0, 100) as f32 / 100.0;
+        Self {
+            lo: percent(lo, 3),
+            hi: percent(hi, 15),
+            room: percent(room, 85),
+            dim: percent(dim, 50),
+        }
+    }
 }
 
 impl ColorKeyParams {
@@ -482,5 +537,28 @@ impl<'a> Deref for PassthroughLayer<'a> {
         } else {
             panic!("No passthrough extension available");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn problem_view_params_defaults_and_clamps() {
+        assert_eq!(
+            ProblemViewParams::from_values(None, None, None, None),
+            ProblemViewParams {
+                lo: 0.03,
+                hi: 0.15,
+                room: 0.85,
+                dim: 0.5,
+            }
+        );
+        let params = ProblemViewParams::from_values(Some(10), Some(250), Some(-5), Some(100));
+        assert_eq!(
+            (params.lo, params.hi, params.room, params.dim),
+            (0.1, 1.0, 0.0, 1.0)
+        );
     }
 }

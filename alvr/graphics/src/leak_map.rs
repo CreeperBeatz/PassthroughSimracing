@@ -135,7 +135,7 @@ fn cell_index(vector: Vec3) -> Option<usize> {
 }
 
 /// Unit direction of the center of a cell
-fn cell_direction(index: usize) -> Vec3 {
+pub(crate) fn cell_direction(index: usize) -> Vec3 {
     let (x, y) = (index % LEAK_MAP_SIZE, index / LEAK_MAP_SIZE);
     let p = (Vec2::new(x as f32 + 0.5, y as f32 + 0.5) / LEAK_MAP_SIZE as f32) * 2.0 - 1.0;
     let down = 1.0 - p.x.abs() - p.y.abs();

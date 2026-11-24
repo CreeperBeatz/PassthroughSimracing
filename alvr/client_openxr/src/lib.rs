@@ -876,6 +876,7 @@ pub fn entry_point() {
                 );
                 stream.set_game_dim(area_editor.game_dim());
                 stream.set_game_see(area_editor.game_see());
+                stream.allow_problem_view(!area_editor.is_editing());
                 // The pinches of the editor are not sent to the PC
                 stream.withhold_hands(area_editor.withholds_hands());
             }

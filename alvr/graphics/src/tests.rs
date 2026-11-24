@@ -929,6 +929,7 @@ fn render_v2(
         }
     }
 
+    let problem_view = crate::problem_view::ProblemViewGpu::new(device, &pipelines.problem_layout);
     let playzone_view = stream::create_playzone_texture(device, UVec2::splat(DEPTH_SIZE))
         .create_view(&TextureViewDescriptor::default());
     let playzone_bind_group = stream::create_playzone_bind_group(
@@ -996,6 +997,7 @@ fn render_v2(
         pass.set_immediates(72, &1_f32.to_le_bytes());
         pass.set_bind_group(0, &view_bind_group, &[]);
         pass.set_bind_group(1, &depth_bind_group, &[]);
+        pass.set_bind_group(2, &problem_view.bind_group, &[]);
         pass.draw(0..4, 0..1);
 
         if overlay_count > 0 {

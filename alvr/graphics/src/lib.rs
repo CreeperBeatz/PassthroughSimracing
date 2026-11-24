@@ -9,6 +9,7 @@ mod lobby;
 mod marker_box;
 mod overlay;
 mod play_area;
+mod problem_view;
 mod room_memory;
 mod room_memory_gpu;
 mod staging;
@@ -32,6 +33,7 @@ pub use lobby::*;
 pub use marker_box::*;
 pub use overlay::*;
 pub use play_area::*;
+pub use problem_view::*;
 pub use room_memory::*;
 pub use stream::*;
 

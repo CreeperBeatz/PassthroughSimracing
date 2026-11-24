@@ -375,3 +375,35 @@ step 3, plus the check's addition:
   No blue near the hands at the wheel or the shifter: change `mem_pitch_deg`.
 - Record: a burst with `mem_roll 1` (the display records have `memory`) and a `key_dump` (the memory
   files); `read_burst.py` prints the `room memory` line.
+## U4: problem view and `sep:` log (2026-11-24)
+
+Reduced scope of design §2.5: the existing leak map (head-anchored, 2° cells) drawn as a tint, and a log
+line to judge the separation of hand and room. Not built: the rig-frame (QR) anchor, the static distance
+per cell, the 3 x 3 pooling, vis(r), the "Hands / Arms" card and the 8 s showing at the end of setup.
+
+- `debug.alvr.problem_view 1` (default 0: off, the picture is unchanged and nothing is uploaded). Depth
+  passthrough only. The room shows through the dimmed game; each direction around the head is tinted from
+  the leak map: nothing under `problem_view_lo`, amber hatching up to `problem_view_hi`, red cross-hatching
+  above, grey dots where the cell is unknown (everything grey until the map has its first snapshot). Never
+  while the play-area editor is active. It also learns the leak map, as `key_leak_map` does, but does not
+  narrow the rim.
+- `debug.alvr.problem_view_lo` / `problem_view_hi` (percent of cell leak): default `key_leak_map_lo` /
+  `key_leak_map_hi` (3 / 15).
+- `debug.alvr.problem_view_room` / `problem_view_dim` (percent): how much the room shows through the game
+  (85) and how much the game is dimmed (50).
+- `sep:` (`ALVR_CAM`, every 2 s with the key learner, while `problem_view` is on): `hands recall` (share of
+  this pass's skin label colors that the LUT keeps), `leak L / R` (share of the colors around each hand that
+  it keeps, the same as `leak` of the `auto key:` line), `arms` (no arm labels yet: `-`), `known cells` (of
+  96 x 96) and the 10 leakiest cells as `yaw/pitch@leak` (degrees from the map anchor, yaw positive to the
+  left of -Z, pitch positive up).
+
+How it works: the CPU turns the leak map snapshot into one byte per cell (class: none, medium, high,
+unknown) and uploads a 96 x 96 R8 texture when the snapshot changes. The stream shader (depth path) maps
+each view ray, 0.8 m out from the eye, to the octahedral cell from the map anchor, as the learner does,
+and draws the pattern in map space so the hatching stays fixed in the room.
+
+On the headset (one minute): color key on, `setprop debug.alvr.problem_view 1`. The game dims and the room
+is grey-dotted; look around for 10-20 s: the dots clear where the camera has seen the room, and amber / red
+hatching stays where the key would let the room through (skin-coloured desk, wood, a beige wall). Hold a
+hand over a red area: that is where the rim leaks. Open the play-area editor: the view goes away. `adb
+logcat -s ALVR_CAM | grep sep:` shows recall near 1 and low leaks when the key separates well.

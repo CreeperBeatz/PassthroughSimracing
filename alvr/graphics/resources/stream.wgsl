@@ -44,6 +44,18 @@ override UPSCALE_EDGE_SHARPNESS: f32 = 2.0;
 
 @group(1) @binding(0) var<uniform> depth_u: DepthUniforms;
 
+// `debug.alvr.problem_view`, see problem_view.rs. All zero (off) unless it is on
+struct ProblemView {
+    // xyz: anchor of the leak map (stage space), w: on (0/1)
+    anchor: vec4f,
+    // x: how much the room shows through the game, y: how much the game is dimmed
+    look: vec4f,
+}
+// One texel per cell of the leak map (octahedral, 96 x 96): round(r * 3) is 0 nothing, 1 medium, 2 high,
+// 3 unknown
+@group(2) @binding(0) var problem_cells: texture_2d<f32>;
+@group(2) @binding(1) var<uniform> problem_u: ProblemView;
+
 struct VertexOutput {
     @builtin(position) position: vec4f,
     @location(0) uv: vec2f,
@@ -138,10 +150,18 @@ fn mask_edge(coverage: f32) -> f32 {
 fn depth_passthrough(stream_color: vec3f, uv: vec2f) -> vec4f {
     let debug_view = u32(depth_u.region.w + 0.5);
     // Dimmed while the play area is edited
-    let game_color = stream_color * (1.0 - depth_u.lighting2.w);
+    var game_color = stream_color * (1.0 - depth_u.lighting2.w);
     // While the play area is edited the real room shows through the game by this much where the mask
     // does not show it fully (outside the area). The overlay is drawn after this, opaque
-    let see = depth_u.area.y;
+    var see = depth_u.area.y;
+    let problem_on = problem_u.anchor.w > 0.5;
+    var problem = vec4f(0.0);
+    if problem_on {
+        // The problem view: the room through the dimmed game, with the tint of the leak map over it
+        see = max(see, problem_u.look.x);
+        game_color = game_color * (1.0 - problem_u.look.y);
+        problem = problem_tint(uv);
+    }
 
     let mask_sample = textureSampleLevel(depth_mask, stream_sampler, uv, 0.0);
     let mask = mask_edge(mask_sample.r);
@@ -192,6 +212,11 @@ fn depth_passthrough(stream_color: vec3f, uv: vec2f) -> vec4f {
             lower_alpha = min(lower_alpha, 1.0 - see);
             upper_alpha = 0.0;
         }
+        if problem_on {
+            // In the lower layer, which alone can be part way (upper is 0 while the room shows)
+            rgb = mix(rgb, problem.rgb, problem.a);
+            lower_alpha = max(lower_alpha, problem.a);
+        }
         var alpha = 0.5 * (lower_alpha + upper_alpha);
         // Where the lower layer is cropped away or not used, the upper one shows what both would show
         // over colors that the key doesn't keep: upper + (1 - upper) * lower
@@ -216,8 +241,58 @@ fn depth_passthrough(stream_color: vec3f, uv: vec2f) -> vec4f {
     if debug_view == DEBUG_VIEW_TINT_MASK {
         rgb = rgb + vec3f(0.0, 0.25, 0.0) * mask;
     }
+    if problem_on {
+        // Premultiplied: the tint covers problem.a of the pixel
+        return vec4f(mix(rgb, problem.rgb, problem.a), mix(1.0 - shown * brightness, 1.0, problem.a));
+    }
 
     return vec4f(rgb, 1.0 - shown * brightness);
+}
+
+// The rays of the leak map start at its anchor and see the room this far away, as in leak_map.rs
+const PROBLEM_DEPTH: f32 = 0.8;
+const PROBLEM_MAP_SIZE: f32 = 96.0;
+// Hatching lines per cell (a cell is about 2 degrees)
+const PROBLEM_LINES: f32 = 4.0;
+
+fn sign_or_one(value: f32) -> f32 {
+    return select(-1.0, 1.0, value >= 0.0);
+}
+
+// Tint of the problem view along the view ray of uv: rgb, and how much of the pixel it covers.
+// Nothing under the low threshold, amber hatching (medium), red cross-hatching (high), grey dots
+// (unknown). Same octahedral layout as `grid_position` in leak_map.rs
+fn problem_tint(uv: vec2f) -> vec4f {
+    let eye = depth_u.eyes[imm.view_idx];
+    let direction = normalize((eye.uv_to_world_dir * vec4f(uv, 1.0, 0.0)).xyz);
+    let v = eye.eye_position.xyz + direction * PROBLEM_DEPTH - problem_u.anchor.xyz;
+    let sum = abs(v.x) + abs(v.y) + abs(v.z);
+    if sum < 1e-6 {
+        return vec4f(0.0);
+    }
+    var p = vec2f(v.x, v.z) / sum;
+    if v.y > 0.0 {
+        // Upper hemisphere, folded outwards
+        p = vec2f((1.0 - abs(p.y)) * sign_or_one(p.x), (1.0 - abs(p.x)) * sign_or_one(p.y));
+    }
+    let grid = (p * 0.5 + 0.5) * PROBLEM_MAP_SIZE;
+    let cell = clamp(vec2i(floor(grid)), vec2i(0), vec2i(i32(PROBLEM_MAP_SIZE) - 1));
+    let kind = u32(round(textureLoad(problem_cells, cell, 0).r * 3.0));
+
+    let f = grid * PROBLEM_LINES;
+    let hatch = step(0.7, fract(f.x + f.y));
+    if kind == 1u {
+        return vec4f(1.0, 0.7, 0.1, 0.8 * hatch);
+    }
+    if kind == 2u {
+        let crossed = max(hatch, step(0.7, fract(f.x - f.y)));
+        return vec4f(1.0, 0.1, 0.1, 0.85 * crossed);
+    }
+    if kind == 3u {
+        let dots = step(length(fract(f * 0.5) - 0.5), 0.15);
+        return vec4f(0.6, 0.6, 0.6, 0.7 * dots);
+    }
+    return vec4f(0.0);
 }
 
 // Brightness factor (0..1) applied to the passthrough, following the game lighting

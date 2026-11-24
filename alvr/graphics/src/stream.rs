@@ -5,6 +5,7 @@ use crate::{
     depth_mask::{self, DEPTH_UNIFORMS_SIZE, DepthRenderInput},
     key_dump::{array, object, string},
     overlay::{self, OVERLAY_UNIFORMS_SIZE, OverlayEye, OverlaySegment, SEGMENT_FLOAT_COUNT},
+    problem_view::{self, ProblemViewData, ProblemViewGpu},
     room_memory::MemoryStatus,
     room_memory_gpu::{MemoryPasses, MemoryPipelines, RoomMemory},
 };
@@ -184,6 +185,8 @@ pub(crate) struct StreamPipelines {
     pub view_layout: BindGroupLayout,
     /// depth uniforms, depth texture array
     pub depth_layout: BindGroupLayout,
+    /// Group 2 of `main`: `debug.alvr.problem_view`, see problem_view.rs
+    pub problem_layout: BindGroupLayout,
     pub main: RenderPipeline,
     /// Uses `depth_layout` and `playzone_layout`
     pub depth_mask: RenderPipeline,
@@ -235,6 +238,8 @@ impl StreamPipelines {
             ],
         });
 
+        let problem_layout = problem_view::problem_view_layout(device);
+
         let main_module = shader_module(device, "stream", stream_shader_source());
         let compilation_options = PipelineCompilationOptions {
             constants,
@@ -246,7 +251,11 @@ impl StreamPipelines {
             // Note: Layout cannot be inferred because of a bug with push constants
             layout: Some(&device.create_pipeline_layout(&PipelineLayoutDescriptor {
                 label: None,
-                bind_group_layouts: &[Some(&view_layout), Some(&depth_layout)],
+                bind_group_layouts: &[
+                    Some(&view_layout),
+                    Some(&depth_layout),
+                    Some(&problem_layout),
+                ],
                 immediate_size: IMMEDIATE_SIZE,
             })),
             vertex: VertexState {
@@ -543,6 +552,7 @@ impl StreamPipelines {
         Self {
             view_layout,
             depth_layout,
+            problem_layout,
             main,
             depth_mask,
             playzone_layout,
@@ -855,6 +865,7 @@ pub struct StreamRenderer {
     // on (dropped when it is off)
     memory_pipelines: OnceCell<MemoryPipelines>,
     memory: RefCell<Option<RoomMemory>>,
+    problem_view: ProblemViewGpu,
 }
 
 impl StreamRenderer {
@@ -1027,6 +1038,7 @@ impl StreamRenderer {
             create_playzone(device, &pipelines, &views_objects, &sampler, UVec2::ONE);
         let overlay_buffer = create_overlay_buffer(device);
         let overlay_bind_group = create_overlay_bind_group(device, &pipelines, &overlay_buffer);
+        let problem_view = ProblemViewGpu::new(device, &pipelines.problem_layout);
 
         Self {
             context,
@@ -1058,7 +1070,14 @@ impl StreamRenderer {
             target_view_resolution,
             memory_pipelines: OnceCell::new(),
             memory: RefCell::new(None),
+            problem_view,
         }
+    }
+
+    /// `debug.alvr.problem_view`: the leak map as a tint over the room (depth passthrough only), or off
+    /// (None, the default). Writes nothing while it stays off.
+    pub fn set_problem_view(&self, data: Option<ProblemViewData>) {
+        self.problem_view.write(&self.context.queue, data);
     }
 
     /// Register the images of the environment depth swapchain (GL texture arrays with one layer
@@ -1502,6 +1521,7 @@ impl StreamRenderer {
             render_pass.set_immediates(VIEW_INDEX_CONST_OFFSET, &(view_idx as u32).to_le_bytes());
             render_pass.set_bind_group(0, &self.views_objects[view_idx].bind_group, &[]);
             render_pass.set_bind_group(1, depth_bind_group, &[]);
+            render_pass.set_bind_group(2, &self.problem_view.bind_group, &[]);
             set_passthrough_immediates(&mut render_pass, passthrough);
             render_pass.draw(0..4, 0..1);
 

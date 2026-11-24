@@ -554,6 +554,17 @@ fn learn_loop(context: &Context) {
                     model.kept_fraction(&samples.scene),
                     last_update.elapsed().as_secs_f32() * 1000.0,
                 ));
+                // `debug.alvr.problem_view` (U4): how well the key separates hand and room. Recall: the
+                // share of this pass's hand label colors (skin) that the LUT keeps; leak: the share of
+                // the colors around each hand that it keeps (as `leak` above); then the leak map
+                if debug_property("debug.alvr.problem_view").unwrap_or(0) > 0 {
+                    let state = context.leak_map.lock().state.clone();
+                    camera::log(&alvr_graphics::sep_log(
+                        (!samples.skin.is_empty()).then(|| model.kept_fraction(&samples.skin)),
+                        leak,
+                        state.as_ref().map(|state| &state.snapshot),
+                    ));
+                }
             }
 
             if let Some(new_lut) = new_lut {
@@ -720,7 +731,9 @@ impl LeakLearner {
         let view_mode = debug_property("debug.alvr.key_leak_view").unwrap_or(0);
         let is_on = debug_property("debug.alvr.key_leak_map").unwrap_or(0) > 0
             || view_mode == 2
-            || debug_property("debug.alvr.key_leak_dump").unwrap_or(0) != 0;
+            || debug_property("debug.alvr.key_leak_dump").unwrap_or(0) != 0
+            // The problem view shows the map, without narrowing the rim
+            || debug_property("debug.alvr.problem_view").unwrap_or(0) > 0;
         if !is_on {
             // Hands are not excluded while it is off, so start again
             if self.is_on {
