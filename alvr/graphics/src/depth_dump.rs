@@ -4,7 +4,7 @@
 
 use crate::{
     PlacedArea,
-    depth_mask::{self, ArmMotion, DepthFrame, DepthRenderInput},
+    depth_mask::{self, ArmGap, ArmMotion, DepthFrame, DepthRenderInput},
     key_dump::{array, number, numbers, object, pose, string},
     stream,
 };
@@ -380,6 +380,26 @@ pub(crate) fn arm(arm: Option<&ArmMotion>) -> String {
     })
 }
 
+/// The wrist gap of an arm (`debug.alvr.arm_gap_mm`), null: off. Also in the display records of bursts
+pub(crate) fn arm_gap(gap: Option<&ArmGap>) -> String {
+    gap.map_or("null".into(), |gap| {
+        object([
+            ("wrist", numbers(&gap.wrist.to_array())),
+            ("axis", numbers(&gap.axis.to_array())),
+            ("length_mm", number(gap.length * 1000.0)),
+        ])
+    })
+}
+
+/// `debug.alvr.edge_cut` in percent as the mask used it (`DepthRenderInput::edge_cut`, 0: today's 20)
+pub(crate) fn edge_cut_percent(centre: f32) -> f32 {
+    if centre > 0.0 {
+        (centre * 100.0).round()
+    } else {
+        20.0
+    }
+}
+
 fn optional(value: Option<i64>) -> String {
     value.map_or("null".into(), |value| value.to_string())
 }
@@ -533,6 +553,11 @@ impl DumpFrame<'_> {
             .arms
             .each_ref()
             .map(|motion| arm(motion.as_ref()));
+        let arm_gaps = self
+            .input
+            .arm_gaps
+            .each_ref()
+            .map(|gap| arm_gap(gap.as_ref()));
 
         let mut depth = size(self.depth_size).to_vec();
         depth.extend([
@@ -568,6 +593,9 @@ impl DumpFrame<'_> {
             ("eyes", array(eyes)),
             ("hands", array(hands)),
             ("arms", array(arms)),
+            // Steps 1 and 2 of docs/mask-v2-design.md
+            ("edge_cut", number(edge_cut_percent(self.input.edge_cut))),
+            ("arm_gaps", array(arm_gaps)),
         ])
     }
 }
@@ -677,6 +705,15 @@ mod tests {
                     extrapolated: 0.015625,
                 }),
             ],
+            arm_gaps: [
+                None,
+                Some(ArmGap {
+                    wrist: Vec3::new(0.1, 1.2, -0.3),
+                    axis: Vec3::NEG_Y,
+                    length: 0.03,
+                }),
+            ],
+            edge_cut: 0.65,
             capture_playzone: false,
             playzone_view: false,
             key_lower_rects: None,
@@ -721,7 +758,15 @@ mod tests {
                 "{json}"
             );
             assert!(json.contains(r#""arms":[null,{"wrist":"#), "{json}");
+            assert!(
+                json.contains(
+                    r#""edge_cut":65,"arm_gaps":[null,{"wrist":[0.1,1.2,-0.3],"axis":[0,-1,0],"length_mm":30}]"#
+                ),
+                "{json}"
+            );
         }
+        // Today's edge reads as 20
+        assert_eq!(edge_cut_percent(0.0), 20.0);
 
         // A box placed from a marker is written instead of the region of the settings
         let input = DepthRenderInput {

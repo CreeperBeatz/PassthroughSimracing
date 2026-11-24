@@ -120,6 +120,21 @@ const DEBUG_VIEW_SHOW_DEPTH: u32 = 2u;
 const MASK_EDGE_MIN: f32 = 0.05;
 const MASK_EDGE_MAX: f32 = 0.35;
 
+// The mask (0..1) from the coverage of the depth mask. `debug.alvr.edge_cut` (step 1 of
+// docs/mask-v2-design.md) moves the centre of the cut, in area.z (0: today's range above, so an unset
+// uniform draws what it always did). Fingers are drawn by the hand zone now, so the growth only leaves a
+// rim of room around every still object (4-6 mm measured). A straight depth border moves inward by 0.37
+// depth texel from a centre of 0.2 to 0.5 and by 0.74 to 0.8; a line one texel wide fades above 0.6.
+// It is global: the soft borders of the play-area boxes and of the remembered zone move inward too
+fn mask_edge(coverage: f32) -> f32 {
+    let cut = depth_u.area.z;
+    if cut <= 0.0 {
+        return smoothstep(MASK_EDGE_MIN, MASK_EDGE_MAX, coverage);
+    }
+    let low = clamp(cut - 0.15, 0.02, 0.69);
+    return smoothstep(low, low + 0.3, coverage);
+}
+
 fn depth_passthrough(stream_color: vec3f, uv: vec2f) -> vec4f {
     let debug_view = u32(depth_u.region.w + 0.5);
     // Dimmed while the play area is edited
@@ -129,7 +144,7 @@ fn depth_passthrough(stream_color: vec3f, uv: vec2f) -> vec4f {
     let see = depth_u.area.y;
 
     let mask_sample = textureSampleLevel(depth_mask, stream_sampler, uv, 0.0);
-    let mask = smoothstep(MASK_EDGE_MIN, MASK_EDGE_MAX, mask_sample.r);
+    let mask = mask_edge(mask_sample.r);
 
     if debug_view == DEBUG_VIEW_SHOW_DEPTH {
         if mask_sample.b < 0.5 {
@@ -163,8 +178,7 @@ fn depth_passthrough(stream_color: vec3f, uv: vec2f) -> vec4f {
             if depth_u.playzone.w > 0.5 {
                 // Shown only because of the remembered playzone: half opaque blue over the passthrough.
                 // Faintly blue where it is used, near the hands
-                let remembered =
-                    mask - smoothstep(MASK_EDGE_MIN, MASK_EDGE_MAX, mask_sample.r - mask_sample.a);
+                let remembered = mask - mask_edge(mask_sample.r - mask_sample.a);
                 rgb = mix(rgb, vec3f(0.0, 0.3, 1.0), max(0.25 * hand.b, remembered));
                 // Only the lower layer: both at 0.5 would pack to 0.5, an opaque lower layer
                 lower_alpha = max(lower_alpha, 0.5 * remembered);

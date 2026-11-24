@@ -48,7 +48,8 @@ struct DepthUniforms {
     world_to_area: mat4x4f,
     // x: number of boxes in area_boxes (0 with the distance region), y: how much the real room shows
     // through the game where the mask does not show it fully (0: not, 1: no game; while the play area
-    // is edited)
+    // is edited), z: centre of the cut of the mask edge in stream.wgsl (`debug.alvr.edge_cut`, 0:
+    // today's)
     area: vec4f,
     // x: region mode (0: distance, 1: volume), y: max distance, z: edge feathering, w: debug view
     region: vec4f,
@@ -70,8 +71,12 @@ struct DepthUniforms {
     // Start and end of each capsule, xyz: position, w: radius
     hand_points: array<vec4f, 2u * 2u * HAND_SEGMENTS>,
     // Motion of each arm since the depth image was captured: xyz: wrist position, xyz: direction from
-    // the wrist to the elbow, xyz: displacement (0: plain depth)
+    // the wrist to the elbow, xyz: displacement (0: plain depth). Without a motion the wrist is still
+    // set when the arm has a wrist gap (nothing else reads it while the displacement is 0)
     arms: array<vec4f, 6>,
+    // The wrist gap of each arm (`debug.alvr.arm_gap_mm`), xyz: unit vector from the middle knuckle to
+    // the wrist (up the arm), w: its length G in meters (0: off)
+    arm_gap: array<vec4f, 2>,
     playzone_eyes: array<PlayzoneEye, 2>,
     // x: available (0/1), y, z: debug view, how much the rim of each hand is narrowed (0..1), w: debug
     // view of the playzone (0/1)

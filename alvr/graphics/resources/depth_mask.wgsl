@@ -52,6 +52,16 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
 
     var result = current_mask(uv);
 
+    // The strip the runtime removes behind each wrist. Only adds, and with both gaps off (the default)
+    // nothing is done, so the mask is today's
+    if (depth_u.arm_gap[0].w > 0.0 || depth_u.arm_gap[1].w > 0.0) && result.r < 1.0 {
+        let eye = depth_u.eyes[imm.view_idx];
+        let origin = eye.eye_position.xyz;
+        let dir = normalize((eye.uv_to_world_dir * vec4f(uv, 1.0, 0.0)).xyz);
+        let gap = max(gap_coverage(origin, dir, 0u), gap_coverage(origin, dir, 1u));
+        result.r = max(result.r, gap);
+    }
+
     // Near the hands, objects may be missing in the depth map
     if depth_u.lighting2.z > 0.5 && depth_u.playzone.x > 0.5 && result.r < 1.0 {
         let near_hand = textureSampleLevel(focus_area, linear_sampler, uv, 0.0).b;
@@ -281,6 +291,85 @@ fn arm_displacement(point: vec3f) -> vec3f {
         result += displacement * weight;
     }
     return result;
+}
+
+// Rays farther than this from the gap segment of an arm get nothing from it
+const GAP_REACH: f32 = 0.055;
+// The surface found for the gap must lie this near the lookup point (fading over the last cm): then it
+// is the forearm, not the wall behind it
+const GAP_SURFACE: f32 = 0.06;
+// Rays that pass this far in front of the wrist (towards the fingers) get nothing; less: a part
+const GAP_FRONT: f32 = 0.005;
+
+// Step 2 of docs/mask-v2-design.md (4.2), `debug.alvr.arm_gap_mm`: the runtime removes the forearm
+// 0.6-2.6 cm behind the wrist (5-8 cm with the hands on a wheel, measured), and moving the arm
+// (arm_displacement) cannot bring back what is not in the depth. A ray that passes just behind the wrist
+// is given the forearm's surface from G further up the arm, moved back by the same amount: the arm is
+// continued to the hand like a tube. Coverage of the region there, 0 where the ray is far from the gap
+// or the depth up the arm is not an arm. The caller takes the max with the plain mask, so the background
+// beside the wrist is never moved; it also works for a still arm and without arm motions (arm_shift 0)
+fn gap_coverage(origin: vec3f, dir: vec3f, hand: u32) -> f32 {
+    let gap = depth_u.arm_gap[hand];
+    let gap_len = gap.w;
+    if gap_len <= 0.0 {
+        return 0.0;
+    }
+    let view_idx = imm.view_idx;
+    // From the wrist up the arm to wrist + G * axis. The wrist is the one the arm is placed with
+    let wrist = depth_u.arms[hand * 3u].xyz;
+    let axis = gap.xyz;
+
+    // The point of the segment nearest the ray (`along` from the wrist), and the ray's point nearest it
+    let w = origin - wrist;
+    let b = dot(dir, axis);
+    let denominator = 1.0 - b * b;
+    var along = 0.0;
+    if denominator > 1e-6 {
+        along = (dot(axis, w) - b * dot(dir, w)) / denominator;
+    }
+    // Only behind the wrist: a ray past it, towards the fingers, would be looked up G further up the arm
+    // and land on the arm too. Fades out over GAP_FRONT so that the end is not a hard line
+    let front = 1.0 - smoothstep(0.0, GAP_FRONT, -along);
+    if front <= 0.0 {
+        return 0.0;
+    }
+    along = clamp(along, 0.0, gap_len);
+    let on_segment = wrist + axis * along;
+    let near_point = origin + dir * max(dot(on_segment - origin, dir), 0.05);
+    if distance(near_point, on_segment) > GAP_REACH {
+        return 0.0;
+    }
+
+    // Look G - along further up the arm, where the depth still shows the arm before arm_displacement
+    // moved it
+    let shift = axis * (gap_len - along);
+    let lookup_point = near_point + shift;
+    let displacement = arm_displacement(lookup_point);
+    let lookup = project_to_depth(lookup_point - displacement, view_idx);
+    if !lookup.valid {
+        return 0.0;
+    }
+
+    // 2x2 neighborhood, blended so that the edge is not blocky. Each surface counts only if it is near
+    // the lookup point, and is classified where it is moved back to, next to the wrist
+    let corner = floor(lookup.texel - 0.5);
+    let f = lookup.texel - 0.5 - corner;
+    var coverage = 0.0;
+    for (var y = 0; y < 2; y++) {
+        for (var x = 0; x < 2; x++) {
+            let depth = load_depth(vec2i(corner) + vec2i(x, y), view_idx);
+            if depth < MAX_DEPTH {
+                let hit = lookup_to_world(lookup, linearize_depth(depth), view_idx) + displacement;
+                let arm_like =
+                    1.0 - smoothstep(GAP_SURFACE - 0.01, GAP_SURFACE, distance(hit, lookup_point));
+                if arm_like > 0.0 {
+                    let weight = mix(1.0 - f.x, f.x, f32(x)) * mix(1.0 - f.y, f.y, f32(y));
+                    coverage += weight * arm_like * region_mask(hit - shift, view_idx);
+                }
+            }
+        }
+    }
+    return coverage * front;
 }
 
 struct DepthLookup {

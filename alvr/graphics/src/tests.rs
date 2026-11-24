@@ -5,8 +5,8 @@
 use crate::{
     depth_dump::{DumpReadback, DumpSource},
     depth_mask::{
-        self, ArmMotion, ColorKeyInput, DepthFrame, DepthRenderInput, HAND_SEGMENTS, HandShape,
-        HandSweep, HandZones, RegionOverride, SweepParams, WristBridge,
+        self, ArmGap, ArmMotion, ColorKeyInput, DepthFrame, DepthRenderInput, HAND_SEGMENTS,
+        HandShape, HandSweep, HandZones, RegionOverride, SweepParams, WristBridge,
     },
     overlay::{self, OVERLAY_AMBER, OVERLAY_SLOTS, OverlayEye, OverlaySegment},
     play_area::{self, AreaBox, PlacedArea, PlayArea, Side},
@@ -159,6 +159,9 @@ fn depth_uniforms_layout_matches_the_shader() {
     assert_eq!(offset("area_bounds"), area_start);
     assert_eq!(offset("area_boxes"), area_start + 32);
     assert_eq!(offset("hand_bridge_end"), area_start - 16);
+    // The wrist gaps right after the 6 vectors of the arms, where `depth_uniforms` writes them
+    assert_eq!(offset("arm_gap"), offset("arms") + 6 * 16);
+    assert_eq!(offset("playzone_eyes"), offset("arm_gap") + 2 * 16);
     // Where the box of the settings was: 2 eyes, then the transform and the number of boxes
     let eyes = 2 * 4 * (16 + 4 + 16 + 16 + 4);
     assert_eq!(offset("world_to_area"), eyes);
@@ -551,6 +554,58 @@ fn render_with_area(
     game_dim: f32,
     game_see: f32,
 ) -> Output {
+    render_v2(
+        device,
+        queue,
+        config,
+        scene,
+        eye_position,
+        depth_camera_position,
+        depth_available,
+        color_key,
+        arms,
+        playzone,
+        key_lower_rects,
+        playzone_view,
+        overlay,
+        region_override,
+        game_dim,
+        game_see,
+        MaskV2::default(),
+    )
+}
+
+/// The switches of steps 1 and 2 of docs/mask-v2-design.md. Default: off, today's mask
+#[derive(Clone, Copy, Default)]
+struct MaskV2 {
+    edge_cut: f32,
+    arm_gaps: [Option<ArmGap>; 2],
+    /// The depth camera turned about +y by this (radians). With the eye at its position nothing moves
+    /// by parallax: the depth texels only slide under the pixels, by a part of a texel
+    depth_yaw: f32,
+}
+
+/// `render_with_area` with the edge cut and the wrist gaps
+#[expect(clippy::too_many_arguments)]
+fn render_v2(
+    device: &Device,
+    queue: &Queue,
+    config: &DepthPassthroughConfig,
+    scene: &Scene,
+    eye_position: Vec3,
+    depth_camera_position: Vec3,
+    depth_available: bool,
+    color_key: Option<ColorKeyInput>,
+    arms: [Option<ArmMotion>; 2],
+    playzone: Option<&Scene>,
+    key_lower_rects: Option<[(Vec2, Vec2); 2]>,
+    playzone_view: bool,
+    overlay: &[OverlaySegment],
+    region_override: Option<PlacedArea>,
+    game_dim: f32,
+    game_see: f32,
+    mask_v2: MaskV2,
+) -> Output {
     let target_format = TextureFormat::Rgba8Unorm;
     let constants = [
         ("ENABLE_SRGB_CORRECTION", 0.0),
@@ -711,11 +766,19 @@ fn render_with_area(
             swapchain_index: 0,
             near: NEAR,
             far: f32::INFINITY,
-            depth_views: [view(depth_camera_position); 2],
+            depth_views: [ViewParams {
+                pose: Pose {
+                    orientation: Quat::from_rotation_y(mask_v2.depth_yaw),
+                    position: depth_camera_position,
+                },
+                fov: fov(),
+            }; 2],
         }),
         eye_positions: [eye_position; 2],
         color_key,
         arms,
+        arm_gaps: mask_v2.arm_gaps,
+        edge_cut: mask_v2.edge_cut,
         capture_playzone: false,
         playzone_view,
         key_lower_rects,
@@ -1769,6 +1832,302 @@ fn late_arms_are_moved() {
     assert!(shift_35.abs() < 0.005, "{shift_35}");
 }
 
+/// The eye at the depth camera, no color key, no playzone: only the arms and the switches of steps 1
+/// and 2 of docs/mask-v2-design.md
+fn render_mask_v2(
+    device: &Device,
+    queue: &Queue,
+    config: &DepthPassthroughConfig,
+    scene: &Scene,
+    arms: [Option<ArmMotion>; 2],
+    mask_v2: MaskV2,
+) -> Output {
+    render_v2(
+        device,
+        queue,
+        config,
+        scene,
+        Vec3::ZERO,
+        Vec3::ZERO,
+        true,
+        None,
+        arms,
+        None,
+        None,
+        false,
+        &[],
+        None,
+        0.0,
+        0.0,
+        mask_v2,
+    )
+}
+
+// `debug.alvr.edge_cut`: a straight depth border moves inward by 0.37 depth texel at 50 and by 0.74 at
+// 80 (B-spline arithmetic of the 3 x 3 blend, confirmed by the check of the design)
+#[test]
+fn edge_cut_moves_the_border_inward() {
+    let (device, queue) = gpu_or_skip!();
+    let config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
+
+    // An object at 0.5 m, u 0.3..0.7 (texels 19..44), on a background at 3 m. One pixel of the view is
+    // one depth texel
+    let scene = Scene::new(3.0, [0.3, 0.3, 0.7, 0.7], 0.5);
+    // Width of the room in the middle row (pixels = texels), averaged over 8 positions of the depth
+    // texels under the pixels, an eighth of a texel apart (a texel is 0.03125 in tangent, the edges
+    // are near a tangent of 0.4: about 1.16 times the angle). Without that the pixels would see the
+    // edge at only one position, where a shift of a part of a texel hardly shows
+    let width = |edge_cut: f32| {
+        (0..8)
+            .map(|k| {
+                let output = render_mask_v2(
+                    &device,
+                    &queue,
+                    &config,
+                    &scene,
+                    [None; 2],
+                    MaskV2 {
+                        edge_cut,
+                        depth_yaw: k as f32 * 0.03125 / 8.0 / 1.16,
+                        ..Default::default()
+                    },
+                );
+                (0..TARGET_SIZE)
+                    .map(|x| 1.0 - output.alpha((x as f32 + 0.5) / TARGET_SIZE as f32, 0.5))
+                    .sum::<f32>()
+            })
+            .sum::<f32>()
+            / 8.0
+    };
+
+    let today = width(0.0);
+    // The object is 26 texels wide, today drawn 0.38 texel too big on each side
+    assert!((today - 26.75).abs() < 0.3, "{today}");
+    // Two borders in the row: half the change of the width is the shift of one
+    let shift = |edge_cut| (today - width(edge_cut)) / 2.0;
+    let at_50 = shift(0.5);
+    assert!((at_50 - 0.37).abs() < 0.08, "{at_50}");
+    let at_80 = shift(0.8);
+    assert!((at_80 - 0.74).abs() < 0.08, "{at_80}");
+    // 20 as a value is today's within a step of the 8 bit output (0 draws today's exactly, 0.2 goes
+    // through the general path)
+    let at_20 = shift(0.2);
+    assert!(at_20.abs() < 0.02, "{at_20}");
+}
+
+// The arm of the wrist gap tests: a forearm at 0.5 m, 8 cm wide (x -0.04..0.04), from the bottom of
+// the view up to y = -0.094, on a background at 3 m. The runtime removed it from there up to the wrist
+// at y = -0.06: a strip of 3.4 cm, as with the hands on a wheel. A gap of 5 cm looks the depth up at
+// y = -0.11, a texel inside the arm (one texel is 1.56 cm at 0.5 m)
+const GAP_WRIST: Vec3 = Vec3::new(0.0, -0.06, -0.5);
+const GAP_LEN: f32 = 0.05;
+// Rows of pixels in the strip: 1 cm behind the wrist (y = -0.070, centre of row 36), and 2.6 cm
+// (y = -0.086, row 37, half a texel from the arm's edge in the depth: today's mask shows a little room
+// there)
+const GAP_ROW_CLEAN: f32 = 36.5 / 64.0;
+const GAP_ROW_EDGE: f32 = 37.5 / 64.0;
+
+fn gap_arm_scene() -> Scene {
+    Scene::new(3.0, [0.46, 0.0, 0.54, 0.41], 0.5)
+}
+
+fn gap(wrist: Vec3, length: f32) -> MaskV2 {
+    MaskV2 {
+        // From the middle knuckle to the wrist: down, up the arm
+        arm_gaps: [
+            None,
+            Some(ArmGap {
+                wrist,
+                axis: Vec3::NEG_Y,
+                length,
+            }),
+        ],
+        ..Default::default()
+    }
+}
+
+// `debug.alvr.arm_gap_mm` closes the strip behind the wrist with the forearm's depth from up the arm:
+// for a still arm, without arm motions (arm_shift 0) and for a moved arm. Nothing beside the arm
+#[test]
+fn wrist_gap_closes_the_strip_behind_the_wrist() {
+    let (device, queue) = gpu_or_skip!();
+    let config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
+    let scene = gap_arm_scene();
+    let render = |arms, mask_v2| render_mask_v2(&device, &queue, &config, &scene, arms, mask_v2);
+    let strip = [GAP_ROW_CLEAN, GAP_ROW_EDGE];
+
+    // Today: the game in the strip
+    let off = render([None; 2], MaskV2::default());
+    assert_eq!(off.alpha(0.5, GAP_ROW_CLEAN), 1.0);
+    assert!(off.alpha(0.5, GAP_ROW_EDGE) > 0.8);
+    // The arm itself is room
+    assert_eq!(off.alpha(0.5, 0.75), 0.0);
+
+    let still = arm_motion(GAP_WRIST, Vec3::ZERO, 0.0);
+    for arms in [[None; 2], [None, Some(still)]] {
+        let on = render(arms, gap(GAP_WRIST, GAP_LEN));
+        for v in strip {
+            assert!(on.alpha(0.5, v) < 0.1, "{}", on.alpha(0.5, v));
+        }
+        // Beside the arm, 1.5 cm outside its edge but within the reach of the gap: the depth up the arm
+        // there is the far wall, nothing is added
+        for v in strip {
+            assert_eq!(on.alpha(0.4453, v), 1.0);
+            assert_eq!(on.alpha(0.5547, v), 1.0);
+        }
+        // Not past the wrist, towards the fingers (the hand zone draws them)
+        assert_eq!(on.alpha(0.5, 0.52), 1.0);
+        // Only adds near the wrist: everywhere else the picture is the same
+        for (i, (a, b)) in off.pixels.iter().zip(&on.pixels).enumerate() {
+            let (x, y) = (i as u32 % TARGET_SIZE, i as u32 / TARGET_SIZE);
+            let near = (26..=38).contains(&x) && (32..=40).contains(&y);
+            assert!(near || a == b, "{x} {y}: {a:?} {b:?}");
+        }
+    }
+
+    // The arm moved since the depth was captured (arm_shift 1): the gap follows the moved arm (5 cm to
+    // the right: x 0.01..0.09). Without subtracting the arm's displacement at the lookup the strip
+    // would stay the game
+    let moved = arm_motion(
+        GAP_WRIST + Vec3::new(0.05, 0.0, 0.0),
+        Vec3::new(0.05, 0.0, 0.0),
+        0.0,
+    );
+    let on = render([None, Some(moved)], gap(moved.wrist, GAP_LEN));
+    for v in strip {
+        assert!(on.alpha(0.5547, v) < 0.1, "{}", on.alpha(0.5547, v));
+    }
+    // 10 cm to the right (x 0.06..0.14): the moved strip is room, and the gap adds nothing at the arm's
+    // old place, which stays the game as without the gap (with 5 cm the old place is inside the moved
+    // arm's drawn edge, so it cannot be told)
+    let moved = arm_motion(
+        GAP_WRIST + Vec3::new(0.1, 0.0, 0.0),
+        Vec3::new(0.1, 0.0, 0.0),
+        0.0,
+    );
+    let plain = render([None, Some(moved)], MaskV2::default());
+    let on = render([None, Some(moved)], gap(moved.wrist, GAP_LEN));
+    for v in strip {
+        assert!(on.alpha(0.6016, v) < 0.1, "{}", on.alpha(0.6016, v));
+        assert!(plain.alpha(0.6016, v) > 0.8, "{}", plain.alpha(0.6016, v));
+        assert!(on.alpha(0.5, v) > 0.8, "{}", on.alpha(0.5, v));
+        assert_eq!(on.at(0.5, v), plain.at(0.5, v));
+    }
+
+    // At 0: off, today's picture
+    let zero = render([None; 2], gap(GAP_WRIST, 0.0));
+    assert_eq!(zero.pixels, off.pixels);
+}
+
+// A short strip (1.8 cm, as on the lap: the arm up to y = -0.078) with a gap of 5 cm: the strip is
+// closed, but rays past the wrist, towards the fingers, get nothing although a lookup G further up the
+// arm would land on the arm there too (found by review: before the fix 1-2 cm past the wrist was room)
+#[test]
+fn wrist_gap_stays_behind_the_wrist() {
+    let (device, queue) = gpu_or_skip!();
+    let config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
+    let scene = Scene::new(3.0, [0.46, 0.0, 0.54, 0.425], 0.5);
+    let render = |mask_v2| render_mask_v2(&device, &queue, &config, &scene, [None; 2], mask_v2);
+
+    let off = render(MaskV2::default());
+    let on = render(gap(GAP_WRIST, GAP_LEN));
+    // 1 cm behind the wrist (a texel above the arm's edge: today mostly the game): closed
+    assert!(off.alpha(0.5, GAP_ROW_CLEAN) > 0.8);
+    assert!(
+        on.alpha(0.5, GAP_ROW_CLEAN) < 0.1,
+        "{}",
+        on.alpha(0.5, GAP_ROW_CLEAN)
+    );
+    // 2.1 cm (row 34) and 3.7 cm (row 33) past the wrist, in the middle and 2.3 cm to the side: the game
+    // as today
+    for v in [34.5 / 64.0, 33.5 / 64.0] {
+        for u in [0.5, 0.4766] {
+            assert_eq!(off.alpha(u, v), 1.0);
+            assert_eq!(on.alpha(u, v), 1.0, "{u} {v}");
+        }
+    }
+}
+
+// Where the depth up the arm is not an arm (here a desk at 0.75 m, inside the region, 25 cm behind the
+// lookup point) the strip behind the wrist stays the game, although the desk moved back to the strip
+// would be inside the region
+#[test]
+fn wrist_gap_needs_an_arm_up_the_arm() {
+    let (device, queue) = gpu_or_skip!();
+    let config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
+    // The lower part of the view (up to y = -0.094 at 0.5 m) is the desk, the rest the far wall
+    let desk = Scene::new(3.0, [0.0, 0.0, 1.0, 0.41], 0.75);
+    let render = |mask_v2| render_mask_v2(&device, &queue, &config, &desk, [None; 2], mask_v2);
+
+    let off = render(MaskV2::default());
+    let on = render(gap(GAP_WRIST, GAP_LEN));
+    assert_eq!(off.alpha(0.5, GAP_ROW_CLEAN), 1.0);
+    assert_eq!(on.pixels, off.pixels);
+}
+
+// Both switches unset: the uniform block has zeros where they go, and the picture of a scene with an
+// arm, a moved arm and a play area border is the same as with a gap far away (nothing leaks out of the
+// new code) and as with the edge cut at its value of today (20 %) within a step of the 8 bit output
+#[test]
+fn mask_v2_switches_off_are_today() {
+    let (device, queue) = gpu_or_skip!();
+    let mut config = base_config(DepthMaskRegion::Volume(CockpitVolumeConfig {
+        center_x: 0.05,
+        center_y: 0.0,
+        center_z: -0.6,
+        yaw_deg: 10.0,
+        width: 0.5,
+        height: 0.4,
+        depth: 0.5,
+    }));
+    config.edge_feathering = 0.03;
+    let scene = Scene::new(0.8, [0.1, 0.1, 0.6, 0.7], 0.55);
+    let arms = [
+        Some(arm_motion(
+            Vec3::new(0.0, 0.0, -0.55),
+            Vec3::new(0.03, 0.0, 0.0),
+            0.3,
+        )),
+        Some(arm_motion(Vec3::new(-0.1, 0.05, -0.5), Vec3::ZERO, 0.0)),
+    ];
+    let render = |mask_v2| render_mask_v2(&device, &queue, &config, &scene, arms, mask_v2);
+
+    let off = render(MaskV2::default());
+    // A gap on an arm 2 m away: no ray passes within its reach. On an arm without a motion, so that the
+    // gap's own wrist is used (with a motion the gap starts at the arm's wrist, in view)
+    let one_arm = [arms[0], None];
+    let off_one = render_mask_v2(&device, &queue, &config, &scene, one_arm, MaskV2::default());
+    let far = render_mask_v2(
+        &device,
+        &queue,
+        &config,
+        &scene,
+        one_arm,
+        gap(Vec3::new(2.0, 0.0, -0.5), 0.04),
+    );
+    assert_eq!(far.pixels, off_one.pixels);
+    // A gap of length 0 on both arms is no gap
+    let zero = render(MaskV2 {
+        arm_gaps: [Some(ArmGap {
+            wrist: Vec3::new(0.0, 0.0, -0.55),
+            axis: Vec3::NEG_Y,
+            length: 0.0,
+        }); 2],
+        ..Default::default()
+    });
+    assert_eq!(zero.pixels, off.pixels);
+    // The edge cut as a value of 20 %: the general path, at most one step of the output apart
+    let at_20 = render(MaskV2 {
+        edge_cut: 0.2,
+        ..Default::default()
+    });
+    for (a, b) in off.pixels.iter().zip(&at_20.pixels) {
+        for (a, b) in a.iter().zip(b) {
+            assert!(a.abs_diff(*b) <= 1, "{a} {b}");
+        }
+    }
+}
+
 fn arm_motion(wrist: Vec3, displacement: Vec3, weight_len: f32) -> ArmMotion {
     ArmMotion {
         wrist,
@@ -2123,6 +2482,8 @@ fn depth_dump_reads_back_meters_and_masks() {
         eye_positions: [Vec3::ZERO; 2],
         color_key: None,
         arms: [None; 2],
+        arm_gaps: [None; 2],
+        edge_cut: 0.0,
         capture_playzone: false,
         playzone_view: false,
         key_lower_rects: None,

@@ -412,6 +412,37 @@ wave; then `arm_target_ms` 20 / 40 / 60.
 - The streamer's settings interface hung once after SteamVR had run for 17 hours (118 dead connections on
   port 8082) and needed a SteamVR restart.
 
+*Mask v2, steps 1 and 2: built, not yet judged on the headset.* The design is `docs/mask-v2-design.md`, its
+independent check `docs/mask-v2-check.md`. Built: `edge_cut` (step 1) and `arm_gap_mm` / `arm_gap_hands`
+(step 2), see "Settings". With all three unset the picture is bit for bit today's (the existing GPU tests
+pass unchanged; a hash of 14 rendered test pictures, with moved arms, the key's hands, the remembered
+playzone and all three debug views, was the same before and after the change on the development PC). The uniform block grew from 4144 to 4176 bytes (`arm_gap`, one vector per arm, after
+`arms`; the bridge slots are untouched). Bursts are version 3: each display record has `edge_cut` and
+`arm_gaps` (wrist, axis, length_mm per arm, null: off or not drawn), plus `arm_gap_set_mm` (the
+setting per arm, so that "set but the joints not located" can be told from "off"); the depth dump has
+`edge_cut` and `arm_gaps`; `read_burst.py` reads them (`edge_cut`, `gap_length_mm`, `gap_axis`,
+`gap_wrist`, `gap_set_mm`), old bursts read as 20 and no gap. What the user should look at (design section 8, with the check's additions):
+- Step 1, `edge_cut` 20 / 50 / 65 / 80: a still object in front of the game (the cardboard wheel's top,
+  the bottle on the desk, the monitor stand), head still and moving. Is the rim of room around it gone,
+  does anything thin vanish (a cable, a thin lever), does the edge flicker more? Also: **a place where a
+  box face cuts through the desk or the legs** (that border moves inward too, about 2 cm at feathering
+  0.03) and **an object close on the desk** (some are already drawn at their camera edge and lose 3-5 mm at
+  80). Also (found in review) **a seam where two play-area boxes meet on the desk or the legs**, at the
+  current `edge_feathering`: boxes that only touch show half game at 50 and a game stripe at 65 / 80;
+  boxes that overlap by 5 cm (editor-added) are fine at 0.03, but at 0.08 show a stripe about 2 cm wide
+  that is mostly game at 80 (0.85 room at 65). Record: screenshots at each value with the head still; bursts as b3 and b7. Stop rule: if 80 eats
+  objects or no difference is seen, keep the best value and do not build the erosion (step 6a).
+- Step 2, `arm_gap_mm` 0 / 30 / 50 with `arm_gap_hands 1` (left arm new, right as before; can run
+  together with `arm_shift 2`): hands on the wheel and on the lap, sleeve down and pushed up. Is the strip
+  between hand and arm closed; is there room beside the wrist in front of the game, or beside the palm
+  seen edge-on / the fingers on the rim (the gap stops at the wrist since the review fix; a little room
+  past it would mean the knuckle axis is off)? With `arm_shift 0` the gap is placed at the depth's capture
+  time, so it stays with the depth's own (late) arm: a moving arm is as late as without the gap.
+  Record: bursts as b4,
+  b2, b8 with the gap fields, one with a bare forearm. Stop rule: room beside the wrist at 30: try 20;
+  still there: leave it off. Then ask gate G1 again: is the arm's edge still too coarse or too late?
+- Each value: a progress screenshot, one burst on and one off, and the GPU load (`vrstat`) on and off.
+
 *Next steps as of the evening of 2026-11-24.*
 1. Build step 1 of the arm plan, with the live switch; the user judges on the headset. (Built, not yet
    installed or judged.)
@@ -1161,6 +1192,9 @@ Measured in the SteamVR home, 72 Hz, with color key on unless noted:
 | `arm_target_ms` | 40 ms | With `arm_shift 2`: the arm is placed for the display time minus this (the passthrough latency; try 20 / 40 / 60 while waving). 0..150 |
 | `arm_history_ms` | 80 ms | With `arm_shift 2`: the wrist is looked up at the display time minus this, at least `arm_target_ms` (the runtime's newest estimate is late, the past is accurate). 0..200. If the H or H-30 lookups fail (`arm:` line), lower it (and check the tracking): a lookup too far in the past is the likely cause (not measured) |
 | `arm_weight_mm` | 300 mm | With `arm_shift 2`: length of the linear weight along the arm. Offline best 26-35 cm, 20 cm worse. 100..600 |
+| `edge_cut` | 20 % | Step 1 of `docs/mask-v2-design.md` (built 2026-11-24, not yet run on the headset): the centre of the cut of the mask edge in `stream.wgsl`, in percent of the mask's coverage (today `smoothstep(0.05, 0.35)`, centre 20). Higher draws the edge further on the object: a straight depth border moves inward by 0.37 depth texel at 50 and 0.74 at 80 (2.7 mm at 0.5 m; GPU test: 0.37 / 0.54 / 0.75 texel at 50 / 65 / 80). To try: 50 / 65 / 80. 20 and 0 give exactly today's picture; others are clamped to 17..84. Also without the key. Known price: a line one depth texel wide (a cable) fades above 60 and is almost gone at 80; the arm gets 2-3 mm thinner per side; objects already drawn at their camera edge (desk edges of bursts 11 and 13) lose 3-5 mm at 80. **It is global, not only objects:** the soft play-area box faces that cut through a surface (desk, legs) move inward too (about 2.2 cm at `edge_feathering` 0.03, about 6 cm at 0.08), and the remembered zone near the hands shrinks by about 0.8 cm. Where two boxes meet the region coverage is only that of one box (the minimum of the distances): boxes that only touch have 0.5 there (half game at 50, a game stripe at 65 / 80), boxes overlapping by 5 cm (editor-added) have 0.98 at feathering 0.03 (fine) but 0.73 at 0.08 (a stripe about 2 cm wide, 0.85 room at 65, mostly game at 80). Not compensated in this build. Line `mask: edge cut <n> %, wrist gap ...` on `ALVR_CAM` at the start and on each change of `edge_cut`, `arm_gap_mm` or `arm_gap_hands` |
+| `arm_gap_mm` | 0 mm | Step 2 of `docs/mask-v2-design.md` (built 2026-11-24, not yet run on the headset): the strip the runtime removes behind the wrist (0.6-2.6 cm, 5-8 cm with the hands on a wheel) is filled with the forearm's depth from this far up the arm, moved back to the wrist (`gap_coverage` in `depth_mask.wgsl`). Axis from the middle knuckle to the wrist, joints at the time the arm is placed for (`arm_target_ms` with `arm_shift 2`, display − `key_delay` with `arm_shift 1`; without a motion, i.e. `arm_shift 0` or a failed arm lookup, the depth's capture time, where the depth's own arm is); with a moved arm the gap starts at the moved wrist. Only behind the wrist: rays past it towards the fingers get nothing (fading over 5 mm). Only adds to the mask, works for a still arm and with `arm_shift 0`, takes a surface only within 6 cm of the lookup point (an arm, not the wall behind), blends 2 x 2 depth texels. A ray is looked at only within 5.5 cm of the gap. 0: off, exactly today's picture. ..80. To try: 30 (the design's default, offline 78.5 -> 90.7 % of the strip covered, leak 3.4 -> 5.9 %), 50 with the hands on a wheel (94 %, leak 11.9 %); room beside the wrist at 30: try 20, then off. The lookups all land at the wrist + G along the axis, so G must be longer than the removed strip to reach the arm. Extra GPU: one ray-segment test per hand per mask texel while it is on; 4 depth reads (+ up to 3 arm-shift evaluations, no reads) per mask texel near a wrist |
+| `arm_gap_hands` | 3 | With `arm_gap_mm`: the arms with a gap (1 left, 2 right, 3 both, 0 none), for a side-by-side check |
 | `key_leak` | 0 % | Narrower rim where the background around a hand looks like it, 0: off, 100: on. Needs `auto_key`. Not tested |
 | `key_leak_lo` / `key_leak_hi` | 5 / 20 % | Share of the colors around the hand that the key keeps: where the narrowing starts / is complete |
 | `key_leak_inset` | 3 mm | Rim at full narrowing, inside the hand. 0: down to the soft edge only |
@@ -1241,7 +1275,10 @@ another thread):
   `displacement`, and since 2026-11-24 `mode` (1 or 2, see `arm_shift`), `weight_len` (m, 0: the smoothstep
   of mode 1), `target_ns` (the time the arm is placed for), `history_ns` (when the wrist was looked up; =
   `target_ns` in mode 1), `wrist_history` (the wrist at `history_ns`), `extrapolated_mm` (from
-  `wrist_history` to `wrist`); null: plain depth). Stage space, meters.
+  `wrist_history` to `wrist`); null: plain depth); since the mask v2 build of 2026-11-24 `edge_cut`
+  (`debug.alvr.edge_cut` in percent as the mask used it, 20: today's) and `arm_gaps` (left, right: `wrist`
+  where the gap starts, `axis` the unit vector from the middle knuckle to the wrist, `length_mm`; null:
+  off). Stage space, meters.
 
 Depth texel (x, y) to the world: `tx = l + (x + 0.5) / width * (r - l)`, `ty = d + (y + 0.5) / height * (u - d)`
 with the `tangents` of `depth_camera` (`y` from the bottom), point `view_to_world * (tx * z, ty * z, -z, 1)`
@@ -1275,8 +1312,9 @@ on a synthetic burst written by the Rust unit test `depth_burst::tests::files_ho
   (then the table of the file is shown). After a `color_key` reload the file's table is shown until the
   learner publishes again, and the burst records none (since the review fix of 2026-11-24: a new
   `color_key` version clears the recorded table). None therefore means the file's table (or no key).
-- `alvr_burst_<n>.json`, the index: `format` "alvr_burst", `version` 2 (1 until 2026-11-24: no `key_lut`
-  and only `wrist`, `direction`, `displacement` per arm; `read_burst.py` reads both), `n`, `duration_ms` (asked),
+- `alvr_burst_<n>.json`, the index: `format` "alvr_burst", `version` 3 (1 until 2026-11-24: no `key_lut`
+  and only `wrist`, `direction`, `displacement` per arm; 2: no `edge_cut` and `arm_gaps` in the display
+  records; `read_burst.py` reads all three), `n`, `duration_ms` (asked),
   `start_ns` / `end_ns` (XrTime, CLOCK_MONOTONIC on Quest like every time here), `depth` (`width`,
   `height`, `flip_y`), `camera` (`width`, `height`, null: no image), `counts` (`depth`, `depth_read`,
   `depth_skipped`: new depth frames not recorded because the limit of 240 was reached (a new depth frame
@@ -1307,8 +1345,10 @@ on a synthetic burst written by the Rust unit test `depth_burst::tests::files_ho
     so the runtime may answer slightly differently), `capsules` (left, right, null: no hand in the mask or no key: `capsules` 28 x start xyz r,
     end xyz r exactly as the mask used them, scaled, after `marker_hands`; `rim`), `arms` (left, right, null:
     plain depth: `wrist`, `direction`, `displacement`, and since version 2 `mode`, `weight_len`,
-    `target_ns`, `history_ns`, `wrist_history`, `extrapolated_mm` as in the depth dump JSON). Stage space,
-    meters.
+    `target_ns`, `history_ns`, `wrist_history`, `extrapolated_mm` as in the depth dump JSON), and since
+    version 3 `edge_cut` and `arm_gaps` as in the depth dump JSON, and `arm_gap_set_mm` (left, right: the
+    gap each arm was set to, 0: off; set while `arm_gaps` is null: the joints were not located in that
+    frame; only in bursts, not in the depth dump). Stage space, meters.
   - `camera`: one pass of the key learner (about every 60 ms, not every camera frame: the learner takes
     the newest image when it runs). `t_ns` = `now_ns` (CLOCK_MONOTONIC when the pass started),
     `image_ns`, `width`, `height`, `fx`, `fy`, `cx`, `cy`, `pose` and `head` (as in the `key_dump` JSON:

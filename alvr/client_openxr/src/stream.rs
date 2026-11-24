@@ -21,10 +21,10 @@ use alvr_common::{
     parking_lot::RwLock,
 };
 use alvr_graphics::{
-    ArmMotion, BridgeChoice, BurstHand, BurstLut, ColorKeyInput, DepthDumpFiles, DepthDumpRequest,
-    DepthFrame, DepthRenderInput, DumpJoint, EditorHand, EditorInput, GraphicsContext,
-    HAND_SEGMENTS, HandRay, HandShape, HandZones, LeakGains, OverlaySegment, PlacedArea,
-    SEGMENT_JOINTS, StreamRenderer, StreamViewParams, WristBridge,
+    ArmGap, ArmMotion, BridgeChoice, BurstHand, BurstLut, ColorKeyInput, DepthDumpFiles,
+    DepthDumpRequest, DepthFrame, DepthRenderInput, DumpJoint, EditorHand, EditorInput,
+    GraphicsContext, HAND_SEGMENTS, HandRay, HandShape, HandZones, LeakGains, OverlaySegment,
+    PlacedArea, SEGMENT_JOINTS, StreamRenderer, StreamViewParams, WristBridge,
 };
 use alvr_packets::{ClientStreamConfig, RealTimeConfig, TrackingData};
 use alvr_session::{
@@ -55,7 +55,8 @@ const WRIST_JOINT: usize = 1;
 const MIN_FILL_SPEED: f32 = 0.08;
 const MAX_FILL_SPEED: f32 = 0.25;
 
-// How often `debug.alvr.arm_*`, `debug.alvr.playzone_auto` and `debug.alvr.key_dump` are read
+// How often `debug.alvr.arm_*`, `debug.alvr.edge_cut`, `debug.alvr.playzone_auto` and
+// `debug.alvr.key_dump` are read
 const PROPERTY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 // The playzone is remembered when no hand was near the view of the depth camera for a while
@@ -137,6 +138,68 @@ impl ArmParams {
             history_ns,
             (target_ns - history_ns) as f32 * 1e-9,
         )
+    }
+}
+
+/// `debug.alvr.edge_cut`, `debug.alvr.arm_gap_mm` and `debug.alvr.arm_gap_hands`: steps 1 and 2 of
+/// `docs/mask-v2-design.md`. Unset, the mask is exactly today's
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct MaskParams {
+    /// Centre of the cut of the mask edge, percent of the coverage: 20 today's (also for 0 or less),
+    /// higher draws the edge further on the object. 17..84, so that the cut stays inside 0..1
+    edge_cut: i64,
+    /// Length of the wrist gap (0: off), at most 80 mm
+    gap_mm: i64,
+    /// Arms with a wrist gap (1 left, 2 right, 3 both), to compare them side by side
+    gap_hands: i64,
+}
+
+impl MaskParams {
+    fn read() -> Self {
+        Self::from_values(
+            debug_property("debug.alvr.edge_cut"),
+            debug_property("debug.alvr.arm_gap_mm"),
+            debug_property("debug.alvr.arm_gap_hands"),
+        )
+    }
+
+    fn from_values(edge_cut: Option<i64>, gap_mm: Option<i64>, gap_hands: Option<i64>) -> Self {
+        Self {
+            edge_cut: match edge_cut.unwrap_or(20) {
+                ..=0 => 20,
+                value => value.clamp(17, 84),
+            },
+            gap_mm: gap_mm.unwrap_or(0).clamp(0, 80),
+            gap_hands: gap_hands.unwrap_or(3).clamp(0, 3),
+        }
+    }
+
+    // The wrist gap of arm `hand` (0 left, 1 right) in meters, None: off
+    fn gap(&self, hand: usize) -> Option<f32> {
+        (self.gap_mm > 0 && self.gap_hands & (1 << hand) != 0).then(|| self.gap_mm as f32 / 1000.0)
+    }
+
+    // The `mask:` line on `ALVR_CAM`, at the start and on each change
+    fn text(&self) -> String {
+        let cut = if self.edge_cut == 20 {
+            "edge cut 20 % (today's)".to_string()
+        } else {
+            format!("edge cut {} %", self.edge_cut)
+        };
+        let gap = match (self.gap_mm, self.gap_hands) {
+            (0, _) => "wrist gap off".to_string(),
+            (_, 0) => format!("wrist gap {} mm on no arm", self.gap_mm),
+            (mm, hands) => format!(
+                "wrist gap {mm} mm on {}",
+                match hands {
+                    1 => "the left arm",
+                    2 => "the right arm",
+                    _ => "both arms",
+                }
+            ),
+        };
+
+        format!("mask: {cut}, {gap}")
     }
 }
 
@@ -315,6 +378,8 @@ pub struct StreamContext {
     last_arm_log: Instant,
     arm_params_changed: bool,
     arm_log: [ArmHandLog; 2],
+    // `debug.alvr.edge_cut` and the wrist gap. None until the first poll, which logs them
+    mask_params: Option<MaskParams>,
     // The wrists of the hand capsules of the key in this frame (display time minus `key_delay`), for
     // the distance to the wrist of the arm
     key_wrists: Cell<[Option<Vec3>; 2]>,
@@ -525,6 +590,7 @@ impl StreamContext {
             // The settings at the start are logged once
             arm_params_changed: true,
             arm_log: Default::default(),
+            mask_params: None,
             key_wrists: Cell::new([None; 2]),
             published_lut: None,
             lut_uploads: 0,
@@ -817,7 +883,8 @@ impl StreamContext {
         }
     }
 
-    // `debug.alvr.arm_shift` (with the other `arm_*`), `debug.alvr.playzone_auto`, and a new `debug.alvr.key_dump` (like the learner, which writes the camera
+    // `debug.alvr.arm_shift` (with the other `arm_*`, also `arm_gap_*`), `debug.alvr.edge_cut` (logged on each
+    // change), `debug.alvr.playzone_auto`, and a new `debug.alvr.key_dump` (like the learner, which writes the camera
     // image: the depth of the next frame with a depth image)
     fn poll_properties(&mut self) {
         if self.last_property_poll.elapsed() < PROPERTY_POLL_INTERVAL {
@@ -829,6 +896,11 @@ impl StreamContext {
         if arm_params != self.arm_params {
             self.arm_params = arm_params;
             self.arm_params_changed = true;
+        }
+        let mask_params = MaskParams::read();
+        if self.mask_params != Some(mask_params) {
+            self.mask_params = Some(mask_params);
+            crate::stream_log(&mask_params.text());
         }
         self.playzone_auto = debug_property("debug.alvr.playzone_auto").unwrap_or(1) > 0;
 
@@ -935,6 +1007,13 @@ impl StreamContext {
             hands,
             color_key: depth_input.color_key.as_ref(),
             arms: depth_input.arms,
+            arm_gaps: depth_input.arm_gaps,
+            arm_gap_set_mm: [0, 1].map(|i| {
+                self.mask_params
+                    .filter(|params| params.gap(i).is_some())
+                    .map_or(0.0, |params| params.gap_mm as f32)
+            }),
+            edge_cut: depth_input.edge_cut,
             region,
         });
     }
@@ -1044,6 +1123,56 @@ impl StreamContext {
                 history_ns: arm_history_ns,
                 wrist_history,
                 extrapolated,
+            })
+        })
+    }
+
+    // The wrist gap of each arm (`debug.alvr.arm_gap_mm`), with the joints of the time the arm is placed
+    // for: the arm's target time with a motion (`arm_shift 2`: T, `arm_shift 1`: the display time minus
+    // `key_delay`). Without a motion (`arm_shift 0`, or the arm's lookup failed) the depth's own arm is
+    // drawn, so the joints of the depth's capture time (the display time minus `key_delay` while there is
+    // none). With a motion the gap starts at the arm's wrist, so that it continues the moved arm. None:
+    // off, or the wrist or the middle knuckle not located
+    fn arm_gaps(
+        &self,
+        display_time: xr::Time,
+        arms: &[Option<ArmMotion>; 2],
+    ) -> [Option<ArmGap>; 2] {
+        let Some(params) = self.mask_params else {
+            return [None; 2];
+        };
+        let delay = self
+            .color_key
+            .map_or(0, |params| params.passthrough_delay_ms * 1_000_000);
+        let still_ns = self
+            .depth_capture_time
+            .map_or(display_time.as_nanos() - delay, |time| time.as_nanos());
+        let int_ctx = self.interaction_context.read();
+
+        [0, 1].map(|i| {
+            let length = params.gap(i)?;
+            let tracker = int_ctx.hands_interaction[i].skeleton_tracker.as_ref()?;
+            let arm = arms[i];
+            let time_ns = arm.map_or(still_ns, |arm| arm.target_ns);
+            let joints = self
+                .stage_reference_space
+                .locate_hand_joints(tracker, xr::Time::from_nanos(time_ns))
+                .ok()
+                .flatten()?;
+            let position = |joint: xr::HandJointEXT| {
+                let joint = joints[joint];
+                joint
+                    .location_flags
+                    .contains(xr::SpaceLocationFlags::POSITION_VALID)
+                    .then(|| crate::from_xr_vec3(joint.pose.position))
+            };
+            let wrist = position(xr::HandJointEXT::WRIST)?;
+            let knuckle = position(xr::HandJointEXT::MIDDLE_PROXIMAL)?;
+
+            Some(ArmGap {
+                wrist: arm.map_or(wrist, |arm| arm.wrist),
+                axis: (wrist - knuckle).try_normalize()?,
+                length,
             })
         })
     }
@@ -1630,6 +1759,8 @@ impl StreamContext {
                         eye_positions: [Vec3::ZERO; 2],
                         color_key: self.color_key_input(display_time, None),
                         arms: [None; 2],
+                        arm_gaps: [None; 2],
+                        edge_cut: 0.0,
                         capture_playzone: false,
                         playzone_view: false,
                         key_lower_rects: None,
@@ -1668,6 +1799,10 @@ impl StreamContext {
         ];
         let color_key = self.color_key_input(display_time, Some(eye_positions));
         self.log_arms(&arms);
+        let arm_gaps = self.arm_gaps(display_time, &arms);
+        let edge_cut = self.mask_params.map_or(0.0, |params| {
+            alvr_graphics::edge_cut_centre(params.edge_cut)
+        });
         let capture_playzone = self.should_capture_playzone(frame.as_ref());
 
         Some(DepthRenderInput {
@@ -1675,6 +1810,8 @@ impl StreamContext {
             eye_positions,
             color_key,
             arms,
+            arm_gaps,
+            edge_cut,
             capture_playzone,
             playzone_view: self.color_key.is_some_and(|params| params.playzone_view),
             key_lower_rects: None,
@@ -2226,6 +2363,43 @@ mod tests {
             history_ms,
             weight_mm: 300,
         }
+    }
+
+    #[test]
+    fn mask_params_unset_are_today() {
+        // Nothing set: today's edge (the uniform gets 0) and no wrist gap
+        let unset = MaskParams::from_values(None, None, None);
+        assert_eq!(unset.edge_cut, 20);
+        assert_eq!(alvr_graphics::edge_cut_centre(unset.edge_cut), 0.0);
+        assert_eq!(unset.gap(0), None);
+        assert_eq!(unset.gap(1), None);
+        assert_eq!(unset.text(), "mask: edge cut 20 % (today's), wrist gap off");
+        // 0 also means today's edge
+        assert_eq!(MaskParams::from_values(Some(0), None, None), unset);
+
+        // The values the user will try, and the clamps (the cut's lower end stays in 0.02..0.69)
+        for (value, expected) in [(50, 50), (65, 65), (80, 80), (5, 17), (100, 84)] {
+            let params = MaskParams::from_values(Some(value), None, None);
+            assert_eq!(params.edge_cut, expected, "{value}");
+        }
+        assert_eq!(alvr_graphics::edge_cut_centre(50), 0.5);
+        assert_eq!(MaskParams::from_values(None, Some(200), None).gap_mm, 80);
+
+        // Bit 1: left (hand 0), bit 2: right (hand 1)
+        let left = MaskParams::from_values(Some(65), Some(30), Some(1));
+        assert_eq!(left.gap(0), Some(0.03));
+        assert_eq!(left.gap(1), None);
+        assert_eq!(
+            left.text(),
+            "mask: edge cut 65 %, wrist gap 30 mm on the left arm"
+        );
+        let both = MaskParams::from_values(None, Some(50), None);
+        assert_eq!(both.gap(0), Some(0.05));
+        assert_eq!(both.gap(1), Some(0.05));
+        assert_eq!(
+            MaskParams::from_values(None, Some(30), Some(0)).gap(0),
+            None
+        );
     }
 
     #[test]

@@ -26,9 +26,9 @@ use alvr_common::{
     parking_lot::Mutex,
 };
 use alvr_graphics::{
-    ArmMotion, BURST_DEFAULT_MS, BURST_MAX_DEPTH, BURST_MAX_DISPLAY, BURST_MAX_MS, BURST_MIN_MS,
-    Burst, BurstDepth, BurstDisplay, BurstHand, BurstLut, BurstRegion, CameraBurstSink,
-    ColorKeyInput, DepthFrame, SharedCameraBurst,
+    ArmGap, ArmMotion, BURST_DEFAULT_MS, BURST_MAX_DEPTH, BURST_MAX_DISPLAY, BURST_MAX_MS,
+    BURST_MIN_MS, Burst, BurstDepth, BurstDisplay, BurstHand, BurstLut, BurstRegion,
+    CameraBurstSink, ColorKeyInput, DepthFrame, SharedCameraBurst,
 };
 use std::{
     path::PathBuf,
@@ -55,6 +55,11 @@ pub struct DisplayInput<'a> {
     pub hands: [Option<BurstHand>; 2],
     pub color_key: Option<&'a ColorKeyInput>,
     pub arms: [Option<ArmMotion>; 2],
+    /// The wrist gaps and the edge cut the mask used (`DepthRenderInput`)
+    pub arm_gaps: [Option<ArmGap>; 2],
+    /// The wrist gap each arm was set to (mm, 0: off), see `BurstDisplay::arm_gap_set_mm`
+    pub arm_gap_set_mm: [f32; 2],
+    pub edge_cut: f32,
     /// See `alvr_graphics::region_json`
     pub region: String,
 }
@@ -262,6 +267,9 @@ impl BurstRecorder {
             hands: input.hands,
             capsules: input.color_key.map_or([None; 2], |key| key.hands),
             arms: input.arms,
+            arm_gaps: input.arm_gaps,
+            arm_gap_set_mm: input.arm_gap_set_mm,
+            edge_cut: input.edge_cut,
         });
     }
 

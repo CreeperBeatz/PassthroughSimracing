@@ -21,7 +21,12 @@
 #          arm_weight_len (K, 2) (m, 0: smoothstep of mode 1), arm_target_ns / arm_history_ns (K, 2) (-1: no
 #          arm), arm_wrist_history (K, 2, 3), arm_extrapolated_mm (K, 2). Version 1 bursts only had mode 1:
 #          their arms read as mode 1, weight 0, target and history = hand_ns (the time mode 1 used), the
-#          history wrist = arm_wrist, extrapolated 0
+#          history wrist = arm_wrist, extrapolated 0. Steps 1 and 2 of the mask design (burst version 3):
+#          edge_cut (K,) (`debug.alvr.edge_cut` in percent as the mask used it, 20: today's; older bursts
+#          read as 20), gap_length_mm (K, 2) (wrist gap, NaN: off or an older burst), gap_axis (K, 2, 3)
+#          (unit vector from the middle knuckle to the wrist, up the arm), gap_wrist (K, 2, 3) (where the
+#          gap starts: the arm's wrist when the arm has a motion), gap_set_mm (K, 2) (the gap each arm was
+#          set to, 0: off or an older burst; set while gap_length_mm is NaN: the joints were not located)
 # camera:  image_ns, now_ns (C,), intrinsics (C, 4) fx fy cx cy, position (C, 3), orientation (C, 4),
 #          head_position, head_orientation, joints (C, 2, 26, 4), rgb (C, H, W, 3) uint8
 # regions: list of the region JSON objects; index: the whole index JSON
@@ -139,6 +144,11 @@ def load_burst(path, images=True):
         "arm_history_ns": np.full((k, 2), -1, np.int64),
         "arm_wrist_history": np.full((k, 2, 3), np.nan),
         "arm_extrapolated_mm": np.full((k, 2), np.nan),
+        "edge_cut": np.full(k, 20.0),
+        "gap_length_mm": np.full((k, 2), np.nan),
+        "gap_axis": np.full((k, 2, 3), np.nan),
+        "gap_wrist": np.full((k, 2, 3), np.nan),
+        "gap_set_mm": np.zeros((k, 2)),
     }
     for i, r in enumerate(display_records):
         _hands(r["hands"], display["joints"], display["tracked"], display["velocities"], i)
@@ -158,6 +168,14 @@ def load_burst(path, images=True):
                 display["arm_history_ns"][i, side] = arm.get("history_ns", r["hand_ns"])
                 display["arm_wrist_history"][i, side] = _floats(arm.get("wrist_history", arm["wrist"]), 3)
                 display["arm_extrapolated_mm"][i, side] = _float(arm.get("extrapolated_mm", 0.0))
+        # Version 3: the edge cut and the wrist gaps (older bursts: today's edge, no gap)
+        display["edge_cut"][i] = _float(r.get("edge_cut", 20.0))
+        for side, gap in enumerate(r.get("arm_gaps") or [None, None]):
+            if gap is not None:
+                display["gap_length_mm"][i, side] = _float(gap["length_mm"])
+                display["gap_axis"][i, side] = _floats(gap["axis"], 3)
+                display["gap_wrist"][i, side] = _floats(gap["wrist"], 3)
+        display["gap_set_mm"][i] = _floats(r.get("arm_gap_set_mm", [0.0, 0.0]), 2)
 
     camera_records = by_kind["camera"]
     c = len(camera_records)
@@ -280,6 +298,25 @@ def summary(burst):
             )
         arm_parts.append(part)
     lines.append("display frames per arm mode (burst version %d): %s" % (index.get("version", 1), "; ".join(arm_parts)))
+    cuts = np.unique(display["edge_cut"])
+    gap_parts = []
+    for side, name in enumerate(("left", "right")):
+        on = np.isfinite(display["gap_length_mm"][:, side])
+        set_on = display["gap_set_mm"][:, side] > 0
+        if on.any() or set_on.any():
+            part = "%s %d frames" % (name, int(on.sum()))
+            if on.any():
+                part += ", %.0f mm" % np.median(display["gap_length_mm"][on, side])
+            missed = int((set_on & ~on).sum())
+            if missed:
+                part += ", %d frames set but not drawn (joints not located)" % missed
+            gap_parts.append(part)
+        else:
+            gap_parts.append("%s off" % name)
+    lines.append(
+        "mask: edge cut %s %%; wrist gap %s"
+        % ("/".join("%.0f" % c for c in cuts) if len(cuts) else "-", ", ".join(gap_parts))
+    )
     key_lut = burst.get("key_lut")
     if key_lut is None:
         lines.append("key table: none recorded")

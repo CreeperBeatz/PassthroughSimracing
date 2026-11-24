@@ -478,6 +478,46 @@ pub struct ArmMotion {
     pub extrapolated: f32,
 }
 
+/// The wrist gap of an arm (`debug.alvr.arm_gap_mm`, step 2 of docs/mask-v2-design.md): the strip the
+/// runtime removes behind the wrist is filled with the forearm's depth from `length` further up the arm
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ArmGap {
+    /// Where the gap starts: the wrist the arm is placed with (`ArmMotion::wrist`), or without a motion
+    /// the wrist at the depth's capture time (the depth's own arm is drawn)
+    pub wrist: Vec3,
+    /// Unit vector from the middle knuckle to the wrist, with the joints of the same time: up the arm
+    pub axis: Vec3,
+    /// G (meters, above 0)
+    pub length: f32,
+}
+
+/// Longest wrist gap (meters): `debug.alvr.arm_gap_mm` is clamped to 80
+pub const MAX_ARM_GAP: f32 = 0.08;
+
+impl ArmGap {
+    /// None unless it can be drawn: a finite wrist, a unit axis, a length above 0 (at most `MAX_ARM_GAP`)
+    fn checked(self) -> Option<Self> {
+        let axis = self.axis.try_normalize()?;
+        (self.wrist.is_finite() && self.length.is_finite() && self.length > 0.0).then(|| Self {
+            axis,
+            length: self.length.min(MAX_ARM_GAP),
+            ..self
+        })
+    }
+}
+
+/// `debug.alvr.edge_cut` in percent as the centre of the cut of the mask edge for `DepthRenderInput`:
+/// 20 (today's, the default) and 0 or less (off, like the other switches) give 0, which draws exactly
+/// today's edge. Others are clamped so that the lower end of the cut stays in 0.02..0.69, as the shader
+/// clamps it
+pub fn edge_cut_centre(percent: i64) -> f32 {
+    if percent <= 0 || percent == 20 {
+        0.0
+    } else {
+        (percent as f32 / 100.0).clamp(0.17, 0.84)
+    }
+}
+
 /// Step 1 of the arm plan: the wrist at the target time T, from the wrist at an earlier time H (`w_h`)
 /// and the wrist `gap_s` before H (`w_p`, None: not located). `ahead_s` is T - H. Lookups in the past
 /// are accurate, the newest estimate of the runtime is late, so the arm is placed from the past and
@@ -513,6 +553,11 @@ pub struct DepthRenderInput {
     pub color_key: Option<ColorKeyInput>,
     /// The depth map of the arms is shifted by their motion. None: plain depth
     pub arms: [Option<ArmMotion>; 2],
+    /// The wrist gap of each arm, also without a motion. None: off
+    pub arm_gaps: [Option<ArmGap>; 2],
+    /// Centre of the cut of the mask edge (`debug.alvr.edge_cut` / 100), 0: today's (0.2). See
+    /// `edge_cut_centre`
+    pub edge_cut: f32,
     /// Remember the current depth image as the playzone. There must be no hands in it
     pub capture_playzone: bool,
     /// Debug view (with "Tint mask" and the color key): what only the playzone shows is blue
@@ -637,6 +682,7 @@ pub const DEPTH_UNIFORMS_FLOAT_COUNT: usize = 2 * EYE_FLOAT_COUNT
         + 2
         + 2 * 2 * HAND_SEGMENTS
         + 6
+        + 2
         + 2 * 9
         + 1
         + 2
@@ -723,7 +769,13 @@ pub fn depth_uniforms(
     } else {
         0.0
     };
-    data.extend([area.map_or(0, |area| area.len()) as f32, see, 0.0, 0.0]);
+    // The centre of the cut of the mask edge, 0: today's
+    let edge_cut = if input.edge_cut.is_finite() && input.edge_cut > 0.0 {
+        input.edge_cut.clamp(0.17, 0.84)
+    } else {
+        0.0
+    };
+    data.extend([area.map_or(0, |area| area.len()) as f32, see, edge_cut, 0.0]);
 
     let debug_view = match config.debug_view {
         DepthPassthroughDebugView::Off => 0.0,
@@ -797,10 +849,17 @@ pub fn depth_uniforms(
         }
     }
     // The `w` of the third vec4 is the length of the linear weight (0: the smoothstep of mode 1)
-    for arm in &input.arms {
+    let gaps = input.arm_gaps.map(|gap| gap.and_then(ArmGap::checked));
+    for (arm, gap) in input.arms.iter().zip(&gaps) {
         let [wrist, direction, displacement] = arm.map_or([Vec3::ZERO; 3], |arm| {
             [arm.wrist, arm.direction, arm.displacement]
         });
+        // The gap starts at the wrist of this slot. Without a motion nothing else reads it (the
+        // displacement is 0), so the gap's own wrist goes there
+        let wrist = match (arm, gap) {
+            (None, Some(gap)) => gap.wrist,
+            _ => wrist,
+        };
         let weight_len = arm.map_or(0.0, |arm| arm.weight_len);
         for v in [
             wrist.extend(0.0),
@@ -809,6 +868,10 @@ pub fn depth_uniforms(
         ] {
             data.extend(v.to_array());
         }
+    }
+    // The axis and length of each wrist gap, zeros: off
+    for gap in &gaps {
+        data.extend(gap.map_or([0.0; 4], |gap| gap.axis.extend(gap.length).to_array()));
     }
 
     for view_idx in 0..2 {
@@ -1188,6 +1251,8 @@ mod tests {
             DEPTH_UNIFORMS_SIZE,
             592 + 16
                 * (2 + 2 * HAND_SEGMENTS / 4 + 2 + 2 * 2 * HAND_SEGMENTS + 6 + 2 * 9 + 1 + 2 + 2)
+                // The wrist gaps
+                + 16 * 2
                 // The bridges, and the radii at their ends
                 + 16 * 4
                 + 16
@@ -1195,8 +1260,115 @@ mod tests {
                 + 16 * 2
                 + 8 * 7 * 16
         );
-        // 28 capsules per hand, the bridges from the wrists, the boxes of the play area
-        assert_eq!(DEPTH_UNIFORMS_SIZE, 4144);
+        // 28 capsules per hand, the wrist gaps, the bridges from the wrists, the boxes of the play area
+        assert_eq!(DEPTH_UNIFORMS_SIZE, 4176);
+    }
+
+    // Steps 1 and 2 of docs/mask-v2-design.md in the uniform block: off is all zeros, as before
+    #[test]
+    fn edge_cut_and_arm_gaps_in_the_uniforms() {
+        let cfg = config(DepthMaskRegion::Distance { max_distance: 0.9 });
+        let mut input = DepthRenderInput {
+            frame: None,
+            eye_positions: [Vec3::ZERO; 2],
+            color_key: None,
+            arms: [None; 2],
+            arm_gaps: [None; 2],
+            edge_cut: 0.0,
+            capture_playzone: false,
+            playzone_view: false,
+            key_lower_rects: None,
+            region_override: None,
+            game_dim: 0.0,
+            game_see: 0.0,
+        };
+        let area_z = 2 * EYE_FLOAT_COUNT + 16 + 2;
+        // After the hand zones, the solid fill, the bounds and the capsules
+        let arms = 2 * EYE_FLOAT_COUNT
+            + 16
+            + 4 * 5
+            + 4 * (2 + 2 * HAND_SEGMENTS / 4 + 2 + 4 * HAND_SEGMENTS);
+        let gaps = arms + 4 * 6;
+        let uniforms =
+            |input: &DepthRenderInput| depth_uniforms(&cfg, &[view(), view()], input, None, false);
+
+        let off = uniforms(&input);
+        assert_eq!(off[area_z], 0.0);
+        assert!(off[arms..gaps + 8].iter().all(|&value| value == 0.0));
+
+        // The centre of the cut, clamped so that its lower end stays in 0.02..0.69
+        for (centre, expected) in [
+            (0.5, 0.5),
+            (0.8, 0.8),
+            (0.95, 0.84),
+            (0.1, 0.17),
+            (f32::NAN, 0.0),
+        ] {
+            input.edge_cut = centre;
+            assert_eq!(uniforms(&input)[area_z], expected, "{centre}");
+        }
+        assert_eq!(edge_cut_centre(20), 0.0);
+        assert_eq!(edge_cut_centre(0), 0.0);
+        assert_eq!(edge_cut_centre(65), 0.65);
+        assert_eq!(edge_cut_centre(100), 0.84);
+        input.edge_cut = 0.0;
+
+        // A gap on the right arm without a motion (arm_shift 0): its wrist goes into the wrist slot, the
+        // displacement stays 0. The axis is made a unit vector, the length is clamped to 8 cm
+        let wrist = Vec3::new(0.1, 1.0, -0.4);
+        input.arm_gaps[1] = Some(ArmGap {
+            wrist,
+            axis: Vec3::new(0.0, -2.0, 0.0),
+            length: 0.2,
+        });
+        let data = uniforms(&input);
+        assert!(data[arms..arms + 12].iter().all(|&value| value == 0.0));
+        assert_eq!(&data[arms + 12..arms + 16], &[0.1, 1.0, -0.4, 0.0]);
+        assert!(data[arms + 16..gaps].iter().all(|&value| value == 0.0));
+        assert_eq!(
+            &data[gaps..gaps + 8],
+            &[0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, MAX_ARM_GAP]
+        );
+
+        // With a motion the gap starts at the arm's wrist
+        let arm = ArmMotion {
+            wrist: Vec3::new(0.12, 1.0, -0.4),
+            direction: Vec3::NEG_Y,
+            displacement: Vec3::new(0.02, 0.0, 0.0),
+            weight_len: 0.3,
+            mode: 2,
+            target_ns: 0,
+            history_ns: 0,
+            wrist_history: wrist,
+            extrapolated: 0.0,
+        };
+        input.arms[1] = Some(arm);
+        let data = uniforms(&input);
+        assert_eq!(&data[arms + 12..arms + 15], &arm.wrist.to_array());
+
+        // Not drawable: off
+        for gap in [
+            ArmGap {
+                axis: Vec3::ZERO,
+                ..input.arm_gaps[1].unwrap()
+            },
+            ArmGap {
+                length: 0.0,
+                ..input.arm_gaps[1].unwrap()
+            },
+            ArmGap {
+                wrist: Vec3::NAN,
+                ..input.arm_gaps[1].unwrap()
+            },
+        ] {
+            input.arms[1] = None;
+            input.arm_gaps[1] = Some(gap);
+            let data = uniforms(&input);
+            assert!(
+                data[arms..gaps + 8].iter().all(|&value| value == 0.0),
+                "{gap:?}"
+            );
+        }
     }
 
     #[test]
@@ -1404,6 +1576,8 @@ mod tests {
             eye_positions: [Vec3::ZERO; 2],
             color_key: None,
             arms: [None; 2],
+            arm_gaps: [None; 2],
+            edge_cut: 0.0,
             capture_playzone: false,
             playzone_view: false,
             key_lower_rects: None,
@@ -1469,6 +1643,8 @@ mod tests {
                 eye_positions: [Vec3::ZERO; 2],
                 color_key: None,
                 arms: [None; 2],
+                arm_gaps: [None; 2],
+                edge_cut: 0.0,
                 capture_playzone: false,
                 playzone_view: false,
                 key_lower_rects: None,
@@ -1550,6 +1726,8 @@ mod tests {
             eye_positions: [Vec3::ZERO; 2],
             color_key: None,
             arms: [None; 2],
+            arm_gaps: [None; 2],
+            edge_cut: 0.0,
             capture_playzone: false,
             playzone_view: false,
             key_lower_rects: None,

@@ -1220,6 +1220,8 @@ impl StreamRenderer {
                 eye_positions: [Vec3::ZERO; 2],
                 color_key: None,
                 arms: [None; 2],
+                arm_gaps: [None; 2],
+                edge_cut: 0.0,
                 capture_playzone: false,
                 playzone_view: false,
                 key_lower_rects: None,

@@ -130,6 +130,12 @@ impl PassthroughLayer<'_> {
 ///   `arm_shift 2`, the arm is placed for the display time minus `arm_target_ms` (0..150, 40), from the wrist
 ///   at the display time minus `arm_history_ms` (0..200, 80, at least `arm_target_ms`); the weight falls
 ///   linearly to 0 over `arm_weight_mm` (100..600, 300)
+/// - `setprop debug.alvr.edge_cut <percent>`: where the mask edge is cut, 20 (default, also 0): today's, a
+///   rim of room around still objects; 50 / 65 / 80 draw the edge further on the object (17..84). Also
+///   without the key
+/// - `setprop debug.alvr.arm_gap_mm <mm>`: the strip the runtime removes behind the wrist is filled with the
+///   forearm's depth from this far up the arm (0: off, default, ..80); `arm_gap_hands <n>`: on which arms
+///   (1 left, 2 right, 3 both, default)
 /// - `setprop debug.alvr.playzone -1`: forget the remembered playzone
 /// - `setprop debug.alvr.key_leak <percent>`: narrow the rim where the background around a hand looks like
 ///   the hand (needs `auto_key`), 0: off, 100: on

@@ -5,7 +5,7 @@
 //! in time order, and binary files for the images. The format is in the knowledge base.
 
 use crate::{
-    ArmMotion, DumpJoint, HandShape, HandZones,
+    ArmGap, ArmMotion, DumpJoint, HandShape, HandZones,
     depth_dump::{self, DEPTH_DUMP_TIMEOUT},
     depth_mask::{self, DepthFrame},
     key_dump::{array, number, numbers, object, pose, string},
@@ -89,6 +89,13 @@ pub struct BurstDisplay {
     pub capsules: [Option<(HandShape, HandZones)>; 2],
     /// The shift of the depth around each arm. None: plain depth
     pub arms: [Option<ArmMotion>; 2],
+    /// The wrist gap of each arm (`debug.alvr.arm_gap_mm`). None: off
+    pub arm_gaps: [Option<ArmGap>; 2],
+    /// The wrist gap each arm was set to (mm, `debug.alvr.arm_gap_mm` where `arm_gap_hands` selects the
+    /// arm, 0: off). Set but `arm_gaps` None: the joints were not located in this frame
+    pub arm_gap_set_mm: [f32; 2],
+    /// `DepthRenderInput::edge_cut` (0: today's)
+    pub edge_cut: f32,
 }
 
 /// One camera image of the key learner
@@ -305,6 +312,10 @@ impl BurstDisplay {
             .arms
             .each_ref()
             .map(|arm| depth_dump::arm(arm.as_ref()));
+        let arm_gaps = self
+            .arm_gaps
+            .each_ref()
+            .map(|gap| depth_dump::arm_gap(gap.as_ref()));
         object([
             ("kind", string("display")),
             ("t_ns", self.now_ns.to_string()),
@@ -323,6 +334,12 @@ impl BurstDisplay {
             ("hands", array(self.hands.iter().map(hand))),
             ("capsules", array(capsules)),
             ("arms", array(arms)),
+            (
+                "edge_cut",
+                number(depth_dump::edge_cut_percent(self.edge_cut)),
+            ),
+            ("arm_gaps", array(arm_gaps)),
+            ("arm_gap_set_mm", numbers(&self.arm_gap_set_mm)),
         ])
     }
 }
@@ -412,10 +429,11 @@ impl Burst {
             ])
         });
         // Version 2: the arms of the display records have the fields of step 1 of the arm plan, and
-        // `key_lut` is new
+        // `key_lut` is new. Version 3: the display records have `edge_cut`, `arm_gaps` and `arm_gap_set_mm` (steps 1 and 2
+        // of docs/mask-v2-design.md)
         object([
             ("format", string("alvr_burst")),
-            ("version", "2".into()),
+            ("version", "3".into()),
             ("n", n.to_string()),
             ("duration_ms", self.duration_ms.to_string()),
             ("start_ns", self.start_ns.to_string()),
@@ -816,6 +834,17 @@ mod tests {
                             extrapolated: 0.01,
                         }),
                     ],
+                    // A wrist gap on the right arm only (`arm_gap_hands 2`), the edge cut at 50
+                    arm_gaps: [
+                        None,
+                        Some(ArmGap {
+                            wrist: Vec3::new(0.1, 1.0, -0.4),
+                            axis: Vec3::NEG_Y,
+                            length: 0.03,
+                        }),
+                    ],
+                    arm_gap_set_mm: [0.0, 30.0],
+                    edge_cut: 0.5,
                 }
             })
             .collect();
@@ -913,7 +942,7 @@ mod tests {
         let burst = synthetic_burst(7, UVec2::new(4, 3), 4);
         let json = burst.index_json();
         assert!(is_valid_json(&json), "{json}");
-        assert!(json.starts_with(r#"{"format":"alvr_burst","version":2,"n":7,"#));
+        assert!(json.starts_with(r#"{"format":"alvr_burst","version":3,"n":7,"#));
         assert!(
             json.contains(
                 r#""key_lut":{"file":"alvr_dump_7_key.lut","version":3,"published_ns":999600000000,"bytes":131072}"#
@@ -929,7 +958,14 @@ mod tests {
             json.contains(r#""mode":2,"weight_len":0.3,"target_ns":"#),
             "{json}"
         );
-        assert!(json.contains(r#""extrapolated_mm":10}]"#), "{json}");
+        assert!(json.contains(r#""extrapolated_mm":10}],"#), "{json}");
+        // The fields of steps 1 and 2 of the mask design
+        assert!(
+            json.contains(
+                r#""edge_cut":50,"arm_gaps":[null,{"wrist":[0.1,1,-0.4],"axis":[0,-1,0],"length_mm":30}],"arm_gap_set_mm":[0,30]}"#
+            ),
+            "{json}"
+        );
         assert!(
             json.contains(
                 r#""counts":{"depth":4,"depth_read":3,"depth_skipped":1,"display":9,"camera":2,"region":1}"#
