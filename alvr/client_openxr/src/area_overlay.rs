@@ -1,29 +1,44 @@
-//! Outline of the anchor (the QR code) and of the box placed from it, drawn over the stream. Only with
-//! a marker box and Passthrough = Depth. Experimental, controlled with adb (polled about twice a
-//! second):
+//! Outline of the anchor (the QR code) and of the play area placed from it, drawn over the stream.
+//! Only with a marker box and Passthrough = Depth. Experimental, controlled with adb (polled about
+//! twice a second):
 //! - `debug.alvr.area_show`: unset: for 8 s each time the pose of the code becomes measured, each time
 //!   the box is carried over a stage change and each time a box is placed after there was none. 1:
 //!   always while there is a box. 0: never
 //! - `debug.alvr.area_line <hundredths of a degree>`: width of the lines on screen (12, 2 to 100)
+//! - `debug.alvr.area_dashed 1`: the play area dashed (it is anyway while it is placed from the anchor
+//!   saved in the layout file, before the code is seen in this run, see area_editor.rs)
+//!
+//! While the play area is edited, and for a moment after, the outline shows whatever `area_show` says,
+//! with the handles of the editor over it (area_editor.rs). While the two-hand gesture of the editor is
+//! held the outline shows and brightens.
 //!
 //! Drawn in stage space: the outline of the code (its reported size, at the estimated pose; amber while
-//! the pose is measured, green once it is measured), the axes of the box at the code (heading 20 cm,
-//! up and to the right of the heading 10 cm) and the 12 edges of the box the mask uses (white).
+//! the pose is measured, green once it is measured), the axes of the area at the code (heading 20 cm,
+//! up and to the right of the heading 10 cm) and the play area the mask uses (white): the edges of
+//! its boxes without the parts inside another box, and of each dome its rim and two arcs over it.
 
-use crate::{marker_region::MarkerRegion, passthrough::debug_property};
-use alvr_graphics::{OVERLAY_AMBER, OVERLAY_GREEN, OVERLAY_WHITE, OverlaySegment, RegionOverride};
+use crate::{area_editor::AreaEditor, marker_region::MarkerRegion, passthrough::debug_property};
+use alvr_graphics::{
+    MAX_OVERLAY_SEGMENTS, OVERLAY_AMBER, OVERLAY_GREEN, OverlaySegment, PlacedArea,
+};
 use std::time::{Duration, Instant};
 
 const PROPERTY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 // How long the outline shows after an event (unset `area_show`)
 const SHOW_DURATION: Duration = Duration::from_secs(8);
 const DEFAULT_LINE: i64 = 12;
+// Segments of the code and the axes: the rest of an eye is for the editor and the play area
+const ANCHOR_SEGMENTS: usize = 4 + 3;
 
 pub struct AreaOverlay {
     // `debug.alvr.area_show`. None: automatic
     show: Option<bool>,
     // Of the lines (radians)
     width: f32,
+    // `debug.alvr.area_dashed`
+    dashed: bool,
+    // Segments of the play area left out to stay within the segments of an eye, as last logged
+    left_out: usize,
     last_poll: Option<Instant>,
     // Automatic: shown until then, and why
     auto_until: Option<Instant>,
@@ -35,6 +50,8 @@ pub struct AreaOverlay {
     // Why the outline is shown, as last logged. None: hidden
     shown: Option<&'static str>,
     segments: Vec<OverlaySegment>,
+    // Of the editor, in this frame
+    editor_segments: Vec<OverlaySegment>,
 }
 
 impl AreaOverlay {
@@ -42,6 +59,8 @@ impl AreaOverlay {
         Self {
             show: None,
             width: alvr_graphics::overlay_width(DEFAULT_LINE as f32),
+            dashed: false,
+            left_out: 0,
             last_poll: None,
             auto_until: None,
             auto_reason: "",
@@ -50,6 +69,7 @@ impl AreaOverlay {
             carried: 0,
             shown: None,
             segments: Vec::new(),
+            editor_segments: Vec::new(),
         }
     }
 
@@ -68,15 +88,18 @@ impl AreaOverlay {
             .unwrap_or(DEFAULT_LINE)
             .clamp(2, 100);
         self.width = alvr_graphics::overlay_width(line as f32);
+        self.dashed = debug_property("debug.alvr.area_dashed").unwrap_or(0) != 0;
     }
 
-    /// The lines to draw in this frame, in stage space. Empty: nothing is shown. `region`: the box of
-    /// the marker the mask uses (None: no box). `depth_passthrough`: the stream uses Passthrough = Depth
+    /// The lines to draw in this frame, in stage space. Empty: nothing is shown. `region`: the play
+    /// area of the marker the mask uses (None: no area). `depth_passthrough`: the stream uses
+    /// Passthrough = Depth. `editor`: its handles are drawn over the outline
     pub fn update(
         &mut self,
         marker_region: &MarkerRegion,
-        region: Option<RegionOverride>,
+        region: Option<PlacedArea>,
         depth_passthrough: bool,
+        editor: &AreaEditor,
     ) -> &[OverlaySegment] {
         self.poll_properties();
 
@@ -104,6 +127,7 @@ impl AreaOverlay {
 
         let shown = match self.show {
             _ if region.is_none() || !depth_passthrough => None,
+            _ if editor.forced_show().is_some() => editor.forced_show(),
             Some(false) => None,
             Some(true) => Some("area_show 1"),
             None => self
@@ -120,28 +144,54 @@ impl AreaOverlay {
         }
 
         self.segments.clear();
-        if let (Some(region), Some(anchor), Some(_)) = (region, anchor, shown) {
-            let color = if anchor.measured {
-                OVERLAY_GREEN
-            } else {
-                OVERLAY_AMBER
-            };
-            self.segments.extend(alvr_graphics::code_outline(
-                anchor.position,
-                anchor.orientation,
-                anchor.size,
-                color,
-                self.width,
-            ));
-            // The frame of the box: the heading it uses, with `marker_box_yaw`
-            let (_, rotation, _) = region.volume_to_world.to_scale_rotation_translation();
+        if let (Some(region), Some(_)) = (region, shown) {
+            // Without a code seen in this run (placed from the anchor of the layout file): no outline
+            // of the code
+            if let Some(anchor) = anchor {
+                let color = if anchor.measured {
+                    OVERLAY_GREEN
+                } else {
+                    OVERLAY_AMBER
+                };
+                self.segments.extend(alvr_graphics::code_outline(
+                    anchor.position,
+                    anchor.orientation,
+                    anchor.size,
+                    color,
+                    self.width,
+                ));
+            }
+            // The frame of the area at the code: the heading it uses, with `marker_box_yaw`
+            let (_, rotation, position) = region.area_to_world.to_scale_rotation_translation();
             self.segments.extend(alvr_graphics::anchor_axes(
-                anchor.position,
+                position,
                 rotation.normalize(),
                 self.width,
             ));
-            self.segments
-                .extend(alvr_graphics::box_edges(&region, OVERLAY_WHITE, self.width));
+            self.editor_segments.clear();
+            editor.draw(self.width, &mut self.editor_segments);
+            self.editor_segments
+                .truncate(MAX_OVERLAY_SEGMENTS - ANCHOR_SEGMENTS);
+            let (outline, left_out) = alvr_graphics::area_outline(
+                &region,
+                editor.outline_color(),
+                self.width,
+                self.dashed || editor.dashed(),
+                MAX_OVERLAY_SEGMENTS - ANCHOR_SEGMENTS - self.editor_segments.len(),
+            );
+            self.segments.extend(outline);
+            // Over the outline
+            self.segments.extend_from_slice(&self.editor_segments);
+            if left_out != self.left_out {
+                self.left_out = left_out;
+                if left_out > 0 {
+                    crate::stream_log(&format!(
+                        "area: outline cut, {left_out} segments of the play area left out ({} per \
+                         eye)",
+                        MAX_OVERLAY_SEGMENTS
+                    ));
+                }
+            }
         }
 
         &self.segments

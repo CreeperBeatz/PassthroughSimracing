@@ -1,5 +1,5 @@
 // Outline overlay: thin opaque lines drawn into the main pass of the stream, over the stream image. See
-// overlay.rs. One instance per segment, 4 vertices each (a quad facing the screen).
+// overlay.rs. One instance per segment, 4 vertices each (a quad facing the screen). Solid or dashed.
 // Keep `Immediate` the first declaration, see stream_shader_source().
 
 struct Immediate {
@@ -13,7 +13,11 @@ struct Immediate {
 }
 var<immediate> imm: Immediate;
 
-const MAX_SEGMENTS: u32 = 256u;
+const MAX_SEGMENTS: u32 = 512u;
+// Of a dashed line: a dash and a gap, measured from its start (meters), and the part that is drawn. As
+// in overlay.rs
+const DASH_PERIOD: f32 = 0.04;
+const DASH_ON: f32 = 0.6;
 
 const DIV12: f32 = 1.0 / 12.92;
 const DIV1: f32 = 1.0 / 1.055;
@@ -24,10 +28,10 @@ const GAMMA: vec3f = vec3f(2.4);
 override ENABLE_SRGB_CORRECTION: bool;
 
 struct Segment {
-    // xyz: stage space, w: width on screen (radians)
+    // xyz: stage space, w: width on screen (radians), negative: dashed
     start: vec4f,
+    // xyz: stage space, w: color as in the stream image, 8 bits per channel: r * 65536 + g * 256 + b
     end: vec4f,
-    color: vec4f,
 }
 struct Segments {
     items: array<Segment, MAX_SEGMENTS>,
@@ -37,6 +41,8 @@ struct Segments {
 struct VertexOutput {
     @builtin(position) position: vec4f,
     @location(0) color: vec3f,
+    // Of a dashed line: meters from its start. -1: solid
+    @location(1) dash: f32,
 }
 
 @vertex
@@ -64,14 +70,25 @@ fn vertex_main(
     let at_end = vertex_index >= 2u;
     let side = select(-1.0, 1.0, (vertex_index & 1u) == 1u);
     let along = select(-1.0, 1.0, at_end);
-    let half_width = 0.5 * segment.start.w * imm.pixels_per_radian;
+    let half_width = 0.5 * abs(segment.start.w) * imm.pixels_per_radian;
     let offset = (normal * side + direction * along) * half_width / half_viewport;
 
     let base = select(a, b, at_end);
     var result: VertexOutput;
     result.position = vec4f(base.xy + offset * base.w, base.zw);
 
-    var color = segment.color.rgb;
+    // Interpolated with the perspective: in meters along the segment
+    result.dash = -1.0;
+    if segment.start.w < 0.0 {
+        result.dash = select(0.0, length(segment.end.xyz - segment.start.xyz), at_end);
+    }
+
+    let packed = u32(segment.end.w + 0.5);
+    var color = vec3f(
+        f32((packed >> 16u) & 255u),
+        f32((packed >> 8u) & 255u),
+        f32(packed & 255u),
+    ) / 255.0;
     if ENABLE_SRGB_CORRECTION {
         let condition = vec3f(f32(color.r < THRESHOLD), f32(color.g < THRESHOLD), f32(color.b < THRESHOLD));
         let lowValues = color * DIV12;
@@ -86,6 +103,9 @@ fn vertex_main(
 // Opaque: alpha 1 is "game" in every mode of stream.wgsl (premultiplied, and both packed layer alphas
 // of the color key)
 @fragment
-fn fragment_main(@location(0) color: vec3f) -> @location(0) vec4f {
+fn fragment_main(@location(0) color: vec3f, @location(1) dash: f32) -> @location(0) vec4f {
+    if dash >= 0.0 && fract(dash / DASH_PERIOD) >= DASH_ON {
+        discard;
+    }
     return vec4f(color, 1.0);
 }

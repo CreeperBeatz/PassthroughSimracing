@@ -9,6 +9,7 @@ use crate::{
         HandSweep, HandZones, RegionOverride, SweepParams, WristBridge,
     },
     overlay::{self, OVERLAY_AMBER, OVERLAY_SLOTS, OverlayEye, OverlaySegment},
+    play_area::{self, AreaBox, PlacedArea, PlayArea, Side},
     stream::{self, FOVEATION_UNIFORM_SIZE, LIGHT_PROBE_SIZE, StreamPipelines, floats_to_bytes},
 };
 use alvr_common::{
@@ -125,6 +126,46 @@ fn depth_mask_shader_translates_to_gles() {
     translate_to_gles("depth mask", &stream::depth_mask_shader_source(), &[]);
 }
 
+// The uniform block as naga lays it out is the one `depth_uniforms` fills: the same size, and the
+// play area at the end where the Rust side writes it
+#[test]
+fn depth_uniforms_layout_matches_the_shader() {
+    let source = stream::depth_mask_shader_source();
+    let module = naga::front::wgsl::parse_str(&source).unwrap();
+    let struct_of = |name: &str| {
+        module
+            .types
+            .iter()
+            .find_map(|(_, ty)| match &ty.inner {
+                naga::TypeInner::Struct { members, span } if ty.name.as_deref() == Some(name) => {
+                    Some((members.clone(), *span as usize))
+                }
+                _ => None,
+            })
+            .unwrap()
+    };
+    let (members, span) = struct_of("DepthUniforms");
+    assert_eq!(span, depth_mask::DEPTH_UNIFORMS_SIZE);
+    let offset = |name: &str| {
+        members
+            .iter()
+            .find(|member| member.name.as_deref() == Some(name))
+            .unwrap()
+            .offset as usize
+    };
+    let (_, box_size) = struct_of("AreaBox");
+    assert_eq!(box_size, 4 * play_area::AREA_BOX_FLOAT_COUNT);
+    let area_start = depth_mask::DEPTH_UNIFORMS_SIZE - 4 * play_area::AREA_FLOAT_COUNT;
+    assert_eq!(offset("area_bounds"), area_start);
+    assert_eq!(offset("area_boxes"), area_start + 32);
+    assert_eq!(offset("hand_bridge_end"), area_start - 16);
+    // Where the box of the settings was: 2 eyes, then the transform and the number of boxes
+    let eyes = 2 * 4 * (16 + 4 + 16 + 16 + 4);
+    assert_eq!(offset("world_to_area"), eyes);
+    assert_eq!(offset("area"), eyes + 64);
+    assert_eq!(offset("region"), eyes + 80);
+}
+
 #[test]
 fn playzone_copy_shader_translates_to_gles() {
     translate_to_gles("playzone copy", &stream::playzone_copy_shader_source(), &[]);
@@ -165,6 +206,14 @@ fn overlay_shader_translates_to_gles() {
     }
     // The uniform buffer holds the segments of both eyes
     assert!(stream::OVERLAY_WGSL.contains(&format!("const MAX_SEGMENTS: u32 = {OVERLAY_SLOTS}u;")));
+    // The dashes as in overlay.rs
+    assert!(stream::OVERLAY_WGSL.contains(&format!(
+        "const DASH_PERIOD: f32 = {:?};",
+        overlay::DASH_PERIOD
+    )));
+    assert!(
+        stream::OVERLAY_WGSL.contains(&format!("const DASH_ON: f32 = {:?};", overlay::DASH_ON))
+    );
 }
 
 // The camera of the overlay (as `StreamRenderer::write_overlay` builds it) puts a point where the
@@ -452,6 +501,44 @@ fn render_full(
     playzone_view: bool,
     overlay: &[OverlaySegment],
 ) -> Output {
+    render_with_area(
+        device,
+        queue,
+        config,
+        scene,
+        eye_position,
+        depth_camera_position,
+        depth_available,
+        color_key,
+        arms,
+        playzone,
+        key_lower_rects,
+        playzone_view,
+        overlay,
+        None,
+        0.0,
+    )
+}
+
+/// `render_full` with a play area instead of the region of the settings
+#[expect(clippy::too_many_arguments)]
+fn render_with_area(
+    device: &Device,
+    queue: &Queue,
+    config: &DepthPassthroughConfig,
+    scene: &Scene,
+    eye_position: Vec3,
+    depth_camera_position: Vec3,
+    depth_available: bool,
+    color_key: Option<ColorKeyInput>,
+    arms: [Option<ArmMotion>; 2],
+    playzone: Option<&Scene>,
+    key_lower_rects: Option<[(Vec2, Vec2); 2]>,
+    playzone_view: bool,
+    overlay: &[OverlaySegment],
+    region_override: Option<PlacedArea>,
+    game_dim: f32,
+) -> Output {
     let target_format = TextureFormat::Rgba8Unorm;
     let constants = [
         ("ENABLE_SRGB_CORRECTION", 0.0),
@@ -620,7 +707,8 @@ fn render_full(
         capture_playzone: false,
         playzone_view,
         key_lower_rects,
-        region_override: None,
+        region_override,
+        game_dim,
     };
     let lighting_enabled = config.lighting.as_option().is_some();
     let playzone_views = [view(depth_camera_position); 2];
@@ -1491,7 +1579,7 @@ fn hand_limited_to_a_marker_box() {
         &shape,
         &zones,
         bridge,
-        &region,
+        &PlacedArea::from(region),
         depth_mask::HAND_REGION_FEATHER,
     );
     let limited = render_hand(limited_shape, limited_bridge);
@@ -1970,6 +2058,7 @@ fn depth_dump_reads_back_meters_and_masks() {
         playzone_view: false,
         key_lower_rects: None,
         region_override: None,
+        game_dim: 0.0,
     };
     let uniforms = depth_mask::depth_uniforms(
         &config,
@@ -2201,6 +2290,46 @@ fn missing_depth_shows_only_the_game() {
 }
 
 #[test]
+fn editing_dims_the_game() {
+    let (device, queue) = gpu_or_skip!();
+    let config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
+    let draw = |game_dim: f32| {
+        render_with_area(
+            &device,
+            &queue,
+            &config,
+            &hand_scene(),
+            Vec3::ZERO,
+            Vec3::ZERO,
+            false,
+            None,
+            [None; 2],
+            None,
+            None,
+            false,
+            &[],
+            None,
+            game_dim,
+        )
+    };
+
+    // Only the game (no depth): its color times 1 - dim, still opaque
+    let plain = draw(0.0);
+    let dimmed = draw(0.6);
+    for (plain, dimmed) in plain.pixels.iter().zip(&dimmed.pixels) {
+        assert_eq!((plain[3], dimmed[3]), (255, 255));
+        for channel in 0..3 {
+            let expected = f32::from(plain[channel]) * 0.4;
+            assert!(
+                (f32::from(dimmed[channel]) - expected).abs() <= 1.5,
+                "{plain:?} {dimmed:?}"
+            );
+        }
+    }
+    assert!(plain.pixels[0][0] > 100);
+}
+
+#[test]
 fn eye_offset_from_depth_camera_is_compensated() {
     let (device, queue) = gpu_or_skip!();
     let config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
@@ -2267,6 +2396,127 @@ fn volume_mode_selects_by_position() {
     );
     assert_eq!(out.alpha(0.5, 0.25), 1.0);
     assert_eq!(out.alpha(0.5, 0.75), 0.0);
+}
+
+// The play area on the GPU against its Rust copy: two boxes, one with a dome, cut by a wall
+#[test]
+fn play_area_mask_matches_the_rust_distance() {
+    let (device, queue) = gpu_or_skip!();
+    let config = base_config(DepthMaskRegion::Distance { max_distance: 0.1 });
+    // A wall 0.6 m away fills the view: 1.2 x 1.2 m, about 2 cm per pixel
+    let wall = 0.6;
+    let scene = Scene::new(wall, [0.0; 4], wall);
+
+    let mut area = PlayArea::single(AreaBox::new(
+        Vec3::new(-0.2, 0.05, 0.0),
+        Vec3::new(0.12, 0.2, 0.3),
+    ));
+    // A half ball on +X, as high as the rim (0.2 m)
+    area.set_dome(0, Side::new(0, true), 1.0);
+    let added = area.add_box(0, Side::new(1, false)).unwrap();
+    area.drag_side(added, Side::new(0, true), 0.45);
+    area.move_box(added, Vec3::new(0.0, -0.05, 0.0));
+    // The area frame is turned and moved: the wall is at z = 0 in it
+    let area_to_world =
+        Mat4::from_rotation_translation(Quat::from_rotation_z(0.1), Vec3::new(0.0, 0.0, -wall));
+    let placed = PlacedArea {
+        area_to_world,
+        area,
+    };
+    let out = render_with_area(
+        &device,
+        &queue,
+        &config,
+        &scene,
+        Vec3::ZERO,
+        Vec3::ZERO,
+        true,
+        None,
+        [None; 2],
+        None,
+        None,
+        false,
+        &[],
+        Some(placed),
+        0.0,
+    );
+
+    // Pixel centers on the wall (view uv origin top-left, +Y up)
+    let (mut inside, mut outside, mut dome) = (0, 0, 0);
+    for y in 0..TARGET_SIZE {
+        for x in 0..TARGET_SIZE {
+            let u = (x as f32 + 0.5) / TARGET_SIZE as f32;
+            let v = (y as f32 + 0.5) / TARGET_SIZE as f32;
+            let point = Vec3::new((2.0 * u - 1.0) * wall, (1.0 - 2.0 * v) * wall, -wall);
+            let distance = placed.signed_distance(point);
+            // A pixel and a half, and the soft edge
+            if distance.abs() < 0.04 {
+                continue;
+            }
+            let alpha = out.alpha(u, v);
+            if distance < 0.0 {
+                assert_eq!(alpha, 0.0, "inside at {x}, {y}: {distance}");
+                inside += 1;
+                let local = area_to_world.inverse().transform_point3(point);
+                if local.x > -0.08 + 0.04 && local.y > 0.0 {
+                    dome += 1;
+                }
+            } else {
+                assert_eq!(alpha, 1.0, "outside at {x}, {y}: {distance}");
+                outside += 1;
+            }
+        }
+    }
+    assert!(
+        inside > 200 && outside > 1000 && dome > 20,
+        "{inside} {outside} {dome}"
+    );
+
+    // One box: the same mask from the settings and as a placed area
+    let volume = CockpitVolumeConfig {
+        center_x: 0.1,
+        center_y: -0.05,
+        center_z: -wall,
+        yaw_deg: 20.0,
+        width: 0.5,
+        height: 0.3,
+        depth: 0.4,
+    };
+    let from_settings = render(
+        &device,
+        &queue,
+        &base_config(DepthMaskRegion::Volume(volume.clone())),
+        &scene,
+        Vec3::ZERO,
+        Vec3::ZERO,
+        true,
+    );
+    let region = RegionOverride {
+        volume_to_world: Mat4::from_rotation_translation(
+            Quat::from_rotation_y(volume.yaw_deg.to_radians()),
+            Vec3::new(volume.center_x, volume.center_y, volume.center_z),
+        ),
+        half_extents: Vec3::new(volume.width, volume.height, volume.depth) * 0.5,
+    };
+    let from_area = render_with_area(
+        &device,
+        &queue,
+        &config,
+        &scene,
+        Vec3::ZERO,
+        Vec3::ZERO,
+        true,
+        None,
+        [None; 2],
+        None,
+        None,
+        false,
+        &[],
+        Some(PlacedArea::from(region)),
+        0.0,
+    );
+    assert!(from_settings.pixels.iter().any(|pixel| pixel[3] == 0));
+    assert!(from_settings.pixels == from_area.pixels);
 }
 
 #[test]
@@ -2473,4 +2723,72 @@ fn overlay_draws_the_box_outline_over_the_stream() {
         }
     }
     assert!(away > TARGET_SIZE * TARGET_SIZE / 2, "{away}");
+}
+
+// A dashed line: dashes of DASH_ON * DASH_PERIOD in the room, gaps between them
+#[test]
+fn overlay_draws_dashed_lines() {
+    let (device, queue) = gpu_or_skip!();
+    let config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
+    let eye = OverlayEye::new(
+        Vec3::ZERO,
+        Quat::IDENTITY,
+        fov(),
+        Vec2::splat(TARGET_SIZE as f32),
+    );
+    // 15 cm ahead: 64 pixels over 30 cm, a period of 8.5 pixels
+    let line = OverlaySegment {
+        start: Vec3::new(-0.1, 0.0, -0.15),
+        end: Vec3::new(0.1, 0.0, -0.15),
+        color: OVERLAY_AMBER,
+        width: 3.0 / eye.pixels_per_radian,
+        dashed: true,
+    };
+    let draw = |overlay: &[OverlaySegment]| {
+        render_full(
+            &device,
+            &queue,
+            &config,
+            &hand_scene(),
+            Vec3::ZERO,
+            Vec3::ZERO,
+            true,
+            None,
+            [None; 2],
+            None,
+            None,
+            false,
+            overlay,
+        )
+    };
+    let plain = draw(&[]);
+    let dashed = draw(&[line]);
+    let solid = draw(&[OverlaySegment {
+        dashed: false,
+        ..line
+    }]);
+
+    // Along the middle row, where the line is (x from 11 to 53)
+    let row = TARGET_SIZE / 2;
+    let pixel = |out: &Output, x: u32| out.pixels[(row * TARGET_SIZE + x) as usize];
+    let (mut drawn, mut gaps, mut runs) = (0, 0, 0);
+    let mut previous = false;
+    for x in 12..52 {
+        assert_ne!(pixel(&solid, x), pixel(&plain, x), "solid at {x}");
+        let on = pixel(&dashed, x) == pixel(&solid, x);
+        if on {
+            drawn += 1;
+            if !previous {
+                runs += 1;
+            }
+        } else {
+            assert_eq!(pixel(&dashed, x), pixel(&plain, x), "gap at {x}");
+            gaps += 1;
+        }
+        previous = on;
+    }
+    // 40 pixels: about 4.7 periods, 60 % drawn
+    let fraction = drawn as f32 / (drawn + gaps) as f32;
+    assert!((fraction - overlay::DASH_ON).abs() < 0.15, "{drawn} {gaps}");
+    assert!((4..=6).contains(&runs), "{runs}");
 }

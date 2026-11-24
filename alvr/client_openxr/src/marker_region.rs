@@ -18,7 +18,13 @@
 //!   reported (the value at the start of the app is not a request)
 //! - `debug.alvr.marker_hands 0`: the hands of the color key show also outside the box (1: only
 //!   inside it, faded at its surface)
+//! - `debug.alvr.area_test <n>`: a test layout of the play area instead of the one box, made from the
+//!   box of the properties (see `PlayArea`): 1: two boxes and a dome on the top of the first, 8: that
+//!   box cut into 8 boxes with 24 domes (the worst case for the GPU). Unset or 0: the one box
 //!
+//! The play area: the mask shows the real room inside up to 8 boxes in the frame of the code, each
+//! with a dome on any of its sides. Without a test layout it is the one box of the properties above.
+//! A layout file of the code, or the edits in the headset, replace both (area_editor.rs).
 //! The frame of the box is level (stage +Y up). Its heading: for a code lying flat (normal within 45
 //! degrees of vertical) the direction of the top of the code, for a standing code the direction out of
 //! its front. So for a standing code facing the driver +x is the driver's LEFT and +z comes TOWARDS the
@@ -41,7 +47,9 @@ use crate::{
     passthrough::{debug_property, debug_property_string},
 };
 use alvr_common::glam::{Quat, Vec2, Vec3};
-use alvr_graphics::{MarkerBoxParams, PoseSmoother, RegionOverride, StageChange};
+use alvr_graphics::{
+    MarkerBoxParams, PlacedArea, PlayArea, PoseSmoother, RegionOverride, StageChange,
+};
 use openxr as xr;
 use std::time::{Duration, Instant};
 
@@ -93,6 +101,11 @@ pub struct MarkerRegion {
     last_scan_request: i64,
     // `debug.alvr.marker_hands`
     hands_limited: bool,
+    // The boxes in the frame of the code, from the properties (`debug.alvr.area_test`, else the box
+    // of `params`), and the layout as last logged
+    layout: PlayArea,
+    area_test: i64,
+    logged_layout: Option<PlayArea>,
     last_logged: Option<RegionOverride>,
     last_move_log: Option<Instant>,
     last_wait_log: Option<Instant>,
@@ -105,14 +118,15 @@ pub struct MarkerRegion {
 
 impl MarkerRegion {
     pub fn new() -> Self {
+        let params = MarkerBoxParams {
+            offset: Vec3::new(0.0, 0.15, 0.0),
+            size: Vec3::new(1.2, 0.9, 1.0),
+            extra_yaw: 0.0,
+        };
         Self {
             enabled: false,
             marker_id: None,
-            params: MarkerBoxParams {
-                offset: Vec3::new(0.0, 0.15, 0.0),
-                size: Vec3::new(1.2, 0.9, 1.0),
-                extra_yaw: 0.0,
-            },
+            params,
             last_poll: None,
             smoother: {
                 let mut smoother = PoseSmoother::new(
@@ -137,6 +151,9 @@ impl MarkerRegion {
             // A value left from before is not a request
             last_scan_request: debug_property("debug.alvr.marker_scan").unwrap_or(0),
             hands_limited: true,
+            layout: PlayArea::from_marker_box(&params),
+            area_test: 0,
+            logged_layout: None,
             last_logged: None,
             last_move_log: None,
             last_wait_log: None,
@@ -244,6 +261,28 @@ impl MarkerRegion {
                 .clamp(-360, 360) as f32)
                 .to_radians(),
         };
+
+        let area_test = debug_property("debug.alvr.area_test").unwrap_or(0);
+        self.layout = match area_test {
+            1 => PlayArea::test_layout(&self.params),
+            8 => PlayArea::stress_layout(&self.params),
+            _ => PlayArea::from_marker_box(&self.params),
+        };
+        if area_test != self.area_test {
+            self.area_test = area_test;
+            crate::stream_log(&match area_test {
+                0 => "play area: the box of the marker_box properties (area_test 0)".to_owned(),
+                1 | 8 => format!("play area: test layout {area_test}"),
+                _ => {
+                    format!("play area: area_test {area_test} is not a layout (1, 8), the one box")
+                }
+            });
+        }
+        // The layout as the mask uses it, each time it changes (properties)
+        if self.logged_layout != Some(self.layout) {
+            self.logged_layout = Some(self.layout);
+            crate::stream_log(&format!("play area: {}", self.layout.describe()));
+        }
     }
 
     /// The estimated pose of the code, while there is a box. Its orientation is the tilt of the last
@@ -257,6 +296,23 @@ impl MarkerRegion {
             size: self.code_size,
             measured: self.smoother.is_measured(),
         })
+    }
+
+    /// The estimated position and heading yaw of the code (stage space), while there is a box. The play
+    /// area is placed from it (`PlayArea::area_to_world`)
+    pub fn anchor_pose(&self) -> Option<(Vec3, f32)> {
+        self.kept
+    }
+
+    /// `debug.alvr.marker_box` is on
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// The payload of the code the box is placed from: `debug.alvr.marker_id`, else that of the code in
+    /// use. None: not known yet (or a code without payload)
+    pub fn payload(&self) -> Option<&str> {
+        self.wanted_payload()
     }
 
     /// How many times the box was carried over a change of the stage space so far
@@ -387,12 +443,13 @@ impl MarkerRegion {
             .or_else(|| candidates().max_by_key(|marker| marker.trusted_updated))
     }
 
-    /// The box for the frame displayed at `now`. None: the region of the settings
+    /// The play area for the frame displayed at `now`, placed at the code. None: the region of the
+    /// settings
     pub fn update(
         &mut self,
         tracker: Option<&SpatialMarkerTracker>,
         now: xr::Time,
-    ) -> Option<RegionOverride> {
+    ) -> Option<PlacedArea> {
         self.poll_properties();
         if !self.enabled {
             if self.kept.is_some() {
@@ -469,7 +526,11 @@ impl MarkerRegion {
             ));
         }
 
-        Some(region)
+        // The first box of the layout is `region` unless a test layout is on
+        Some(PlacedArea {
+            area_to_world: self.layout.area_to_world(position, yaw),
+            area: self.layout,
+        })
     }
 
     // The pose is measured: logged once per measurement

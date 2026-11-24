@@ -7,6 +7,11 @@ use alvr_common::{
 };
 use alvr_session::{DepthMaskRegion, DepthPassthroughConfig, DepthPassthroughDebugView};
 
+use crate::{
+    AreaBox, PlacedArea, PlayArea,
+    play_area::{AREA_FLOAT_COUNT, area_uniforms},
+};
+
 /// One environment depth image, as returned by `xrAcquireEnvironmentDepthImageMETA`
 #[derive(Clone, Copy)]
 pub struct DepthFrame {
@@ -356,7 +361,7 @@ impl WristBridge {
     }
 }
 
-/// The hands fade out over this on each side of the surface of a marker box (meters)
+/// The hands fade out over this on each side of the surface of the play area (meters)
 pub const HAND_REGION_FEATHER: f32 = 0.02;
 // A capsule end that is outside gets a radius this much below minus the reach of the zones: more than
 // the soft edge of the rim in focus_area.wgsl (3 mm)
@@ -367,25 +372,30 @@ fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// A hand limited to a marker box (`debug.alvr.marker_hands`). Each capsule end gets a weight, 1
-/// inside the box and 0 outside, smooth over `feather` on each side of its surface (like the region
-/// of the depth mask), and its radius goes from the radius (weight 1) down to minus the reach of the
-/// zones (weight 0), where neither the rim nor the solid fill shows. The radius is linear along a
-/// capsule, so a capsule that crosses the surface tapers off towards the outside; one that reaches
-/// past `feather` outside ends there (nothing beyond shows anyway), so that a long capsule doesn't
-/// taper over its whole length out of the box. The bridge from the wrist is one more capsule. Nothing
-/// changes on the GPU: only the capsule ends
+/// A hand limited to the play area placed from a marker (`debug.alvr.marker_hands`): its boxes with
+/// their domes. Each capsule end gets a weight, 1 inside the area and 0 outside, smooth over `feather`
+/// on each side of its surface (like the region of the depth mask), and its radius goes from the
+/// radius (weight 1) down to minus the reach of the zones (weight 0), where neither the rim nor the
+/// solid fill shows. The radius is linear along a capsule, so a capsule that crosses the surface
+/// tapers off towards the outside; one that reaches past `feather` outside ends there (nothing beyond
+/// shows anyway), so that a long capsule doesn't taper over its whole length out of the area. The
+/// bridge from the wrist is one more capsule. Nothing changes on the GPU: only the capsule ends
 pub fn limit_hand_to_region(
     shape: &HandShape,
     zones: &HandZones,
     bridge: Option<WristBridge>,
-    region: &RegionOverride,
+    region: &PlacedArea,
     feather: f32,
 ) -> (HandShape, Option<WristBridge>) {
-    let world_to_volume = region.volume_to_world.inverse();
+    let world_to_area = region.area_to_world.inverse();
     let feather = feather.max(0.0005);
     let reach = zones.rim.max(zones.core + zones.falloff).max(0.0) + HAND_FADE_MARGIN;
-    let distance = |point: Vec3| box_signed_distance(&world_to_volume, region.half_extents, point);
+    // The exact distance, the same shape as the mask
+    let distance = |point: Vec3| {
+        region
+            .area
+            .signed_distance(world_to_area.transform_point3(point), f32::INFINITY)
+    };
     let limit = |[start, end]: [Vec4; 2]| {
         let mut ends = [start, end];
         let distances = ends.map(|point| distance(point.truncate()));
@@ -393,7 +403,8 @@ pub fn limit_hand_to_region(
         for (inner, outer) in [(0, 1), (1, 0)] {
             if distances[inner] < feather && distances[outer] > feather {
                 let (mut a, mut b) = (ends[inner].truncate(), ends[outer].truncate());
-                // The box is convex: the capsule crosses that distance once
+                // A single box is convex: the capsule crosses that distance once. With several boxes
+                // or domes it may cross more than once, this finds one of the crossings
                 for _ in 0..12 {
                     let middle = (a + b) * 0.5;
                     if distance(middle) > feather {
@@ -429,12 +440,6 @@ pub fn limit_hand_to_region(
     });
 
     (limited, bridge)
-}
-
-// Distance from the surface of a box, negative inside. Same as `region_mask` in depth_mask.wgsl
-fn box_signed_distance(world_to_volume: &Mat4, half_extents: Vec3, point: Vec3) -> f32 {
-    let e = world_to_volume.transform_point3(point).abs() - half_extents;
-    e.max(Vec3::ZERO).length() + e.max_element().min(0.0)
 }
 
 /// The hands are passthrough, the color key decides where the hand tracking is not certain
@@ -475,9 +480,11 @@ pub struct DepthRenderInput {
     /// With the color key: the part of each view (min and max view uv) where the lower game layer is
     /// shown. Outside of it the upper layer shows what both would. None: the whole view
     pub key_lower_rects: Option<[(Vec2, Vec2); 2]>,
-    /// A box that replaces the region of the settings (placed from a marker on the rig). None: the
-    /// region of the settings
-    pub region_override: Option<RegionOverride>,
+    /// The play area that replaces the region of the settings (boxes placed from a marker on the rig).
+    /// None: the region of the settings
+    pub region_override: Option<PlacedArea>,
+    /// How much the game is dimmed (0: not, 1: black), while the play area is edited
+    pub game_dim: f32,
 }
 
 /// An oriented box in stage space, used for the depth mask instead of `DepthPassthroughConfig::region`
@@ -531,13 +538,18 @@ impl RegionOverride {
 
 /// The region the depth mask uses in a frame: the override if there is one, else the settings
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "made once per frame and used at once, a box would only add an allocation"
+)]
 pub(crate) enum EffectiveRegion {
     Distance {
         max_distance: f32,
     },
+    /// Boxes: the play area, or the box of the settings as an area of one box centered in its frame
     Volume {
-        volume_to_world: Mat4,
-        half_extents: Vec3,
+        area_to_world: Mat4,
+        area: PlayArea,
         /// From `DepthRenderInput::region_override`
         from_override: bool,
     },
@@ -549,8 +561,8 @@ pub(crate) fn effective_region(
 ) -> EffectiveRegion {
     if let Some(region) = input.region_override {
         return EffectiveRegion::Volume {
-            volume_to_world: region.volume_to_world,
-            half_extents: region.half_extents,
+            area_to_world: region.area_to_world,
+            area: region.area,
             from_override: true,
         };
     }
@@ -560,11 +572,14 @@ pub(crate) fn effective_region(
             max_distance: *max_distance,
         },
         DepthMaskRegion::Volume(volume) => EffectiveRegion::Volume {
-            volume_to_world: Mat4::from_rotation_translation(
+            area_to_world: Mat4::from_rotation_translation(
                 Quat::from_rotation_y(volume.yaw_deg.to_radians()),
                 Vec3::new(volume.center_x, volume.center_y, volume.center_z),
             ),
-            half_extents: Vec3::new(volume.width, volume.height, volume.depth) * 0.5,
+            area: PlayArea::single(AreaBox::new(
+                Vec3::ZERO,
+                Vec3::new(volume.width, volume.height, volume.depth) * 0.5,
+            )),
             from_override: false,
         },
     }
@@ -584,7 +599,8 @@ pub const DEPTH_UNIFORMS_FLOAT_COUNT: usize = 2 * EYE_FLOAT_COUNT
         + 2
         + 2
         + 2 * 2
-        + 1);
+        + 1)
+    + AREA_FLOAT_COUNT;
 pub const DEPTH_UNIFORMS_SIZE: usize = DEPTH_UNIFORMS_FLOAT_COUNT * size_of::<f32>();
 
 pub(crate) fn pose_to_mat4(pose: Pose) -> Mat4 {
@@ -649,19 +665,17 @@ pub fn depth_uniforms(
         }
     }
 
-    let (region_mode, max_distance, world_to_volume, half_extents) =
-        match effective_region(config, input) {
-            EffectiveRegion::Distance { max_distance } => {
-                (0.0, max_distance, Mat4::IDENTITY, Vec3::ZERO)
-            }
-            EffectiveRegion::Volume {
-                volume_to_world,
-                half_extents,
-                ..
-            } => (1.0, 0.0, volume_to_world.inverse(), half_extents),
-        };
-    data.extend(world_to_volume.to_cols_array());
-    data.extend(half_extents.extend(0.0).to_array());
+    let (region_mode, max_distance, world_to_area, area) = match effective_region(config, input) {
+        EffectiveRegion::Distance { max_distance } => (0.0, max_distance, Mat4::IDENTITY, None),
+        EffectiveRegion::Volume {
+            area_to_world,
+            area,
+            ..
+        } => (1.0, 0.0, area_to_world.inverse(), Some(area)),
+    };
+    data.extend(world_to_area.to_cols_array());
+    // The number of boxes; the boxes are at the end
+    data.extend([area.map_or(0, |area| area.len()) as f32, 0.0, 0.0, 0.0]);
 
     let debug_view = match config.debug_view {
         DepthPassthroughDebugView::Off => 0.0,
@@ -704,7 +718,14 @@ pub fn depth_uniforms(
         data.extend([0.0; 6]);
     }
     let hands = input.color_key.map_or([None; 2], |key| key.hands);
-    data.extend([f32::from(u8::from(input.color_key.is_some())), 0.0]);
+    data.extend([
+        f32::from(u8::from(input.color_key.is_some())),
+        if input.game_dim.is_finite() {
+            input.game_dim.clamp(0.0, 1.0)
+        } else {
+            0.0
+        },
+    ]);
     for hand in &hands {
         data.extend(hand.map_or([0.0; 4], |(_, zones)| {
             [zones.rim, zones.core, zones.falloff, zones.sweep.backward]
@@ -783,6 +804,7 @@ pub fn depth_uniforms(
     let end_radius = bridges.map(|bridge| bridge.map_or(0.0, |bridge| bridge.end_radius));
     let has_bridge = bridges.map(|bridge| if bridge.is_some() { 1.0 } else { 0.0 });
     data.extend([end_radius[0], end_radius[1], has_bridge[0], has_bridge[1]]);
+    data.extend(area_uniforms(area.as_ref()));
 
     data.try_into().unwrap()
 }
@@ -1115,9 +1137,12 @@ mod tests {
                 // The bridges, and the radii at their ends
                 + 16 * 4
                 + 16
+                // The bounds of the play area, and its 8 boxes of 6 vectors
+                + 16 * 2
+                + 8 * 6 * 16
         );
-        // 28 capsules per hand, and the bridges from the wrists
-        assert_eq!(DEPTH_UNIFORMS_SIZE, 3216);
+        // 28 capsules per hand, the bridges from the wrists, the boxes of the play area
+        assert_eq!(DEPTH_UNIFORMS_SIZE, 4016);
     }
 
     // A hand reaching out of a marker box: inside unchanged, outside nothing reaches even the rim,
@@ -1149,8 +1174,9 @@ mod tests {
         });
         let shape = HandShape { segments };
         let bridge = WristBridge::new(at(0.45), rotation * Vec3::X, 0.1, 0.02, 1.0);
+        let area = PlacedArea::from(region);
         let (limited, bridge) =
-            limit_hand_to_region(&shape, &zones, bridge, &region, HAND_REGION_FEATHER);
+            limit_hand_to_region(&shape, &zones, bridge, &area, HAND_REGION_FEATHER);
 
         // The reach of the zones: the rim (12 mm) and the margin
         let gone = -(0.012 + HAND_FADE_MARGIN);
@@ -1190,7 +1216,7 @@ mod tests {
         let long = HandShape {
             segments: [[at(0.4).extend(0.01), at(0.6).extend(0.01)]; HAND_SEGMENTS],
         };
-        let (limited, _) = limit_hand_to_region(&long, &zones, None, &region, HAND_REGION_FEATHER);
+        let (limited, _) = limit_hand_to_region(&long, &zones, None, &area, HAND_REGION_FEATHER);
         let [start, end] = limited.segments[0];
         assert!((start.w - 0.01).abs() < 1e-4);
         assert!((end.truncate() - at(0.52)).length() < 1e-3, "{end}");
@@ -1293,6 +1319,7 @@ mod tests {
             playzone_view: false,
             key_lower_rects: None,
             region_override: None,
+            game_dim: 0.0,
         };
         let data = depth_uniforms(&cfg, &[view(), view()], &input, None, false);
 
@@ -1309,7 +1336,13 @@ mod tests {
             "{local}"
         );
 
-        assert_eq!(&data[base + 16..base + 19], &[0.5, 0.5, 1.0]);
+        // One box, centered in that frame
+        assert_eq!(&data[base + 16..base + 20], &[1.0, 0.0, 0.0, 0.0]);
+        let boxes = DEPTH_UNIFORMS_FLOAT_COUNT - AREA_FLOAT_COUNT + 8;
+        assert_eq!(
+            &data[boxes..boxes + 8],
+            &[0.0, 0.0, 0.0, 0.0, 0.5, 0.5, 1.0, 0.0]
+        );
         // region mode = volume
         assert_eq!(data[base + 20], 1.0);
         // depth unavailable
@@ -1349,7 +1382,8 @@ mod tests {
                 capture_playzone: false,
                 playzone_view: false,
                 key_lower_rects: None,
-                region_override: Some(region),
+                region_override: Some(PlacedArea::from(region)),
+                game_dim: 0.0,
             };
             let data = depth_uniforms(&cfg, &[view(), view()], &input, None, false);
             let world_to_volume = Mat4::from_cols_slice(&data[base..base + 16]);
@@ -1357,7 +1391,9 @@ mod tests {
                 world_to_volume.abs_diff_eq(volume_to_world.inverse(), 1e-6),
                 "{world_to_volume}"
             );
-            assert_eq!(&data[base + 16..base + 19], &[0.6, 0.45, 0.5]);
+            assert_eq!(data[base + 16], 1.0);
+            let boxes = DEPTH_UNIFORMS_FLOAT_COUNT - AREA_FLOAT_COUNT + 8;
+            assert_eq!(&data[boxes + 4..boxes + 7], &[0.6, 0.45, 0.5]);
             assert_eq!(data[base + 20], 1.0);
             assert_eq!(data[base + 21], 0.0);
             // Feathering and debug view still from the settings
@@ -1427,6 +1463,7 @@ mod tests {
             playzone_view: false,
             key_lower_rects: None,
             region_override: None,
+            game_dim: 0.0,
         };
         let base = 2 * EYE_FLOAT_COUNT + 16 + 4 * 3;
 

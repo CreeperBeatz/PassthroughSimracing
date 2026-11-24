@@ -21,8 +21,9 @@ use alvr_common::{
 };
 use alvr_graphics::{
     ArmMotion, BridgeChoice, ColorKeyInput, DepthDumpFiles, DepthDumpRequest, DepthFrame,
-    DepthRenderInput, GraphicsContext, HAND_SEGMENTS, HandShape, HandZones, LeakGains,
-    OverlaySegment, RegionOverride, SEGMENT_JOINTS, StreamRenderer, StreamViewParams, WristBridge,
+    DepthRenderInput, EditorHand, EditorInput, GraphicsContext, HAND_SEGMENTS, HandShape,
+    HandZones, LeakGains, OverlaySegment, PlacedArea, SEGMENT_JOINTS, StreamRenderer,
+    StreamViewParams, WristBridge,
 };
 use alvr_packets::{ClientStreamConfig, RealTimeConfig, TrackingData};
 use alvr_session::{
@@ -194,12 +195,14 @@ pub struct StreamContext {
     // Log of the leak map: last time, and the lookup time since then
     last_leak_log: Cell<Instant>,
     leak_lookup_time: Cell<(Duration, u32)>,
-    // Box placed from a marker, used instead of the region of the settings, and whether the hands of
-    // the color key show only inside it
-    region_override: Option<RegionOverride>,
+    // Play area placed from a marker (its boxes), used instead of the region of the settings, and
+    // whether the hands of the color key show only inside it
+    region_override: Option<PlacedArea>,
     hands_in_region: bool,
     // Outline of the anchor and the box, drawn over the stream (stage space). Empty: none
     area_overlay: Vec<OverlaySegment>,
+    // How much the game is dimmed (0..1), while the play area is edited
+    game_dim: f32,
 }
 
 impl StreamContext {
@@ -376,6 +379,7 @@ impl StreamContext {
             region_override: None,
             hands_in_region: false,
             area_overlay: Vec::new(),
+            game_dim: 0.0,
         };
 
         this.update_reference_space(None);
@@ -414,10 +418,11 @@ impl StreamContext {
         }
     }
 
-    /// A box placed from a marker on the rig, used for the depth mask instead of the region of the
-    /// settings. None: the settings. `hands_in_region`: the hands of the color key show only inside
-    /// the box (`debug.alvr.marker_hands`); the region of the settings never limits them
-    pub fn set_region_override(&mut self, region: Option<RegionOverride>, hands_in_region: bool) {
+    /// The play area placed from a marker on the rig (its boxes), used for the depth mask instead of
+    /// the region of the settings. None: the settings. `hands_in_region`: the hands of the color key
+    /// show only inside the area (`debug.alvr.marker_hands`); the region of the settings never limits
+    /// them
+    pub fn set_region_override(&mut self, region: Option<PlacedArea>, hands_in_region: bool) {
         self.region_override = region;
         self.hands_in_region = hands_in_region;
     }
@@ -427,6 +432,73 @@ impl StreamContext {
     pub fn set_area_overlay(&mut self, segments: &[OverlaySegment]) {
         self.area_overlay.clear();
         self.area_overlay.extend_from_slice(segments);
+    }
+
+    /// How much the game is dimmed (0: not, 1: black), while the play area is edited. Only with
+    /// Passthrough = Depth
+    pub fn set_game_dim(&mut self, dim: f32) {
+        self.game_dim = dim;
+    }
+
+    /// The eyes and the hands at `time` (stage space) for the play area editor. None: not Passthrough =
+    /// Depth, or no head pose. A hand without a valid pose of its thumb tip, index tip and palm is None
+    pub fn editor_input(&self, time: xr::Time) -> Option<EditorInput> {
+        if !self.uses_depth_passthrough() {
+            return None;
+        }
+        let head = self
+            .view_reference_space
+            .locate(&self.stage_reference_space, time)
+            .ok()?;
+        let valid =
+            xr::SpaceLocationFlags::POSITION_VALID | xr::SpaceLocationFlags::ORIENTATION_VALID;
+        if !head.location_flags.contains(valid) {
+            return None;
+        }
+        let head = crate::from_xr_pose(head.pose);
+        let int_ctx = self.interaction_context.read();
+
+        let hands = [0, 1].map(|i| {
+            let tracker = int_ctx.hands_interaction[i].skeleton_tracker.as_ref()?;
+            let joints = self
+                .stage_reference_space
+                .locate_hand_joints(tracker, time)
+                .ok()
+                .flatten()?;
+            let thumb = joints[xr::HandJointEXT::THUMB_TIP];
+            let index = joints[xr::HandJointEXT::INDEX_TIP];
+            let palm = joints[xr::HandJointEXT::PALM];
+            let has = |joint: &xr::HandJointLocation, flags| joint.location_flags.contains(flags);
+            if ![&thumb, &index, &palm]
+                .iter()
+                .all(|&joint| has(joint, xr::SpaceLocationFlags::POSITION_VALID))
+            {
+                return None;
+            }
+            // The palm faces its -Y (XR_EXT_hand_tracking: +Y out of the back of the hand)
+            let palm_normal = if has(&palm, xr::SpaceLocationFlags::ORIENTATION_VALID) {
+                crate::from_xr_quat(palm.pose.orientation) * Vec3::NEG_Y
+            } else {
+                Vec3::ZERO
+            };
+
+            Some(EditorHand {
+                thumb_tip: crate::from_xr_vec3(thumb.pose.position),
+                index_tip: crate::from_xr_vec3(index.pose.position),
+                tip_radii: thumb.radius + index.radius,
+                palm: crate::from_xr_vec3(palm.pose.position),
+                palm_normal,
+                tracked: [&thumb, &index]
+                    .iter()
+                    .all(|&joint| has(joint, xr::SpaceLocationFlags::POSITION_TRACKED)),
+            })
+        });
+
+        Some(EditorInput {
+            eye: head.position,
+            forward: head.orientation * Vec3::NEG_Z,
+            hands,
+        })
     }
 
     /// New colors for the key, learned from the camera
@@ -866,8 +938,8 @@ impl StreamContext {
         self.hand_bounds
             .set(hands.map(|hand| hand.map(|(shape, _)| shape.bounds())));
 
-        // With a box placed from a marker only the part of the hands inside it shows, faded at its
-        // surface. After the bounds: the playzone still knows about the whole hands
+        // With a play area placed from a marker only the part of the hands inside it shows, faded at
+        // its surface. After the bounds: the playzone still knows about the whole hands
         let mut hands = hands;
         if let Some(region) = self.region_override.filter(|_| self.hands_in_region) {
             for (hand, bridge) in hands.iter_mut().zip(&mut bridges) {
@@ -1105,6 +1177,7 @@ impl StreamContext {
                         playzone_view: false,
                         key_lower_rects: None,
                         region_override: self.region_override,
+                        game_dim: self.game_dim,
                     });
                 }
                 Err(e) => {
@@ -1147,6 +1220,7 @@ impl StreamContext {
             playzone_view: self.color_key.is_some_and(|params| params.playzone_view),
             key_lower_rects: None,
             region_override: self.region_override,
+            game_dim: self.game_dim,
         })
     }
 

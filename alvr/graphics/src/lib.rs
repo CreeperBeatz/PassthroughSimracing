@@ -1,3 +1,4 @@
+mod area_edit;
 mod color_model;
 mod depth_dump;
 mod depth_mask;
@@ -6,12 +7,14 @@ mod leak_map;
 mod lobby;
 mod marker_box;
 mod overlay;
+mod play_area;
 mod staging;
 mod stream;
 
 #[cfg(test)]
 mod tests;
 
+pub use area_edit::*;
 pub use color_model::*;
 pub use depth_dump::{DEPTH_DUMP_TIMEOUT, DepthDumpFiles, DepthDumpRequest};
 pub use depth_mask::*;
@@ -20,6 +23,7 @@ pub use leak_map::*;
 pub use lobby::*;
 pub use marker_box::*;
 pub use overlay::*;
+pub use play_area::*;
 pub use stream::*;
 
 use alvr_common::{

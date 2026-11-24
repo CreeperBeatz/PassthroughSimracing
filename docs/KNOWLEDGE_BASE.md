@@ -996,6 +996,12 @@ shows the pose as last reported, with ` (size not trusted)` when it is not trust
 | `marker_box_yaw` | 0 deg | Added to the heading, counter-clockwise from above; turns the box about the code |
 | `area_show` | unset | Outline of the code and the box over the stream (see "Outline of the anchor and the box"). Unset: for 8 s each time the pose of the code becomes measured, each time the box is carried over a STAGE change and each time a box is placed after there was none. 1 (any number but 0): always while there is a box. 0: never. Only with a marker box and Passthrough = Depth. Polled, applies at once |
 | `area_line` | 12 | Width of the lines of the outline on screen, hundredths of a degree (12 = 0.12 deg, about 2 px at the center of a view about 2000 px wide), 2 to 100. Polled |
+| `area_test` | unset | A test layout of the play area (see "Play area: boxes and domes") made from the box of the `marker_box_*` properties. 1: that box with a dome on its top (25 cm) and a second box on its +x side (40 cm beyond it, half as high, same floor). 8: that box cut into 2 x 2 x 2 boxes with domes on their 24 outer sides (15 cm), the worst case for the GPU. Unset, 0 or another number: the one box, as before. A change is logged. Polled |
+| `area_dashed` | unset | 1: the play area in the outline is dashed (4 cm period, 60 % drawn, fixed in the room). It is dashed anyway while it is placed from the anchor saved in the layout file, before the code is seen in this run (the editor). Polled |
+| `area_edit` | value at app start | Play area editor (see "Play area editor"). A change to 1 starts editing, a change to 0 ends it (and saves). The value at the start of the app is not a request: set 0, then 1. Only with a marker box, a play area placed and Passthrough = Depth (else logged: `area editor: can't edit`). Polled |
+| `area_pinch_on` / `area_pinch_off` | 10 / 25 | Editor: gap in mm between the surfaces of the thumb and index tips (joint distance minus the two joint radii) below which a pinch closes (2 updates in a row) / above which it opens (for 80 ms). 0 to 100; off is at least on + 5. Not measured yet: the editor logs the min/max gap every 5 s while editing. Polled |
+| `area_edit_dim` | 60 | Editor: how much the game is dimmed while editing, percent (0 to 90). Polled |
+| `area_file` | unset (= 1) | 0: the layout files of the play area are neither read nor written: the box of the `marker_box_*` properties (and `area_test`) again, edits last until the app stops. Unset or another value: a layout file of the code replaces that box. A change reads the file again. Polled |
 
 The box frame is level (stage +Y up); only the heading comes from the code, never its tilt (a tilt error of
 a few degrees would move the far end of the box by centimeters). Heading: a code lying flat (normal within
@@ -1091,6 +1097,9 @@ stream on the PC: line color along an edge, every pixel away from the lines unch
 (from the eye position of the depth input, in the direction `depth_uniforms` uses) lands on the place
 where `reprojection_transform` draws that pixel, also with input and output views that differ in
 orientation, position and fov.
+Since the play area (2026-11-24) the outline draws the whole area instead of the 12 edges: see "Play
+area: boxes and domes". The buffer now holds 256 segments per eye (16 KB, 32 bytes a segment: the color
+packed into one float, a negative width for a dashed line).
 Test on the headset (box on, Passthrough = Depth, `setprop debug.alvr.area_show 1` or wait for
 `marker box: measured:`): the square sits on the real code and is turned like it (the heading line
 points to the top of a flat code, out of the face of a standing one); the white outline runs along the
@@ -1098,6 +1107,237 @@ border where the real world ends and the game begins; with the head moved sidewa
 stay glued to the desk and do not swim; both eyes fuse the lines into one (no double image); the frame
 rate and the GPU load (VrApi) with and without `area_show 1`. If the lines are too thin or too thick:
 `area_line`.
+
+**Play area: boxes and domes (2026-11-24, not tested on the headset).** The region of a marker is now a
+layout of up to 8 boxes (`alvr/graphics/src/play_area.rs`, pure geometry with unit tests). Area frame:
+the level frame of the code that `marker_box` builds (+x to the right of the heading, +y up, -z along
+the heading), turned by the yaw of the layout (`marker_box_yaw` for the box of the properties). Every box
+is level and axis aligned in it (single boxes are never turned). Each of the 6 sides can bulge out as a
+dome of height h (0: flat): the part beyond the side of a capsule that cuts the side along the largest
+stadium inside it (a circle on a square side: a spherical cap). Its rim radius b is half the shorter edge
+of the side, the capsule axis runs along the longer edge (half length a - b), radius R = (b^2 + h^2) / 2h,
+axis d = R - h below the side; h is at most b (half ball or half cylinder), below 5 mm the side is flat.
+The corners of a side stay flat. Without `area_test` the layout is the one box of the properties: the
+same box as before (tested: `single_box_matches_the_marker_box` compares the old box distance and the
+new one on random placements, within 2e-5 m).
+The mask: `region_mask` in depth_mask.wgsl takes the signed distance of the union (`area_signed_distance`,
+a line-by-line copy of `PlayArea::signed_distance`) with the same feather as before. It is exact outside
+(the feather keeps its meaning in meters) and has the right sign inside (under a dome never deeper than
+the opposite side of the box, so a box thinner than the capsule of its dome has no jump at its middle;
+`thin_box_has_no_jump_under_a_dome`). Cost: a bounding box test of
+the whole area first, then a loop over the used boxes only, which stops once a point is inside by the
+feather; a box evaluates its domes only between -feather and its tallest dome + feather (outside it
+returns the box distance minus the tallest dome, a lower bound). And the 9 samples of a mask texel lie
+on one ray of the depth camera, each at its own depth: the region is evaluated once at the middle depth,
+and only if that point is within feather + spread of the surface are the 9 classified one by one (the
+spread is half the depth range along the ray). Exact: the mask is the same, but a flat surface costs one
+evaluation instead of 9 (also for the old single box and the Distance region). Not measured on the
+headset: compare App GPU time with `area_test` unset, 1 and 8 on a fixed scene, several runs each.
+Hands limited to the area (`marker_hands`) use the same distance on the CPU (`limit_hand_to_region`).
+Boxes that only touch have a distance of 0 on the side they share: the mask shows the real room there
+(coverage 0.5, full from 0.35 on), but hands would be thinned along it, so a box added next to another
+reaches 5 cm into it (`ADDED_BOX_OVERLAP`).
+Uniform block (`DepthUniforms`, Rust `depth_uniforms`, asserted 4016 bytes): `world_to_volume` became
+`world_to_area` (same place: stage to the area frame, or to the box of the settings), `volume_half_extents`
+became `area` (x: number of boxes, 0 with the Distance region); at the end after `hand_bridge_end` come
+`area_bounds` (2 vectors: center and half extents of all boxes with domes) and `area_boxes`, 8 x
+`AreaBox` of 6 vectors (center + tallest dome, half extents, R of the + and - sides, d of the + and -
+sides). The box of the settings ("Cockpit volume") is sent as one box centered in its frame.
+The outline (`area_outline` in overlay.rs): the edges of the boxes without the parts strictly inside
+another box, and of each dome its rim and two arcs over its top (across and along the side), 8 segments
+per half circle, fewer (down to 2) when the layout would not fit in the 249 segments left per eye; the
+edges come first, the rest is cut and logged. Dumps (`key_dump`) write the first box as before plus
+`area_to_world` and `boxes` (center, half, the 6 dome heights as used).
+The layout as text (`PlayArea::to_text` / `PlayArea::parse`), saved and read by the editor (see "Play
+area editor", which adds an `anchor` line):
+```
+alvr_play_area 1
+# comments
+payload RIG1
+yaw_deg 0.00
+box cx cy cz hx hy hz [dome+x dome-x dome+y dome-y dome+z dome-z]
+```
+meters in the area frame, half extents, one box line per box (6 or 12 numbers). Unknown lines are kept
+aside, values out of the limits are clamped (with a warning), boxes after the 8th left out; a wrong
+first line, another version, a box line that does not read or no box is an error.
+
+**Play area editor (2026-11-24, not tested on the headset).** `alvr/client_openxr/src/area_editor.rs`
+(state, files, logs) on top of `alvr/graphics/src/area_edit.rs` (pure: handles, picking, drags, pinch,
+gesture, glyphs, undo, file name and text; unit tests). Only with a marker box and Passthrough = Depth.
+- Modes: hidden (racing; only the gesture is watched, the hands are located every frame at the display
+  time, in STAGE), shown (the outline for 3 s after editing), editing (game dimmed by `area_edit_dim`,
+  handles drawn, the mask follows every drag at once, the pose of the code frozen and carried over
+  STAGE changes at their change time like the box of the marker region; the hands are not limited to
+  the area while editing, since the handles are on and outside it).
+- Start and end: the two-hand gesture, both hands pinched with both palms turned away from the eyes
+  (cos > 0.5 between the normal out of the palm, -Y of the palm joint, and eyes-to-palm), the two
+  pinch points within 20 cm of each other, each 15-65 cm from the eyes and within 45 deg of the view
+  direction, held 1.5 s (drops under 0.15 s ignored; after it fired the pose must be let go). The outline
+  brightens and an amber square closes between the hands. Driving guard: hands on a wheel are about 30
+  cm apart, palms towards the rim and not pinched; the gesture is logged each time it is held or let go.
+  Also: `area_edit` 1/0, the done handle (green check mark 12 cm above the code), 120 s without a grab
+  (counted from the end of the last grab; pinches not on a handle don't count), the area gone (also
+  `marker_box 0`). Ending saves only if something was changed: entering and leaving without a change
+  writes no file, and without a file the box of the properties stays the layout.
+- Hands: a hand is used only while its thumb and index tips are POSITION_TRACKED and its cursor (the
+  midpoint of the two tips) is within 50 deg of the view direction. Pinch on the gap between the tip
+  surfaces with hysteresis (`area_pinch_on/_off`); a closed pinch of a hand that is lost opens after
+  0.3 s. A frame without the eyes (head pose not valid) counts as both hands not seen, at the last view
+  (up to 1 s), so a grab then ends like a lost hand (the last displacement kept).
+- Handles of the selected box: a square on each side (on top of its dome; drag along the normal: that
+  side moves, the opposite stays), a small triangle beside it (up the side, along the longer edge on
+  top and bottom; 35 % of the half extent, 4-12 cm) for the dome (drag out: higher, up to the rim; below
+  1.5 cm: flat), a diamond at the center (moves the box), "+" and a red "x" 9 cm above the center. The
+  other boxes show only a dim diamond; pinching any handle of a box selects it (cyan edges). Undo (an
+  arrow) beside done above the code while there is something to take back (20 steps, per editing
+  session). Handle size max(1.5 cm, 0.012 x distance), 1.3x and amber when lit, cyan when grabbed, with a
+  dashed guide line along the normal for side and dome drags. Cursors: a small plus, a square while
+  pinched.
+- Picking: the nearest handle within 8 cm of the cursor; handles up to 1.5 cm farther than the nearest
+  go by the line of sight from the eyes through the cursor; none in reach: the handle within 4 deg of
+  that line (ties within 1.5 deg: nearer to the eyes). The lit one stays against a 1 cm better one, up to
+  10 cm away and 6 deg off. It is kept while the fingers close (gap below on + 10 mm).
+- Drags: relative to the cursor at the pinch (no jump), 8 mm dead zone caught up over the next 3 cm.
+  On release the value of 0.12 s before the release was confirmed is kept (the fingers move the cursor
+  while they open), the last one when the hand was lost. "+": a tap (moved under 2 cm) adds a box on the
+  side of the selected box the line of sight goes through first (from inside the box: where it leaves,
+  from outside: where it enters), else the next side facing the eyes whose new box would not have its
+  center in another box; `PlayArea::add_box` sizes it. "x": held 0.8 s within 2 cm removes the box (a red
+  square closes around it), not on the last box. Undo and done: taps.
+- A two-hand gesture while one hand grabs drops the grab (the layout as before it).
+- Dimming: `DepthRenderInput.game_dim` goes to `lighting2.w` of the uniform block (unused before: no
+  layout change, the block stays 4016 bytes); `depth_passthrough` in stream.wgsl multiplies the game color
+  by 1 - dim in both the plain and the color key path. Tested on the PC GPU (`editing_dims_the_game`).
+- Layout file: one per code, `area-<payload, other than [A-Za-z0-9_-] as _, at most 40>-<FNV-1a of the
+  payload, 8 hex>.txt` (`area-no-payload.txt` for a code without payload), in
+  `/sdcard/Android/data/alvr.client.dev/files/areas/` and `/data/local/tmp/alvr-areas/`. Read once the
+  payload is known (`marker_id`, else the code seen first; before any code is seen and without
+  `marker_id`: the payload named in the newest `area-*.txt` of the two folders): the newer of the two
+  that reads. Written to both by a saver thread (only the newest pending layout, temporary file then
+  rename) on each released grab that changed something, add, remove, undo, end of editing after a
+  change, and when the code gets measured while a file is used. The text of `PlayArea::to_text` plus `anchor x y z heading_deg`, the pose of the code
+  measured last (stage space). With a file its layout replaces the box of the properties (and
+  `area_test`); `area_file 0` goes back. The CI uninstall wipes the first folder; the second survives it.
+  The app most likely can only read the second (SELinux gives apps no write access to /data/local/tmp,
+  `chmod` does not change that; reading works, as for the LUT file): the failed write is logged once per
+  run. `tools/install_apk.sh` copies `files/areas/area-*.txt` there with `adb shell` before it
+  uninstalls (by hand: `adb pull` before, `adb push` to `/data/local/tmp/alvr-areas/` after).
+- Restore: before the code is seen in this run the area is placed from the anchor of the file (STAGE
+  coordinates stayed the same across sleep and reinstall on 2026-11-24; a STAGE change carries it at its
+  change time, one without a valid pose drops it until the code is seen); once the code is seen, from the
+  code. The outline is dashed while placed from the saved anchor (the code outline is amber while the
+  pose is being measured). Restoring before the code is seen needs `marker_box 1`; without `marker_id`
+  the file is the newest one (its payload), so after a reboot only `marker_box 1` must be set again.
+- Not done: the pinches reach the PC as hand gestures (trigger clicks) while editing; no snapping or
+  minimum overlap of moved boxes (boxes that only touch thin a limited hand along the shared side); no
+  turning of the layout (yaw only in the file).
+
+## Play area editor (v1)
+
+Summary of the two paragraphs above ("Play area: boxes and domes", "Play area editor"), written for the
+first headset test. Built 2026-11-24, checked only on the PC (`cargo test -p alvr_graphics`, 178 tests
+incl. GPU and shader parse; `cargo check -p alvr_client_openxr`); nothing of it has run on the Quest.
+
+**What it is.** After the code is scanned, the play area (the part of the real room shown through the
+game) is drawn in the headset as an outline together with the code. With a two-hand pinch the person
+enters edit mode: the game is dimmed, handles appear on the boxes, and with a one-hand pinch the sides
+are pulled, domes raised, boxes moved, added and removed. The mask, the hand limit and the outline follow
+the hand at once. The layout is saved in a file per code and comes back after a restart.
+
+**Shape model.** Up to 8 boxes, all level and axis-aligned in the area frame (the level frame of the code,
+turned only by the yaw of the layout, which exists only in the file). Each of the 6 sides can carry a
+dome (a spherical cap on a square side) of a height; 0 or under 5 mm is flat, the maximum is half the
+shorter edge of the side, the corners stay flat. Limits: half extent 2.5 cm to 2.5 m, center within
+3 m. The mask is the signed distance of the union with the usual feather.
+
+**Layout file.** Text, `PlayArea::to_text` plus the anchor line:
+```
+alvr_play_area 1
+payload RIG1
+yaw_deg 0.00
+box cx cy cz hx hy hz [dome+x dome-x dome+y dome-y dome+z dome-z]
+anchor x y z heading_deg
+```
+Metres, area frame, half extents. Name `area-<payload>-<8 hex>.txt` (`area-no-payload.txt` without a
+payload). Folders: `/sdcard/Android/data/alvr.client.dev/files/areas/` (lost by every CI uninstall) and
+`/data/local/tmp/alvr-areas/` (survives, but the app probably cannot write it; `tools/install_apk.sh`
+copies the first into it before the uninstall). The newer file that reads wins. A file replaces the
+`marker_box_*` box and `area_test`; with no file the layout is that one box, as before.
+
+**Gestures (numbers from the code).**
+- Start/end: both hands pinched, palms away from the eyes (cos at least 0.5), pinch points at most 20 cm
+  apart, each 15-65 cm from the eyes and within 45 deg of the view, held 1.5 s (drops under 0.15 s ignored).
+  Also `area_edit` 1/0, the done handle, 120 s without a grab, loss of the play area.
+- Pinch: closes below a tip gap of 10 mm (2 updates), opens above 25 mm for 80 ms; a lost hand opens
+  after 0.3 s. A hand is used when both tips are tracked and the cursor is within 50 deg of the view.
+- Picking: nearest handle within 8 cm; line of sight (4 deg, ties 1.5 deg) when out of reach; hysteresis 1 cm / 10 cm / 6 deg.
+- Drag: 8 mm dead zone caught up over 3 cm; release keeps the value of 0.12 s earlier; dome under 1.5 cm snaps flat.
+- Handles: square per side, triangle for the dome, diamond for moving, "+" (tap, moved under 2 cm), red
+  "x" (held 0.8 s, not on the last box), undo (20 steps) and done above the code. Game dimmed 60 %.
+
+**Properties (all `debug.alvr.*`, polled).**
+
+| Property | Default | Meaning |
+|---|---|---|
+| `area_edit` | value at app start | change to 1 starts editing, to 0 ends it and saves; set 0 then 1 |
+| `area_pinch_on` | 10 mm | tip gap below which a pinch closes |
+| `area_pinch_off` | 25 mm | tip gap above which a pinch opens (at least on + 5) |
+| `area_edit_dim` | 60 % | dimming of the game while editing, 0 to 90 |
+| `area_file` | unset (on) | 0: no layout file read or written, the property box again |
+| `area_test` | unset | 1: test layout (box with a dome and a second box); 8: 8 boxes, 24 domes; else the one box |
+| `area_dashed` | unset | 1: area drawn dashed (4 cm period, 60 % drawn) |
+| `area_show` | unset | outline always (1) or never (0); the editor's own reasons override 0 |
+
+**Log lines (stable prefixes `area editor:`, `play area:`, `area:`).**
+
+| Line | Meaning |
+|---|---|
+| `play area: <n> box(es), yaw ..: #0 at (..) m, w x h x d m, dome +y ..` | layout at start and on every change of the properties |
+| `play area: test layout 1 or 8`, `... area_test <n> is not a layout` | `area_test` changed |
+| `area: outline cut, <n> segments of the play area left out (256 per eye)` | outline over the budget |
+| `area editor: no layout file for "<payload>"`, `loaded <path> (...)` | file looked for / read; says which of the two folders won |
+| `area editor: play area placed from the code`, `... from the anchor saved in the layout file` | placement; the second is drawn dashed |
+| `area editor: two-hand gesture held (1.5 s to start or end editing)`, `... let go after <s> s` | the gesture is recognised; at most every 2 s; the false-trigger check |
+| `area editor: editing (gesture or area_edit 1), game dimmed by <n> %` | edit mode on |
+| `area editor: editing ended (<reason>)`, with `, nothing changed` when so | edit mode off |
+| `area editor: pinch gap min/max over 5 s: left a/b mm, right ..` | measured gaps, every 5 s while editing |
+| `area editor: grab <handle> of box #i (left or right hand)` | a pinch took a handle |
+| `area editor: release <handle> ..: moved, dome, moved by <m> m` or `no change` | drag result |
+| `area editor: added box #n ...`, `removed box #i`, `remove .. not done`, `undo (n more)`, `nothing to undo` | box buttons |
+| `area editor: saved <path> (<why>, n boxes, ..)`, `could not save <path>: <err>` | per folder; a failure is logged once |
+| `area editor: can't edit (area_edit 1): ..` | no play area, or Passthrough is not Depth |
+
+**Headset test checklist** (box on, code measured, Passthrough = Depth; read the log after each step).
+1. `setprop debug.alvr.area_test 1`, `area_show 1`: a dome on the box and a second lower box, the real
+   room inside both; log `play area: test layout 1`. Then `area_test 0`.
+2. Unset `area_test`: the mask looks as before (one box, no domes); `area_dashed 1` makes the dashes stay put in the room.
+3. Look at the log of a normal lap with hands on the wheel: no `two-hand gesture held` line.
+4. Pinch with both hands in front of the face, palms forward, close together: dim outline, amber square
+   closing, after 1.5 s the game darkens. Log `two-hand gesture held`, `editing (gesture)`. If it does not
+   start: `area_edit 0` then `1`, read `pinch gap` lines, set `area_pinch_on/_off`.
+5. Handles: cyan box, squares, triangles, diamond, "+", "x" (2+ boxes), check mark above the code; a
+   plus cursor at each hand. Point at a square: it turns amber (also by looking through the fingers).
+6. Pinch a square and pull: no jump at the pinch, the hole follows live, guide line; release: `grab side`,
+   `release side ..: moved`, `saved ..` (note whether /data/local/tmp is written or logged once as failed).
+7. Triangle: a dome grows (arcs, room under it), pushed back it goes flat. Diamond: the box moves.
+8. "+" tap: a box on the side looked at (`added box`). "x" held 0.8 s: `removed box`; a quick tap: `not done`. Arrow: `undo`.
+9. Check mark: `editing ended (done handle)`; the outline stays 3 s. Entering and leaving with no change: `nothing changed`, no `saved`.
+10. Restart the app with the code hidden: `loaded ..`, `play area placed from the anchor saved in the
+    layout file`, area dashed in the right place; show the code: `placed from the code`, solid.
+11. Reinstall with `tools/install_apk.sh`, `marker_box 1`: `loaded /data/local/tmp/alvr-areas/..`.
+    `area_file 0`: the property box again.
+12. Cost: App GPU time with `area_test` unset, 1, 8; and editing against not editing (hands located every frame).
+
+**Not verified yet.** Anything on the Quest. In particular: whether the two-hand gesture starts (pinch
+gap at contact, the palm normal sign `-Y` of the palm joint, a clash with the Meta system pinch, hand
+tracking with the hands close); false triggers while driving; hand data at the predicted display time;
+drag feel and handle sizes; reachability of the handles from the seat (centre, "+" and "x" may be
+inside the body); the dashed restore and the saved anchor in the right place; whether the app can write
+/data/local/tmp/alvr-areas; the dimming in both the plain and the colour key path; GPU cost of the
+shader (area_test 1 and 8) and the 16 KB overlay uniform block on Adreno; dashes on lines clipped at the
+near plane crawl. Known gaps: pinches still reach the PC as trigger clicks, moved boxes are not
+snapped to overlap, no turning of the layout, undo is cleared on each entry, and the hands outside the
+area are seen over the dimmed game only through the colour key.
 
 **The printed codes** (2026-11-23). Three codes with the payloads `RIG1`, `RIG2` and `RIG3`, black edge on
 the paper 144.2, 95.6 and 67.4 mm. The printer scaled the page to 96 %: the 100 mm check bar measured
@@ -1210,6 +1450,43 @@ Log lines (`ALVR_CAM`, all start with `marker`):
 - `area: outline shown (measured | carried over | placed | area_show 1)` when the outline of the code
   and the box appears or shows for another reason, `area: outline hidden` when it goes (after 8 s, with
   `area_show 0`, without a box, or when Passthrough is not Depth).
+- `area: outline cut, <n> segments of the play area left out (256 per eye)` when the outline of the
+  play area does not fit (`area_test 8`).
+- `play area: <n> box(es), yaw <deg> deg: #0 at (x, y, z) m, w x h x d m, dome +y 0.250 m; #1 ...` (area
+  frame) at the start and each time the layout changes (properties); `play area: test layout 1 | 8`,
+  `play area: the box of the marker_box properties (area_test 0)` or `play area: area_test <n> is not a
+  layout (1, 8), the one box` when `area_test` changes. With a layout file these describe the box of
+  the properties, which is then not used.
+- Editor (`area editor:`): `editing (gesture | area_edit 1), game dimmed by <n> %, placed from <the
+  code | the saved anchor>: <layout>`; `editing ended (gesture | done handle | area_edit 0 | no grab for
+  120 s | marker box off | no play area | Passthrough is not Depth | another code | area_file changed),
+  <layout>{, nothing changed}`; `the edited layout replaces the box of the marker_box properties from now
+  on (...)` at the first change of the box of the properties; `stage space changed without a pose, the
+  saved anchor is dropped until the code is seen`; `no code seen yet and no marker_id: the layout of
+  "<payload>", saved last (<path>)` or `...: the newest layout file (<path>) names no payload, waiting for
+  a code`; `can't list <dir>: <error>`; `can't
+  edit (area_edit 1): no play area (...)`; `two-hand gesture held (1.5 s to start | end editing)` and
+  `two-hand gesture let go after <s> s` (at most every 2 s); `grab <side +x | dome +y | center | add |
+  remove | undo | done> of box #<i> (left | right hand)`; `release <handle> of box #<i>{ (hand lost)}:
+  moved <m> m | dome <m> m | moved by <m> m, #<i> at (x, y, z) m, w x h x d m{, dome ...}` or `...: no
+  change`; `release <handle>: not a tap (moved <mm> mm), nothing done`; `grab of <handle> of box #<i>
+  dropped (two-hand gesture | editing ended | stage space changed | no hands)`; `added box #<n> on side
+  <s> of box #<i>: ...` or `no room for a box next to box #<i> (...)`; `removed box #<i>, <layout>` or
+  `remove of box #<i> not done (held <s> s, moved <mm> mm; ...)`; `undo (<n> more), <layout>` or `nothing
+  to undo`; `saved <path> (<why>, <n> boxes, with the anchor | no anchor measured yet)` or `could not
+  save <path>: <error> (not logged again for this folder until a save there works)`; `not saved (<why>): area_file 0 | the payload of the
+  code is not known yet`; `loaded <path> (the only one found | the newer of the two | the newer one does
+  not read, written <h> h ago): <layout>; anchor (x, y, z) m, heading <deg> deg | none`, then its warnings,
+  unknown lines, a payload that differs, and `the marker_box_* properties and area_test are not used while
+  a layout file is`; `no layout file for "<payload>" (<name> in <dir> or <dir>): the box of the
+  marker_box properties`; `<path> does not read: <error>`; `can't read <path>: <error>`; `play area
+  placed from the code | from the anchor saved in the layout file, the code at (...) m, heading <deg> deg
+  (dashed until the code is seen) | no play area placed`; `pinch gap min/max over 5 s: left <a>/<b>
+  mm, right - mm (closes below 10, opens above 25)` while editing; `a pinch closes below a gap of <n> mm
+  and opens above <n> mm`, `the game is dimmed by <n> % while editing`, `layout files are (not) used
+  (area_file ...)` when those properties change.
+- `area: outline shown (editing | editing ended | edit gesture)` from the editor (these override
+  `area_show 0`).
 - `ReferenceSpaceChangePending type: <type>, change time <ns> ns, pose valid: <bool>, pose in previous
   space (x, y, z) m, yaw <deg> deg` (now in `ALVR_CAM`, for every reference space type; only STAGE ones
   give `marker: stage space changed, poses dropped until the markers are seen again` and, at the change
@@ -1296,6 +1573,39 @@ Testing (`adb logcat -s ALVR_CAM` running):
       turned like it; the white lines along the border of the passthrough; move the head 10 cm sideways:
       the lines stay on the desk; both eyes fuse them. Note fps and GPU load (VrApi) with `area_show 1`
       and `0`. Recenter: `area: outline shown (carried over)` and the outline stays on the rig.
+- [ ] Play area (box on, `area_show 1`): `setprop debug.alvr.area_test 1`: `play area: test layout 1`
+      and the layout line; a white dome over the top of the box and a lower box on its +x side; the real
+      room shows inside both and under the dome, the lines on the border of the hole. `area_dashed 1`:
+      the area dashed, the dashes fixed in the room. `area_test 8`: 8 boxes with 24 domes (the outline
+      is cut, logged). App GPU time with `area_test` 0, 1 and 8, several runs each; and with `area_test`
+      unset the mask must look as before.
+- [ ] Editor, no layout file yet (box on, code measured, `area_show` unset): the log has `area
+      editor: no layout file for "SCR1" (...)`. Hands on the wheel, driving a lap: no `two-hand gesture
+      held` line (if there is one, note what the hands did). Both hands up in front of the face, pinch
+      thumb and index on both, palms turned forward, the pinches close together: the outline appears
+      dim, brightens, an amber square closes between the hands, after 1.5 s `editing (gesture)` and the
+      game darker. If it does not start: read the `pinch gap` lines (only while editing, so first try
+      `setprop debug.alvr.area_edit 0` then `1`) and set `area_pinch_on/_off`.
+- [ ] Editor, handles: a cyan box with white squares on its sides, triangles beside them, a diamond
+      at its center, "+" and (with 2+ boxes) a red "x" above it; a green check and (after a change) an
+      arrow above the code; a small plus at each hand. Point at a square: it turns amber and larger (also
+      for one out of reach, by looking through the fingers at it). Pinch and pull: `grab side ...`, the
+      side follows the hand (no jump at the pinch), the hole in the game follows live, a dashed guide
+      line; release: `release side ...: moved ...` and `saved ...` (note whether
+      /data/local/tmp/alvr-areas could be written or `could not save` is logged once). Triangle: pull out, a dome grows (arcs in the
+      outline, room shows under it); push back: flat. Diamond: the box moves. "+" tap: a box on the side
+      looked at; "x" held 0.8 s: removed, a quick tap: `not done`. Arrow: undo. Check mark: `editing
+      ended (done handle)`, the outline stays 3 s. Judge: hand jitter while dragging, the dead zone, the
+      value kept on release (does it jump back when the fingers open?), handle sizes, whether wrong
+      handles light.
+- [ ] Editor, restore: restart the app with the code hidden: `loaded .../area-SCR1-....txt`, `play
+      area placed from the anchor saved in the layout file` and the area dashed in the right place; show
+      the code: `placed from the code`, solid at once. Restart without `marker_id`: the same, after `no
+      code seen yet and no marker_id: the layout of ...`. Enter and leave editing without a change:
+      `nothing changed`, no `saved`. Reinstall a CI build with tools/install_apk.sh: `kept ...` lines,
+      then `loaded /data/local/tmp/alvr-areas/...`. `setprop debug.alvr.area_file 0`: the box of the properties again.
+- [ ] Editor cost: App GPU time and CPU frame time editing vs not (the hands are located every frame
+      while the marker box is on and Passthrough = Depth, also while racing).
 
 ## Open problems, in order
 

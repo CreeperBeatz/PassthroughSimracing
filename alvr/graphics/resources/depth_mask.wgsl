@@ -7,7 +7,7 @@
 //
 // For each texel, find the real-world surface seen along the view ray using the headset depth map,
 // then decide whether that surface belongs to the "keep real" region (close to the eyes, or inside
-// the cockpit box).
+// the boxes of the play area or the cockpit box of the settings).
 //
 // Output: r: region coverage (0..1), g: proximity for the debug view (1: at the eye, 0: 3 m or
 // more), b: whether there is depth data (0/1), a: how much of r comes from the remembered playzone
@@ -145,13 +145,46 @@ fn current_mask(uv: vec2f) -> vec4f {
     weights[1] = 0.75 - d * d;
     weights[2] = 0.5 * (0.5 + d) * (0.5 + d);
 
-    var coverage = 0.0;
+    // The 9 depths (0: no depth). All 9 points lie on the ray of `lookup`, each at its own depth
+    var depths: array<f32, 9>;
+    var z_min = 1e9;
+    var z_max = 0.0;
+    var weight_with_depth = 0.0;
     for (var y = 0; y < 3; y++) {
         for (var x = 0; x < 3; x++) {
             let depth = load_depth(vec2i(center) + vec2i(x - 1, y - 1), view_idx);
+            var z = 0.0;
             if depth < MAX_DEPTH {
-                let hit = lookup_to_world(lookup, linearize_depth(depth), view_idx) + displacement;
-                coverage += weights[x].x * weights[y].y * region_mask(hit, view_idx);
+                z = linearize_depth(depth);
+                z_min = min(z_min, z);
+                z_max = max(z_max, z);
+                weight_with_depth += weights[x].x * weights[y].y;
+            }
+            depths[y * 3 + x] = z;
+        }
+    }
+
+    // A distance changes by at most the distance moved. When the point in the middle of the depths
+    // is farther from the soft edge than their spread, all 9 are on the same side of it: all outside
+    // (0) or all inside (1 each), as the loop below would give. Only near the edge each point is
+    // classified. The region is evaluated about once per texel instead of 9 times
+    var coverage = 0.0;
+    if weight_with_depth > 0.0 {
+        let feathering = region_feathering();
+        let spread = 0.5 * (z_max - z_min) * length(vec3f(lookup.tan_xy, 1.0));
+        let middle = lookup_to_world(lookup, 0.5 * (z_min + z_max), view_idx) + displacement;
+        let distance = region_signed_distance(middle, view_idx);
+        if distance <= -(feathering + spread) {
+            coverage = weight_with_depth;
+        } else if distance < feathering + spread {
+            for (var y = 0; y < 3; y++) {
+                for (var x = 0; x < 3; x++) {
+                    let z = depths[y * 3 + x];
+                    if z > 0.0 {
+                        let hit = lookup_to_world(lookup, z, view_idx) + displacement;
+                        coverage += weights[x].x * weights[y].y * region_mask(hit, view_idx);
+                    }
+                }
             }
         }
     }
@@ -340,19 +373,108 @@ fn linearize_depth(depth: f32) -> f32 {
     return 2.0 * near * far / ((far + near) - ndc * (far - near));
 }
 
-// 1 inside the region, 0 outside, with a soft edge of `feathering` meters
-fn region_mask(world_point: vec3f, view_idx: u32) -> f32 {
-    let feathering = max(depth_u.region.z, 0.0005);
+// The soft edge of the region (meters, on each side of its surface)
+fn region_feathering() -> f32 {
+    return max(depth_u.region.z, 0.0005);
+}
 
-    var signed_distance: f32;
+// Distance from the surface of the region (meters, negative inside). Beyond the soft edge on either
+// side it may be only a bound, which gives the same mask (see area_signed_distance)
+fn region_signed_distance(world_point: vec3f, view_idx: u32) -> f32 {
     if depth_u.region.x < 0.5 {
         let dist = length(world_point - depth_u.eyes[view_idx].eye_position.xyz);
-        signed_distance = dist - depth_u.region.y;
-    } else {
-        let local_point = (depth_u.world_to_volume * vec4f(world_point, 1.0)).xyz;
-        let e = abs(local_point) - depth_u.volume_half_extents.xyz;
-        signed_distance = length(max(e, vec3f(0.0))) + min(max(e.x, max(e.y, e.z)), 0.0);
+        return dist - depth_u.region.y;
+    }
+    let area_point = (depth_u.world_to_area * vec4f(world_point, 1.0)).xyz;
+    return area_signed_distance(area_point, region_feathering());
+}
+
+// 1 inside the region, 0 outside, with a soft edge of `feathering` meters
+fn region_mask(world_point: vec3f, view_idx: u32) -> f32 {
+    let feathering = region_feathering();
+    let signed_distance = region_signed_distance(world_point, view_idx);
+    return 1.0 - smoothstep(-feathering, feathering, signed_distance);
+}
+
+// Larger than any distance in the room
+const FAR_DISTANCE: f32 = 1e9;
+
+// Distance from the surface of the union of the boxes of the play area (area frame), see play_area.rs.
+// A line-by-line copy of PlayArea::signed_distance: keep both the same. Below -feathering the value can
+// be too large, above +feathering too small: the mask is the same
+fn area_signed_distance(point: vec3f, feathering: f32) -> f32 {
+    // Outside the bounds of all boxes by the soft edge: that distance is a lower bound
+    let e = abs(point - depth_u.area_bounds[0].xyz) - depth_u.area_bounds[1].xyz;
+    let outside = length(max(e, vec3f(0.0)));
+    if outside >= feathering {
+        return outside;
     }
 
-    return 1.0 - smoothstep(-feathering, feathering, signed_distance);
+    var distance = FAR_DISTANCE;
+    let count = min(u32(depth_u.area.x), AREA_BOXES);
+    for (var i = 0u; i < count; i++) {
+        distance = min(distance, area_box_distance(point, i, feathering));
+        // Inside by the soft edge: the mask is 1 whatever the other boxes give
+        if distance <= -feathering {
+            break;
+        }
+    }
+    return distance;
+}
+
+// A box with its domes, a copy of AreaBox::signed_distance
+fn area_box_distance(point: vec3f, index: u32, feathering: f32) -> f32 {
+    let area_box = depth_u.area_boxes[index];
+    let local = point - area_box.center.xyz;
+    let half = area_box.half.xyz;
+    let e = abs(local) - half;
+    let plain = length(max(e, vec3f(0.0))) + min(max(e.x, max(e.y, e.z)), 0.0);
+    let tallest = area_box.center.w;
+    // Deep inside, a dome only makes it more negative. Far outside no dome is within the soft edge,
+    // and every dome is within its height of the box: minus that is still a lower bound
+    if tallest <= 0.0 || plain <= -feathering {
+        return plain;
+    }
+    if plain >= tallest + feathering {
+        return plain - tallest;
+    }
+
+    // Of each axis only the side the point is on: the other one is farther than the box
+    let positive = local >= vec3f(0.0);
+    let radius = select(area_box.dome_radius_neg.xyz, area_box.dome_radius_pos.xyz, positive);
+    let depth = select(area_box.dome_depth_neg.xyz, area_box.dome_depth_pos.xyz, positive);
+    // Rim radius of the sides of each axis: half their shorter edge
+    let rim = vec3f(min(half.y, half.z), min(half.x, half.z), min(half.x, half.y));
+    var distance = plain;
+    distance = min(distance, area_dome_distance(e.x, e.yz, rim.x, radius.x, depth.x, 2.0 * half.x));
+    distance = min(distance, area_dome_distance(e.y, e.xz, rim.y, radius.y, depth.y, 2.0 * half.y));
+    distance = min(distance, area_dome_distance(e.z, e.xy, rim.z, radius.z, depth.z, 2.0 * half.z));
+    return distance;
+}
+
+// Distance from the dome of a side, a copy of dome_distance in play_area.rs: `height` above the plane
+// of the side, `aside` how far outside its edges in its plane (per in-plane axis), the rim radius, the
+// capsule (radius 0: flat), the edge of the box across the side. FAR_DISTANCE where the box itself is
+// the answer
+fn area_dome_distance(
+    height: f32,
+    aside: vec2f,
+    rim: f32,
+    radius: f32,
+    depth: f32,
+    thickness: f32,
+) -> f32 {
+    if radius <= 0.0 {
+        return FAR_DISTANCE;
+    }
+    // Distance from the axis in the plane of the side
+    let rho = length(max(aside + rim, vec2f(0.0)));
+    let y = height + depth;
+    // Inside the cone from the axis through the rim the nearest point of the capsule is on the dome.
+    // Under the side, inside the box, the capsule counts too, so that there is no seam at the side;
+    // never deeper than the opposite side (thickness + height below the point)
+    if depth * rho < rim * y || (height <= 0.0 && max(aside.x, aside.y) < 0.0) {
+        return max(max(length(vec2f(rho, y)) - radius, max(aside.x, aside.y)), -(thickness + height));
+    }
+    return FAR_DISTANCE;
 }

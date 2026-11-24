@@ -120,8 +120,10 @@ const DEBUG_VIEW_SHOW_DEPTH: u32 = 2u;
 const MASK_EDGE_MIN: f32 = 0.05;
 const MASK_EDGE_MAX: f32 = 0.35;
 
-fn depth_passthrough(game_color: vec3f, uv: vec2f) -> vec4f {
+fn depth_passthrough(stream_color: vec3f, uv: vec2f) -> vec4f {
     let debug_view = u32(depth_u.region.w + 0.5);
+    // Dimmed while the play area is edited
+    let game_color = stream_color * (1.0 - depth_u.lighting2.w);
 
     let mask_sample = textureSampleLevel(depth_mask, stream_sampler, uv, 0.0);
     let mask = smoothstep(MASK_EDGE_MIN, MASK_EDGE_MAX, mask_sample.r);

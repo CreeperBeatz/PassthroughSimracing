@@ -1,3 +1,4 @@
+mod area_editor;
 mod area_overlay;
 #[cfg(target_os = "android")]
 mod auto_color_key;
@@ -23,6 +24,7 @@ use alvr_common::{
 use alvr_graphics::GraphicsContext;
 use alvr_session::{BodyTrackingBDConfig, BodyTrackingSourcesConfig, PerformanceLevel};
 use alvr_system_info::Platform;
+use area_editor::AreaEditor;
 use area_overlay::AreaOverlay;
 use extra_extensions::{
     BD_MOTION_TRACKING_EXTENSION_NAME, META_BODY_TRACKING_FIDELITY_EXTENSION_NAME,
@@ -523,6 +525,8 @@ pub fn entry_point() {
         let mut marker_box_used = None::<bool>;
         // Outline of the code and the box over the stream (`debug.alvr.area_show`)
         let mut area_overlay = AreaOverlay::new();
+        // The play area edited with the hands, and its layout file
+        let mut area_editor = AreaEditor::new();
 
         let mut event_storage = xr::EventDataBuffer::new();
         let mut headset_is_worn = true;
@@ -603,6 +607,7 @@ pub fn entry_point() {
                                 orientation: from_xr_quat(pose.orientation).normalize(),
                             });
                             marker_region.on_reference_space_change(event.change_time(), change);
+                            area_editor.on_stage_change(event.change_time(), change);
                         }
                     }
                     xr::Event::SpatialDiscoveryRecommendedEXT(event) => {
@@ -803,8 +808,28 @@ pub fn entry_point() {
             }
             let region_override =
                 marker_region.update(marker_tracker.as_ref(), frame_state.predicted_display_time);
+            let depth_passthrough = stream_context
+                .as_ref()
+                .is_some_and(|stream| stream.uses_depth_passthrough());
+            // The layout file of the code and the edits replace the box of the properties
+            let editor_input = stream_context
+                .as_ref()
+                .filter(|_| marker_region.is_enabled())
+                .and_then(|stream| stream.editor_input(frame_state.predicted_display_time));
+            let region_override = area_editor.update(
+                &marker_region,
+                region_override,
+                frame_state.predicted_display_time,
+                editor_input.as_ref(),
+                depth_passthrough,
+            );
             if let Some(stream) = &mut stream_context {
-                stream.set_region_override(region_override, marker_region.limits_hands());
+                // While editing the hands are not cut to the area: the handles are on and outside it
+                stream.set_region_override(
+                    region_override,
+                    marker_region.limits_hands() && !area_editor.is_editing(),
+                );
+                stream.set_game_dim(area_editor.game_dim());
             }
             // The box applies only to a stream with Passthrough = Depth
             let used = region_override.map(|_| {
@@ -822,10 +847,12 @@ pub fn entry_point() {
                     None => (),
                 }
             }
-            let depth_passthrough = stream_context
-                .as_ref()
-                .is_some_and(|stream| stream.uses_depth_passthrough());
-            let outline = area_overlay.update(&marker_region, region_override, depth_passthrough);
+            let outline = area_overlay.update(
+                &marker_region,
+                region_override,
+                depth_passthrough,
+                &area_editor,
+            );
             if let Some(stream) = &mut stream_context {
                 stream.set_area_overlay(outline);
             }

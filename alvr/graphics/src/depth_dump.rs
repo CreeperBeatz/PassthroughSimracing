@@ -376,19 +376,43 @@ impl DumpFrame<'_> {
     pub fn to_json(&self) -> String {
         let n = self.request.n;
         let config = self.config;
-        // The region the mask used: a box placed from a marker replaces the one of the settings
+        // The region the mask used: the play area placed from a marker replaces the one of the
+        // settings. center, yaw_deg, size and volume_to_world are of its first box, "boxes" has all of
+        // them in the area frame
         let mut region = match (&self.input.region_override, &config.region) {
-            (Some(volume), _) => vec![
-                ("mode", string("volume")),
-                ("source", string("marker")),
-                ("center", numbers(&volume.center().to_array())),
-                ("yaw_deg", number(volume.yaw().to_degrees())),
-                ("size", numbers(&volume.size().to_array())),
-                (
-                    "volume_to_world",
-                    numbers(&volume.volume_to_world.to_cols_array()),
-                ),
-            ],
+            (Some(placed), _) => {
+                let volume = placed.box_region(0);
+                vec![
+                    ("mode", string("volume")),
+                    ("source", string("marker")),
+                    ("center", numbers(&volume.center().to_array())),
+                    ("yaw_deg", number(volume.yaw().to_degrees())),
+                    ("size", numbers(&volume.size().to_array())),
+                    (
+                        "volume_to_world",
+                        numbers(&volume.volume_to_world.to_cols_array()),
+                    ),
+                    (
+                        "area_to_world",
+                        numbers(&placed.area_to_world.to_cols_array()),
+                    ),
+                    (
+                        "boxes",
+                        array(placed.area.boxes().iter().map(|area_box| {
+                            object([
+                                ("center", numbers(&area_box.center.to_array())),
+                                ("half", numbers(&area_box.half.to_array())),
+                                (
+                                    "domes",
+                                    numbers(
+                                        &crate::Side::ALL.map(|side| area_box.dome_height(side)),
+                                    ),
+                                ),
+                            ])
+                        })),
+                    ),
+                ]
+            }
             (None, DepthMaskRegion::Distance { max_distance }) => vec![
                 ("mode", string("distance")),
                 ("max_distance", number(*max_distance)),
@@ -620,6 +644,7 @@ mod tests {
             playzone_view: false,
             key_lower_rects: None,
             region_override: None,
+            game_dim: 0.0,
         };
 
         for playzone in [None, Some(([view; 2], 2.5))] {
@@ -655,13 +680,13 @@ mod tests {
 
         // A box placed from a marker is written instead of the region of the settings
         let input = DepthRenderInput {
-            region_override: Some(depth_mask::RegionOverride {
+            region_override: Some(crate::PlacedArea::from(depth_mask::RegionOverride {
                 volume_to_world: alvr_common::glam::Mat4::from_rotation_translation(
                     alvr_common::glam::Quat::from_rotation_y(90_f32.to_radians()),
                     Vec3::new(0.25, 0.9, -0.5),
                 ),
                 half_extents: Vec3::new(0.6, 0.45, 0.5),
-            }),
+            })),
             ..input
         };
         let json = DumpFrame {
@@ -690,5 +715,11 @@ mod tests {
         );
         assert!(!json.contains("max_distance"), "{json}");
         assert!(json.contains(r#""size":[1.2,0.9,1]"#), "{json}");
+        assert!(
+            json.contains(
+                r#""boxes":[{"center":[0,0,0],"half":[0.6,0.45,0.5],"domes":[0,0,0,0,0,0]}]"#
+            ),
+            "{json}"
+        );
     }
 }
