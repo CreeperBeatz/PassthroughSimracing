@@ -376,7 +376,8 @@ fn size(size: UVec2) -> [(&'static str, String); 2] {
 
 /// The region the mask uses as JSON (`region` of the depth dump, also in the burst): the play area
 /// placed from a marker replaces the one of the settings. center, yaw_deg, size and volume_to_world are
-/// of its first box, "boxes" has all of them in the area frame
+/// of its first box, "boxes" has all of them in the area frame (center, half extents in the frame of the
+/// box, its yaw about +y, the 6 dome heights)
 pub fn region_json(
     region_override: Option<&PlacedArea>,
     config: &DepthPassthroughConfig,
@@ -404,6 +405,7 @@ pub fn region_json(
                         object([
                             ("center", numbers(&area_box.center.to_array())),
                             ("half", numbers(&area_box.half.to_array())),
+                            ("yaw_deg", number(area_box.yaw.to_degrees())),
                             (
                                 "domes",
                                 numbers(&crate::Side::ALL.map(|side| area_box.dome_height(side))),
@@ -726,7 +728,7 @@ mod tests {
         assert!(json.contains(r#""size":[1.2,0.9,1]"#), "{json}");
         assert!(
             json.contains(
-                r#""boxes":[{"center":[0,0,0],"half":[0.6,0.45,0.5],"domes":[0,0,0,0,0,0]}]"#
+                r#""boxes":[{"center":[0,0,0],"half":[0.6,0.45,0.5],"yaw_deg":0,"domes":[0,0,0,0,0,0]}]"#
             ),
             "{json}"
         );

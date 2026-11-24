@@ -153,6 +153,8 @@ pub struct StreamContext {
     last_good_video_frame_metadata: VideoFrameMetadata,
     input_thread: Option<JoinHandle<()>>,
     input_thread_running: Arc<RelaxedAtomic>,
+    // The hands are not sent to the PC (while the play area is edited), see `withhold_hands`
+    hands_withheld: Arc<RelaxedAtomic>,
     config: ParsedStreamConfig,
     target_view_resolution: UVec2,
     renderer: StreamRenderer,
@@ -327,6 +329,7 @@ impl StreamContext {
         }
 
         let input_thread_running = Arc::new(RelaxedAtomic::new(false));
+        let hands_withheld = Arc::new(RelaxedAtomic::new(false));
 
         let stage_reference_space = Arc::new(interaction::get_reference_space(
             &xr_session,
@@ -352,6 +355,7 @@ impl StreamContext {
             },
             input_thread: None,
             input_thread_running,
+            hands_withheld,
             config,
             target_view_resolution,
             renderer,
@@ -448,6 +452,14 @@ impl StreamContext {
     /// Passthrough = Depth
     pub fn set_game_dim(&mut self, dim: f32) {
         self.game_dim = dim;
+    }
+
+    /// While true the tracked hands are not sent to the PC: no hand skeletons, and no hand pose of a
+    /// hand that is tracked as a hand (controllers are sent as before). The PC then sees the hands as
+    /// not tracked, as when they are out of view: its hand gestures (hand_tracking_interaction) and the
+    /// SteamVR hands see none of the pinches of the play area editor
+    pub fn withhold_hands(&self, withheld: bool) {
+        self.hands_withheld.set(withheld);
     }
 
     /// The eyes and the hands at `time` (stage space) for the play area editor. None: not Passthrough =
@@ -1185,6 +1197,7 @@ impl StreamContext {
             let view_reference_space = Arc::clone(&self.view_reference_space);
             let refresh_rate = self.config.refresh_rate_hint;
             let running = Arc::clone(&self.input_thread_running);
+            let hands_withheld = Arc::clone(&self.hands_withheld);
             move || {
                 stream_input_loop(
                     &core_ctx,
@@ -1194,6 +1207,7 @@ impl StreamContext {
                     &view_reference_space,
                     refresh_rate,
                     running,
+                    &hands_withheld,
                 )
             }
         }));
@@ -1704,6 +1718,7 @@ impl Drop for StreamContext {
     }
 }
 
+#[expect(clippy::too_many_arguments)]
 fn stream_input_loop(
     core_ctx: &ClientCoreContext,
     xr_session: xr::Session<xr::OpenGlEs>,
@@ -1712,6 +1727,7 @@ fn stream_input_loop(
     view_reference_space: &xr::Space,
     refresh_rate: f32,
     running: Arc<RelaxedAtomic>,
+    hands_withheld: &RelaxedAtomic,
 ) {
     let mut last_controller_poses = [Pose::IDENTITY; 2];
     let mut last_palm_poses = [Pose::IDENTITY; 2];
@@ -1758,7 +1774,7 @@ fn stream_input_loop(
 
         device_motions.push((*HEAD_ID, head_motion));
 
-        let left_hand_data = crate::interaction::get_hand_data(
+        let mut left_hand_data = crate::interaction::get_hand_data(
             &xr_session,
             core_ctx.platform(),
             stage_reference_space,
@@ -1768,7 +1784,7 @@ fn stream_input_loop(
             &mut last_controller_poses[0],
             &mut last_palm_poses[0],
         );
-        let right_hand_data = crate::interaction::get_hand_data(
+        let mut right_hand_data = crate::interaction::get_hand_data(
             &xr_session,
             core_ctx.platform(),
             stage_reference_space,
@@ -1778,6 +1794,16 @@ fn stream_input_loop(
             &mut last_controller_poses[1],
             &mut last_palm_poses[1],
         );
+        // While the play area is edited: the hands that are tracked as hands (with a skeleton) are not
+        // sent, see `withhold_hands`. Without multimodal input the grip pose of such a hand is the hand
+        // (it would be sent below once its skeleton is gone); with it, a held controller stays
+        if hands_withheld.value() {
+            for data in [&mut left_hand_data, &mut right_hand_data] {
+                if data.skeleton_joints.take().is_some() && !int_ctx.multimodal_hands_enabled {
+                    data.grip_motion = None;
+                }
+            }
+        }
 
         // Note: When multimodal input is enabled, we are sure that when free hands are used
         // (not holding controllers) the controller data is None.

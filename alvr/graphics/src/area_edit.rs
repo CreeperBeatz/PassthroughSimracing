@@ -3,13 +3,15 @@
 //! stack and the layout file. The client (area_editor.rs) keeps the state, reads the hands and writes
 //! the files. Positions are in stage space unless the name says area frame.
 //!
-//! Handles of the selected box: one on each side, on top of its dome (drag along the normal of the
-//! side: that side moves, the opposite one stays), a smaller one next to it for the dome (drag out:
-//! higher, back to the side: flat, snapped below `DOME_SNAP`), one at its center (moves the box), "+"
-//! (a tap adds a box next to the side the eyes look at) and "x" (held still for `REMOVE_HOLD_S`: removes
-//! the box; not on the last one). The other boxes show their center handle only; pinching any handle
-//! of a box selects it. Above the code: undo (a tap takes the last change back) and done (a tap ends
-//! editing).
+//! Handles of the selected box (in its own frame, which turns with its yaw): one on each side, on top
+//! of its dome (drag along the normal of the side: that side moves, the opposite one stays), a smaller
+//! one next to it for the dome (drag out: higher, back to the side: flat, snapped below `DOME_SNAP`), one
+//! at its center (moves the box), a curved arrow beside the center (turns the box about its vertical
+//! axis by the angle the cursor sweeps around that axis, with detents every `TURN_DETENT`), "+" (adds a
+//! box next to the side the eyes look at) and "x" (held for `REMOVE_HOLD_S`: removes the box; not on the
+//! last one). The other boxes show their center handle only; pinching any handle of a box selects it.
+//! Above the code: undo (takes the last change back) and done (ends editing). Buttons ("+", undo, done)
+//! act when the pinch opens with the hand usable, however far the hand moved: they have no drag.
 //!
 //! Picking: the cursor of a hand is the midpoint of its thumb and index tips. The handle nearest to the
 //! cursor within `HANDLE_REACH` is lit; handles about as near as that one (`HANDLE_TIE`) go by the line
@@ -18,11 +20,17 @@
 //! handle stays lit against small changes, and the client keeps it while the fingers close: what is lit
 //! before the pinch is what is taken. A grab moves the handle by the displacement of the cursor since
 //! the pinch (no jump), after a small dead zone that is caught up over `DRAG_RAMP`.
+//!
+//! A hand is usable while both its tips are tracked and its cursor is within `IN_VIEW_ANGLE` of the
+//! view direction; the hand that holds a grab within `GRAB_IN_VIEW_ANGLE` (an arm reaching for a far
+//! side leaves the middle of the view), and its pinch opens only after it was not usable for
+//! `GRAB_LOST_HOLD_S` (else `HAND_LOST_HOLD_S`).
 
 use crate::{
-    AreaBox, OverlaySegment, ParsedArea, PlacedArea, PlayArea, Side, play_area::OTHER_AREA_AXES,
+    AreaBox, OVERLAY_AMBER, OVERLAY_GREEN, OverlaySegment, ParsedArea, PlacedArea, PlayArea, Side,
+    play_area::OTHER_AREA_AXES,
 };
-use alvr_common::glam::{Vec2, Vec3, Vec4};
+use alvr_common::glam::{Mat4, Vec2, Vec3, Vec4};
 use std::fmt::Write;
 
 /// A handle within this of the cursor is picked by nearness (meters)
@@ -46,10 +54,17 @@ pub const DRAG_DEAD_ZONE: f32 = 0.008;
 pub const DRAG_RAMP: f32 = 0.03;
 /// A dome dragged lower than this is flat (meters)
 pub const DOME_SNAP: f32 = 0.015;
-/// A pinch released within this of where it started is a tap (meters)
-pub const TAP_MOVE: f32 = 0.02;
-/// The remove handle is held still this long (seconds)
+/// The remove handle is held this long (seconds), the cursor within `REMOVE_HOLD_MOVE` of where the
+/// pinch closed: on 2026-11-24 a held pinch drifted 23-50 mm (closing and holding the fingers moves
+/// their midpoint), a hand pulled away on purpose 189 mm
 pub const REMOVE_HOLD_S: f64 = 0.8;
+pub const REMOVE_HOLD_MOVE: f32 = 0.08;
+/// Turning a box: the yaw snaps to multiples of `TURN_DETENT` within `TURN_DETENT_WINDOW` (radians).
+/// The cursor sweeps around the vertical axis of the box only farther than `TURN_MIN_RADIUS` from it
+/// (meters; nearer, the angle is not steady)
+pub const TURN_DETENT: f32 = 15.0 * std::f32::consts::PI / 180.0;
+pub const TURN_DETENT_WINDOW: f32 = 2.0 * std::f32::consts::PI / 180.0;
+pub const TURN_MIN_RADIUS: f32 = 0.03;
 /// Changes that can be taken back
 pub const UNDO_DEPTH: usize = 20;
 
@@ -58,9 +73,16 @@ pub const UNDO_DEPTH: usize = 20;
 const DOME_HANDLE_SHARE: f32 = 0.35;
 const DOME_HANDLE_MIN: f32 = 0.04;
 const DOME_HANDLE_MAX: f32 = 0.12;
-/// "+" and "x": above the center of the box, to its left and right (meters, area frame)
+/// "+" and "x": above the center of the box, to its left and right (meters, frame of the box)
 const BUTTON_HEIGHT: f32 = 0.09;
 const BUTTON_GAP: f32 = 0.05;
+/// The turn handle: beside the center towards the +x +z corner (frame of the box), this share of the
+/// shorter horizontal half extent away from the vertical axis, within the two distances (meters)
+const TURN_HANDLE_SHARE: f32 = 0.6;
+const TURN_HANDLE_MIN: f32 = 0.06;
+const TURN_HANDLE_MAX: f32 = 0.15;
+/// Most segments of the arc of the turn guide
+const TURN_GUIDE_SEGMENTS: usize = 6;
 /// Undo and done: above the code, to its left and right (meters, area frame)
 const TOOLBAR_HEIGHT: f32 = 0.12;
 const TOOLBAR_GAP: f32 = 0.05;
@@ -72,13 +94,18 @@ const HANDLE_MIN_RADIUS: f32 = 0.015;
 const CURSOR_RADIUS: f32 = 0.008;
 
 /// Pinch: the gap between the surfaces of the thumb and index tips (center distance minus the two
-/// radii) below `on` for this many updates closes it, above `off` for this long opens it (seconds)
-pub const DEFAULT_PINCH_ON: f32 = 0.010;
-pub const DEFAULT_PINCH_OFF: f32 = 0.025;
+/// radii) below `on` for this many updates closes it, above `off` for this long opens it (seconds).
+/// The tips touch at a gap of 0 or less: on the Quest the joints of tips in contact were -2 to -16 mm
+/// apart (2026-11-24; with on at 10 mm the pinch closed 1-2 cm before the fingers met). `off` may equal
+/// `on`: the updates and the hold keep it from flickering
+pub const DEFAULT_PINCH_ON: f32 = 0.0;
+pub const DEFAULT_PINCH_OFF: f32 = 0.005;
 pub const PINCH_ON_UPDATES: u32 = 2;
 pub const PINCH_OFF_HOLD_S: f64 = 0.08;
-/// A closed pinch of a hand that is not usable (not tracked, out of view) opens after this (seconds)
+/// A closed pinch of a hand that is not usable (not tracked, out of view) opens after this (seconds);
+/// of the hand that holds a grab after `GRAB_LOST_HOLD_S`
 pub const HAND_LOST_HOLD_S: f64 = 0.3;
+pub const GRAB_LOST_HOLD_S: f64 = 1.0;
 /// On release the drag goes back to where it was this long before the release was confirmed: the
 /// fingers moved the cursor while they opened (seconds)
 pub const RELEASE_LOOKBACK_S: f64 = 0.12;
@@ -98,8 +125,10 @@ pub const GESTURE_CONE: f32 = 45.0 * std::f32::consts::PI / 180.0;
 /// direction from the eyes to the palm, at least this
 pub const PALM_AWAY_COS: f32 = 0.5;
 /// A hand is used only while its cursor is within this angle of the view direction: the runtime
-/// reports hands as tracked also out of view (radians)
+/// reports hands as tracked also out of view (radians). The hand that holds a grab: within
+/// `GRAB_IN_VIEW_ANGLE` (still in the field of view of the Quest 3, about 110 deg wide)
 pub const IN_VIEW_ANGLE: f32 = 50.0 * std::f32::consts::PI / 180.0;
+pub const GRAB_IN_VIEW_ANGLE: f32 = 75.0 * std::f32::consts::PI / 180.0;
 
 // Colors of the editor, as in the stream image (sRGB values)
 pub const OVERLAY_CYAN: Vec4 = Vec4::new(0.2, 0.9, 1.0, 1.0);
@@ -115,13 +144,15 @@ pub enum HandleKind {
     Dome(Side),
     /// Moves the box
     Center,
-    /// A tap adds a box next to this one
+    /// Turns the box about its vertical axis
+    Turn,
+    /// Adds a box next to this one
     Add,
-    /// Held still: removes this box
+    /// Held: removes this box
     Remove,
-    /// A tap takes the last change back
+    /// Takes the last change back
     Undo,
-    /// A tap ends editing
+    /// Ends editing
     Done,
 }
 
@@ -132,6 +163,7 @@ impl HandleKind {
             Self::Side(side) => format!("side {}", side.name()),
             Self::Dome(side) => format!("dome {}", side.name()),
             Self::Center => "center".into(),
+            Self::Turn => "turn".into(),
             Self::Add => "add".into(),
             Self::Remove => "remove".into(),
             Self::Undo => "undo".into(),
@@ -141,7 +173,15 @@ impl HandleKind {
 
     /// Dragging it changes the layout
     pub fn is_drag(self) -> bool {
-        matches!(self, Self::Side(_) | Self::Dome(_) | Self::Center)
+        matches!(
+            self,
+            Self::Side(_) | Self::Dome(_) | Self::Center | Self::Turn
+        )
+    }
+
+    /// A button: it acts when the pinch opens, wherever the hand went (add, undo, done)
+    pub fn is_button(self) -> bool {
+        matches!(self, Self::Add | Self::Undo | Self::Done)
     }
 
     /// It belongs to a box (pinching it selects that box)
@@ -179,7 +219,15 @@ pub fn dome_handle_offset(area_box: &AreaBox, side: Side) -> Vec3 {
     let mut offset = Vec3::ZERO;
     offset[along] =
         (DOME_HANDLE_SHARE * area_box.half[along]).clamp(DOME_HANDLE_MIN, DOME_HANDLE_MAX);
-    offset
+    area_box.turn(offset)
+}
+
+/// Where the turn handle of a box sits from its center (area frame): at its height, towards the +x +z
+/// corner of its own frame, away from the side handles
+pub fn turn_handle_offset(area_box: &AreaBox) -> Vec3 {
+    let radius = (TURN_HANDLE_SHARE * area_box.half.x.min(area_box.half.z))
+        .clamp(TURN_HANDLE_MIN, TURN_HANDLE_MAX);
+    area_box.turn(Vec3::new(1.0, 0.0, 1.0) * (radius * std::f32::consts::FRAC_1_SQRT_2))
 }
 
 /// The handles while editing, stage space. Of the selected box all of them, of the others the center
@@ -206,12 +254,13 @@ pub fn edit_handles(placed: &PlacedArea, selected: usize, can_undo: bool) -> Vec
         }
         for side in Side::ALL {
             let top = area_box.side_handle(side);
-            handles.push(handle(HandleKind::Side(side), index, top, side.normal()));
+            let normal = area_box.side_normal(side);
+            handles.push(handle(HandleKind::Side(side), index, top, normal));
             handles.push(handle(
                 HandleKind::Dome(side),
                 index,
                 top + dome_handle_offset(area_box, side),
-                side.normal(),
+                normal,
             ));
         }
         handles.push(handle(
@@ -220,7 +269,13 @@ pub fn edit_handles(placed: &PlacedArea, selected: usize, can_undo: bool) -> Vec
             area_box.center,
             Vec3::ZERO,
         ));
-        let button = |x: f32| area_box.center + Vec3::new(x, BUTTON_HEIGHT, 0.0);
+        handles.push(handle(
+            HandleKind::Turn,
+            index,
+            area_box.center + turn_handle_offset(area_box),
+            Vec3::ZERO,
+        ));
+        let button = |x: f32| area_box.to_area(Vec3::new(x, BUTTON_HEIGHT, 0.0));
         handles.push(handle(
             HandleKind::Add,
             index,
@@ -331,18 +386,21 @@ pub fn drag_displacement(hand: Vec3) -> Vec3 {
 }
 
 /// The layout `start` with handle `id` dragged by `displacement` (area frame, after
-/// `drag_displacement`), and the value it took for the log: how far the side moved, the height of the
-/// dome, how far the box moved (meters). Other handles change nothing
+/// `drag_displacement`), and the value it took for the log: how far the side moved (along the normal of
+/// the side of the box as it is turned), the height of the dome, how far the box moved (meters). Other
+/// handles change nothing (turning: `apply_turn`)
 pub fn apply_drag(start: &PlayArea, id: HandleId, displacement: Vec3) -> (PlayArea, f32) {
     let mut area = *start;
     let index = id.box_index;
+    let Some(area_box) = start.boxes().get(index) else {
+        return (area, 0.0);
+    };
     let value = match id.kind {
-        HandleKind::Side(side) => area.drag_side(index, side, displacement.dot(side.normal())),
+        HandleKind::Side(side) => {
+            area.drag_side(index, side, displacement.dot(area_box.side_normal(side)))
+        }
         HandleKind::Dome(side) => {
-            let Some(area_box) = start.boxes().get(index) else {
-                return (area, 0.0);
-            };
-            let height = area_box.dome_height(side) + displacement.dot(side.normal());
+            let height = area_box.dome_height(side) + displacement.dot(area_box.side_normal(side));
             area.set_dome(index, side, if height < DOME_SNAP { 0.0 } else { height })
         }
         HandleKind::Center => area.move_box(index, displacement).length(),
@@ -350,6 +408,99 @@ pub fn apply_drag(start: &PlayArea, id: HandleId, displacement: Vec3) -> (PlayAr
     };
 
     (area, value)
+}
+
+/// The angle a point sweeps around the vertical axis through `center` going from `from` to `to`
+/// (radians, counter-clockwise seen from above like a yaw, -pi..pi). None: one of them is within
+/// `TURN_MIN_RADIUS` of the axis
+pub fn sweep_angle(center: Vec3, from: Vec3, to: Vec3) -> Option<f32> {
+    // The angle of a yaw: +x is 0, -z (where a yaw of pi/2 turns +x) is pi/2
+    let angle = |point: Vec3| {
+        let offset = point - center;
+        (Vec2::new(offset.x, offset.z).length() >= TURN_MIN_RADIUS)
+            .then(|| (-offset.z).atan2(offset.x))
+    };
+    Some(crate::wrap_angle(angle(to)? - angle(from)?))
+}
+
+/// The yaw of a box turned from `start` by `swept` (radians), snapped to a multiple of `TURN_DETENT`
+/// within `TURN_DETENT_WINDOW`, and whether it snapped
+pub fn turned_yaw(start: f32, swept: f32) -> (f32, bool) {
+    let yaw = crate::wrap_angle(start + swept);
+    let detent = (yaw / TURN_DETENT).round() * TURN_DETENT;
+    if (yaw - detent).abs() <= TURN_DETENT_WINDOW {
+        (crate::wrap_angle(detent), true)
+    } else {
+        (yaw, false)
+    }
+}
+
+/// The layout `start` with box `index` turned by `swept` (radians, see `turned_yaw`) about its vertical
+/// axis, its yaw (radians) and whether it is on a detent
+pub fn apply_turn(start: &PlayArea, index: usize, swept: f32) -> (PlayArea, f32, bool) {
+    let mut area = *start;
+    let Some(area_box) = start.boxes().get(index) else {
+        return (area, 0.0, false);
+    };
+    let (yaw, snapped) = turned_yaw(area_box.yaw, swept);
+    let yaw = area.turn_box(index, yaw);
+    (area, yaw, snapped)
+}
+
+/// What is drawn while a box is turned (stage space): a dashed line from its center through the turn
+/// handle as it was at the grab, a line through it now (green on a detent) and the arc between them at
+/// the radius of the handle (at most `TURN_GUIDE_SEGMENTS`). `start` and `now`: the box at the grab and
+/// now (area frame)
+pub fn turn_guide(
+    area_to_world: &Mat4,
+    start: &AreaBox,
+    now: &AreaBox,
+    snapped: bool,
+    width: f32,
+) -> Vec<OverlaySegment> {
+    let center = now.center;
+    let offset = turn_handle_offset(start);
+    // A little beyond the handle
+    let reach = 1.6;
+    let swept = crate::wrap_angle(now.yaw - start.yaw);
+    let turned = |angle: f32| {
+        let (sin, cos) = angle.sin_cos();
+        Vec3::new(
+            cos * offset.x + sin * offset.z,
+            0.0,
+            cos * offset.z - sin * offset.x,
+        )
+    };
+    let segment = |a: Vec3, b: Vec3, color: Vec4, dashed: bool| OverlaySegment {
+        start: area_to_world.transform_point3(a),
+        end: area_to_world.transform_point3(b),
+        color,
+        width,
+        dashed,
+    };
+    let mut lines = vec![
+        segment(center, center + offset * reach, OVERLAY_DIM, true),
+        segment(
+            center,
+            center + turned(swept) * reach,
+            if snapped {
+                OVERLAY_GREEN
+            } else {
+                OVERLAY_AMBER
+            },
+            false,
+        ),
+    ];
+    if swept.abs() > 1e-3 {
+        let count = ((swept.abs() / (std::f32::consts::PI / 8.0)).ceil() as usize)
+            .clamp(1, TURN_GUIDE_SEGMENTS);
+        lines.extend((0..count).map(|i| {
+            let a = swept * i as f32 / count as f32;
+            let b = swept * (i + 1) as f32 / count as f32;
+            segment(center + turned(a), center + turned(b), OVERLAY_AMBER, false)
+        }));
+    }
+    lines
 }
 
 /// The side of a box a ray goes through first (area frame): where it leaves the box when it starts
@@ -387,9 +538,16 @@ pub fn add_box_facing(
     eye: Vec3,
     gaze: Vec3,
 ) -> Option<(usize, Side)> {
-    let source = *area.boxes().get(from)?;
-    let gaze = gaze.normalize_or_zero();
-    let inside = ((eye - source.center).abs() - source.half).max_element() < 0.0;
+    let area_box = *area.boxes().get(from)?;
+    // In the frame of the box
+    let source = AreaBox {
+        center: Vec3::ZERO,
+        yaw: 0.0,
+        ..area_box
+    };
+    let eye = area_box.to_local(eye);
+    let gaze = area_box.turn_back(gaze).normalize_or_zero();
+    let inside = (eye.abs() - source.half).max_element() < 0.0;
     let facing = |side: Side| {
         if inside {
             gaze.dot(side.normal())
@@ -461,8 +619,8 @@ fn glyph(
 }
 
 /// The lines of a handle, facing the eyes, `scale` times its size: a square (side), a triangle
-/// pointing out of the side (dome, smaller), a diamond (center), a plus (add), a cross (remove), an
-/// arrow to the left (undo), a check mark (done). At most 4 segments
+/// pointing out of the side (dome, smaller), a diamond (center), a curved arrow (turn), a plus (add), a
+/// cross (remove), an arrow to the left (undo), a check mark (done). At most 4 segments
 pub fn handle_glyph(
     handle: &Handle,
     eye: Vec3,
@@ -510,6 +668,17 @@ pub fn handle_glyph(
                 p(0.0, -1.3),
             ];
             glyph(handle.position, eye, radius, &[&diamond], color, width)
+        }
+        HandleKind::Turn => {
+            // Three quarters of a circle and the barb of the arrow at its end
+            let at = |degrees: f32| {
+                let (sin, cos) = degrees.to_radians().sin_cos();
+                p(cos, sin)
+            };
+            let tip = at(-45.0);
+            let arc = [at(225.0), at(135.0), at(45.0), tip];
+            let barb = [tip, tip + p(-0.7, 0.05)];
+            glyph(handle.position, eye, radius, &[&arc, &barb], color, width)
         }
         HandleKind::Add => glyph(
             handle.position,
@@ -634,9 +803,24 @@ impl EditorHand {
         self.thumb_tip.distance(self.index_tip) - self.tip_radii.max(0.0)
     }
 
-    /// Tracked and in view
+    /// Tracked and in view (within `IN_VIEW_ANGLE`)
     pub fn usable(&self, eye: Vec3, forward: Vec3) -> bool {
-        self.tracked && in_view(eye, forward, self.cursor(), IN_VIEW_ANGLE)
+        self.unusable_reason(eye, forward, IN_VIEW_ANGLE).is_none()
+    }
+
+    /// Why the hand is not usable with its cursor within `angle` of the view direction, for the log.
+    /// None: it is
+    pub fn unusable_reason(&self, eye: Vec3, forward: Vec3, angle: f32) -> Option<String> {
+        if !self.tracked {
+            return Some("tips not tracked".into());
+        }
+        if in_view(eye, forward, self.cursor(), angle) {
+            return None;
+        }
+        Some(format!(
+            "{:.0} deg from the view direction",
+            forward.angle_between(self.cursor() - eye).to_degrees()
+        ))
     }
 }
 
@@ -699,14 +883,22 @@ impl Pinch {
     }
 
     /// `gap`: of the hand (`EditorHand::gap`), None: the hand is not usable. `now`: seconds. `on`,
-    /// `off`: the thresholds of the gap (meters)
-    pub fn update(&mut self, gap: Option<f32>, now: f64, on: f32, off: f32) -> PinchEvent {
+    /// `off`: the thresholds of the gap (meters). `lost_hold`: how long a closed pinch of a hand that is
+    /// not usable stays closed (`HAND_LOST_HOLD_S`, `GRAB_LOST_HOLD_S`; seconds)
+    pub fn update(
+        &mut self,
+        gap: Option<f32>,
+        now: f64,
+        on: f32,
+        off: f32,
+        lost_hold: f64,
+    ) -> PinchEvent {
         let Some(gap) = gap.filter(|gap| gap.is_finite()) else {
             self.below = 0;
             self.above_since = None;
             if self.closed {
                 let since = *self.lost_since.get_or_insert(now);
-                if now - since >= HAND_LOST_HOLD_S {
+                if now - since >= lost_hold {
                     self.closed = false;
                     self.lost_since = None;
                     return PinchEvent::Lost;
@@ -962,12 +1154,13 @@ mod tests {
 
     #[test]
     fn pinch_has_hysteresis() {
-        let (on, off) = (DEFAULT_PINCH_ON, DEFAULT_PINCH_OFF);
+        // The thresholds of the first build, the steps below are made for them
+        let (on, off) = (0.010, 0.025);
         let mut pinch = Pinch::default();
         let mut t = 0.0;
         let mut step = |pinch: &mut Pinch, gap: Option<f32>| {
             t += 1.0 / 72.0;
-            pinch.update(gap, t, on, off)
+            pinch.update(gap, t, on, off, HAND_LOST_HOLD_S)
         };
         // One update below is noise
         assert_eq!(step(&mut pinch, Some(0.005)), PinchEvent::None);
@@ -1016,6 +1209,93 @@ mod tests {
         }
         assert_eq!(step(&mut pinch, Some(0.0)), PinchEvent::None);
         assert!(pinch.is_closed());
+    }
+
+    // The defaults: closes when the tips press into each other (gap below 0), opens 5 mm apart; and
+    // with the opening gap equal to the closing one it still does not flicker
+    #[test]
+    fn pinch_at_contact_and_equal_thresholds() {
+        let dt = 1.0 / 72.0;
+        for (on, off) in [(DEFAULT_PINCH_ON, DEFAULT_PINCH_OFF), (-0.005, -0.005)] {
+            let mut pinch = Pinch::default();
+            let mut t = 0.0;
+            let mut step = |pinch: &mut Pinch, gap: f32| {
+                t += dt;
+                pinch.update(Some(gap), t, on, off, HAND_LOST_HOLD_S)
+            };
+            // Fingers 1-2 cm apart and closing to just touching: still open
+            for gap in [0.02, 0.015, 0.01, 0.005, 0.001] {
+                assert_eq!(step(&mut pinch, gap + on.max(0.0)), PinchEvent::None);
+            }
+            assert!(!pinch.is_closed());
+            // Pressed together (measured: -2 to -16 mm)
+            step(&mut pinch, on - 0.004);
+            assert_eq!(step(&mut pinch, on - 0.008), PinchEvent::Closed);
+            // Noise around the thresholds shorter than 80 ms: closed
+            for i in 0..40 {
+                let gap = if i % 4 == 0 { off + 0.002 } else { on - 0.003 };
+                assert_eq!(step(&mut pinch, gap), PinchEvent::None, "{i}");
+            }
+            assert!(pinch.is_closed());
+            // Opened
+            let events = (0..8)
+                .map(|_| step(&mut pinch, off + 0.01))
+                .collect::<Vec<_>>();
+            assert!(events.contains(&PinchEvent::Opened), "{events:?}");
+        }
+    }
+
+    // The hand that grabs keeps its pinch longer when it is not usable
+    #[test]
+    fn grab_keeps_the_pinch_longer() {
+        let (on, off) = (DEFAULT_PINCH_ON, DEFAULT_PINCH_OFF);
+        let dt = 1.0 / 72.0;
+        let mut pinch = Pinch::default();
+        pinch.update(Some(-0.01), 0.0, on, off, GRAB_LOST_HOLD_S);
+        assert_eq!(
+            pinch.update(Some(-0.01), dt, on, off, GRAB_LOST_HOLD_S),
+            PinchEvent::Closed
+        );
+        let mut t = dt;
+        let mut lost_at = None;
+        while t < 2.0 {
+            t += dt;
+            if pinch.update(None, t, on, off, GRAB_LOST_HOLD_S) == PinchEvent::Lost {
+                lost_at = Some(t);
+                break;
+            }
+        }
+        let lost_at = lost_at.unwrap() - 2.0 * dt;
+        assert!(
+            (GRAB_LOST_HOLD_S..GRAB_LOST_HOLD_S + 0.03).contains(&lost_at),
+            "{lost_at}"
+        );
+    }
+
+    #[test]
+    fn why_a_hand_is_not_usable() {
+        let eye = Vec3::new(0.0, 1.2, 0.0);
+        let forward = Vec3::NEG_Z;
+        // 60 deg to the side: out for picking, in for a grab
+        let cursor =
+            eye + Vec3::new(60_f32.to_radians().sin(), 0.0, -60_f32.to_radians().cos()) * 0.5;
+        let side = hand(cursor, Vec3::NEG_Z, 0.0);
+        assert!(!side.usable(eye, forward));
+        assert_eq!(
+            side.unusable_reason(eye, forward, IN_VIEW_ANGLE).as_deref(),
+            Some("60 deg from the view direction")
+        );
+        assert_eq!(side.unusable_reason(eye, forward, GRAB_IN_VIEW_ANGLE), None);
+        let estimated = EditorHand {
+            tracked: false,
+            ..side
+        };
+        assert_eq!(
+            estimated
+                .unusable_reason(eye, forward, GRAB_IN_VIEW_ANGLE)
+                .as_deref(),
+            Some("tips not tracked")
+        );
     }
 
     #[test]
@@ -1130,8 +1410,8 @@ mod tests {
         area.add_box(0, Side::new(2, true)).unwrap();
         let placed = placed(area);
         let handles = edit_handles(&placed, 0, false);
-        // 6 sides, 6 domes, center, add, remove; the centers of the 2 other boxes; done
-        assert_eq!(handles.len(), 6 + 6 + 3 + 2 + 1);
+        // 6 sides, 6 domes, center, turn, add, remove; the centers of the 2 other boxes; done
+        assert_eq!(handles.len(), 6 + 6 + 4 + 2 + 1);
         let to_area = placed.area_to_world.inverse();
         let area_box = placed.area.boxes()[0];
         for side in Side::ALL {
@@ -1186,7 +1466,7 @@ mod tests {
                 .iter()
                 .any(|handle| handle.id.kind == HandleKind::Remove)
         );
-        assert_eq!(handles.len(), 6 + 6 + 2 + 1);
+        assert_eq!(handles.len(), 6 + 6 + 3 + 1);
     }
 
     fn at(kind: HandleKind, position: Vec3) -> Handle {
@@ -1360,6 +1640,7 @@ mod tests {
             HandleKind::Side(Side::new(0, true)),
             HandleKind::Dome(Side::new(1, true)),
             HandleKind::Center,
+            HandleKind::Turn,
             HandleKind::Add,
             HandleKind::Remove,
             HandleKind::Undo,
@@ -1411,8 +1692,8 @@ mod tests {
 
     #[test]
     fn handles_of_eight_boxes_leave_room_for_the_outline() {
-        // The client draws the handles, the 12 edges of the selected box, 2 cursors, a guide line and
-        // 2 progress squares; the outline of the area gets what is left of the 249 segments of an eye
+        // The client draws the handles, the 12 edges of the selected box, 2 cursors, a guide and 2
+        // progress squares; the outline of the area gets what is left of the 249 segments of an eye
         let placed = placed(PlayArea::stress_layout(&params()));
         let eye = Vec3::new(0.0, 1.2, 0.0);
         let handles = edit_handles(&placed, 3, true);
@@ -1420,8 +1701,9 @@ mod tests {
             .iter()
             .map(|handle| handle_glyph(handle, eye, 1.3, OVERLAY_CYAN, 0.002).len())
             .sum::<usize>();
-        let editor = glyphs + 12 + 2 * 4 + 1 + 2 * 4;
-        assert!(editor <= 115, "{editor}");
+        // The guide of a turn is the longest
+        let editor = glyphs + 12 + 2 * 4 + (2 + TURN_GUIDE_SEGMENTS) + 2 * 4;
+        assert!(editor <= 123, "{editor}");
         // All 96 edges of the 8 boxes still fit
         assert!(crate::MAX_OVERLAY_SEGMENTS - 7 - editor >= 96 + 30);
     }
@@ -1518,5 +1800,262 @@ mod tests {
         assert!(file.parsed.warnings[0].contains("anchor"));
         // Errors of the layout stay errors
         assert!(parse_area_file("anchor 1 2 3 4").is_err());
+    }
+
+    fn turned_area(yaw: f32) -> PlayArea {
+        let mut area = PlayArea::from_marker_box(&params());
+        area.turn_box(0, yaw);
+        area
+    }
+
+    #[test]
+    fn handles_of_a_turned_box_turn_with_it() {
+        let yaw = 0.7;
+        let straight = placed(turned_area(0.0));
+        let turned = placed(turned_area(yaw));
+        let to_area = turned.area_to_world.inverse();
+        let area_box = turned.area.boxes()[0];
+        let handles = edit_handles(&turned, 0, false);
+        for (handle, unturned) in handles.iter().zip(edit_handles(&straight, 0, false)) {
+            assert_eq!(handle.id, unturned.id);
+            if handle.id.kind.of_box() {
+                // The same place in the frame of the box
+                let local = area_box.to_local(to_area.transform_point3(handle.position));
+                let local_unturned = to_area.transform_point3(unturned.position) - area_box.center;
+                assert!(local.distance(local_unturned) < 1e-5, "{:?}", handle.id);
+                assert!(
+                    area_box
+                        .turn_back(to_area.transform_vector3(handle.normal))
+                        .distance(to_area.transform_vector3(unturned.normal))
+                        < 1e-5
+                );
+            }
+        }
+        // The side handles are on the surface, the turn handle away from the center and the sides
+        for handle in &handles {
+            let local = to_area.transform_point3(handle.position);
+            match handle.id.kind {
+                HandleKind::Side(_) => {
+                    assert!(area_box.signed_distance(local, f32::INFINITY).abs() < 1e-5);
+                }
+                HandleKind::Turn => {
+                    let offset = local - area_box.center;
+                    assert!(offset.y.abs() < 1e-6);
+                    let radius = offset.length();
+                    assert!((TURN_HANDLE_MIN..=TURN_HANDLE_MAX + 1e-6).contains(&radius));
+                    for other in &handles {
+                        if other.id != handle.id {
+                            assert!(other.position.distance(handle.position) > 0.04, "{other:?}");
+                        }
+                    }
+                }
+                _ => (),
+            }
+        }
+    }
+
+    #[test]
+    fn turn_handle_of_a_small_box_stays_apart() {
+        let area = PlayArea::single(AreaBox::new(Vec3::ZERO, Vec3::splat(0.1)));
+        let handles = edit_handles(&placed(area), 0, false);
+        let turn = handles
+            .iter()
+            .find(|handle| handle.id.kind == HandleKind::Turn)
+            .unwrap();
+        for other in &handles {
+            if other.id != turn.id {
+                assert!(other.position.distance(turn.position) > 0.04, "{other:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn sweep_angle_around_the_axis() {
+        let center = Vec3::new(0.3, 1.0, -0.5);
+        let at = |degrees: f32, radius: f32, height: f32| {
+            // An angle like a yaw: +x is 0, -z is 90
+            let (sin, cos) = degrees.to_radians().sin_cos();
+            center + Vec3::new(cos * radius, height, -sin * radius)
+        };
+        let swept = sweep_angle(center, at(10.0, 0.2, 0.0), at(40.0, 0.25, 0.1)).unwrap();
+        assert!((swept - 30_f32.to_radians()).abs() < 1e-5, "{swept}");
+        // As a yaw turns: the box turned by the angle swept keeps the point where it was
+        let mut area_box = AreaBox::new(center, Vec3::splat(0.3));
+        let point = at(10.0, 0.2, 0.0);
+        let local = area_box.to_local(point);
+        area_box.yaw = swept;
+        assert!(area_box.to_area(local).distance(at(40.0, 0.2, 0.0)) < 1e-5);
+        // Across -180 / 180: the short way
+        let swept = sweep_angle(center, at(170.0, 0.2, 0.0), at(-170.0, 0.2, 0.0)).unwrap();
+        assert!((swept - 20_f32.to_radians()).abs() < 1e-5, "{swept}");
+        // Near the axis: none
+        assert_eq!(
+            sweep_angle(center, at(0.0, 0.01, 0.0), at(90.0, 0.2, 0.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn turning_snaps_to_detents() {
+        let deg = f32::to_radians;
+        let (yaw, snapped) = turned_yaw(0.0, deg(13.5));
+        assert!(snapped && (yaw - deg(15.0)).abs() < 1e-6);
+        let (yaw, snapped) = turned_yaw(deg(5.0), deg(7.0));
+        assert!(!snapped && (yaw - deg(12.0)).abs() < 1e-6);
+        let (yaw, snapped) = turned_yaw(deg(-44.0), deg(-2.5));
+        assert!(snapped && (yaw - deg(-45.0)).abs() < 1e-6);
+        // Wrapped
+        let (yaw, snapped) = turned_yaw(deg(170.0), deg(44.0));
+        assert!(
+            !snapped && (yaw - deg(-146.0)).abs() < 1e-5,
+            "{}",
+            yaw.to_degrees()
+        );
+        let (yaw, snapped) = turned_yaw(deg(179.0), deg(2.0));
+        assert!(snapped && (yaw.abs() - deg(180.0)).abs() < 1e-5);
+
+        // The layout: only that box, nothing else changes
+        let mut area = PlayArea::from_marker_box(&params());
+        area.add_box(0, Side::new(0, true)).unwrap();
+        let (turned, yaw, snapped) = apply_turn(&area, 1, deg(31.0));
+        assert!(snapped && (yaw - deg(30.0)).abs() < 1e-6);
+        assert_eq!(turned.boxes()[0], area.boxes()[0]);
+        let (before, after) = (area.boxes()[1], turned.boxes()[1]);
+        assert_eq!((after.center, after.half), (before.center, before.half));
+        assert_eq!(apply_turn(&area, 5, 1.0).0, area);
+    }
+
+    #[test]
+    fn drags_in_the_frame_of_a_turned_box() {
+        let yaw = 0.6;
+        let area = turned_area(yaw);
+        let start = area.boxes()[0];
+        let side = Side::new(0, true);
+        let normal = start.side_normal(side);
+        let id = |kind| HandleId { kind, box_index: 0 };
+        // Along the normal of the turned side: that side moves by it, the opposite one stays
+        let across = start.turn(Vec3::new(0.0, 0.1, 0.2));
+        let (dragged, moved) = apply_drag(&area, id(HandleKind::Side(side)), normal * 0.1 + across);
+        assert!((moved - 0.1).abs() < 1e-5, "{moved}");
+        let after = dragged.boxes()[0];
+        assert!((after.half.x - start.half.x - 0.05).abs() < 1e-5);
+        assert_eq!(
+            (after.half.y, after.half.z, after.yaw),
+            (start.half.y, start.half.z, yaw)
+        );
+        let opposite = side.opposite();
+        assert!(
+            after
+                .side_center(opposite)
+                .distance(start.side_center(opposite))
+                < 1e-5
+        );
+        assert!(
+            after
+                .side_center(side)
+                .distance(start.side_center(side) + normal * 0.1)
+                < 1e-5
+        );
+        // The +x axis of the area frame moves the side by the cosine of the yaw only
+        let (_, moved) = apply_drag(&area, id(HandleKind::Side(side)), Vec3::X * 0.1);
+        assert!((moved - 0.1 * yaw.cos()).abs() < 1e-5, "{moved}");
+
+        // A dome along its normal
+        let front = Side::new(2, false);
+        let (domed, height) = apply_drag(
+            &area,
+            id(HandleKind::Dome(front)),
+            start.side_normal(front) * 0.12 + start.turn(Vec3::new(0.1, 0.1, 0.0)),
+        );
+        assert!((height - 0.12).abs() < 1e-5, "{height}");
+        assert!((domed.boxes()[0].dome_height(front) - 0.12).abs() < 1e-5);
+
+        // The center: in the area frame, the box keeps its yaw
+        let delta = Vec3::new(0.1, -0.05, 0.2);
+        let (moved_area, _) = apply_drag(&area, id(HandleKind::Center), delta);
+        assert!(moved_area.boxes()[0].center.distance(start.center + delta) < 1e-6);
+        assert_eq!(moved_area.boxes()[0].yaw, yaw);
+    }
+
+    #[test]
+    fn added_box_of_a_turned_box_goes_where_the_eyes_look() {
+        let yaw = 0.9;
+        let area = turned_area(yaw);
+        let area_box = area.boxes()[0];
+        // From outside in front of the -z side of the turned box, looking at it
+        let eye = area_box.to_area(Vec3::new(0.1, 0.2, -area_box.half.z - 0.8));
+        let mut outside = area;
+        let (index, side) = add_box_facing(&mut outside, 0, eye, area_box.center - eye).unwrap();
+        assert_eq!(side, Side::new(2, false));
+        let added = outside.boxes()[index];
+        assert_eq!(added.yaw, yaw);
+        // In front of that side in the frame of the box
+        let local = area_box.to_local(added.center);
+        assert!(
+            local.z < -area_box.half.z && local.x.abs() < 1e-5,
+            "{local}"
+        );
+        // From inside, looking along the turned +x
+        let mut inside = area;
+        let (_, side) =
+            add_box_facing(&mut inside, 0, area_box.center, area_box.turn(Vec3::X)).unwrap();
+        assert_eq!(side, Side::new(0, true));
+    }
+
+    #[test]
+    fn turn_guide_shows_the_angle() {
+        let area = turned_area(0.0);
+        let start = area.boxes()[0];
+        let (turned, _, snapped) = apply_turn(&area, 0, 50_f32.to_radians());
+        let now = turned.boxes()[0];
+        let lines = turn_guide(&Mat4::IDENTITY, &start, &now, snapped, 0.002);
+        // The two radial lines and the arc of 50 deg in 3 segments
+        assert_eq!(lines.len(), 2 + 3);
+        assert!(lines[0].dashed && !lines[1].dashed);
+        assert_eq!(lines[1].color, OVERLAY_AMBER);
+        // The line through the turned handle
+        let handle = now.center + turn_handle_offset(&now);
+        let direction = (lines[1].end - lines[1].start).normalize();
+        assert!(direction.dot((handle - now.center).normalize()) > 1.0 - 1e-5);
+        // The arc at the radius of the handle, from the handle at the grab to it now
+        let radius = turn_handle_offset(&start).length();
+        for line in &lines[2..] {
+            assert!((line.start.distance(now.center) - radius).abs() < 1e-5);
+        }
+        assert!(
+            lines[2]
+                .start
+                .distance(start.center + turn_handle_offset(&start))
+                < 1e-5
+        );
+        assert!(lines[4].end.distance(handle) < 1e-5);
+        // On a detent: green; without a turn: no arc
+        let (turned, _, snapped) = apply_turn(&area, 0, 44_f32.to_radians());
+        let lines = turn_guide(&Mat4::IDENTITY, &start, &turned.boxes()[0], snapped, 0.002);
+        assert!(snapped && lines[1].color == OVERLAY_GREEN);
+        assert_eq!(
+            turn_guide(&Mat4::IDENTITY, &start, &start, false, 0.002).len(),
+            2
+        );
+        // A whole half turn: at most the longest arc
+        let (turned, _, _) = apply_turn(&area, 0, 3.1);
+        let lines = turn_guide(&Mat4::IDENTITY, &start, &turned.boxes()[0], false, 0.002);
+        assert_eq!(lines.len(), 2 + TURN_GUIDE_SEGMENTS);
+    }
+
+    #[test]
+    fn buttons_have_no_drag() {
+        for kind in [HandleKind::Add, HandleKind::Undo, HandleKind::Done] {
+            assert!(kind.is_button() && !kind.is_drag());
+        }
+        for kind in [
+            HandleKind::Remove,
+            HandleKind::Turn,
+            HandleKind::Center,
+            HandleKind::Side(Side::new(0, true)),
+        ] {
+            assert!(!kind.is_button());
+        }
+        assert!(HandleKind::Turn.is_drag());
     }
 }

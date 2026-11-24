@@ -96,6 +96,35 @@ pub fn box_edges(region: &RegionOverride, color: Vec4, width: f32) -> [OverlaySe
     })
 }
 
+/// The part of the segment from `a` to `b` (area frame) inside a box, as parameters along it (0: `a`,
+/// 1: `b`). Across a face the segment runs along, it must be inside by `HIDDEN_EDGE_MARGIN`; a face it
+/// crosses cuts it where it crosses. None: not inside
+fn segment_inside(a: Vec3, b: Vec3, other: &AreaBox) -> Option<(f32, f32)> {
+    let start = other.to_local(a);
+    let direction = other.turn_back(b - a);
+    let length = direction.length();
+    if length <= 0.0 {
+        return None;
+    }
+    let (mut low, mut high) = (0.0_f32, 1.0_f32);
+    for k in 0..3 {
+        let half = other.half[k];
+        if (direction[k] / length).abs() < 1e-4 {
+            if start[k].abs() >= half - HIDDEN_EDGE_MARGIN {
+                return None;
+            }
+            continue;
+        }
+        let (t0, t1) = (
+            (-half - start[k]) / direction[k],
+            (half - start[k]) / direction[k],
+        );
+        low = low.max(t0.min(t1));
+        high = high.min(t0.max(t1));
+    }
+    (low < high).then_some((low, high))
+}
+
 /// The outline of a play area, stage space: the edges of its boxes without the parts inside another
 /// box, and of each dome its rim and two arcs over its top (across the side and along it). At most
 /// `budget` segments: with many domes their arcs get fewer segments (down to 2), the edges come
@@ -111,38 +140,38 @@ pub fn area_outline(
     let mut lines = Vec::<(Vec3, Vec3)>::new();
 
     for (index, area_box) in boxes.iter().enumerate() {
-        let min = area_box.center - area_box.half;
-        let max = area_box.center + area_box.half;
+        let half = area_box.half;
         for axis in 0..3 {
             let (u, v) = OTHER_AREA_AXES[axis];
             for corner in 0..4 {
-                let mut point = Vec3::ZERO;
-                point[u] = if corner & 1 == 0 { min[u] } else { max[u] };
-                point[v] = if corner & 2 == 0 { min[v] } else { max[v] };
-                // The parts of the edge along `axis` that are not inside another box
-                let mut pieces = vec![(min[axis], max[axis])];
+                // The edge along `axis` in the frame of the box, then in the area frame
+                let mut local = Vec3::ZERO;
+                local[u] = if corner & 1 == 0 { -half[u] } else { half[u] };
+                local[v] = if corner & 2 == 0 { -half[v] } else { half[v] };
+                let (mut a, mut b) = (local, local);
+                a[axis] = -half[axis];
+                b[axis] = half[axis];
+                let (a, b) = (area_box.to_area(a), area_box.to_area(b));
+                let length = a.distance(b);
+                // The parts of the edge that are not inside another box (parameters along it)
+                let mut pieces = vec![(0.0, 1.0)];
                 for (other_index, other) in boxes.iter().enumerate() {
-                    let inside = |k: usize| {
-                        (point[k] - other.center[k]).abs() < other.half[k] - HIDDEN_EDGE_MARGIN
-                    };
-                    if other_index == index || !inside(u) || !inside(v) {
+                    if other_index == index {
                         continue;
                     }
-                    let (low, high) = (
-                        other.center[axis] - other.half[axis],
-                        other.center[axis] + other.half[axis],
-                    );
+                    let Some((low, high)) = segment_inside(a, b, other) else {
+                        continue;
+                    };
                     pieces = pieces
                         .into_iter()
-                        .flat_map(|(start, end)| [(start, end.min(low)), (start.max(high), end)])
-                        .filter(|(start, end)| end - start > HIDDEN_EDGE_MARGIN)
+                        .flat_map(|(start, end): (f32, f32)| {
+                            [(start, end.min(low)), (start.max(high), end)]
+                        })
+                        .filter(|(start, end)| (end - start) * length > HIDDEN_EDGE_MARGIN)
                         .collect();
                 }
                 for (start, end) in pieces {
-                    let (mut a, mut b) = (point, point);
-                    a[axis] = start;
-                    b[axis] = end;
-                    lines.push((a, b));
+                    lines.push((a.lerp(b, start), a.lerp(b, end)));
                 }
             }
         }
@@ -191,6 +220,20 @@ pub fn area_outline(
 // The lines of the dome of a side (area frame): its rim, the arc across the side and the one along it
 // (over the straight top of a long side), `segments` per half circle
 fn dome_lines(area_box: &AreaBox, side: Side, segments: usize) -> Vec<(Vec3, Vec3)> {
+    // Drawn in the frame of the box, then turned and moved into the area frame
+    let local_box = AreaBox {
+        center: Vec3::ZERO,
+        yaw: 0.0,
+        ..*area_box
+    };
+    local_dome_lines(&local_box, side, segments)
+        .into_iter()
+        .map(|(a, b)| (area_box.to_area(a), area_box.to_area(b)))
+        .collect()
+}
+
+// `dome_lines` of a box that is not turned
+fn local_dome_lines(area_box: &AreaBox, side: Side, segments: usize) -> Vec<(Vec3, Vec3)> {
     let (radius, depth) = area_box.dome_sphere(side);
     if radius <= 0.0 {
         return vec![];
@@ -663,6 +706,65 @@ box 0.6 0 0 0.4 0.1 0.1",
         assert!((length - expected).abs() < 1e-4, "{length} vs {expected}");
     }
 
+    // The whole layout of `edges_inside_another_box_are_left_out` turned about the code: the boxes
+    // turned by their own yaw, the same outline
+    #[test]
+    fn edges_of_turned_boxes_inside_another_box_are_left_out() {
+        let mut area = crate::PlayArea::parse(
+            "alvr_play_area 1
+box 0 0 0 0.5 0.5 0.5
+box 0.6 0 0 0.4 0.1 0.1",
+        )
+        .unwrap()
+        .area;
+        let yaw = 0.5_f32;
+        for index in 0..2 {
+            let center = area.boxes()[index].center;
+            area.move_box(index, Quat::from_rotation_y(yaw) * center - center);
+            area.turn_box(index, yaw);
+        }
+        let placed = placed(area);
+        let to_area = placed.area_to_world.inverse();
+        let (outline, _) = area_outline(&placed, OVERLAY_WHITE, 0.01, false, 100);
+        let mut length = 0.0;
+        for line in &outline {
+            let a = to_area.transform_point3(line.start);
+            let b = to_area.transform_point3(line.end);
+            length += a.distance(b);
+            for t in [0.01, 0.5, 0.99] {
+                let point = a.lerp(b, t);
+                let inside = placed
+                    .area
+                    .boxes()
+                    .iter()
+                    .filter(|area_box| {
+                        (area_box.to_local(point).abs() - area_box.half).max_element() < -0.002
+                    })
+                    .count();
+                assert_eq!(inside, 0, "{point}");
+                // On the surface of a box
+                assert!(placed.area.signed_distance(point, f32::INFINITY).abs() < 1e-4);
+            }
+        }
+        let expected = 12.0 + 4.0 * 0.5 + 4.0 * 0.2;
+        assert!((length - expected).abs() < 1e-4, "{length} vs {expected}");
+
+        // One turned box: its outline is the edges of its region
+        let single = self::placed(crate::PlayArea::single(crate::AreaBox {
+            yaw: -0.8,
+            ..crate::AreaBox::new(Vec3::new(0.2, 0.1, -0.3), Vec3::new(0.4, 0.3, 0.2))
+        }));
+        let (outline, _) = area_outline(&single, OVERLAY_WHITE, 0.01, false, 100);
+        assert_eq!(outline.len(), 12);
+        for edge in &box_edges(&single.box_region(0), OVERLAY_WHITE, 0.01) {
+            assert!(outline.iter().any(|line| {
+                let same = line.start.distance(edge.start) + line.end.distance(edge.end);
+                let reversed = line.start.distance(edge.end) + line.end.distance(edge.start);
+                same.min(reversed) < 1e-5
+            }));
+        }
+    }
+
     #[test]
     fn dome_lines_lie_on_the_dome() {
         let mut area = crate::PlayArea::test_layout(&params());
@@ -696,6 +798,26 @@ box 0.6 0 0 0.4 0.1 0.1",
             for point in [line.start, line.end] {
                 let local = to_area.transform_point3(point);
                 // On the surface of the area, or on an edge hidden only by a dome
+                let distance = placed.area.signed_distance(local, f32::INFINITY);
+                assert!(distance.abs() < 1e-4, "{local}: {distance}");
+            }
+        }
+
+        // A turned box with domes: the lines on its surface too
+        let mut turned = crate::PlayArea::single(crate::AreaBox {
+            yaw: 1.1,
+            ..crate::AreaBox::new(Vec3::new(0.1, 0.0, -0.2), Vec3::new(0.4, 0.2, 0.3))
+        });
+        turned.set_dome(0, Side::new(0, true), 0.15);
+        turned.set_dome(0, Side::new(1, true), 0.1);
+        let placed = self::placed(turned);
+        let (outline, left_out) = area_outline(&placed, OVERLAY_GREEN, 0.01, false, 249);
+        assert_eq!(left_out, 0);
+        // Both sides are long: 3 straight lines each
+        assert_eq!(outline.len(), 12 + 2 * (32 + 3));
+        for line in &outline {
+            for point in [line.start, line.end] {
+                let local = to_area.transform_point3(point);
                 let distance = placed.area.signed_distance(local, f32::INFINITY);
                 assert!(distance.abs() < 1e-4, "{local}: {distance}");
             }

@@ -5,7 +5,9 @@
 //!
 //! Area frame: the level frame of the code that `marker_box` builds (origin at the center of the code,
 //! +Y stage up, -Z along the heading, +X to the right of the heading), turned about +Y by the yaw of
-//! the layout. Every box is level and axis aligned in it: single boxes are never turned.
+//! the layout. Every box is level: its own frame is the area frame moved to its center and turned about
+//! +Y by its yaw (`AreaBox::yaw`, 0: axis aligned). Its sides, domes, handles and drags are those of its
+//! own frame; `Side::normal` is the normal there, `AreaBox::side_normal` the one in the area frame.
 //!
 //! Domes ("balloons"): each of the 6 sides of a box can bulge out by a height h (0: flat). The dome is
 //! the part beyond the side of a capsule that cuts the side along the largest stadium that fits in it
@@ -49,6 +51,24 @@ pub const ADDED_BOX_OVERLAP: f32 = 0.05;
 /// First line of the text of a layout, followed by the version
 pub const AREA_FILE_HEADER: &str = "alvr_play_area";
 pub const AREA_FILE_VERSION: u32 = 1;
+/// Key of the line after a box line that turns that box (degrees). A reader without it leaves the line
+/// out as unknown and reads the box unturned
+pub const BOX_YAW_KEY: &str = "box_yaw_deg";
+
+/// An angle in -pi..pi (radians); 0 for one that is not finite
+pub fn wrap_angle(angle: f32) -> f32 {
+    if !angle.is_finite() {
+        return 0.0;
+    }
+    let tau = std::f32::consts::TAU;
+    (angle - tau * (angle / tau).round()).clamp(-std::f32::consts::PI, std::f32::consts::PI)
+}
+
+/// A vector turned about +Y by the angle of this sine and cosine (counter-clockwise seen from above,
+/// as `Quat::from_rotation_y`). Same as in `area_box_distance` of depth_mask.wgsl
+fn turn_y(v: Vec3, sin: f32, cos: f32) -> Vec3 {
+    Vec3::new(cos * v.x + sin * v.z, v.y, cos * v.z - sin * v.x)
+}
 
 /// The two other axes of each axis, in order
 pub(crate) const OTHER_AREA_AXES: [(usize, usize); 3] = [(1, 2), (0, 2), (0, 1)];
@@ -86,7 +106,7 @@ impl Side {
         if self.positive { 1.0 } else { -1.0 }
     }
 
-    /// Outward unit normal, area frame
+    /// Outward unit normal in the frame of its box (`AreaBox::side_normal`: in the area frame)
     pub fn normal(self) -> Vec3 {
         let mut normal = Vec3::ZERO;
         normal[self.axis] = self.sign();
@@ -103,16 +123,20 @@ impl Side {
     }
 }
 
-/// A level box of the area, axis aligned in the area frame
+/// A level box of the area, in its own frame (the area frame moved to its center, turned by its yaw)
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AreaBox {
     /// Area frame (meters)
     pub center: Vec3,
+    /// Along the axes of its own frame (meters)
     pub half: Vec3,
     /// Height of the dome of each side, in the order of `Side::ALL` (meters, 0: flat). As set: the dome
     /// shown is at most the rim radius (`dome_height`), so that a box made smaller and larger again
     /// keeps its domes
     pub domes: [f32; 6],
+    /// Turns the box about the vertical axis through its center (radians, counter-clockwise seen from
+    /// above, -pi..pi; 0: axis aligned in the area frame)
+    pub yaw: f32,
 }
 
 impl AreaBox {
@@ -121,7 +145,35 @@ impl AreaBox {
             center,
             half,
             domes: [0.0; 6],
+            yaw: 0.0,
         }
+    }
+
+    /// A vector of the frame of the box in the area frame
+    pub fn turn(&self, v: Vec3) -> Vec3 {
+        let (sin, cos) = self.yaw.sin_cos();
+        turn_y(v, sin, cos)
+    }
+
+    /// A vector of the area frame in the frame of the box
+    pub fn turn_back(&self, v: Vec3) -> Vec3 {
+        let (sin, cos) = self.yaw.sin_cos();
+        turn_y(v, -sin, cos)
+    }
+
+    /// A point of the area frame in the frame of the box (origin at its center)
+    pub fn to_local(&self, point: Vec3) -> Vec3 {
+        self.turn_back(point - self.center)
+    }
+
+    /// A point of the frame of the box in the area frame
+    pub fn to_area(&self, local: Vec3) -> Vec3 {
+        self.center + self.turn(local)
+    }
+
+    /// Outward unit normal of a side, area frame
+    pub fn side_normal(&self, side: Side) -> Vec3 {
+        self.turn(side.normal())
     }
 
     /// Radius of the rim of the dome of a side: half its shorter edge
@@ -166,7 +218,7 @@ impl AreaBox {
     /// which give the same mask: below -feathering the distance can be too large, above +feathering
     /// too small. `f32::INFINITY`: exact. Same as `area_box_distance` in depth_mask.wgsl
     pub fn signed_distance(&self, point: Vec3, feathering: f32) -> f32 {
-        let local = point - self.center;
+        let local = self.to_local(point);
         let e = local.abs() - self.half;
         let plain = e.max(Vec3::ZERO).length() + e.max_element().min(0.0);
         let tallest = self.tallest_dome();
@@ -200,7 +252,7 @@ impl AreaBox {
     /// Whether a point (area frame) is in the box or one of its domes. Exact, for the tests and the
     /// outline
     pub fn contains(&self, point: Vec3) -> bool {
-        let local = point - self.center;
+        let local = self.to_local(point);
         let e = local.abs() - self.half;
         if e.max_element() <= 0.0 {
             return true;
@@ -215,10 +267,10 @@ impl AreaBox {
         })
     }
 
-    /// Smallest and largest corner of the box with its domes, area frame
-    pub fn bounds(&self) -> (Vec3, Vec3) {
-        let mut min = self.center - self.half;
-        let mut max = self.center + self.half;
+    /// Smallest and largest corner of the box with its domes in its own frame (around its center)
+    pub fn local_bounds(&self) -> (Vec3, Vec3) {
+        let mut min = -self.half;
+        let mut max = self.half;
         for side in Side::ALL {
             let height = self.dome_height(side);
             if side.positive {
@@ -230,14 +282,36 @@ impl AreaBox {
         (min, max)
     }
 
-    /// The center of a side (on the flat side, below a dome)
-    pub fn side_center(&self, side: Side) -> Vec3 {
-        self.center + side.normal() * self.half[side.axis]
+    /// Smallest and largest corner of the box with its domes, area frame. Of a turned box those of its
+    /// local bounds turned, which hold it
+    pub fn bounds(&self) -> (Vec3, Vec3) {
+        let (min, max) = self.local_bounds();
+        if self.yaw == 0.0 {
+            return (self.center + min, self.center + max);
+        }
+        let corners = [
+            (min.x, min.z),
+            (max.x, min.z),
+            (min.x, max.z),
+            (max.x, max.z),
+        ]
+        .map(|(x, z)| self.turn(Vec3::new(x, 0.0, z)));
+        let low = corners.iter().fold(Vec3::INFINITY, |a, &b| a.min(b));
+        let high = corners.iter().fold(Vec3::NEG_INFINITY, |a, &b| a.max(b));
+        (
+            self.center + Vec3::new(low.x, min.y, low.z),
+            self.center + Vec3::new(high.x, max.y, high.z),
+        )
     }
 
-    /// Where the handle of a side is: its center, on top of its dome
+    /// The center of a side (on the flat side, below a dome), area frame
+    pub fn side_center(&self, side: Side) -> Vec3 {
+        self.center + self.side_normal(side) * self.half[side.axis]
+    }
+
+    /// Where the handle of a side is: its center, on top of its dome, area frame
     pub fn side_handle(&self, side: Side) -> Vec3 {
-        self.side_center(side) + side.normal() * self.dome_height(side)
+        self.side_center(side) + self.side_normal(side) * self.dome_height(side)
     }
 }
 
@@ -425,36 +499,47 @@ impl PlayArea {
             })
     }
 
-    /// Moves one side of a box by `amount` along its outward normal (meters, negative: inwards); the
-    /// opposite side stays. Within `MIN_BOX_HALF`, `MAX_BOX_HALF` and `MAX_BOX_CENTER`. Returns how far
-    /// it moved
+    /// Moves one side of a box by `amount` along its outward normal (meters, negative: inwards; of a
+    /// turned box the normal in its own frame); the opposite side stays. Within `MIN_BOX_HALF`,
+    /// `MAX_BOX_HALF` and `MAX_BOX_CENTER` (per axis of the area frame). Returns how far it moved
     pub fn drag_side(&mut self, index: usize, side: Side, amount: f32) -> f32 {
         if index >= self.count || !amount.is_finite() {
             return 0.0;
         }
         let area_box = &mut self.boxes[index];
         let half = area_box.half[side.axis];
-        let center = area_box.center[side.axis];
-        // The size grows by the amount, the center moves by half of it towards the side
+        let normal = area_box.side_normal(side);
+        // The size grows by the amount, the center moves by half of it along the normal
         let mut low = 2.0 * (MIN_BOX_HALF.min(half) - half);
         let mut high = 2.0 * (MAX_BOX_HALF.max(half) - half);
-        let (center_low, center_high) = if side.positive {
-            (
-                2.0 * (-MAX_BOX_CENTER - center),
-                2.0 * (MAX_BOX_CENTER - center),
-            )
-        } else {
-            (
-                2.0 * (center - MAX_BOX_CENTER),
-                2.0 * (center + MAX_BOX_CENTER),
-            )
-        };
-        low = low.max(center_low.min(0.0));
-        high = high.min(center_high.max(0.0));
+        for axis in 0..3 {
+            let step = 0.5 * normal[axis];
+            if step.abs() < 1e-6 {
+                continue;
+            }
+            let center = area_box.center[axis];
+            let (a, b) = (
+                (-MAX_BOX_CENTER - center) / step,
+                (MAX_BOX_CENTER - center) / step,
+            );
+            // A center already beyond the limit may stay where it is
+            low = low.max(a.min(b).min(0.0));
+            high = high.min(a.max(b).max(0.0));
+        }
         let applied = amount.clamp(low.min(0.0), high.max(0.0));
         area_box.half[side.axis] = half + 0.5 * applied;
-        area_box.center[side.axis] = center + 0.5 * applied * side.sign();
+        area_box.center += normal * (0.5 * applied);
         applied
+    }
+
+    /// Turns a box about its vertical axis to `yaw` (radians, wrapped to -pi..pi). Returns the yaw set
+    pub fn turn_box(&mut self, index: usize, yaw: f32) -> f32 {
+        if index >= self.count {
+            return 0.0;
+        }
+        let yaw = wrap_angle(yaw);
+        self.boxes[index].yaw = yaw;
+        yaw
     }
 
     /// Sets the dome of a side, within 0 and its rim radius (below `MIN_DOME`: flat). Returns the
@@ -490,8 +575,9 @@ impl PlayArea {
     }
 
     /// Adds a box on a side of another: as large as that side, reaching `NEW_BOX_DEPTH` beyond it (at
-    /// most as far as the other box is thick) and `ADDED_BOX_OVERLAP` into the other box, no domes.
-    /// Returns its index. None: already `MAX_AREA_BOXES`, or it would be farther than `MAX_BOX_CENTER`
+    /// most as far as the other box is thick) and `ADDED_BOX_OVERLAP` into the other box, turned like
+    /// it, no domes. Returns its index. None: already `MAX_AREA_BOXES`, or it would be farther than
+    /// `MAX_BOX_CENTER`
     pub fn add_box(&mut self, from: usize, side: Side) -> Option<usize> {
         if from >= self.count || self.count >= MAX_AREA_BOXES {
             return None;
@@ -502,12 +588,15 @@ impl PlayArea {
         let beyond = NEW_BOX_DEPTH.min(2.0 * source_half);
         let mut half = source.half;
         half[side.axis] = 0.5 * (beyond + overlap);
-        let mut center = source.center;
-        center[side.axis] += side.sign() * (source_half - overlap + half[side.axis]);
+        let center =
+            source.center + source.side_normal(side) * (source_half - overlap + half[side.axis]);
         if center.abs().max_element() > MAX_BOX_CENTER {
             return None;
         }
-        self.boxes[self.count] = AreaBox::new(center, half);
+        self.boxes[self.count] = AreaBox {
+            yaw: source.yaw,
+            ..AreaBox::new(center, half)
+        };
         self.count += 1;
         Some(self.count - 1)
     }
@@ -538,7 +627,8 @@ impl PlayArea {
         text
     }
 
-    /// One box for the log: "#<index> at (x, y, z) m, w x h x d m, dome +y 0.250 m"
+    /// One box for the log: "#<index> at (x, y, z) m, w x h x d m, yaw 30.0 deg, dome +y 0.250 m" (the
+    /// yaw only when the box is turned)
     pub fn describe_box(&self, index: usize) -> String {
         let Some(area_box) = self.boxes().get(index) else {
             return format!("#{index} (no such box)");
@@ -548,6 +638,9 @@ impl PlayArea {
             "#{index} at ({:.3}, {:.3}, {:.3}) m, {:.3} x {:.3} x {:.3} m",
             area_box.center.x, area_box.center.y, area_box.center.z, size.x, size.y, size.z
         );
+        if area_box.yaw != 0.0 {
+            let _ = write!(text, ", yaw {:.1} deg", area_box.yaw.to_degrees());
+        }
         for side in Side::ALL {
             let height = area_box.dome_height(side);
             if height > 0.0 {
@@ -563,9 +656,12 @@ impl PlayArea {
     /// payload RIG1
     /// yaw_deg 0.00
     /// box cx cy cz hx hy hz [dome+x dome-x dome+y dome-y dome+z dome-z]
+    /// box_yaw_deg 30.00
     /// ```
     /// `payload`: the text of the code the layout belongs to (written when given, the rest of its
-    /// line). Lines starting with # are comments
+    /// line). `box_yaw_deg`: turns the box of the line before (written only for a turned box; a reader
+    /// of before it leaves the line out as unknown and reads the box unturned, and this one reads its
+    /// files: the version stays 1). Lines starting with # are comments
     pub fn to_text(&self, payload: Option<&str>) -> String {
         let mut text = format!("{AREA_FILE_HEADER} {AREA_FILE_VERSION}\n");
         text.push_str(
@@ -573,7 +669,9 @@ impl PlayArea {
              the heading, +y up, -z along the heading\n",
         );
         text.push_str(
-            "# box center_x center_y center_z half_x half_y half_z [domes +x -x +y -y +z -z]\n",
+            "# box center_x center_y center_z half_x half_y half_z [domes +x -x +y -y +z -z]; half \
+             extents and domes in the frame of the box, turned about +y by the box_yaw_deg line after \
+             it (counter-clockwise seen from above; none: 0)\n",
         );
         if let Some(payload) = payload {
             // One line
@@ -595,6 +693,9 @@ impl PlayArea {
                 }
             }
             text.push('\n');
+            if area_box.yaw != 0.0 {
+                let _ = writeln!(text, "{BOX_YAW_KEY} {:.2}", area_box.yaw.to_degrees());
+            }
         }
         text
     }
@@ -634,6 +735,8 @@ impl PlayArea {
             ignored: Vec::new(),
             warnings: Vec::new(),
         };
+        // Whether the last box line made a box (a `box_yaw_deg` line turns it)
+        let mut last_box_kept = false;
         for (number, line) in lines {
             let (key, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
             let rest = rest.trim();
@@ -663,12 +766,14 @@ impl PlayArea {
                         parsed.warnings.push(format!(
                             "line {number}: more than {MAX_AREA_BOXES} boxes, left out"
                         ));
+                        last_box_kept = false;
                         continue;
                     }
                     let given = AreaBox {
                         center: Vec3::from_slice(&values[0..3]),
                         half: Vec3::from_slice(&values[3..6]),
                         domes: std::array::from_fn(|i| values.get(6 + i).copied().unwrap_or(0.0)),
+                        yaw: 0.0,
                     };
                     let mut area_box = AreaBox {
                         center: given
@@ -678,6 +783,7 @@ impl PlayArea {
                             .half
                             .clamp(Vec3::splat(MIN_FILE_HALF), Vec3::splat(MAX_BOX_HALF)),
                         domes: given.domes.map(|dome| dome.max(0.0)),
+                        yaw: 0.0,
                     };
                     for side in Side::ALL {
                         let rim = area_box.dome_rim(side);
@@ -690,6 +796,24 @@ impl PlayArea {
                     }
                     parsed.area.boxes[parsed.area.count] = area_box;
                     parsed.area.count += 1;
+                    last_box_kept = true;
+                }
+                BOX_YAW_KEY => {
+                    let yaw = rest
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|yaw| yaw.is_finite())
+                        .ok_or(format!("line {number}: {BOX_YAW_KEY} is not a number"))?;
+                    if last_box_kept {
+                        let index = parsed.area.count - 1;
+                        parsed.area.boxes[index].yaw = wrap_angle(yaw.to_radians());
+                    } else {
+                        parsed.warnings.push(format!(
+                            "line {number}: {BOX_YAW_KEY} without a box before it, left out"
+                        ));
+                    }
+                    // One per box
+                    last_box_kept = false;
                 }
                 _ => parsed.ignored.push(format!("line {number}: {line}")),
             }
@@ -728,11 +852,16 @@ impl PlacedArea {
         self.area.signed_distance(point, f32::INFINITY)
     }
 
-    /// Box `index` as an oriented box in stage space (no domes)
+    /// Box `index` as an oriented box in stage space (no domes; turned by its yaw)
     pub fn box_region(&self, index: usize) -> RegionOverride {
         let area_box = self.area.boxes()[index.min(self.area.len() - 1)];
+        let box_to_area = if area_box.yaw == 0.0 {
+            Mat4::from_translation(area_box.center)
+        } else {
+            Mat4::from_rotation_translation(Quat::from_rotation_y(area_box.yaw), area_box.center)
+        };
         RegionOverride {
-            volume_to_world: self.area_to_world * Mat4::from_translation(area_box.center),
+            volume_to_world: self.area_to_world * box_to_area,
             half_extents: area_box.half,
         }
     }
@@ -749,7 +878,7 @@ impl From<RegionOverride> for PlacedArea {
 }
 
 /// Floats of one box in the uniform block of the mask (`AreaBox` in depth_common.wgsl)
-pub(crate) const AREA_BOX_FLOAT_COUNT: usize = 6 * 4;
+pub(crate) const AREA_BOX_FLOAT_COUNT: usize = 7 * 4;
 /// Floats of the area at the end of the uniform block: the bounds (center, half extents) and the boxes
 pub(crate) const AREA_FLOAT_COUNT: usize = 2 * 4 + MAX_AREA_BOXES * AREA_BOX_FLOAT_COUNT;
 
@@ -780,6 +909,9 @@ pub(crate) fn area_uniforms(area: Option<&PlayArea>) -> [f32; AREA_FLOAT_COUNT] 
         out[12..15].copy_from_slice(&pick(false, false));
         out[16..19].copy_from_slice(&pick(true, true));
         out[20..23].copy_from_slice(&pick(false, true));
+        let (sin, cos) = area_box.yaw.sin_cos();
+        out[24] = cos;
+        out[25] = sin;
     }
     data
 }
@@ -1352,6 +1484,261 @@ mod tests {
                 "{text:?}: {result:?}"
             );
         }
+    }
+
+    #[test]
+    fn turning_matches_quat_and_wraps() {
+        let mut area_box = domed_box();
+        area_box.yaw = 0.8;
+        let v = Vec3::new(0.3, -0.2, 0.7);
+        assert!(area_box.turn(v).distance(Quat::from_rotation_y(0.8) * v) < 1e-6);
+        assert!(area_box.turn_back(area_box.turn(v)).distance(v) < 1e-6);
+        let point = Vec3::new(-0.4, 0.5, 0.2);
+        assert!(area_box.to_area(area_box.to_local(point)).distance(point) < 1e-6);
+        assert!((wrap_angle(3.5) - (3.5 - std::f32::consts::TAU)).abs() < 1e-6);
+        assert!((wrap_angle(-7.0) - (-7.0 + std::f32::consts::TAU)).abs() < 1e-5);
+        assert_eq!(wrap_angle(0.25), 0.25);
+        assert_eq!(wrap_angle(f32::NAN), 0.0);
+        assert!(wrap_angle(std::f32::consts::PI).abs() <= std::f32::consts::PI);
+    }
+
+    // A turned box is the box without its yaw in its own frame: distance, inside, handles
+    #[test]
+    fn turned_box_is_the_unturned_box_in_its_own_frame() {
+        let unturned = domed_box();
+        let mut random = Random(2718);
+        for yaw in [0.3_f32, -1.2, 2.9] {
+            let turned = AreaBox { yaw, ..unturned };
+            for _ in 0..500 {
+                let local = random.vec3() * Vec3::new(0.7, 0.6, 0.6);
+                let in_area = turned.to_area(local);
+                let plain = unturned.center + local;
+                for feathering in [0.0005, 0.03, f32::INFINITY] {
+                    let a = turned.signed_distance(in_area, feathering);
+                    let b = unturned.signed_distance(plain, feathering);
+                    assert!((a - b).abs() < 1e-5, "{yaw} {local}: {a} vs {b}");
+                }
+                assert_eq!(turned.contains(in_area), unturned.contains(plain));
+            }
+            for side in Side::ALL {
+                let local = unturned.side_handle(side) - unturned.center;
+                assert!(turned.side_handle(side).distance(turned.to_area(local)) < 1e-5);
+                assert!(
+                    turned
+                        .side_normal(side)
+                        .distance(Quat::from_rotation_y(yaw) * side.normal())
+                        < 1e-6
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn turned_box_matches_brute_force_outside() {
+        let mut area_box = domed_box();
+        area_box.yaw = 0.65;
+        let step = 0.005;
+        let unturned = AreaBox {
+            yaw: 0.0,
+            ..area_box
+        };
+        // The surface of the box without its yaw, turned about its center
+        let points = surface_points(&unturned, step)
+            .into_iter()
+            .map(|point| area_box.to_area(point - area_box.center))
+            .collect::<Vec<_>>();
+        let (min, max) = area_box.bounds();
+        let mut random = Random(16180);
+        let mut checked = 0;
+        for _ in 0..800 {
+            let point = area_box.center + random.vec3() * Vec3::new(0.75, 0.6, 0.75);
+            assert!(
+                area_box.contains(point) == (area_box.signed_distance(point, f32::INFINITY) < 0.0)
+                    || area_box.signed_distance(point, f32::INFINITY).abs() < 1e-4
+            );
+            // The bounds hold the box
+            if area_box.contains(point) {
+                assert!(point.cmpge(min - 1e-5).all() && point.cmple(max + 1e-5).all());
+                continue;
+            }
+            let exact = area_box.signed_distance(point, f32::INFINITY);
+            let expected = brute_force(&points, point);
+            assert!(exact <= expected + 1e-4, "{point}: {exact} > {expected}");
+            assert!(expected - exact < step, "{point}: {exact} vs {expected}");
+            checked += 1;
+        }
+        assert!(checked > 400, "{checked}");
+        // The bounds are those of the turned corners: a box turned by 45 deg is wider
+        let square = AreaBox {
+            yaw: std::f32::consts::FRAC_PI_4,
+            ..AreaBox::new(Vec3::ZERO, Vec3::new(0.5, 0.2, 0.5))
+        };
+        let (min, max) = square.bounds();
+        assert!((max.x - 0.5 * std::f32::consts::SQRT_2).abs() < 1e-5);
+        assert!((min.z + 0.5 * std::f32::consts::SQRT_2).abs() < 1e-5);
+        assert!((max.y - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn union_with_a_turned_box_keeps_the_mask() {
+        let mask = |distance: f32, feathering: f32| {
+            let t = ((distance + feathering) / (2.0 * feathering)).clamp(0.0, 1.0);
+            1.0 - t * t * (3.0 - 2.0 * t)
+        };
+        let mut area = PlayArea::single(domed_box());
+        area.turn_box(0, -0.4);
+        let added = area.add_box(0, Side::new(0, true)).unwrap();
+        area.set_dome(added, Side::new(1, true), 0.1);
+        area.turn_box(added, 0.9);
+        let (min, max) = area.bounds();
+        let mut random = Random(4711);
+        for feathering in [0.0005, 0.01, 0.03] {
+            for _ in 0..3000 {
+                let point = (min + max) * 0.5 + random.vec3() * ((max - min) * 0.5 + 0.1);
+                let fast = area.signed_distance(point, feathering);
+                let exact = area.signed_distance(point, f32::INFINITY);
+                assert!((mask(fast, feathering) - mask(exact, feathering)).abs() < 1e-6);
+                // Every box is within the bounds of the area
+                if area.contains(point) {
+                    assert!(point.cmpge(min - 1e-5).all() && point.cmple(max + 1e-5).all());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn turned_boxes_are_added_and_dragged_in_their_frame() {
+        let yaw = 0.5_f32;
+        let mut area = PlayArea::single(AreaBox {
+            yaw,
+            ..AreaBox::new(Vec3::new(0.1, 0.0, -0.2), Vec3::new(0.5, 0.4, 0.3))
+        });
+        let first = area.boxes()[0];
+        let side = Side::new(2, false);
+        let added = area.add_box(0, side).unwrap();
+        let second = area.boxes()[added];
+        // Turned like the first, on its turned side, as large as it, overlapping it by 5 cm
+        assert_eq!(second.yaw, yaw);
+        assert_eq!((second.half.x, second.half.y), (0.5, 0.4));
+        let shared = first.side_center(side);
+        let normal = first.side_normal(side);
+        assert!(
+            second
+                .side_center(side.opposite())
+                .distance(shared - normal * 0.05)
+                < 1e-5
+        );
+        assert!(second.side_center(side).distance(shared + normal * 0.3) < 1e-5);
+        assert!((area.signed_distance(shared, f32::INFINITY) + 0.05).abs() < 1e-5);
+
+        // A side moves along its turned normal, the opposite one stays
+        let opposite = area.boxes()[0].side_center(Side::new(0, false));
+        let moved = area.drag_side(0, Side::new(0, true), 0.2);
+        assert!((moved - 0.2).abs() < 1e-6);
+        let dragged = area.boxes()[0];
+        assert!(dragged.side_center(Side::new(0, false)).distance(opposite) < 1e-5);
+        assert!((dragged.half.x - 0.6).abs() < 1e-6);
+        // The center stays within the limit per axis of the area frame
+        let moved = area.drag_side(0, Side::new(0, true), 10.0);
+        let center = area.boxes()[0].center;
+        assert!(
+            center.abs().max_element() <= MAX_BOX_CENTER + 1e-5,
+            "{center}"
+        );
+        assert!(moved > 0.0 && area.boxes()[0].half.x <= MAX_BOX_HALF + 1e-6);
+
+        // Turned and described
+        assert!((area.turn_box(1, 4.0) - (4.0 - std::f32::consts::TAU)).abs() < 1e-6);
+        assert_eq!(area.turn_box(9, 1.0), 0.0);
+        assert!(
+            area.describe_box(0).contains(", yaw 28.6 deg"),
+            "{}",
+            area.describe_box(0)
+        );
+        assert!(
+            !PlayArea::single(domed_box())
+                .describe_box(0)
+                .contains("yaw")
+        );
+    }
+
+    #[test]
+    fn turned_box_region_and_uniforms() {
+        let mut area = PlayArea::single(AreaBox::new(
+            Vec3::new(0.2, 0.1, -0.3),
+            Vec3::new(0.4, 0.3, 0.2),
+        ));
+        area.turn_box(0, 0.7);
+        let placed = PlacedArea {
+            area_to_world: Mat4::from_rotation_translation(
+                Quat::from_rotation_y(0.4),
+                Vec3::new(1.0, 0.5, -1.0),
+            ),
+            area,
+        };
+        let region = placed.box_region(0);
+        // A point inside near a corner of the region is inside the area by the same distance
+        let local = Vec3::new(0.35, 0.25, 0.15);
+        let world = region.volume_to_world.transform_point3(local);
+        let e = local.abs() - region.half_extents;
+        let expected = e.max_element();
+        assert!((placed.signed_distance(world) - expected).abs() < 1e-5);
+        let data = area_uniforms(Some(&area));
+        let base = 8;
+        assert!((data[base + 24] - 0.7_f32.cos()).abs() < 1e-6);
+        assert!((data[base + 25] - 0.7_f32.sin()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn text_keeps_the_yaw_of_a_box() {
+        let mut area = PlayArea::test_layout(&MarkerBoxParams {
+            offset: Vec3::new(0.0, 0.15, 0.0),
+            size: Vec3::new(1.2, 0.9, 1.0),
+            extra_yaw: 0.0,
+        });
+        area.turn_box(1, 30_f32.to_radians());
+        let text = area.to_text(Some("RIG1"));
+        // Only the turned box has the line, right after its box line
+        assert_eq!(text.matches(BOX_YAW_KEY).count(), 2, "{text}");
+        let lines = text.lines().collect::<Vec<_>>();
+        let at = lines
+            .iter()
+            .position(|line| line.starts_with("box_yaw_deg 30.00"))
+            .unwrap();
+        assert!(lines[at - 1].starts_with("box "));
+        assert_eq!(
+            lines.iter().filter(|line| line.starts_with("box ")).count(),
+            2
+        );
+        let parsed = PlayArea::parse(&text).unwrap();
+        assert!(
+            parsed.ignored.is_empty() && parsed.warnings.is_empty(),
+            "{parsed:?}"
+        );
+        assert_eq!(parsed.area.boxes()[0].yaw, 0.0);
+        assert!((parsed.area.boxes()[1].yaw - 30_f32.to_radians()).abs() < 1e-5);
+        assert_eq!(parsed.area.to_text(Some("RIG1")), text);
+
+        // A file of before (no yaw lines) reads unturned; a reader of before leaves the yaw line out as
+        // unknown and keeps the boxes: what this parser does with an unknown key
+        let old = "alvr_play_area 1\nbox 0 0 0 0.5 0.5 0.5\n";
+        assert_eq!(PlayArea::parse(old).unwrap().area.boxes()[0].yaw, 0.0);
+        let unknown = text.replace(BOX_YAW_KEY, "box_tilt_deg");
+        let parsed = PlayArea::parse(&unknown).unwrap();
+        assert_eq!(parsed.area.len(), 2);
+        assert_eq!(parsed.ignored.len(), 1);
+
+        // Wrapped, a line without a box before it, one that is not a number
+        let parsed =
+            PlayArea::parse("alvr_play_area 1\nbox 0 0 0 1 1 1\nbox_yaw_deg 370\nbox_yaw_deg 5")
+                .unwrap();
+        assert!((parsed.area.boxes()[0].yaw - 10_f32.to_radians()).abs() < 1e-5);
+        assert_eq!(parsed.warnings.len(), 1);
+        assert!(parsed.warnings[0].contains("without a box"));
+        let parsed = PlayArea::parse("alvr_play_area 1\nbox_yaw_deg 5\nbox 0 0 0 1 1 1").unwrap();
+        assert_eq!(parsed.area.boxes()[0].yaw, 0.0);
+        assert_eq!(parsed.warnings.len(), 1);
+        assert!(PlayArea::parse("alvr_play_area 1\nbox 0 0 0 1 1 1\nbox_yaw_deg x").is_err());
     }
 
     #[test]

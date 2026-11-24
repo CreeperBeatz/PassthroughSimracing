@@ -1137,12 +1137,12 @@ mod tests {
                 // The bridges, and the radii at their ends
                 + 16 * 4
                 + 16
-                // The bounds of the play area, and its 8 boxes of 6 vectors
+                // The bounds of the play area, and its 8 boxes of 7 vectors
                 + 16 * 2
-                + 8 * 6 * 16
+                + 8 * 7 * 16
         );
         // 28 capsules per hand, the bridges from the wrists, the boxes of the play area
-        assert_eq!(DEPTH_UNIFORMS_SIZE, 4016);
+        assert_eq!(DEPTH_UNIFORMS_SIZE, 4144);
     }
 
     // A hand reaching out of a marker box: inside unchanged, outside nothing reaches even the rim,

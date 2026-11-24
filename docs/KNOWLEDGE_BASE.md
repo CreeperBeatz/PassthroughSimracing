@@ -1071,8 +1071,10 @@ shows the pose as last reported, with ` (size not trusted)` when it is not trust
 | `area_test` | unset | A test layout of the play area (see "Play area: boxes and domes") made from the box of the `marker_box_*` properties. 1: that box with a dome on its top (25 cm) and a second box on its +x side (40 cm beyond it, half as high, same floor). 8: that box cut into 2 x 2 x 2 boxes with domes on their 24 outer sides (15 cm), the worst case for the GPU. Unset, 0 or another number: the one box, as before. A change is logged. Polled |
 | `area_dashed` | unset | 1: the play area in the outline is dashed (4 cm period, 60 % drawn, fixed in the room). It is dashed anyway while it is placed from the anchor saved in the layout file, before the code is seen in this run (the editor). Polled |
 | `area_edit` | value at app start | Play area editor (see "Play area editor"). A change to 1 starts editing, a change to 0 ends it (and saves). The value at the start of the app is not a request: set 0, then 1. Only with a marker box, a play area placed and Passthrough = Depth (else logged: `area editor: can't edit`). Polled |
-| `area_pinch_on` / `area_pinch_off` | 10 / 25 | Editor: gap in mm between the surfaces of the thumb and index tips (joint distance minus the two joint radii) below which a pinch closes (2 updates in a row) / above which it opens (for 80 ms). 0 to 100; off is at least on + 5. Not measured yet: the editor logs the min/max gap every 5 s while editing. Polled |
+| `area_pinch_on` / `area_pinch_off` | 0 / 5 | Editor: gap in mm between the surfaces of the thumb and index tips (joint distance minus the two joint radii) below which a pinch closes (2 updates in a row) / above which it opens (for 80 ms). On -30 to 100 (negative: tips pressed together; contact measured -2 to -16 mm on 2026-11-24), off from on to 105 (may equal it). The editor logs the min/max gap every 5 s while editing. Polled |
 | `area_edit_dim` | 60 | Editor: how much the game is dimmed while editing, percent (0 to 90). Polled |
+| `area_edit_grace` | 8 | Editor: how long editing waits for a stopped stream (Passthrough = Depth) to come back before it ends, seconds (0 to 60). Polled |
+| `area_edit_hands_pc` | unset (0) | Editor: 1: the hands are sent to the PC also while editing; else no skeletons and no hand poses while editing. Polled |
 | `area_file` | unset (= 1) | 0: the layout files of the play area are neither read nor written: the box of the `marker_box_*` properties (and `area_test`) again, edits last until the app stops. Unset or another value: a layout file of the code replaces that box. A change reads the file again. Polled |
 
 The box frame is level (stage +Y up); only the heading comes from the code, never its tilt (a tilt error of
@@ -1112,7 +1114,8 @@ a valid pose now KEEPS the coordinates of the box (`debug.alvr.marker_carry` 0, 
 layout file and the pose frozen by the editor stay as they are, and at the change time the event is
 logged with the pose it reported (`marker box: stage space changed, coordinates kept (marker_carry 0; the
 reported pose (x, y, z) m, yaw d deg is not applied)`, and `area editor: stage space changed, coordinates
-of the saved anchor and the frozen pose kept (...)` while the editor has one). The reason, measured on
+of the saved anchor and the frozen pose kept (...)` while the editor has one, at most once a minute with
+the number left out since). The reason, measured on
 2026-11-24 (log `alvr-20261124-0839-bd0dc0f7.log` around 08:46:01): a STAGE event reported the pose
 (-0.130, 0.007, 0.167) m, yaw 39.4 deg in the previous space; the box was carried by it (`box carried over
 (moved by (0.256, -0.007, -0.144) m, yaw -39.4 deg ...)`), but the code measured 4 s later sat at the SAME
@@ -1199,7 +1202,10 @@ rate and the GPU load (VrApi) with and without `area_show 1`. If the lines are t
 layout of up to 8 boxes (`alvr/graphics/src/play_area.rs`, pure geometry with unit tests). Area frame:
 the level frame of the code that `marker_box` builds (+x to the right of the heading, +y up, -z along
 the heading), turned by the yaw of the layout (`marker_box_yaw` for the box of the properties). Every box
-is level and axis aligned in it (single boxes are never turned). Each of the 6 sides can bulge out as a
+is level; since the second build of 2026-11-24 each box has its own yaw (`AreaBox::yaw`, about the
+vertical axis through its center, counter-clockwise seen from above, 0: axis aligned): its frame is the
+area frame moved to its center and turned by it, and its half extents, sides, domes, handles and drags
+are those of that frame (`AreaBox::to_local` / `to_area` / `side_normal`). Each of the 6 sides can bulge out as a
 dome of height h (0: flat): the part beyond the side of a capsule that cuts the side along the largest
 stadium inside it (a circle on a square side: a spherical cap). Its rim radius b is half the shorter edge
 of the side, the capsule axis runs along the longer edge (half length a - b), radius R = (b^2 + h^2) / 2h,
@@ -1224,17 +1230,26 @@ Hands limited to the area (`marker_hands`) use the same distance on the CPU (`li
 Boxes that only touch have a distance of 0 on the side they share: the mask shows the real room there
 (coverage 0.5, full from 0.35 on), but hands would be thinned along it, so a box added next to another
 reaches 5 cm into it (`ADDED_BOX_OVERLAP`).
-Uniform block (`DepthUniforms`, Rust `depth_uniforms`, asserted 4016 bytes): `world_to_volume` became
+Uniform block (`DepthUniforms`, Rust `depth_uniforms`, asserted 4144 bytes; 4016 before the box yaw):
+`world_to_volume` became
 `world_to_area` (same place: stage to the area frame, or to the box of the settings), `volume_half_extents`
 became `area` (x: number of boxes, 0 with the Distance region); at the end after `hand_bridge_end` come
 `area_bounds` (2 vectors: center and half extents of all boxes with domes) and `area_boxes`, 8 x
-`AreaBox` of 6 vectors (center + tallest dome, half extents, R of the + and - sides, d of the + and -
-sides). The box of the settings ("Cockpit volume") is sent as one box centered in its frame.
+`AreaBox` of 7 vectors (center + tallest dome, half extents, R of the + and - sides, d of the + and -
+sides, `turn`: cosine and sine of the yaw of the box). `area_box_distance` turns the point back into the
+frame of the box (the same formula as `turn_y` in play_area.rs) and goes on as before; the bounds of a
+turned box are those of its turned corners (they hold it). The GPU test
+`play_area_mask_matches_the_rust_distance` has a box turned by 35 deg whose cut by the wall lies 10 cm
+beside the unturned one (checked: with the sign of the sine flipped in the shader the test fails). The
+box of the settings ("Cockpit volume") is sent as one box centered in its frame.
 The outline (`area_outline` in overlay.rs): the edges of the boxes without the parts strictly inside
-another box, and of each dome its rim and two arcs over its top (across and along the side), 8 segments
+another box (any yaw: each edge is cut where it enters and leaves the other box in that box's frame;
+across a face it runs along it must be inside by 1 mm), and of each dome its rim and two arcs over its top
+(across and along the side, drawn in the frame of the box), 8 segments
 per half circle, fewer (down to 2) when the layout would not fit in the 249 segments left per eye; the
-edges come first, the rest is cut and logged. Dumps (`key_dump`) write the first box as before plus
-`area_to_world` and `boxes` (center, half, the 6 dome heights as used).
+edges come first, the rest is cut and logged. Dumps (`key_dump`) write the first box as before (its
+region turned by its yaw) plus `area_to_world` and `boxes` (center, half, `yaw_deg`, the 6 dome heights
+as used).
 The layout as text (`PlayArea::to_text` / `PlayArea::parse`), saved and read by the editor (see "Play
 area editor", which adds an `anchor` line):
 ```
@@ -1243,8 +1258,14 @@ alvr_play_area 1
 payload RIG1
 yaw_deg 0.00
 box cx cy cz hx hy hz [dome+x dome-x dome+y dome-y dome+z dome-z]
+box_yaw_deg 30.00
 ```
-meters in the area frame, half extents, one box line per box (6 or 12 numbers). Unknown lines are kept
+meters in the area frame, half extents, one box line per box (6 or 12 numbers). `box_yaw_deg` (degrees)
+turns the box of the line before it and is written only for a turned box. The version stays 1, readable
+both ways: a file without the line reads unturned, and a build from before it reads a new file with
+the line left out as unknown (logged as `unknown, left out`), the boxes unturned. A `box_yaw_deg` without
+a box before it is left out with a warning, one that is not a number is an error, the angle is wrapped
+to -180..180. Unknown lines are kept
 aside, values out of the limits are clamped (with a warning), boxes after the 8th left out; a wrong
 first line, another version, a box line that does not read or no box is an error.
 
@@ -1268,14 +1289,18 @@ gesture, glyphs, undo, file name and text; unit tests). Only with a marker box a
   `marker_box 0`). Ending saves only if something was changed: entering and leaving without a change
   writes no file, and without a file the box of the properties stays the layout.
 - Hands: a hand is used only while its thumb and index tips are POSITION_TRACKED and its cursor (the
-  midpoint of the two tips) is within 50 deg of the view direction. Pinch on the gap between the tip
-  surfaces with hysteresis (`area_pinch_on/_off`); a closed pinch of a hand that is lost opens after
-  0.3 s. A frame without the eyes (head pose not valid) counts as both hands not seen, at the last view
-  (up to 1 s), so a grab then ends like a lost hand (the last displacement kept).
+  midpoint of the two tips) is within 50 deg of the view direction; the hand that holds a grab within 75
+  deg (an arm reaching for a far side leaves the middle of the view; the Quest 3 sees about 110 deg).
+  Pinch on the gap between the tip surfaces with hysteresis (`area_pinch_on/_off`, 0 / 5 mm since the
+  first headset run); a closed pinch of a hand that is lost opens after 0.3 s, of the hand that grabs
+  after 1 s. A frame without the eyes (head pose not valid) counts as both hands not seen, at the last
+  view (up to 1.5 s), so a grab then ends like a lost hand (the last displacement kept). The release
+  line says why the hand was lost (`tips not tracked`, `<n> deg from the view direction`, `no pose`).
 - Handles of the selected box: a square on each side (on top of its dome; drag along the normal: that
   side moves, the opposite stays), a small triangle beside it (up the side, along the longer edge on
   top and bottom; 35 % of the half extent, 4-12 cm) for the dome (drag out: higher, up to the rim; below
-  1.5 cm: flat), a diamond at the center (moves the box), "+" and a red "x" 9 cm above the center. The
+  1.5 cm: flat), a diamond at the center (moves the box), a curved arrow beside the center (turns the
+  box, see "Turning"), "+" and a red "x" 9 cm above the center. The
   other boxes show only a dim diamond; pinching any handle of a box selects it (cyan edges). Undo (an
   arrow) beside done above the code while there is something to take back (20 steps, per editing
   session). Handle size max(1.5 cm, 0.012 x distance), 1.3x and amber when lit, cyan when grabbed, with a
@@ -1286,15 +1311,46 @@ gesture, glyphs, undo, file name and text; unit tests). Only with a marker box a
   that line (ties within 1.5 deg: nearer to the eyes). The lit one stays against a 1 cm better one, up to
   10 cm away and 6 deg off. It is kept while the fingers close (gap below on + 10 mm).
 - Drags: relative to the cursor at the pinch (no jump), 8 mm dead zone caught up over the next 3 cm.
-  On release the value of 0.12 s before the release was confirmed is kept (the fingers move the cursor
-  while they open), the last one when the hand was lost. "+": a tap (moved under 2 cm) adds a box on the
+  A side or dome drag goes along the normal of the side of the box as it is turned. On release the
+  value of 0.12 s before the release was confirmed is kept (the fingers move the cursor while they
+  open), the last one when the hand was lost. Buttons act on any release of a usable hand, however far
+  it moved (until the first headset run they needed a tap under 2 cm: 14 of 15 presses were rejected,
+  the hand moved 22-186 mm between closing and opening the fingers). "+" adds a box on the
   side of the selected box the line of sight goes through first (from inside the box: where it leaves,
   from outside: where it enters), else the next side facing the eyes whose new box would not have its
-  center in another box; `PlayArea::add_box` sizes it. "x": held 0.8 s within 2 cm removes the box (a red
-  square closes around it), not on the last box. Undo and done: taps.
-- A two-hand gesture while one hand grabs drops the grab (the layout as before it).
+  center in another box (in the frame of the box); `PlayArea::add_box` sizes it and gives it the yaw of
+  the box it is added to. "x": held 0.8 s with the cursor within 8 cm of where the pinch closed removes
+  the box (a red square closes around it), not on the last box (it was 2 cm: held pinches drifted 23-50
+  mm on 2026-11-24, a hand pulled away on purpose 189 mm), only with the hand usable the whole time (the
+  pinch of a lost hand stays closed for 1 s, longer than the hold; else the square goes and it takes a
+  new pinch). Undo and done: a release.
+- Turning (`HandleKind::Turn`, the curved arrow): beside the center at its height, towards the +x +z
+  corner of the box, 60 % of the shorter horizontal half extent away from its vertical axis (6-15 cm).
+  The box turns about its vertical axis by the angle the cursor sweeps around that axis (added up per
+  frame, so more than half a turn works; a frame with the cursor nearer than 3 cm to the axis adds
+  nothing, so a grab near the axis turns once the cursor is out and crossing the axis does not flip the
+  box), relative to the pinch (no jump; nothing adds up within the 8 mm dead zone, the turn starts where
+  the cursor leaves it), with detents at multiples of 15 deg within 2 deg.
+  While grabbed: a dashed line from the center through the handle as it was, a line through it now
+  (green on a detent) and the arc between them (up to 6 segments). Release: `release turn of box #i:
+  yaw <deg> deg (turned by <deg> deg{, on a detent}), ...`. A box added next to a turned one is turned
+  like it; `describe_box` adds `, yaw <deg> deg` for a turned box.
+- A two-hand gesture while one hand grabs drops the grab (the layout as before it). Other ends of a grab
+  keep what it changed so far (as an undo step, saved): editing ends, the stream stops, the hands go
+  (no input for 1.5 s), a STAGE change: `grab of <handle> of box #i ended (<reason>), kept as it was: ...`.
+- Stream interruptions: without a stream with Passthrough = Depth editing pauses (`editing paused: ...`,
+  a grab kept, pinches reset) and goes on when it is back within `area_edit_grace` (8 s; `editing goes on
+  after <s> s without the stream`), counted from the last frame with the stream (so a paused session,
+  which has no frames, counts too); else it ends (`editing ended (no stream with Passthrough = Depth for
+  <s> s, ...)`, saved).
+- The PC: while editing the client sends no hand skeletons and no pose of a hand tracked as a hand
+  (`StreamContext::withhold_hands`; controllers are sent; `area_edit_hands_pc 1` sends them). The PC then
+  sees both hands as not tracked, as when they are out of view (with `steamvr_input_2_0` the hand
+  trackers disconnect; the last pose stays in the game). The streamer of 2026-11-24 has
+  `hand_tracking_interaction` off, so pinches never became trigger or menu clicks there
+  (`hand_gestures.rs` runs only with it on); this keeps them away also with it on.
 - Dimming: `DepthRenderInput.game_dim` goes to `lighting2.w` of the uniform block (unused before: no
-  layout change, the block stays 4016 bytes); `depth_passthrough` in stream.wgsl multiplies the game color
+  layout change, the block stayed 4016 bytes; 4144 since the box yaw); `depth_passthrough` in stream.wgsl multiplies the game color
   by 1 - dim in both the plain and the color key path. Tested on the PC GPU (`editing_dims_the_game`).
 - Layout file: one per code, `area-<payload, other than [A-Za-z0-9_-] as _, at most 40>-<FNV-1a of the
   payload, 8 hex>.txt` (`area-no-payload.txt` for a code without payload), in
@@ -1317,15 +1373,48 @@ gesture, glyphs, undo, file name and text; unit tests). Only with a marker box a
   code. The outline is dashed while placed from the saved anchor (the code outline is amber while the
   pose is being measured). Restoring before the code is seen needs `marker_box 1`; without `marker_id`
   the file is the newest one (its payload), so after a reboot only `marker_box 1` must be set again.
-- Not done: the pinches reach the PC as hand gestures (trigger clicks) while editing; no snapping or
-  minimum overlap of moved boxes (boxes that only touch thin a limited hand along the shared side); no
-  turning of the layout (yaw only in the file).
+- Not done: no snapping or minimum overlap of moved boxes (boxes that only touch thin a limited hand
+  along the shared side); no turning of the whole layout in the headset (its yaw only in the file; each
+  box turns on its own).
 
 ## Play area editor (v1)
 
 Summary of the two paragraphs above ("Play area: boxes and domes", "Play area editor"), written for the
-first headset test. Built 2026-11-24, checked only on the PC (`cargo test -p alvr_graphics`, 178 tests
-incl. GPU and shader parse; `cargo check -p alvr_client_openxr`); nothing of it has run on the Quest.
+first headset test. Built 2026-11-24 (aafcbcd3, d98535d2), first run on the Quest the same morning (see
+"First headset run"); the second build of that day (box yaw, buttons, pinch at contact, pauses over
+stream interruptions, hands kept from the PC) is checked only on the PC (`cargo test -p alvr_graphics`,
+202 tests incl. GPU and shader parse; `cargo test` / `clippy -p alvr_client_openxr`, also for
+`aarch64-linux-android`).
+
+**First headset run (2026-11-24, build d98535d2, log `alvr-20261124-1047-d98535d2.log`).** It worked end
+to end: 10 times into editing with the two-hand gesture, 130 grabs, sides, domes and moves, 3 boxes
+added and 1 removed, the file saved after each change (`/data/local/tmp/alvr-areas` could not be
+written: `Permission denied`, logged once, as expected). The user: "other stuff is good enough for now -
+it gets the job done". What the log showed:
+- Buttons: 25 of 29 presses of "+", undo and done were rejected as `not a tap (moved 13-307 mm)`: the
+  hand moves while the fingers close and open. Now any release counts for a button. The remove hold
+  failed 5 times at 23-50 mm of drift with the 2 cm limit, now 8 cm.
+- Pinch: with on 10 mm the pinch closed while the fingers were still 1-2 cm apart ("the tap registers
+  while my fingers are still around 1-2cm away"); at contact the gap measured -2 to -16 mm. After live
+  changes (2/15, 0/15, 0/5 mm) the user kept 0 / 5 mm: now the defaults; the properties may go negative
+  and off may equal on.
+- 14 drags ended `(hand lost)` (mostly the ±x sides and a dome reached 0.5 m to the side): the reason was
+  not logged (out of the 50 deg cone or tips not tracked); now the hand that grabs may be 75 deg off the
+  view and is kept 1 s, and the line says why.
+- 4 times editing ended `(Passthrough is not Depth)`, once in the middle of a drag (11:05:15, the drag
+  was dropped): each time the stream had stopped (`marker box: placed but not used`, then `hand removal
+  ... at the start of the depth` of a new stream 2-12 s later). The streamer log
+  (`session_log.txt` of the 241f051e streamer) has `Client disconnected ... (os error 10053/10054)` at the
+  same moments (its clock is about 1.5 s ahead), no restart request and no settings change; the stream
+  came back with Passthrough = Depth each time. Two kinds: at 11:04:13, 11:05:15, 11:08:28 and 11:17:51
+  the client kept rendering (no gap in the log, frames went stale for 1-2 s): a network stall that
+  tripped the 2 s keepalive of the connection; at 11:10:58, 11:11:45, 11:24:50 and 11:28:17 the log has a
+  gap of 5-33 s before and the marker tracker was created again: the OpenXR session paused (headset
+  taken off or asleep). Not the pinches: `hand_tracking_interaction` is off on the streamer, so
+  `hand_gestures.rs` never turned them into clicks. Now editing pauses and goes on (`area_edit_grace`).
+- STAGE changes with only a vertical part (+0.15 to +0.46 m, then back within 1.5 s) came 46 times in
+  35 min, each logged by the editor; with `marker_carry 0` they are ignored. The editor now logs at most
+  one such line a minute (with the number left out).
 
 **What it is.** After the code is scanned, the play area (the part of the real room shown through the
 game) is drawn in the headset as an outline together with the code. With a two-hand pinch the person
@@ -1333,8 +1422,9 @@ enters edit mode: the game is dimmed, handles appear on the boxes, and with a on
 are pulled, domes raised, boxes moved, added and removed. The mask, the hand limit and the outline follow
 the hand at once. The layout is saved in a file per code and comes back after a restart.
 
-**Shape model.** Up to 8 boxes, all level and axis-aligned in the area frame (the level frame of the code,
-turned only by the yaw of the layout, which exists only in the file). Each of the 6 sides can carry a
+**Shape model.** Up to 8 boxes, all level in the area frame (the level frame of the code, turned by the
+yaw of the layout, which exists only in the file), each turned by its own yaw about its vertical axis
+(the curved arrow handle; 0: axis-aligned). Each of the 6 sides can carry a
 dome (a spherical cap on a square side) of a height; 0 or under 5 mm is flat, the maximum is half the
 shorter edge of the side, the corners stay flat. Limits: half extent 2.5 cm to 2.5 m, center within
 3 m. The mask is the signed distance of the union with the usual feather.
@@ -1345,9 +1435,12 @@ alvr_play_area 1
 payload RIG1
 yaw_deg 0.00
 box cx cy cz hx hy hz [dome+x dome-x dome+y dome-y dome+z dome-z]
+box_yaw_deg 30.00
 anchor x y z heading_deg
 ```
-Metres, area frame, half extents. Name `area-<payload>-<8 hex>.txt` (`area-no-payload.txt` without a
+Metres, area frame, half extents in the frame of the box; `box_yaw_deg` turns the box line before it
+(only written for a turned box; older builds leave it out as unknown and read the box unturned, files
+without it read unturned: the version stays 1). Name `area-<payload>-<8 hex>.txt` (`area-no-payload.txt` without a
 payload). Folders: `/sdcard/Android/data/alvr.client.dev/files/areas/` (lost by every CI uninstall) and
 `/data/local/tmp/alvr-areas/` (survives, but the app probably cannot write it; `tools/install_apk.sh`
 copies the first into it before the uninstall). The newer file that reads wins. A file replaces the
@@ -1357,21 +1450,30 @@ copies the first into it before the uninstall). The newer file that reads wins. 
 - Start/end: both hands pinched, palms away from the eyes (cos at least 0.5), pinch points at most 20 cm
   apart, each 15-65 cm from the eyes and within 45 deg of the view, held 1.5 s (drops under 0.15 s ignored).
   Also `area_edit` 1/0, the done handle, 120 s without a grab, loss of the play area.
-- Pinch: closes below a tip gap of 10 mm (2 updates), opens above 25 mm for 80 ms; a lost hand opens
-  after 0.3 s. A hand is used when both tips are tracked and the cursor is within 50 deg of the view.
+- Pinch: closes below a tip gap of 0 mm (2 updates; the tips pressed together), opens above 5 mm for
+  80 ms; a lost hand opens after 0.3 s, the hand that grabs after 1 s. A hand is used when both tips
+  are tracked and the cursor is within 50 deg of the view (75 deg for the hand that grabs).
 - Picking: nearest handle within 8 cm; line of sight (4 deg, ties 1.5 deg) when out of reach; hysteresis 1 cm / 10 cm / 6 deg.
-- Drag: 8 mm dead zone caught up over 3 cm; release keeps the value of 0.12 s earlier; dome under 1.5 cm snaps flat.
-- Handles: square per side, triangle for the dome, diamond for moving, "+" (tap, moved under 2 cm), red
-  "x" (held 0.8 s, not on the last box), undo (20 steps) and done above the code. Game dimmed 60 %.
+- Drag: 8 mm dead zone caught up over 3 cm; release keeps the value of 0.12 s earlier; dome under 1.5 cm
+  snaps flat; side and dome drags along the turned normal.
+- Turn: the angle swept around the vertical axis of the box (3 cm dead radius), detents every 15 deg
+  within 2 deg, guide lines while grabbed.
+- Handles: square per side, triangle for the dome, diamond for moving, curved arrow for turning, "+"
+  (any release), red "x" (held 0.8 s within 8 cm, not on the last box), undo (20 steps) and done above
+  the code (any release). Game dimmed 60 %.
+- Stream interruptions: editing pauses up to 8 s (`area_edit_grace`), a grab is kept; the hands are not
+  sent to the PC while editing.
 
 **Properties (all `debug.alvr.*`, polled).**
 
 | Property | Default | Meaning |
 |---|---|---|
 | `area_edit` | value at app start | change to 1 starts editing, to 0 ends it and saves; set 0 then 1 |
-| `area_pinch_on` | 10 mm | tip gap below which a pinch closes |
-| `area_pinch_off` | 25 mm | tip gap above which a pinch opens (at least on + 5) |
+| `area_pinch_on` | 0 mm | tip gap below which a pinch closes, -30 to 100 (negative: tips pressed together; contact measured -2 to -16) |
+| `area_pinch_off` | 5 mm | tip gap above which a pinch opens, from `area_pinch_on` to 105 (may equal it) |
 | `area_edit_dim` | 60 % | dimming of the game while editing, 0 to 90 |
+| `area_edit_grace` | 8 s | how long editing waits for a stopped stream to come back before it ends, 0 to 60 |
+| `area_edit_hands_pc` | unset (0) | 1: the hands are sent to the PC also while editing; else no skeletons and no hand poses while editing |
 | `area_file` | unset (on) | 0: no layout file read or written, the property box again |
 | `area_test` | unset | 1: test layout (box with a dome and a second box); 8: 8 boxes, 24 domes; else the one box |
 | `area_dashed` | unset | 1: area drawn dashed (4 cm period, 60 % drawn) |
@@ -1388,15 +1490,44 @@ copies the first into it before the uninstall). The newer file that reads wins. 
 | `area editor: play area placed from the code`, `... from the anchor saved in the layout file` | placement; the second is drawn dashed |
 | `area editor: two-hand gesture held (1.5 s to start or end editing)`, `... let go after <s> s` | the gesture is recognised; at most every 2 s; the false-trigger check |
 | `area editor: editing (gesture or area_edit 1), game dimmed by <n> %` | edit mode on |
-| `area editor: editing ended (<reason>)`, with `, nothing changed` when so | edit mode off |
+| `area editor: editing ended (<reason>)`, with `, nothing changed` when so | edit mode off; reasons: gesture, done handle, area_edit 0, no grab for 120 s, marker box off, no play area, `no stream with Passthrough = Depth for <s> s, more than area_edit_grace <n> s`, another code, area_file changed |
+| `area editor: editing paused: no stream with Passthrough = Depth (...)`, `editing goes on after <s> s without the stream (it is back)` | a stream interruption while editing |
 | `area editor: pinch gap min/max over 5 s: left a/b mm, right ..` | measured gaps, every 5 s while editing |
-| `area editor: grab <handle> of box #i (left or right hand)` | a pinch took a handle |
-| `area editor: release <handle> ..: moved, dome, moved by <m> m` or `no change` | drag result |
-| `area editor: added box #n ...`, `removed box #i`, `remove .. not done`, `undo (n more)`, `nothing to undo` | box buttons |
+| `area editor: grab <handle> of box #i (left or right hand)` | a pinch took a handle (`side +x`, `dome +y`, `center`, `turn`, `add`, `remove`, `undo`, `done`) |
+| `area editor: release <handle> of box #i{ (hand lost: tips not tracked \| <n> deg from the view direction \| no pose)}: moved, dome, moved by <m> m, yaw <deg> deg (turned by <deg> deg{, on a detent})` or `no change` | drag or turn result; why a hand was lost |
+| `area editor: grab of <handle> of box #i ended (<reason>), kept as it was: ...` or `..., nothing changed`; `grab of .. dropped (two-hand gesture)` | a grab ended other than by its pinch (editing ended, stream stopped, no hands, stage space changed) |
+| `area editor: release <button>{ (hand lost: ..)}: nothing done (...)` | a button released while the hand was lost |
+| `area editor: added box #n ...`, `removed box #i`, `remove .. not done (held <s> s, moved <mm> mm; it needs 0.8 s held within 80 mm)`, `undo (n more)`, `nothing to undo` | box buttons |
+| `area editor: stage space changed, coordinates of the saved anchor and the frozen pose kept (...){; <n> more such changes since the last line, not logged (...)}` | at most once a minute |
+| `area editor: editing waits <n> s for the stream to come back`, `the hands are (not) sent to the PC ... (area_edit_hands_pc ..)` | those properties changed |
 | `area editor: saved <path> (<why>, n boxes, ..)`, `could not save <path>: <err>` | per folder; a failure is logged once |
 | `area editor: can't edit (area_edit 1): ..` | no play area, or Passthrough is not Depth |
 
-**Headset test checklist** (box on, code measured, Passthrough = Depth; read the log after each step).
+**Headset checklist for the second build** (box on, code measured, Passthrough = Depth; property
+defaults; read the log after each step).
+1. Pinch: the cursor turns into a square only when the fingertips touch (not 1-2 cm before); `pinch gap`
+   lines show the gaps. Two-hand gesture still starts editing.
+2. Buttons: "+", undo and done each work on the first press even with a sloppy hand (`added box`, `undo`,
+   `editing ended (done handle)`); "x" held 0.8 s removes without holding the hand very still.
+3. Turn: pinch the curved arrow beside the center, move the hand around the box: the box turns live
+   with no jump at the pinch, the amber guide and arc show the angle, the line turns green at 0/15/30
+   deg; release: `release turn of box #i: yaw .. deg (turned by .. deg, on a detent)`. The hole in the
+   game follows the turned box exactly (also its domes).
+4. On a turned box: pull a side (it moves along its own normal, guide line along it), raise a dome,
+   "+" (the new box is turned like it, on the side looked at), move it. Restart the app: `loaded ...`
+   with `yaw .. deg` in the layout line, the box still turned.
+5. Far sides: grab a ±x side or dome and pull it out to the side while looking ahead: no `(hand lost)`
+   unless the hand really leaves the view; when it does, the line says why.
+6. Stream interruption: during a drag, lift the headset off the eyes for 2-3 s and put it back (the
+   session pauses and the stream reconnects, 5-7 s in all): `editing paused`, `grab of .. ended (stream
+   stopped), kept as it was`, then `editing goes on after .. s`; the dimmed editor is back with the change
+   kept. Off for 20 s: `editing ended (no stream ... for .. s ...)`, saved.
+7. The PC while editing: in SteamVR the hands show as not tracked (no hand models moving with the
+   pinches), back after editing; `area_edit_hands_pc 1` sends them again.
+8. Log: STAGE pairs give at most one `area editor: stage space changed ...` line per minute.
+
+**Headset test checklist of the first build** (box on, code measured, Passthrough = Depth; read the log
+after each step).
 1. `setprop debug.alvr.area_test 1`, `area_show 1`: a dome on the box and a second lower box, the real
    room inside both; log `play area: test layout 1`. Then `area_test 0`.
 2. Unset `area_test`: the mask looks as before (one box, no domes); `area_dashed 1` makes the dashes stay put in the room.
@@ -1417,16 +1548,15 @@ copies the first into it before the uninstall). The newer file that reads wins. 
     `area_file 0`: the property box again.
 12. Cost: App GPU time with `area_test` unset, 1, 8; and editing against not editing (hands located every frame).
 
-**Not verified yet.** Anything on the Quest. In particular: whether the two-hand gesture starts (pinch
-gap at contact, the palm normal sign `-Y` of the palm joint, a clash with the Meta system pinch, hand
-tracking with the hands close); false triggers while driving; hand data at the predicted display time;
-drag feel and handle sizes; reachability of the handles from the seat (centre, "+" and "x" may be
-inside the body); the dashed restore and the saved anchor in the right place; whether the app can write
-/data/local/tmp/alvr-areas; the dimming in both the plain and the colour key path; GPU cost of the
-shader (area_test 1 and 8) and the 16 KB overlay uniform block on Adreno; dashes on lines clipped at the
-near plane crawl. Known gaps: pinches still reach the PC as trigger clicks, moved boxes are not
-snapped to overlap, no turning of the layout, undo is cleared on each entry, and the hands outside the
-area are seen over the dimmed game only through the colour key.
+**Not verified yet.** Verified by the first run: the gesture starts and ends editing, drags, domes,
+moves, add/remove, saving; the app can not write /data/local/tmp/alvr-areas. Not yet on the Quest:
+everything of the second build (turning, the button and pinch changes, the pause over stream
+interruptions, the hands kept from the PC, the wider cone of a grab); false triggers while driving; the
+dashed restore and the saved anchor in the right place; the dimming in the colour key path; GPU cost of
+the shader (area_test 1 and 8, now with the turn of each box) and the 16 KB overlay uniform block on
+Adreno; dashes on lines clipped at the near plane crawl. Known gaps: moved boxes are not snapped to
+overlap, the whole layout does not turn in the headset, undo is cleared on each entry, and the hands
+outside the area are seen over the dimmed game only through the colour key.
 
 **The printed codes** (2026-11-23). Three codes with the payloads `RIG1`, `RIG2` and `RIG3`, black edge on
 the paper 144.2, 95.6 and 67.4 mm. The printer scaled the page to 96 %: the 100 mm check bar measured
@@ -1548,18 +1678,25 @@ Log lines (`ALVR_CAM`, all start with `marker`):
   the properties, which is then not used.
 - Editor (`area editor:`): `editing (gesture | area_edit 1), game dimmed by <n> %, placed from <the
   code | the saved anchor>: <layout>`; `editing ended (gesture | done handle | area_edit 0 | no grab for
-  120 s | marker box off | no play area | Passthrough is not Depth | another code | area_file changed),
-  <layout>{, nothing changed}`; `the edited layout replaces the box of the marker_box properties from now
+  120 s | marker box off | no play area | no stream with Passthrough = Depth for <s> s, more than
+  area_edit_grace <n> s | another code | area_file changed), <layout>{, nothing changed}` (`Passthrough is
+  not Depth` in the first build); `editing paused: no stream with Passthrough = Depth (...)` and `editing
+  goes on after <s> s without the stream (it is back)`; `the edited layout replaces the box of the marker_box properties from now
   on (...)` at the first change of the box of the properties; `stage space changed without a pose, the
   saved anchor is dropped until the code is seen`; `no code seen yet and no marker_id: the layout of
   "<payload>", saved last (<path>)` or `...: the newest layout file (<path>) names no payload, waiting for
   a code`; `can't list <dir>: <error>`; `can't
   edit (area_edit 1): no play area (...)`; `two-hand gesture held (1.5 s to start | end editing)` and
-  `two-hand gesture let go after <s> s` (at most every 2 s); `grab <side +x | dome +y | center | add |
-  remove | undo | done> of box #<i> (left | right hand)`; `release <handle> of box #<i>{ (hand lost)}:
-  moved <m> m | dome <m> m | moved by <m> m, #<i> at (x, y, z) m, w x h x d m{, dome ...}` or `...: no
-  change`; `release <handle>: not a tap (moved <mm> mm), nothing done`; `grab of <handle> of box #<i>
-  dropped (two-hand gesture | editing ended | stage space changed | no hands)`; `added box #<n> on side
+  `two-hand gesture let go after <s> s` (at most every 2 s); `grab <side +x | dome +y | center | turn |
+  add | remove | undo | done> of box #<i> (left | right hand)`; `release <handle> of box #<i>{ (hand
+  lost: tips not tracked | <n> deg from the view direction | no pose)}: moved <m> m | dome <m> m | moved by
+  <m> m | yaw <deg> deg (turned by <deg> deg{, on a detent}), #<i> at (x, y, z) m, w x h x d m{, yaw <deg>
+  deg}{, dome ...}` or `...: no change`; `release <add | undo | done>{ (hand lost: ...)}: nothing done (a
+  button acts only when the pinch opens with the hand in view)` (`not a tap (moved <mm> mm)` in the first
+  build); `grab of <handle> of box #<i> dropped (two-hand gesture)`; `grab of <handle> of box #<i> ended
+  (editing ended | stream stopped | no hands | stage space changed), kept as it was: <box> | nothing
+  changed`; `stage space changed, coordinates of the saved anchor and the frozen pose kept (marker_carry 0;
+  ...){; <n> more such changes since the last line, not logged (at most one line per 60 s)}`; `added box #<n> on side
   <s> of box #<i>: ...` or `no room for a box next to box #<i> (...)`; `removed box #<i>, <layout>` or
   `remove of box #<i> not done (held <s> s, moved <mm> mm; ...)`; `undo (<n> more), <layout>` or `nothing
   to undo`; `saved <path> (<why>, <n> boxes, with the anchor | no anchor measured yet)` or `could not
@@ -1571,8 +1708,10 @@ Log lines (`ALVR_CAM`, all start with `marker`):
   marker_box properties`; `<path> does not read: <error>`; `can't read <path>: <error>`; `play area
   placed from the code | from the anchor saved in the layout file, the code at (...) m, heading <deg> deg
   (dashed until the code is seen) | no play area placed`; `pinch gap min/max over 5 s: left <a>/<b>
-  mm, right - mm (closes below 10, opens above 25)` while editing; `a pinch closes below a gap of <n> mm
-  and opens above <n> mm`, `the game is dimmed by <n> % while editing`, `layout files are (not) used
+  mm, right - mm (closes below 0, opens above 5)` while editing; `a pinch closes below a gap of <n> mm
+  and opens above <n> mm`, `the game is dimmed by <n> % while editing`, `editing waits <n> s for the
+  stream to come back`, `the hands are not sent to the PC while editing (area_edit_hands_pc 0)` / `... are
+  sent to the PC also while editing (area_edit_hands_pc 1)`, `layout files are (not) used
   (area_file ...)` when those properties change.
 - `area: outline shown (editing | editing ended | edit gesture)` from the editor (these override
   `area_show 0`).

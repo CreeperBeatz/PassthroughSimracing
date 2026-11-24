@@ -25,8 +25,9 @@ struct PlayzoneEye {
     // Tangents of the fov: left, right, down, up
     tangents: vec4f,
 }
-// A level box of the play area, axis aligned in the area frame, with a dome on each side (see
-// play_area.rs). The dome of a side is a capsule of radius R whose axis lies d below the side
+// A level box of the play area, turned about the vertical axis through its center, with a dome on each
+// side (see play_area.rs). The dome of a side is a capsule of radius R whose axis lies d below the side.
+// Sides, half extents and domes are those of the frame of the box
 struct AreaBox {
     // xyz: center (area frame), w: height of the tallest dome (0: no dome)
     center: vec4f,
@@ -38,6 +39,8 @@ struct AreaBox {
     // d of the domes of the +X, +Y, +Z sides and of the -X, -Y, -Z sides
     dome_depth_pos: vec4f,
     dome_depth_neg: vec4f,
+    // x: cosine, y: sine of the yaw of the box (counter-clockwise seen from above)
+    turn: vec4f,
 }
 struct DepthUniforms {
     eyes: array<DepthEye, 2>,

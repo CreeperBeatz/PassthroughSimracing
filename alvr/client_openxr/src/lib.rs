@@ -850,6 +850,8 @@ pub fn entry_point() {
                     marker_region.limits_hands() && !area_editor.is_editing(),
                 );
                 stream.set_game_dim(area_editor.game_dim());
+                // The pinches of the editor are not sent to the PC
+                stream.withhold_hands(area_editor.withholds_hands());
             }
             // The box applies only to a stream with Passthrough = Depth
             let used = region_override.map(|_| {

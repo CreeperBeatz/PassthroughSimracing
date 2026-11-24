@@ -425,7 +425,11 @@ fn area_signed_distance(point: vec3f, feathering: f32) -> f32 {
 // A box with its domes, a copy of AreaBox::signed_distance
 fn area_box_distance(point: vec3f, index: u32, feathering: f32) -> f32 {
     let area_box = depth_u.area_boxes[index];
-    let local = point - area_box.center.xyz;
+    // Into the frame of the box: turned back by its yaw (turn_y of play_area.rs with minus the sine)
+    let offset = point - area_box.center.xyz;
+    let c = area_box.turn.x;
+    let s = area_box.turn.y;
+    let local = vec3f(c * offset.x - s * offset.z, offset.y, c * offset.z + s * offset.x);
     let half = area_box.half.xyz;
     let e = abs(local) - half;
     let plain = length(max(e, vec3f(0.0))) + min(max(e.x, max(e.y, e.z)), 0.0);

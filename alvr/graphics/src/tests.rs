@@ -2416,6 +2416,16 @@ fn play_area_mask_matches_the_rust_distance() {
     let added = area.add_box(0, Side::new(1, false)).unwrap();
     area.drag_side(added, Side::new(0, true), 0.45);
     area.move_box(added, Vec3::new(0.0, -0.05, 0.0));
+    // A box turned by 35 deg about +Y, its center 15 cm in front of the wall: the wall cuts it 10 cm
+    // to the side of where the box without its yaw would be
+    let turned = area.add_box(0, Side::new(1, true)).unwrap();
+    area.move_box(
+        turned,
+        Vec3::new(0.48, 0.0, 0.15) - area.boxes()[turned].center,
+    );
+    area.drag_side(turned, Side::new(0, true), -0.1);
+    area.turn_box(turned, 35_f32.to_radians());
+    let turned_box = area.boxes()[turned];
     // The area frame is turned and moved: the wall is at z = 0 in it
     let area_to_world =
         Mat4::from_rotation_translation(Quat::from_rotation_z(0.1), Vec3::new(0.0, 0.0, -wall));
@@ -2442,7 +2452,7 @@ fn play_area_mask_matches_the_rust_distance() {
     );
 
     // Pixel centers on the wall (view uv origin top-left, +Y up)
-    let (mut inside, mut outside, mut dome) = (0, 0, 0);
+    let (mut inside, mut outside, mut dome, mut in_turned) = (0, 0, 0, 0);
     for y in 0..TARGET_SIZE {
         for x in 0..TARGET_SIZE {
             let u = (x as f32 + 0.5) / TARGET_SIZE as f32;
@@ -2458,8 +2468,18 @@ fn play_area_mask_matches_the_rust_distance() {
                 assert_eq!(alpha, 0.0, "inside at {x}, {y}: {distance}");
                 inside += 1;
                 let local = area_to_world.inverse().transform_point3(point);
-                if local.x > -0.08 + 0.04 && local.y > 0.0 {
+                if local.x > -0.08 + 0.04 && local.y > 0.0 && local.x < 0.2 {
                     dome += 1;
+                }
+                // In the turned box but not where the box would be without its yaw
+                let unturned = AreaBox {
+                    yaw: 0.0,
+                    ..turned_box
+                };
+                if turned_box.signed_distance(local, f32::INFINITY) < -0.02
+                    && unturned.signed_distance(local, f32::INFINITY) > 0.02
+                {
+                    in_turned += 1;
                 }
             } else {
                 assert_eq!(alpha, 1.0, "outside at {x}, {y}: {distance}");
@@ -2468,8 +2488,8 @@ fn play_area_mask_matches_the_rust_distance() {
         }
     }
     assert!(
-        inside > 200 && outside > 1000 && dome > 20,
-        "{inside} {outside} {dome}"
+        inside > 200 && outside > 1000 && dome > 20 && in_turned > 10,
+        "{inside} {outside} {dome} {in_turned}"
     );
 
     // One box: the same mask from the settings and as a placed area

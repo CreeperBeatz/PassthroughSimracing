@@ -5,25 +5,35 @@
 //!
 //! Modes: hidden (racing: only the two-hand gesture is watched), shown (the outline for 3 s after
 //! editing ended) and editing (the game dimmed, the handles drawn, the hands pick and drag them, the
-//! mask follows at once; the pose of the code is frozen while editing).
+//! mask follows at once; the pose of the code is frozen while editing; the hands are not sent to the
+//! PC, see `StreamContext::withhold_hands`).
 //! The two-hand gesture starts and ends editing: both hands pinched (thumb and index tips), both palms
 //! turned away from the eyes, the two pinches within 20 cm of each other, 15 to 65 cm from the eyes and
 //! within 45 degrees of the view direction, held 1.5 s (the outline brightens and a square closes
 //! between the hands). Hands on a wheel don't pinch, are about 30 cm apart and turned towards the rim.
 //! Editing also ends with the done handle (a check mark above the code), after 120 s without a grab,
-//! and when the play area goes (marker box off, another code, no Passthrough = Depth). Ending saves
-//! if something was changed (entering and leaving without a change writes no file).
+//! and when the play area goes (marker box off, another code). Without a stream with Passthrough =
+//! Depth (the stream stopped and restarts, the headset was taken off) editing pauses: a grab in
+//! progress is released where it was (kept), and editing goes on when the stream is back within
+//! `area_edit_grace` seconds, else it ends. Ending saves if something was changed (entering and leaving
+//! without a change writes no file); a grab in progress is kept.
 //! While editing the hands are not limited to the play area (the handles are on and outside it).
 //! A hand is used only while both its tips are tracked and its cursor is within 50 degrees of the view
-//! direction (the runtime reports hands as tracked also out of view).
+//! direction (the runtime reports hands as tracked also out of view); the hand that grabs within 75
+//! degrees, and its pinch opens only after it was not usable for 1 s (else 0.3 s). The hold of "x"
+//! removes only if its hand was usable the whole time (else: a new pinch).
 //!
 //! Experimental, controlled with adb (polled about twice a second):
 //! - `debug.alvr.area_edit`: a change to 1 starts editing, a change to 0 ends it (the value at the
 //!   start of the app is not a request: set 0, then 1)
 //! - `debug.alvr.area_pinch_on` / `debug.alvr.area_pinch_off <mm>`: gap between the surfaces of the
-//!   thumb and index tips (distance of the joints minus their radii) that closes / opens a pinch (10 /
-//!   25, 0 to 100; off at least on + 5)
+//!   thumb and index tips (distance of the joints minus their radii) below which a pinch closes /
+//!   above which it opens (0 / 5; on -30 to 100, off from on to 105: negative is the tips pressed into
+//!   each other, which measured -2 to -16 mm at contact on the Quest)
 //! - `debug.alvr.area_edit_dim <percent>`: how much the game is dimmed while editing (60, 0 to 90)
+//! - `debug.alvr.area_edit_grace <s>`: how long editing waits for the stream to come back (8, 0 to 60)
+//! - `debug.alvr.area_edit_hands_pc 1`: the hands are sent to the PC also while editing (unset or 0:
+//!   not sent while editing)
 //! - `debug.alvr.area_file 0`: layout files are neither read nor written, edits last until the app
 //!   stops (unset or another value: they are)
 //!
@@ -46,11 +56,11 @@ use crate::{
     marker_region::MarkerRegion,
     passthrough::{self, debug_property},
 };
-use alvr_common::glam::{Vec3, Vec4};
+use alvr_common::glam::{Mat4, Vec3, Vec4};
 use alvr_graphics::{
-    EditorHand, EditorInput, Handle, HandleId, HandleKind, HoldTimer, OVERLAY_AMBER, OVERLAY_CYAN,
-    OVERLAY_DIM, OVERLAY_GREEN, OVERLAY_RED, OVERLAY_WHITE, OverlaySegment, Pinch, PinchEvent,
-    PlacedArea, PlayArea, SavedAnchor, StageEvent, UndoStack,
+    AreaBox, EditorHand, EditorInput, Handle, HandleId, HandleKind, HoldTimer, OVERLAY_AMBER,
+    OVERLAY_CYAN, OVERLAY_DIM, OVERLAY_GREEN, OVERLAY_RED, OVERLAY_WHITE, OverlaySegment, Pinch,
+    PinchEvent, PlacedArea, PlayArea, SavedAnchor, StageEvent, UndoStack,
 };
 use openxr as xr;
 use std::{
@@ -67,11 +77,19 @@ const SHOWN_AFTER_EDIT: Duration = Duration::from_secs(3);
 // Editing ends after this long without a grab (seconds)
 const IDLE_TIMEOUT_S: f64 = 120.0;
 // A frame without the eyes uses the last view this long, with the hands not seen (seconds): longer
-// than a lost hand keeps its pinch, so that a grab ends as when the hand is lost
-const VIEW_HOLD_S: f64 = 1.0;
-const DEFAULT_PINCH_ON_MM: i64 = 10;
-const DEFAULT_PINCH_OFF_MM: i64 = 25;
+// than the hand that grabs keeps its pinch, so that a grab ends as when the hand is lost
+const VIEW_HOLD_S: f64 = 1.5;
+// See `DEFAULT_PINCH_ON` of area_edit.rs
+const DEFAULT_PINCH_ON_MM: i64 = 0;
+const DEFAULT_PINCH_OFF_MM: i64 = 5;
 const DEFAULT_DIM_PERCENT: i64 = 60;
+// How long editing waits for the stream to come back (seconds): on 2026-11-24 the stream stopped and
+// came back within 2.9-3.4 s four times without the session pausing, and 7-13 s with the headset
+// taken off for 5-10 s
+const DEFAULT_GRACE_S: i64 = 8;
+// STAGE changes kept with marker_carry 0 are logged at most this often (they come in pairs every
+// minute or two)
+const STAGE_LOG_INTERVAL_S: f64 = 60.0;
 // While the fingers close (gap below `on` plus this) the lit handle stays (meters)
 const HOVER_LOCK_MARGIN: f32 = 0.01;
 // The gaps of the pinches are logged this often while editing (seconds)
@@ -120,19 +138,30 @@ struct Grab {
     start_cursor: Vec3,
     start_layout: PlayArea,
     start_time: f64,
-    // Displacements of the cursor since the pinch (stage space) with their times, newest last
-    history: VecDeque<(f64, Vec3)>,
+    // Displacements of the cursor since the pinch (stage space) and the angle swept around the
+    // vertical axis of the box (turning, radians), with their times, newest last
+    history: VecDeque<(f64, Vec3, f32)>,
     // Largest displacement so far (meters)
     max_move: f32,
+    // Turning: the angle swept so far and the cursor it was last measured at (area frame)
+    swept: f32,
+    turn_from: Vec3,
+    // The yaw is on a detent
+    snapped: bool,
     // The remove handle did its work
     removed: bool,
+    // Why the hand was last not usable during the grab, for the log
+    lost_reason: Option<String>,
 }
 
 impl Grab {
-    // The displacement to keep on release: before the fingers opened (see `RELEASE_LOOKBACK_S`),
-    // the last one when the hand was lost
-    fn release_displacement(&self, now: f64, lost: bool) -> Vec3 {
-        let last = self.history.back().map_or(Vec3::ZERO, |(_, d)| *d);
+    // The displacement and the angle to keep on release: before the fingers opened (see
+    // `RELEASE_LOOKBACK_S`), the last ones when the hand was lost
+    fn release_values(&self, now: f64, lost: bool) -> (Vec3, f32) {
+        let last = self
+            .history
+            .back()
+            .map_or((Vec3::ZERO, 0.0), |(_, d, a)| (*d, *a));
         if lost {
             return last;
         }
@@ -140,10 +169,34 @@ impl Grab {
         self.history
             .iter()
             .rev()
-            .find(|(time, _)| *time <= before)
+            .find(|(time, _, _)| *time <= before)
             .or(self.history.front())
-            .map_or(last, |(_, d)| *d)
+            .map_or(last, |(_, d, a)| (*d, *a))
     }
+
+    // A turn follows the cursor (area frame) of this frame around the vertical axis through `center`.
+    // Per frame, so that more than half a turn adds up. A step with the cursor within
+    // `TURN_MIN_RADIUS` of the axis at either end adds nothing (the angle is not steady there; a cursor
+    // that crossed the axis would flip the box), and nothing adds up within the dead zone of a drag
+    // (closing the fingers moves the cursor): the turn starts where the cursor leaves it
+    fn follow_turn(&mut self, center: Vec3, cursor: Vec3) {
+        let step = alvr_graphics::sweep_angle(center, self.turn_from, cursor).unwrap_or(0.0);
+        self.turn_from = cursor;
+        if self.max_move > alvr_graphics::DRAG_DEAD_ZONE {
+            self.swept += step;
+        }
+    }
+}
+
+// What a drag or a turn gives for a displacement of the cursor (stage space) and an angle swept: the
+// layout, the value for the log and whether a turn is on a detent
+fn grab_result(grab: &Grab, to_area: &Mat4, moved: Vec3, swept: f32) -> (PlayArea, f32, bool) {
+    if grab.id.kind == HandleKind::Turn {
+        return alvr_graphics::apply_turn(&grab.start_layout, grab.id.box_index, swept);
+    }
+    let displacement = to_area.transform_vector3(alvr_graphics::drag_displacement(moved));
+    let (layout, value) = alvr_graphics::apply_drag(&grab.start_layout, grab.id, displacement);
+    (layout, value, false)
 }
 
 // What is drawn in this frame
@@ -162,6 +215,8 @@ struct DrawFrame {
     gesture: Option<(Vec3, f32)>,
     // Of a held remove handle: where, how far
     remove: Option<(Vec3, f32)>,
+    // Of a turn: the box at the grab and now (area frame), on a detent
+    turn: Option<(AreaBox, AreaBox, bool)>,
 }
 
 struct SaveJob {
@@ -180,6 +235,10 @@ pub struct AreaEditor {
     pinch_on: f32,
     pinch_off: f32,
     dim: f32,
+    // `area_edit_grace` (seconds)
+    grace: f64,
+    // `area_edit_hands_pc` is not 1
+    withhold_hands: bool,
     files: bool,
     mode: Mode,
     shown_until: Option<Instant>,
@@ -218,6 +277,15 @@ pub struct AreaEditor {
     last_gesture_log: Option<Instant>,
     // While editing: when a handle was last grabbed or held (seconds)
     last_used: f64,
+    // While editing: the last update with a stream with Passthrough = Depth, and whether editing waits
+    // for it (seconds)
+    last_live: f64,
+    paused: bool,
+    // Why each hand was last not usable (for the log when it ends a grab)
+    unusable: [Option<String>; 2],
+    // Kept STAGE changes: when one was last logged, and how many were not logged since
+    last_stage_log: Option<f64>,
+    stage_not_logged: u32,
     // Smallest and largest gap of each hand since the last log line
     gap_range: [Option<(f32, f32)>; 2],
     last_gap_log: f64,
@@ -236,6 +304,8 @@ impl AreaEditor {
             pinch_on: DEFAULT_PINCH_ON_MM as f32 / 1000.0,
             pinch_off: DEFAULT_PINCH_OFF_MM as f32 / 1000.0,
             dim: DEFAULT_DIM_PERCENT as f32 / 100.0,
+            grace: DEFAULT_GRACE_S as f64,
+            withhold_hands: true,
             files: true,
             mode: Mode::Hidden,
             shown_until: None,
@@ -261,6 +331,11 @@ impl AreaEditor {
             gesture_since: None,
             last_gesture_log: None,
             last_used: 0.0,
+            last_live: 0.0,
+            paused: false,
+            unusable: [None, None],
+            last_stage_log: None,
+            stage_not_logged: 0,
             gap_range: [None; 2],
             last_gap_log: 0.0,
             frame: None,
@@ -289,10 +364,12 @@ impl AreaEditor {
 
         let on_mm = debug_property("debug.alvr.area_pinch_on")
             .unwrap_or(DEFAULT_PINCH_ON_MM)
-            .clamp(0, 100);
+            // Below 0: the tips press into each other (measured on the Quest: -2 to -16 mm at contact)
+            .clamp(-30, 100);
         let off_mm = debug_property("debug.alvr.area_pinch_off")
             .unwrap_or(DEFAULT_PINCH_OFF_MM)
-            .clamp(on_mm + 5, 105);
+            // May equal the closing gap: the pinch still needs 2 updates to close and 80 ms to open
+            .clamp(on_mm, 105);
         let (on, off) = (on_mm as f32 / 1000.0, off_mm as f32 / 1000.0);
         if (on, off) != (self.pinch_on, self.pinch_off) {
             crate::stream_log(&format!(
@@ -312,6 +389,26 @@ impl AreaEditor {
                 dim * 100.0
             ));
             self.dim = dim;
+        }
+
+        let grace = debug_property("debug.alvr.area_edit_grace")
+            .unwrap_or(DEFAULT_GRACE_S)
+            .clamp(0, 60) as f64;
+        if grace != self.grace {
+            crate::stream_log(&format!(
+                "area editor: editing waits {grace:.0} s for the stream to come back"
+            ));
+            self.grace = grace;
+        }
+
+        let withhold_hands = debug_property("debug.alvr.area_edit_hands_pc").unwrap_or(0) != 1;
+        if withhold_hands != self.withhold_hands {
+            crate::stream_log(if withhold_hands {
+                "area editor: the hands are not sent to the PC while editing (area_edit_hands_pc 0)"
+            } else {
+                "area editor: the hands are sent to the PC also while editing (area_edit_hands_pc 1)"
+            });
+            self.withhold_hands = withhold_hands;
         }
 
         let files = debug_property("debug.alvr.area_file").unwrap_or(1) != 0;
@@ -358,6 +455,11 @@ impl AreaEditor {
         self.mode == Mode::Editing
     }
 
+    /// The hands are not sent to the PC: while editing, unless `area_edit_hands_pc 1`
+    pub fn withholds_hands(&self) -> bool {
+        self.mode == Mode::Editing && self.withhold_hands
+    }
+
     /// The play area is drawn dashed: it is placed from the anchor saved in the layout file (the code
     /// was not seen in this run)
     pub fn dashed(&self) -> bool {
@@ -374,13 +476,13 @@ impl AreaEditor {
         }
     }
 
-    /// The STAGE space changes at `change_time`, see `StageEvent`. A grab is dropped; at the change
+    /// The STAGE space changes at `change_time`, see `StageEvent`. A grab ends (kept); at the change
     /// time the saved anchor and the frozen pose of the code are carried into the new space
     /// (`debug.alvr.marker_carry 1`), kept as they are (0) or dropped (no valid pose), like the box of
     /// the marker region
     pub fn on_stage_change(&mut self, change_time: xr::Time, event: StageEvent) {
         if self.mode == Mode::Editing {
-            self.drop_grab("stage space changed");
+            self.keep_grab("stage space changed");
         }
         self.stage_changes.push((change_time, event));
     }
@@ -401,12 +503,7 @@ impl AreaEditor {
                         self.frozen = event.apply(position, yaw).map(|pose| (pose, placement));
                     }
                     if has_pose && matches!(event, StageEvent::Keep(_)) {
-                        crate::stream_log(&format!(
-                            "area editor: stage space changed, coordinates of the saved anchor and \
-                             the frozen pose kept (marker_carry 0; the reported pose {} is not \
-                             applied)",
-                            event.describe_pose()
-                        ));
+                        self.log_kept_stage_change(&event);
                     }
                 }
                 StageEvent::NoPose => {
@@ -421,6 +518,36 @@ impl AreaEditor {
                 }
             }
         }
+    }
+
+    // A STAGE change whose pose is not applied: at most one line per `STAGE_LOG_INTERVAL_S`, with the
+    // number left out since (on 2026-11-24 they came in pairs, +0.15 m then -0.15 m up, every minute or
+    // two)
+    fn log_kept_stage_change(&mut self, event: &StageEvent) {
+        let now = self.start.elapsed().as_secs_f64();
+        if self
+            .last_stage_log
+            .is_some_and(|time| now - time < STAGE_LOG_INTERVAL_S)
+        {
+            self.stage_not_logged += 1;
+            return;
+        }
+        crate::stream_log(&format!(
+            "area editor: stage space changed, coordinates of the saved anchor and the frozen pose \
+             kept (marker_carry 0; the reported pose {} is not applied){}",
+            event.describe_pose(),
+            if self.stage_not_logged > 0 {
+                format!(
+                    "; {} more such changes since the last line, not logged (at most one line per \
+                     {STAGE_LOG_INTERVAL_S:.0} s)",
+                    self.stage_not_logged
+                )
+            } else {
+                String::new()
+            }
+        ));
+        self.last_stage_log = Some(now);
+        self.stage_not_logged = 0;
     }
 
     // Whether the layout is the one of a file (read or to be written): not while an unchanged box of
@@ -494,14 +621,15 @@ impl AreaEditor {
             (None, _) => None,
         };
 
-        if self.mode == Mode::Editing && (!enabled || placed.is_none() || !depth_passthrough) {
+        if self.mode == Mode::Editing && (!enabled || placed.is_none()) {
             self.leave(if !enabled {
                 "marker box off"
-            } else if placed.is_none() {
-                "no play area"
             } else {
-                "Passthrough is not Depth"
+                "no play area"
             });
+        }
+        if self.mode == Mode::Editing {
+            self.follow_stream(depth_passthrough, now);
         }
         // Also without hands: the game must not stay dimmed
         if self.mode == Mode::Editing && now - self.last_used > IDLE_TIMEOUT_S {
@@ -553,17 +681,37 @@ impl AreaEditor {
             return placed;
         };
 
-        // The pinches of the hands that are tracked and in view
-        let usable = input
-            .hands
-            .map(|hand| hand.filter(|hand| hand.usable(input.eye, input.forward)));
+        // The pinches of the hands that are tracked and in view; the hand that grabs may be farther
+        // from the view direction and keeps its pinch longer while it is not usable
+        let grabbing = self.grab.as_ref().map(|grab| grab.hand);
+        let mut usable = [None; 2];
+        for (i, hand) in input.hands.iter().enumerate() {
+            let angle = if grabbing == Some(i) {
+                alvr_graphics::GRAB_IN_VIEW_ANGLE
+            } else {
+                alvr_graphics::IN_VIEW_ANGLE
+            };
+            match hand {
+                Some(hand) => match hand.unusable_reason(input.eye, input.forward, angle) {
+                    None => usable[i] = Some(*hand),
+                    reason => self.unusable[i] = reason,
+                },
+                None => self.unusable[i] = Some("no pose".into()),
+            }
+        }
         let mut events = [PinchEvent::None; 2];
         for (i, event) in events.iter_mut().enumerate() {
+            let lost_hold = if grabbing == Some(i) {
+                alvr_graphics::GRAB_LOST_HOLD_S
+            } else {
+                alvr_graphics::HAND_LOST_HOLD_S
+            };
             *event = self.pinches[i].update(
                 usable[i].map(|hand| hand.gap()),
                 now,
                 self.pinch_on,
                 self.pinch_off,
+                lost_hold,
             );
         }
         if self.mode == Mode::Editing {
@@ -610,6 +758,7 @@ impl AreaEditor {
             grabbed: None,
             gesture,
             remove: None,
+            turn: None,
         };
 
         let placed = if self.mode == Mode::Editing {
@@ -682,7 +831,11 @@ impl AreaEditor {
                         start_time: now,
                         history: VecDeque::new(),
                         max_move: 0.0,
+                        swept: 0.0,
+                        turn_from: to_area.transform_point3(hand.cursor()),
+                        snapped: false,
                         removed: false,
+                        lost_reason: None,
                     });
                     self.last_used = now;
                     break;
@@ -696,35 +849,43 @@ impl AreaEditor {
             // The idle time counts from the end of the last grab
             self.last_used = now;
             // While the hand is not usable the handle stays where it was
-            if let Some(hand) = usable[grab.hand] {
-                let moved = hand.cursor() - grab.start_cursor;
-                grab.max_move = grab.max_move.max(moved.length());
-                grab.history.push_back((now, moved));
-                while grab
-                    .history
-                    .front()
-                    .is_some_and(|(time, _)| now - time > 4.0 * alvr_graphics::RELEASE_LOOKBACK_S)
-                {
-                    grab.history.pop_front();
+            match usable[grab.hand] {
+                Some(hand) => {
+                    let moved = hand.cursor() - grab.start_cursor;
+                    grab.max_move = grab.max_move.max(moved.length());
+                    if let Some(center) = grab
+                        .start_layout
+                        .boxes()
+                        .get(grab.id.box_index)
+                        .map(|area_box| area_box.center)
+                        .filter(|_| grab.id.kind == HandleKind::Turn)
+                    {
+                        grab.follow_turn(center, to_area.transform_point3(hand.cursor()));
+                    }
+                    grab.history.push_back((now, moved, grab.swept));
+                    while grab.history.front().is_some_and(|(time, _, _)| {
+                        now - time > 4.0 * alvr_graphics::RELEASE_LOOKBACK_S
+                    }) {
+                        grab.history.pop_front();
+                    }
                 }
+                None => grab.lost_reason.clone_from(&self.unusable[grab.hand]),
             }
-            let to_area_displacement =
-                |moved: Vec3| to_area.transform_vector3(alvr_graphics::drag_displacement(moved));
 
             match grab.id.kind {
                 kind if kind.is_drag() => {
-                    if let Some(&(_, moved)) = grab.history.back() {
-                        layout = alvr_graphics::apply_drag(
-                            &grab.start_layout,
-                            grab.id,
-                            to_area_displacement(moved),
-                        )
-                        .0;
+                    if let Some(&(_, moved, swept)) = grab.history.back() {
+                        let (dragged, _, snapped) = grab_result(&grab, &to_area, moved, swept);
+                        layout = dragged;
+                        grab.snapped = snapped;
                     }
                 }
+                // Only with the hand usable the whole time: its pinch stays closed for
+                // `GRAB_LOST_HOLD_S` after it went, longer than the hold, with fingers nobody sees
                 HandleKind::Remove
                     if !grab.removed
-                        && grab.max_move < alvr_graphics::TAP_MOVE
+                        && grab.lost_reason.is_none()
+                        && grab.max_move < alvr_graphics::REMOVE_HOLD_MOVE
                         && now - grab.start_time >= alvr_graphics::REMOVE_HOLD_S =>
                 {
                     grab.removed = true;
@@ -746,17 +907,20 @@ impl AreaEditor {
             let event = events[grab.hand];
             if matches!(event, PinchEvent::Opened | PinchEvent::Lost) {
                 let lost = event == PinchEvent::Lost;
-                let tap = grab.max_move < alvr_graphics::TAP_MOVE;
                 let name = grab.id.kind.name();
                 let index = grab.id.box_index;
+                let lost_note = if lost {
+                    format!(
+                        " (hand lost: {})",
+                        grab.lost_reason.as_deref().unwrap_or("not usable")
+                    )
+                } else {
+                    String::new()
+                };
                 match grab.id.kind {
                     kind if kind.is_drag() => {
-                        let moved = grab.release_displacement(now, lost);
-                        let (released, value) = alvr_graphics::apply_drag(
-                            &grab.start_layout,
-                            grab.id,
-                            to_area_displacement(moved),
-                        );
+                        let (moved, swept) = grab.release_values(now, lost);
+                        let (released, value, snapped) = grab_result(&grab, &to_area, moved, swept);
                         layout = released;
                         if released != grab.start_layout {
                             self.undo.push(grab.start_layout);
@@ -764,21 +928,29 @@ impl AreaEditor {
                             let what = match kind {
                                 HandleKind::Side(_) => format!("moved {value:.3} m"),
                                 HandleKind::Dome(_) => format!("dome {value:.3} m"),
+                                HandleKind::Turn => format!(
+                                    "yaw {:.1} deg (turned by {:.1} deg{})",
+                                    value.to_degrees(),
+                                    alvr_graphics::wrap_angle(
+                                        value - grab.start_layout.boxes()[index].yaw
+                                    )
+                                    .to_degrees(),
+                                    if snapped { ", on a detent" } else { "" }
+                                ),
                                 _ => format!("moved by {value:.3} m"),
                             };
                             crate::stream_log(&format!(
-                                "area editor: release {name} of box #{index}{}: {what}, {}",
-                                if lost { " (hand lost)" } else { "" },
+                                "area editor: release {name} of box #{index}{lost_note}: {what}, {}",
                                 released.describe_box(index)
                             ));
                         } else {
                             crate::stream_log(&format!(
-                                "area editor: release {name} of box #{index}: no change{}",
-                                if lost { " (hand lost)" } else { "" },
+                                "area editor: release {name} of box #{index}: no change{lost_note}"
                             ));
                         }
                     }
-                    HandleKind::Add if tap && !lost => {
+                    // Buttons act on any release of a usable hand, wherever it went
+                    HandleKind::Add if !lost => {
                         let before = layout;
                         let eye = to_area.transform_point3(input.eye);
                         let gaze = to_area.transform_vector3(input.forward);
@@ -803,13 +975,19 @@ impl AreaEditor {
                     }
                     HandleKind::Remove if !grab.removed => crate::stream_log(&format!(
                         "area editor: remove of box #{index} not done (held {:.1} s, moved {:.0} \
-                         mm; it needs {:.1} s held within {:.0} mm)",
+                         mm{}; it needs {:.1} s held within {:.0} mm with the hand usable)",
                         now - grab.start_time,
                         grab.max_move * 1000.0,
+                        match (&grab.lost_reason, lost) {
+                            (_, true) => lost_note.clone(),
+                            (Some(reason), false) =>
+                                format!(", hand not usable for a while: {reason}"),
+                            (None, false) => String::new(),
+                        },
                         alvr_graphics::REMOVE_HOLD_S,
-                        alvr_graphics::TAP_MOVE * 1000.0
+                        alvr_graphics::REMOVE_HOLD_MOVE * 1000.0
                     )),
-                    HandleKind::Undo if tap && !lost => match self.undo.pop() {
+                    HandleKind::Undo if !lost => match self.undo.pop() {
                         Some(previous) => {
                             layout = previous;
                             self.selected = self.selected.min(layout.len() - 1);
@@ -822,12 +1000,11 @@ impl AreaEditor {
                         }
                         None => crate::stream_log("area editor: nothing to undo"),
                     },
-                    HandleKind::Done if tap && !lost => done = true,
+                    HandleKind::Done if !lost => done = true,
                     HandleKind::Remove => (),
                     _ => crate::stream_log(&format!(
-                        "area editor: release {name}: not a tap (moved {:.0} mm{}), nothing done",
-                        grab.max_move * 1000.0,
-                        if lost { ", hand lost" } else { "" }
+                        "area editor: release {name}{lost_note}: nothing done (a button acts only \
+                         when the pinch opens with the hand in view)"
                     )),
                 }
             } else {
@@ -874,11 +1051,24 @@ impl AreaEditor {
             .collect();
         frame.remove = self.grab.as_ref().and_then(|grab| {
             let handle = frame.handles.iter().find(|handle| handle.id == grab.id)?;
-            (grab.id.kind == HandleKind::Remove && !grab.removed).then(|| {
-                let progress = (now - grab.start_time) / alvr_graphics::REMOVE_HOLD_S;
-                (handle.position, progress.min(1.0) as f32)
-            })
+            (grab.id.kind == HandleKind::Remove && !grab.removed && grab.lost_reason.is_none())
+                .then(|| {
+                    let progress = (now - grab.start_time) / alvr_graphics::REMOVE_HOLD_S;
+                    (handle.position, progress.min(1.0) as f32)
+                })
         });
+        frame.turn = self
+            .grab
+            .as_ref()
+            .filter(|grab| grab.id.kind == HandleKind::Turn)
+            .and_then(|grab| {
+                let index = grab.id.box_index;
+                Some((
+                    *grab.start_layout.boxes().get(index)?,
+                    *layout.boxes().get(index)?,
+                    grab.snapped,
+                ))
+            });
 
         if done {
             self.leave("done handle");
@@ -907,6 +1097,8 @@ impl AreaEditor {
         self.hovers = [None; 2];
         self.grab = None;
         self.last_used = now;
+        self.last_live = now;
+        self.paused = false;
         self.gap_range = [None; 2];
         self.last_gap_log = now;
         crate::stream_log(&format!(
@@ -924,7 +1116,8 @@ impl AreaEditor {
         if self.mode != Mode::Editing {
             return;
         }
-        self.drop_grab("editing ended");
+        self.keep_grab("editing ended");
+        self.paused = false;
         self.mode = Mode::Shown;
         self.shown_until = Some(Instant::now() + SHOWN_AFTER_EDIT);
         self.frozen = None;
@@ -957,10 +1150,76 @@ impl AreaEditor {
         }
     }
 
+    // A grab ends where it is (the hands are gone, the stream stopped, editing ends): a drag keeps
+    // what it changed so far, as an undo step, and is saved
+    fn keep_grab(&mut self, reason: &str) {
+        let Some(grab) = self.grab.take() else {
+            return;
+        };
+        let (name, index) = (grab.id.kind.name(), grab.id.box_index);
+        match self.layout {
+            _ if grab.removed => crate::stream_log(&format!(
+                "area editor: grab of {name} of box #{index} ended ({reason}), the box was removed \
+                 during it"
+            )),
+            Some(layout) if grab.id.kind.is_drag() && layout != grab.start_layout => {
+                self.undo.push(grab.start_layout);
+                self.edited = true;
+                crate::stream_log(&format!(
+                    "area editor: grab of {name} of box #{index} ended ({reason}), kept as it was: {}",
+                    layout.describe_box(index)
+                ));
+                self.save("grab ended");
+            }
+            _ => crate::stream_log(&format!(
+                "area editor: grab of {name} of box #{index} ended ({reason}), nothing changed"
+            )),
+        }
+    }
+
+    // Editing without a stream with Passthrough = Depth: paused (a grab kept), resumed when it is back
+    // within `area_edit_grace`, else ended. Measured from the last frame with it, so that a paused
+    // session (no frames at all) counts too
+    fn follow_stream(&mut self, depth_passthrough: bool, now: f64) {
+        if depth_passthrough {
+            if self.paused {
+                self.paused = false;
+                crate::stream_log(&format!(
+                    "area editor: editing goes on after {:.1} s without the stream (it is back)",
+                    now - self.last_live
+                ));
+                // The time without it does not count as idle
+                self.last_used = self.last_used.max(now);
+            }
+            self.last_live = now;
+            return;
+        }
+        if now - self.last_live > self.grace {
+            self.leave(&format!(
+                "no stream with Passthrough = Depth for {:.1} s, more than area_edit_grace {:.0} s",
+                now - self.last_live,
+                self.grace
+            ));
+            return;
+        }
+        if !self.paused {
+            self.paused = true;
+            self.keep_grab("stream stopped");
+            self.pinches = [Pinch::default(); 2];
+            self.hovers = [None; 2];
+            crate::stream_log(&format!(
+                "area editor: editing paused: no stream with Passthrough = Depth (stopped or \
+                 restarting); it goes on if the stream is back within {:.0} s, else it ends (the layout \
+                 is kept either way)",
+                self.grace
+            ));
+        }
+    }
+
     fn reset_hands(&mut self, now: f64) {
         self.pinches = [Pinch::default(); 2];
         self.hovers = [None; 2];
-        self.drop_grab("no hands");
+        self.keep_grab("no hands");
         let (progress, _) = self.gesture.update(false, now);
         self.gesture_progress = progress;
         self.log_gesture(progress, false, now);
@@ -1261,7 +1520,7 @@ impl AreaEditor {
                 out.extend(alvr_graphics::handle_glyph(
                     handle, frame.eye, scale, color, width,
                 ));
-                // The line a side or a dome moves along
+                // The line a side or a dome moves along (the turn has its own guide)
                 if grabbed && matches!(handle.id.kind, HandleKind::Side(_) | HandleKind::Dome(_)) {
                     out.push(OverlaySegment {
                         start: handle.position - handle.normal * GUIDE_HALF_LENGTH,
@@ -1279,6 +1538,15 @@ impl AreaEditor {
                     pinched,
                     if pinched { OVERLAY_CYAN } else { OVERLAY_WHITE },
                     width,
+                ));
+            }
+            if let Some((start, now, snapped)) = &frame.turn {
+                out.extend(alvr_graphics::turn_guide(
+                    &frame.placed.area_to_world,
+                    start,
+                    now,
+                    *snapped,
+                    width * 0.6,
                 ));
             }
             if let Some((position, progress)) = frame.remove {
@@ -1388,33 +1656,83 @@ fn newest_saved_payload() -> Option<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn release_goes_back_before_the_fingers_opened() {
-        let grab = Grab {
+    fn grab(kind: HandleKind) -> Grab {
+        Grab {
             hand: 0,
-            id: HandleId {
-                kind: HandleKind::Center,
-                box_index: 0,
-            },
+            id: HandleId { kind, box_index: 0 },
             start_cursor: Vec3::ZERO,
-            start_layout: PlayArea::single(alvr_graphics::AreaBox::new(Vec3::ZERO, Vec3::ONE)),
+            start_layout: PlayArea::single(AreaBox::new(Vec3::ZERO, Vec3::ONE)),
             start_time: 0.0,
             history: (0..30)
-                .map(|i| (i as f64 * 0.01, Vec3::X * i as f32 * 0.001))
+                .map(|i| (i as f64 * 0.01, Vec3::X * i as f32 * 0.001, i as f32 * 0.01))
                 .collect(),
             max_move: 0.029,
+            swept: 0.29,
+            turn_from: Vec3::ZERO,
+            snapped: false,
             removed: false,
-        };
+            lost_reason: None,
+        }
+    }
+
+    #[test]
+    fn release_goes_back_before_the_fingers_opened() {
+        let grab = grab(HandleKind::Center);
         // At 0.295 s: the displacement of 0.17 s (the newest at least 0.12 s before)
-        let kept = grab.release_displacement(0.295, false);
+        let (kept, swept) = grab.release_values(0.295, false);
         assert!((kept.x - 0.017).abs() < 1e-6, "{kept}");
+        assert!((swept - 0.17).abs() < 1e-6);
         // Lost: the last one
-        assert_eq!(
-            grab.release_displacement(0.29, true),
-            grab.history.back().unwrap().1
-        );
+        let last = grab.history.back().unwrap();
+        assert_eq!(grab.release_values(0.29, true), (last.1, last.2));
         // A short grab: the first one
-        assert_eq!(grab.release_displacement(0.05, false), Vec3::ZERO);
+        assert_eq!(grab.release_values(0.05, false), (Vec3::ZERO, 0.0));
+    }
+
+    #[test]
+    fn a_turn_grab_turns_the_box() {
+        let turn = grab(HandleKind::Turn);
+        let (layout, yaw, snapped) = grab_result(&turn, &Mat4::IDENTITY, Vec3::ZERO, 0.6);
+        assert!((yaw - 0.6).abs() < 1e-6 && !snapped);
+        assert!((layout.boxes()[0].yaw - 0.6).abs() < 1e-6);
+        // Other handles drag
+        let side = grab(HandleKind::Side(alvr_graphics::Side::new(0, true)));
+        let (layout, moved, _) = grab_result(&side, &Mat4::IDENTITY, Vec3::X * 0.1, 0.5);
+        assert!((moved - 0.1).abs() < 1e-5);
+        assert_eq!(layout.boxes()[0].yaw, 0.0);
+    }
+
+    #[test]
+    fn a_turn_follows_the_cursor_around_the_axis() {
+        // A point at this yaw angle (degrees) and radius around the axis through the origin
+        let at = |degrees: f32, radius: f32| {
+            let (sin, cos) = degrees.to_radians().sin_cos();
+            Vec3::new(cos * radius, 0.0, -sin * radius)
+        };
+        let deg = |swept: f32| swept.to_degrees();
+        let mut turn = grab(HandleKind::Turn);
+        turn.swept = 0.0;
+        // Within the dead zone: the cursor is followed but nothing adds up
+        turn.max_move = 0.005;
+        turn.turn_from = at(0.0, 0.1);
+        turn.follow_turn(Vec3::ZERO, at(5.0, 0.1));
+        assert_eq!(turn.swept, 0.0);
+        assert_eq!(turn.turn_from, at(5.0, 0.1));
+        // Past it: from where the cursor is
+        turn.max_move = 0.02;
+        turn.follow_turn(Vec3::ZERO, at(15.0, 0.1));
+        assert!((deg(turn.swept) - 10.0).abs() < 1e-3, "{}", deg(turn.swept));
+        // Grabbed near the axis: the turn starts once the cursor is out of it, not stuck
+        turn.swept = 0.0;
+        turn.turn_from = at(0.0, 0.01);
+        turn.follow_turn(Vec3::ZERO, at(90.0, 0.1));
+        assert_eq!(turn.swept, 0.0);
+        turn.follow_turn(Vec3::ZERO, at(100.0, 0.1));
+        assert!((deg(turn.swept) - 10.0).abs() < 1e-3, "{}", deg(turn.swept));
+        // Across the axis: no flip
+        turn.follow_turn(Vec3::ZERO, at(100.0, 0.01));
+        turn.follow_turn(Vec3::ZERO, at(-80.0, 0.1));
+        assert!((deg(turn.swept) - 10.0).abs() < 1e-3, "{}", deg(turn.swept));
     }
 
     #[test]
