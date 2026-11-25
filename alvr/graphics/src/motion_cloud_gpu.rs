@@ -32,13 +32,13 @@ use wgpu::{
     TextureViewDimension, VertexState,
 };
 
-/// `mark_main`: depth (m), M, Mp, Mp before the flip test
+/// `mark_main`: depth (m), M, Mp, Mp before the flip test + 2 x the arrival count
 pub(crate) const CLOUD_STATE_FORMAT: TextureFormat = TextureFormat::Rgba16Float;
 /// `rows_main` and `field_main`
 pub(crate) const CLOUD_FIELD_FORMAT: TextureFormat = TextureFormat::Rgba8Unorm;
 /// A field with nothing in it (the dummy, a field before the first image): far from any edge, no
-/// speed. As RGBA8 bytes
-pub(crate) const CLOUD_CLEARED_FIELD: [u8; 4] = [255, 0, 0, 128];
+/// speed, old surface (an arrival count of 255: the trail hands nothing). As RGBA8 bytes
+pub(crate) const CLOUD_CLEARED_FIELD: [u8; 4] = [255, 0, 0, 255];
 // motion_cloud.wgsl: view_idx, mode
 const CLOUD_IMMEDIATE_SIZE: u32 = 2 * size_of::<u32>() as u32;
 
@@ -166,14 +166,10 @@ fn create_texture(device: &Device, label: &str, size: UVec2, format: TextureForm
         sample_count: 1,
         dimension: TextureDimension::D2,
         format,
-        // The fields are RGBA8: they can be read back (tests, a later stats pass)
+        // They can be read back (tests, a later stats pass)
         usage: TextureUsages::RENDER_ATTACHMENT
             | TextureUsages::TEXTURE_BINDING
-            | if format == CLOUD_FIELD_FORMAT {
-                TextureUsages::COPY_SRC
-            } else {
-                TextureUsages::empty()
-            },
+            | TextureUsages::COPY_SRC,
         view_formats: &[],
     })
 }
@@ -274,6 +270,8 @@ pub(crate) struct MotionCloud {
     pub field_size: UVec2,
     // [eye][slot]
     states: [[TextureView; 2]; 2],
+    #[cfg_attr(not(test), expect(dead_code, reason = "read back by the tests only"))]
+    state_textures: [[Texture; 2]; 2],
     rows: [TextureView; 2],
     #[cfg_attr(not(test), expect(dead_code, reason = "read back by the tests only"))]
     fields: [[Texture; 2]; 2],
@@ -294,6 +292,9 @@ pub(crate) struct MotionCloud {
     // The cameras and pair of the field of each eye, None: no field yet
     eyes: [Option<CloudEyeUniform>; 2],
     status: CloudStatus,
+    // The window (`cloud_window`) of the last frame: a field is decoded with the window it was built
+    // with, so another one starts the cloud over (`plan`). None: no frame yet
+    window: Option<u8>,
 }
 
 impl MotionCloud {
@@ -308,16 +309,12 @@ impl MotionCloud {
         let depth_size = depth_size.max(UVec2::ONE);
         let field_size = (depth_size + 1) / 2;
         let view = |texture: &Texture| texture.create_view(&TextureViewDescriptor::default());
-        let states = [0, 1].map(|_| {
+        let state_textures = [0, 1].map(|_| {
             [0, 1].map(|_| {
-                view(&create_texture(
-                    device,
-                    "motion cloud state",
-                    depth_size,
-                    CLOUD_STATE_FORMAT,
-                ))
+                create_texture(device, "motion cloud state", depth_size, CLOUD_STATE_FORMAT)
             })
         });
+        let states = [0, 1].map(|eye| [0, 1].map(|slot| view(&state_textures[eye][slot])));
         let rows = [0, 1].map(|_| {
             view(&create_texture(
                 device,
@@ -395,6 +392,7 @@ impl MotionCloud {
             depth_size,
             field_size,
             states,
+            state_textures,
             rows,
             fields,
             field_views,
@@ -409,12 +407,16 @@ impl MotionCloud {
             schedule: CloudSchedule::default(),
             eyes: [None; 2],
             status: CloudStatus::default(),
+            window: None,
         }
     }
 
     /// The passes of this frame, and the uniforms (written on every frame: the cameras of the eyes whose
     /// passes run now, the params, the reach time of both eyes). `depth_uniforms`: of this frame, to
-    /// tell a changed region
+    /// tell a changed region. When the window (`cloud_window`) differs from the last frame's the cloud
+    /// starts over (`forget`): the field of each eye is decoded with the window of the uniforms, so no
+    /// field built with another window may stay (both eyes start with a reset, their fields are cleared
+    /// on the next `encode` and until their next pass they open no zone)
     pub fn plan(
         &mut self,
         queue: &Queue,
@@ -422,6 +424,14 @@ impl MotionCloud {
         frame: Option<&DepthFrame>,
         depth_uniforms: &[f32],
     ) -> CloudPasses {
+        if self
+            .window
+            .is_some_and(|window| window != input.params.window)
+        {
+            self.forget();
+        }
+        self.window = Some(input.params.window);
+
         let mut passes = CloudPasses::default();
         if let Some(frame) = frame {
             let key = depth_key(input.capture_ns, frame);
@@ -543,6 +553,12 @@ impl MotionCloud {
     #[cfg(test)]
     pub fn field_texture(&self, eye: usize) -> &Texture {
         &self.fields[eye][self.current[eye]]
+    }
+
+    /// The current state of an eye (`CLOUD_STATE_FORMAT`, `depth_size`)
+    #[cfg(test)]
+    pub fn state_texture(&self, eye: usize) -> &Texture {
+        &self.state_textures[eye][self.current[eye]]
     }
 
     pub fn status(&self) -> CloudStatus {

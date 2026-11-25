@@ -12,7 +12,7 @@ use crate::{
     motion_cloud::{
         CLOUD_EYE_FLOAT_COUNT, CLOUD_SPEED_FLOOR, CLOUD_SPEED_SCALE, CLOUD_TRUNCATION,
         CLOUD_UNIFORMS_SIZE, CLOUD_WINDOW_CELLS, CloudEyeUniform, CloudInput, CloudParams, EyePass,
-        ResetReason, cells_inside, cloud_uniforms, pair_speed, window_distance,
+        ResetReason, cells_inside, cloud_truncation, cloud_uniforms, pair_speed, window_distance,
     },
     motion_cloud_gpu::{CloudPipelines, MotionCloud},
     overlay::{self, OVERLAY_AMBER, OVERLAY_SLOTS, OverlayEye, OverlaySegment},
@@ -294,8 +294,8 @@ fn cloud_uniforms_layout_matches_the_shader() {
     let params_at = offset(&members, "params") / 4;
     assert_eq!(&data[params_at..params_at + 4], &[0.6, 3.0, 9.0, 7.0]);
     let reach_at = offset(&members, "reach") / 4;
-    // z: `onesided`, 1 by default
-    assert_eq!(&data[reach_at..reach_at + 4], &[0.11, 0.12, 1.0, 0.0]);
+    // z: `onesided`, 1 by default; w: `cloud_window`, 12 by default
+    assert_eq!(&data[reach_at..reach_at + 4], &[0.11, 0.12, 1.0, 12.0]);
     // w: the field may open its zone (the mask's stale test)
     let pair_at = (eye_span + offset(&eye_members, "pair")) / 4;
     assert_eq!(&data[pair_at..pair_at + 4], &[0.05, 0.5, 1.0, 1.0]);
@@ -5319,7 +5319,7 @@ fn cloud_window_distance_matches_rust() {
         .collect::<Vec<_>>();
     let (cells, width, height) = cells_inside(&inside, size, size);
     assert_eq!((width, height), (CLOUD_CELLS, CLOUD_CELLS));
-    let reference = window_distance(&cells, width, height);
+    let reference = window_distance(&cells, width, height, CLOUD_WINDOW_CELLS);
     // Edges, cells deep inside and cells beyond the window
     assert!(reference.contains(&-CLOUD_TRUNCATION));
     assert!(reference.contains(&CLOUD_TRUNCATION));
@@ -5349,6 +5349,253 @@ fn cloud_window_distance_matches_rust() {
                 index / width
             );
         }
+    }
+}
+
+/// phi of a field cell built with the window `window` (`cloud_window`, cells; texels)
+fn cloud_phi_window(cell: [u8; 4], window: u8) -> f32 {
+    (f32::from(cell[0]) / 255.0 * 2.0 - 1.0) * cloud_truncation(window)
+}
+
+// `cloud_window 24`: the signed distance of the field on the GPU against `window_distance(.., 24)`,
+// within one 8 bit step as in cloud_window_distance_matches_rust (one step is 96 / 255 texels here).
+// One blob reaches farther than 24 cells inside, and much of the image is farther than 12 cells (24
+// texels) from any edge
+#[test]
+fn cloud_window_distance_matches_rust_24() {
+    let (device, queue) = gpu_or_skip!();
+    let window = 24;
+    let size = CLOUD_DEPTH_SIZE as usize;
+    let mut state = 0x1b87_3593_u32;
+    let mut random = |range: u32| {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state % range
+    };
+    let mut blobs = vec![(Vec2::new(44.0, 74.0), 54.0)];
+    blobs.extend((0..6).map(|_| {
+        let center = Vec2::new(random(128) as f32, random(128) as f32);
+        (center, 2.0 + random(13) as f32)
+    }));
+    let inside = (0..size * size)
+        .map(|index| {
+            let texel = Vec2::new((index % size) as f32 + 0.5, (index / size) as f32 + 0.5);
+            blobs
+                .iter()
+                .any(|(center, radius)| texel.distance(*center) < *radius)
+        })
+        .collect::<Vec<_>>();
+    let (cells, width, height) = cells_inside(&inside, size, size);
+    let reference = window_distance(&cells, width, height, window);
+    // Edges, cells deep inside beyond the window, and many cells beyond the window of 12
+    assert!(reference.contains(&-48.0));
+    assert!(reference.iter().filter(|phi| phi.abs() < 2.0).count() > 100);
+    let beyond_12 = reference.iter().filter(|phi| phi.abs() > 24.0).count();
+    assert!(beyond_12 > 300, "{beyond_12}");
+
+    let mut rig = CloudRig::new(
+        &device,
+        &queue,
+        CloudParams {
+            window,
+            ..Default::default()
+        },
+    );
+    let camera = cloud_camera(0.0, 0.0, Vec3::ZERO);
+    rig.image(
+        &device,
+        &queue,
+        &cloud_mask_depth(&inside),
+        camera,
+        CLOUD_DT_NS,
+    );
+    let step = 2.0 * cloud_truncation(window) / 255.0;
+    for eye in 0..2 {
+        let field = rig.field(&device, &queue, eye);
+        for (index, (cell, expected)) in field.iter().zip(&reference).enumerate() {
+            let phi = cloud_phi_window(*cell, window);
+            assert!(
+                (phi - expected).abs() <= step,
+                "eye {eye} cell {}, {}: {phi} {expected}",
+                index % width,
+                index / width
+            );
+        }
+    }
+}
+
+// `cloud_window`: an edge jumps 30 texels (15 cells) in one pair, `cloud_onesided 0`. The thing covers
+// the image left of the edge (its other sides are outside the image), so the distances are along the
+// rows and exact: phi = 2c - 69 after, 2c - 39 before at cell c. With the window of 12 cells only the
+// cells 23..31 see both edges (|phi| < 24) and measure 30 texels in 66.67 ms (450 texels per second,
+// 225 steps of 2: exact); the cells 32..46 see only the new edge and claim nothing. With 24 cells both
+// edges are inside the window at the cells 11..43 (|phi| < 48) and all of them read 450. Each cell is
+// also checked against `pair_speed` on `window_distance` with the same window
+#[test]
+fn cloud_window_24_measures_a_long_jump() {
+    let (device, queue) = gpu_or_skip!();
+    let camera = cloud_camera(0.0, 0.0, Vec3::ZERO);
+    let rect = |edge: i32| CloudRect {
+        z: CLOUD_BOX,
+        texels: [-10, -10, edge, CLOUD_DEPTH_SIZE as i32 + 10],
+    };
+    let (before, after) = (rect(40), rect(70));
+    let phi_of = |rect: &CloudRect, window: u8| {
+        let (cells, width, height) = cells_inside(
+            &rect.inside(),
+            CLOUD_DEPTH_SIZE as usize,
+            CLOUD_DEPTH_SIZE as usize,
+        );
+        window_distance(&cells, width, height, window)
+    };
+    let dt = CLOUD_DT_NS as f32 / 1e9;
+    let expected_speed = 30.0 / dt;
+    assert!((expected_speed - 450.0).abs() < 0.01);
+
+    for (window, measured) in [(12, 23..=31), (24, 11..=43)] {
+        let params = CloudParams {
+            onesided: 0,
+            window,
+            ..Default::default()
+        };
+        let (phi, phip) = (phi_of(&after, window), phi_of(&before, window));
+        let mut rig = CloudRig::new(&device, &queue, params);
+        let old = cloud_depth(&camera, CLOUD_WALL, &[before]);
+        rig.image(&device, &queue, &old, camera, CLOUD_DT_NS);
+        rig.image(&device, &queue, &old, camera, CLOUD_DT_NS);
+        let new = cloud_depth(&camera, CLOUD_WALL, &[after]);
+        let passes = rig.image(&device, &queue, &new, camera, CLOUD_DT_NS);
+        assert_eq!(passes.map(|pass| pass.reason), [None; 2]);
+        for eye in 0..2 {
+            let field = rig.field(&device, &queue, eye);
+            for (index, cell) in field.iter().enumerate() {
+                let (x, y) = (index % CLOUD_CELLS, index / CLOUD_CELLS);
+                let (_, speed) = cloud_speeds(*cell);
+                let expected = if measured.contains(&x) { 450.0 } else { 0.0 };
+                assert_eq!(speed, expected, "window {window} eye {eye} cell {x}, {y}");
+                // The reference (mode 0: the border band does not matter)
+                let reference = pair_speed(phi[index], phip[index], false, dt, &params);
+                assert!(
+                    (speed - reference).abs() <= CLOUD_SPEED_STEP,
+                    "window {window} eye {eye} cell {x}, {y}: {speed} {reference}"
+                );
+                // phi of the new edge, exact along the row
+                let exact = (2.0 * x as f32 - 69.0)
+                    .clamp(-2.0 * f32::from(window), 2.0 * f32::from(window));
+                assert!(
+                    (cloud_phi_window(*cell, window) - exact).abs()
+                        <= 2.0 * cloud_truncation(window) / 255.0,
+                    "window {window} eye {eye} cell {x}, {y}"
+                );
+            }
+        }
+    }
+}
+
+// `cloud_window 24` with `cloud_cap 48`: the box moves 6 texels to the right (90 texels per second),
+// its leading edge from texel 60 to 66. At a reach of 40 texels (gain 400 %, reach time 0.444 s) a pixel
+// 36 texels outside the moved edge (texel 102, phi 36.5) is in the zone; one at 40.5 is not. With the
+// window of 12 and the cap of 24 (the most today allows) it is not: the field reads no speed there and
+// phi stops at 24. 10 texels out both open the zone
+#[test]
+fn cloud_window_24_reaches_further() {
+    let (device, queue) = gpu_or_skip!();
+    let camera = cloud_camera(0.0, 0.0, Vec3::ZERO);
+    let rect = |dx: i32| CloudRect {
+        z: CLOUD_BOX,
+        texels: [10 + dx, 16, 60 + dx, 112],
+    };
+    let reach_s = 40.0 / 90.0;
+    let (near, far, beyond, y) = (76, 102, 106, 64);
+    for (window, cap, expected) in [(24, 48.0, [255, 255, 0]), (12, 24.0, [255, 0, 0])] {
+        let params = CloudParams {
+            window,
+            cap,
+            gain: 400.0,
+            ..Default::default()
+        };
+        let mut rig = CloudRig::new(&device, &queue, params);
+        let before = cloud_depth(&camera, CLOUD_WALL, &[rect(0)]);
+        let after = cloud_depth(&camera, CLOUD_WALL, &[rect(6)]);
+        rig.image(&device, &queue, &before, camera, CLOUD_DT_NS);
+        let passes = rig.image(&device, &queue, &after, camera, CLOUD_DT_NS);
+        assert_eq!(passes.map(|pass| pass.reason), [None; 2]);
+        rig.display(&queue, reach_s);
+        for eye in 0..2 {
+            let reach_ms = rig.cloud.status().eyes[eye].reach_ms;
+            assert!((reach_ms - reach_s * 1000.0).abs() < 0.01, "{reach_ms}");
+            // The held speed 36 texels out (cells 50 and 51 of the middle row): 90 with the window of
+            // 24, none with 12
+            let field = rig.field(&device, &queue, eye);
+            let held = cloud_speeds(field[32 * CLOUD_CELLS + 50]).0;
+            assert_eq!(held, if window == 24 { 90.0 } else { 0.0 }, "eye {eye}");
+            let mask = rig.mask(&device, &queue, eye, Some(rig.shown()));
+            let zone = [near, far, beyond].map(|x| cloud_zone_at(&mask, x, y));
+            assert_eq!(zone, expected, "window {window} eye {eye}");
+        }
+    }
+}
+
+// Switching `cloud_window` between two frames starts the cloud over: a field is decoded with the
+// window of the uniforms, so none built with the old one may stay. The next pair of each eye is a start
+// reset, the fields are cleared (eye 1's, still waiting for its pass, reads "nothing in it") and no
+// zone opens until a new pair measures a motion; then the field has the distances of the new window
+#[test]
+fn cloud_window_change_resets() {
+    let (device, queue) = gpu_or_skip!();
+    let mut rig = CloudRig::new(&device, &queue, CloudParams::default());
+    let camera = cloud_camera(0.0, 0.0, Vec3::ZERO);
+    let before = cloud_depth(&camera, CLOUD_WALL, &[cloud_box(CLOUD_BOX, 0)]);
+    let after = cloud_depth(&camera, CLOUD_WALL, &[cloud_box(CLOUD_BOX, 6)]);
+    let further = cloud_depth(&camera, CLOUD_WALL, &[cloud_box(CLOUD_BOX, 12)]);
+    rig.image(&device, &queue, &before, camera, CLOUD_DT_NS);
+    rig.image(&device, &queue, &after, camera, CLOUD_DT_NS);
+    for eye in 0..2 {
+        let field = rig.field(&device, &queue, eye);
+        assert!(field.iter().any(|cell| cell[1] > 0), "eye {eye}");
+    }
+    assert_eq!(rig.cloud.status().resets, [[1, 0, 0, 0]; 2]);
+
+    // The window changes with the next image: eye 0 on its display frame, eye 1 still waiting
+    rig.params.window = 24;
+    let passes = rig.image_frames(&device, &queue, &after, camera, CLOUD_DT_NS, 1);
+    assert_eq!(passes[0].unwrap().reason, Some(ResetReason::Start));
+    assert!(passes[1].is_none());
+    let cleared = crate::motion_cloud_gpu::CLOUD_CLEARED_FIELD;
+    assert!(
+        rig.field(&device, &queue, 1)
+            .iter()
+            .all(|cell| *cell == cleared)
+    );
+    let field = rig.field(&device, &queue, 0);
+    assert!(field.iter().all(|cell| cell[1] == 0 && cell[2] == 0));
+    for eye in 0..2 {
+        let mask = rig.mask(&device, &queue, eye, Some(rig.shown()));
+        assert!(mask.iter().all(|texel| texel[1] == 0), "eye {eye}");
+    }
+    // Eye 1 on the next display frame (the same image)
+    let passes = rig.image_frames(&device, &queue, &after, camera, 0, 1);
+    assert!(passes[0].is_none());
+    assert_eq!(passes[1].unwrap().reason, Some(ResetReason::Start));
+    assert_eq!(rig.cloud.status().resets, [[2, 0, 0, 0]; 2]);
+    assert!(
+        rig.field(&device, &queue, 1)
+            .iter()
+            .all(|cell| cell[1] == 0 && cell[2] == 0)
+    );
+
+    // The same window again: the next pair is measured, with the distances of the window of 24 (the
+    // middle of the box, 15 cells deep, reads about -29 texels, beyond today's truncation of 24)
+    let passes = rig.image(&device, &queue, &further, camera, CLOUD_DT_NS);
+    assert_eq!(passes.map(|pass| pass.reason), [None; 2]);
+    for eye in 0..2 {
+        let field = rig.field(&device, &queue, eye);
+        assert!(field.iter().any(|cell| cell[2] > 0), "eye {eye}");
+        assert!(
+            field.iter().any(|cell| cloud_phi_window(*cell, 24) < -27.0),
+            "eye {eye}"
+        );
     }
 }
 
@@ -5462,7 +5709,7 @@ fn cloud_onesided_modes() {
             CLOUD_DEPTH_SIZE as usize,
             CLOUD_DEPTH_SIZE as usize,
         );
-        window_distance(&cells, width, height)
+        window_distance(&cells, width, height, CLOUD_WINDOW_CELLS)
     };
     let (phi, phip) = (phi_of(&after), phi_of(&before));
     let window = CLOUD_WINDOW_CELLS as usize;
@@ -5763,7 +6010,7 @@ fn cloud_eye_1_measures_its_own_image() {
                 CLOUD_DEPTH_SIZE as usize,
                 CLOUD_DEPTH_SIZE as usize,
             );
-            window_distance(&cells, width, height)
+            window_distance(&cells, width, height, CLOUD_WINDOW_CELLS)
         };
         let (phi, phip) = (phi_of(6), phi_of(0));
         let field = rig.field(&device, &queue, eye);
@@ -6032,10 +6279,11 @@ fn cloud_zone_is_inert_outside_the_lower_layer() {
 }
 
 /// Probe cells for `cloud_trail`: inside the mask 2.8 and 10.1 texels from the edge at the largest
-/// speed, and 2.8 texels inside at rest
-const CLOUD_TRAIL_NEAR: [u8; 4] = [112, 255, 255, 128];
-const CLOUD_TRAIL_DEEP: [u8; 4] = [74, 255, 255, 128];
-const CLOUD_TRAIL_STILL: [u8; 4] = [112, 0, 0, 128];
+/// speed, and 2.8 texels inside at rest; all on surface that just arrived (arrival count 0, a recent
+/// one for `cloud_trail_age`)
+const CLOUD_TRAIL_NEAR: [u8; 4] = [112, 255, 255, 0];
+const CLOUD_TRAIL_DEEP: [u8; 4] = [74, 255, 255, 0];
+const CLOUD_TRAIL_STILL: [u8; 4] = [112, 0, 0, 0];
 
 /// The picture and the mask with a probe field of `cell` and `cloud_trail` `trail`: a box at 0.5 m in
 /// the region in the middle of the view (0.3..0.7), the room behind it out of the region, the lower
@@ -6078,7 +6326,10 @@ fn cloud_trail_render(device: &Device, queue: &Queue, cell: [u8; 4], trail: f32)
 }
 
 /// The box of `cloud_zone_grows_with_the_age` moved 6 texels (edges now at texels 30, trailing, and
-/// 90, leading), with `cloud_trail` `trail`, at a reach time of `reach_s`: the masks of both eyes
+/// 90, leading), with `cloud_trail` `trail`, at a reach time of `reach_s`: the masks of both eyes. The
+/// tests of the trail itself run without the age test (`cloud_trail_age 0`): the box stood still on the
+/// first image (a start reset, taken as old surface), so with the age test only its leading 6 texels
+/// count as arrived
 fn cloud_trail_masks(
     device: &Device,
     queue: &Queue,
@@ -6087,6 +6338,7 @@ fn cloud_trail_masks(
 ) -> [Vec<[u8; 4]>; 2] {
     let params = CloudParams {
         trail,
+        trail_age: 0,
         ..Default::default()
     };
     let mut rig = CloudRig::new(device, queue, params);
@@ -6136,10 +6388,10 @@ fn cloud_trail_off_is_the_same_picture() {
     assert!(deep.pixels != edge_trail.pixels);
 }
 
-// `cloud_trail 6` at a reach of 14 texels. (a) The mask of the moving box: the zone inside the mask is
-// at most 6 texels deep (3.5 texels in at both moved edges: open, 10.5 in: none), outside it as
-// without the trail; none inside the top edge the box slid along; only mask g changes, and only
-// downwards. (b) The picture with the probe field: inside the mask 2.8 texels from a moving edge the
+// `cloud_trail 6` (`cloud_trail_age 0`) at a reach of 14 texels. (a) The mask of the moving box: the
+// zone inside the mask is at most 6 texels deep (3.5 texels in at both moved edges: open, 10.5 in:
+// none), outside it as without the trail; none inside the top edge the box slid along; mask g changes
+// only downwards, b carries the trail (the zone), r and a stay. (b) The picture with the probe field: inside the mask 2.8 texels from a moving edge the
 // lower game layer is opaque and the upper one open (packed 0.5: the key decides), 10.1 texels in or at
 // rest the mask still shows the room (0); outside the lower layer (right half) the picture is that of
 // `cloud_trail 0`
@@ -6164,9 +6416,11 @@ fn cloud_trail_hands_the_inner_border_to_the_key() {
         assert_eq!(zone(105, 64), 0, "eye {eye}");
         // 3.5 texels inside the top edge, in the middle of the box
         assert_eq!(zone(60, 108), 0, "eye {eye}");
+        // b carries the trail (without the age test: the zone)
         for (a, b) in today[eye].iter().zip(&trail[eye]) {
-            assert_eq!([a[0], a[2], a[3]], [b[0], b[2], b[3]], "eye {eye}");
+            assert_eq!([a[0], a[3]], [b[0], b[3]], "eye {eye}");
             assert!(b[1] <= a[1], "eye {eye}");
+            assert_eq!(b[2], b[1], "eye {eye}");
         }
         assert!(today[eye] != trail[eye], "eye {eye}");
     }
@@ -6201,8 +6455,9 @@ fn cloud_trail_hands_the_inner_border_to_the_key() {
 }
 
 // The trail is at most the reach: at a reach time of 0.022 s (2 texels at 90 texels per second)
-// `cloud_trail 6` gives the mask of `cloud_trail 0` (all channels), open right inside the moved edges
-// and closed 3.5 texels in, where a border of 6 would still be open (as it is at 0.3 s)
+// `cloud_trail 6` gives the mask of `cloud_trail 0` (r, g, a; b carries the trail, the zone), open right
+// inside the moved edges and closed 3.5 texels in, where a border of 6 would still be open (as it is
+// at 0.3 s)
 #[test]
 fn cloud_trail_is_capped_by_the_reach() {
     let (device, queue) = gpu_or_skip!();
@@ -6210,7 +6465,10 @@ fn cloud_trail_is_capped_by_the_reach() {
     let trail = cloud_trail_masks(&device, &queue, 6.0, 0.022);
     let wide = cloud_trail_masks(&device, &queue, 6.0, 0.3);
     for eye in 0..2 {
-        assert!(today[eye] == trail[eye], "eye {eye}");
+        for (a, b) in today[eye].iter().zip(&trail[eye]) {
+            assert_eq!([a[0], a[1], a[3]], [b[0], b[1], b[3]], "eye {eye}");
+            assert_eq!(b[2], b[1], "eye {eye}");
+        }
         let zone = |x| cloud_zone_at(&trail[eye], x, 64);
         for x in [30, 89] {
             assert!(zone(x) > 0, "eye {eye} x {x}");
@@ -6218,6 +6476,305 @@ fn cloud_trail_is_capped_by_the_reach() {
         for x in [33, 86] {
             assert_eq!(zone(x), 0, "eye {eye} x {x}");
             assert_eq!(cloud_zone_at(&wide[eye], x, 64), 255, "eye {eye} x {x}");
+        }
+    }
+}
+
+/// A 16 bit float as f32
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = if bits >> 15 == 1 { -1.0 } else { 1.0 };
+    let exponent = i32::from((bits >> 10) & 0x1f);
+    let fraction = f32::from(bits & 0x3ff);
+    sign * match exponent {
+        0 => fraction * 2f32.powi(-24),
+        31 => f32::INFINITY,
+        _ => (1.0 + fraction / 1024.0) * 2f32.powi(exponent - 15),
+    }
+}
+
+impl CloudRig {
+    /// The current state of an eye (mark_main: depth, M, Mp, Mp before the flip test + 2 x the arrival
+    /// count) per depth texel, rows from the bottom
+    fn state(&self, device: &Device, queue: &Queue, eye: usize) -> Vec<[f32; 4]> {
+        let size = self.cloud.depth_size;
+        let row = (size.x * 8) as usize;
+        let bytes_per_row = (size.x * 8).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let readback = device.create_buffer(&BufferDescriptor {
+            label: None,
+            size: u64::from(bytes_per_row * size.y),
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            self.cloud.state_texture(eye).as_image_copy(),
+            TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(size.y),
+                },
+            },
+            Extent3d {
+                width: size.x,
+                height: size.y,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([encoder.finish()]);
+        readback
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, |r| r.unwrap());
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        readback
+            .slice(..)
+            .get_mapped_range()
+            .chunks_exact(bytes_per_row as usize)
+            .flat_map(|padded| {
+                padded[..row]
+                    .chunks_exact(8)
+                    .map(|texel| {
+                        let half =
+                            |i: usize| f16_to_f32(u16::from_le_bytes([texel[i], texel[i + 1]]));
+                        [half(0), half(2), half(4), half(6)]
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+}
+
+/// The trail of `CloudRig::mask` (mask b with `cloud_trail`) at the depth texel x, y (rows from the
+/// bottom)
+fn cloud_trail_at(mask: &[[u8; 4]], x: usize, y: usize) -> u8 {
+    let size = CLOUD_DEPTH_SIZE as usize;
+    mask[(size - 1 - y) * size + x][2]
+}
+
+// The arrival count of mark_main (state a = Mp before the flip test + 2 x the count) and its smallest
+// value per cell in the field (a = count / 255). The box stands, moves 5 texels, stands, moves 6, loses
+// its depth in a patch for one image, and the depth then pauses 300 ms. The count is 255 after the start
+// reset, 0 outside the mask, counts up by one per image on surface that arrived, is 255 where the
+// previous state was unknown (no depth there) and after the reset of the pause. Mp before the flip test
+// survives the packing, and Mp (b) is right
+#[test]
+fn cloud_arrival_count() {
+    let (device, queue) = gpu_or_skip!();
+    let mut rig = CloudRig::new(&device, &queue, CloudParams::default());
+    let camera = cloud_camera(0.0, 0.0, Vec3::ZERO);
+    let size = CLOUD_DEPTH_SIZE as usize;
+    let depth = |dx: i32| cloud_depth(&camera, CLOUD_WALL, &[cloud_box(CLOUD_BOX, dx)]);
+    let check = |rig: &CloudRig, what: &str, expected: &[((usize, usize), f32, f32, f32)]| {
+        for eye in 0..2 {
+            let state = rig.state(&device, &queue, eye);
+            for &((x, y), m, mp, a) in expected {
+                let texel = state[y * size + x];
+                assert_eq!(
+                    [texel[1], texel[2], texel[3]],
+                    [m, mp, a],
+                    "{what} eye {eye} texel {x}, {y}"
+                );
+            }
+        }
+    };
+
+    // (texel, M, Mp, a). Start: in the box 1 + 2 x 255, outside 0
+    let passes = rig.image(&device, &queue, &depth(0), camera, CLOUD_DT_NS);
+    assert_eq!(
+        passes.map(|pass| pass.reason),
+        [Some(ResetReason::Start); 2]
+    );
+    check(
+        &rig,
+        "start",
+        &[((50, 64), 1.0, 1.0, 511.0), ((10, 64), 0.0, 0.0, 0.0)],
+    );
+    rig.image(&device, &queue, &depth(0), camera, CLOUD_DT_NS);
+    check(&rig, "still", &[((50, 64), 1.0, 1.0, 511.0)]);
+    // 5 texels to the right: 84..88 arrived (count 1, Mp before the flip test 0), 24..28 left (count 0,
+    // Mp before the flip test 1)
+    rig.image(&device, &queue, &depth(5), camera, CLOUD_DT_NS);
+    check(
+        &rig,
+        "moved",
+        &[
+            ((86, 64), 1.0, 0.0, 2.0),
+            ((26, 64), 0.0, 1.0, 1.0),
+            ((50, 64), 1.0, 1.0, 511.0),
+        ],
+    );
+    // Standing: 2; the texels that left stay out
+    rig.image(&device, &queue, &depth(5), camera, CLOUD_DT_NS);
+    check(
+        &rig,
+        "stands",
+        &[((86, 64), 1.0, 1.0, 5.0), ((26, 64), 0.0, 0.0, 0.0)],
+    );
+    // 6 more: 84..88 at 3, 89..94 at 1
+    rig.image(&device, &queue, &depth(11), camera, CLOUD_DT_NS);
+    check(
+        &rig,
+        "moved again",
+        &[((86, 64), 1.0, 1.0, 7.0), ((90, 64), 1.0, 0.0, 2.0)],
+    );
+    // The field: the smallest count of each cell's four texels (cell 44: texels 88 at 3 and 89 at 1;
+    // cell 47: 94 at 1 and 95 outside)
+    for eye in 0..2 {
+        let field = rig.field(&device, &queue, eye);
+        let count = |x: usize| field[32 * CLOUD_CELLS + x][3];
+        assert_eq!(
+            [5, 25, 43, 44, 46, 47].map(count),
+            [0, 255, 3, 1, 1, 0],
+            "eye {eye}"
+        );
+    }
+
+    // A patch without depth (texels 89..92 of the rows 60..63) for one image: there the mask is out
+    // (count 0; in for one image only, so the flip test keeps Mp at 0), on the next image the previous
+    // state is unknown: 255. Beside it the count goes on
+    let mut hole = depth(11);
+    for y in 60..64 {
+        for x in 89..93 {
+            hole[y * size + x] = 0.0;
+        }
+    }
+    rig.image(&device, &queue, &hole, camera, CLOUD_DT_NS);
+    check(
+        &rig,
+        "hole",
+        &[((90, 62), 0.0, 0.0, 1.0), ((90, 40), 1.0, 1.0, 5.0)],
+    );
+    rig.image(&device, &queue, &depth(11), camera, CLOUD_DT_NS);
+    check(
+        &rig,
+        "after the hole",
+        &[((90, 62), 1.0, 1.0, 511.0), ((90, 40), 1.0, 1.0, 7.0)],
+    );
+
+    // The depth pauses 300 ms: a reset, everything in the mask is old
+    let passes = rig.image(&device, &queue, &depth(11), camera, 300_000_000);
+    assert_eq!(passes.map(|pass| pass.reason), [Some(ResetReason::Dt); 2]);
+    check(
+        &rig,
+        "reset",
+        &[
+            ((90, 40), 1.0, 1.0, 511.0),
+            ((86, 64), 1.0, 1.0, 511.0),
+            ((26, 64), 0.0, 0.0, 0.0),
+        ],
+    );
+}
+
+/// The box of the tests with its right edge going back and forth by 4 texels (at 88 for two images,
+/// at 84 for two, ...) over 20 images, ending at 84 (moved back on the image before the last one): the
+/// masks of both eyes at a reach time of 0.3 s, with `cloud_trail 24` and `cloud_trail_age` `age`
+fn cloud_flicker_masks(device: &Device, queue: &Queue, age: u8) -> [Vec<[u8; 4]>; 2] {
+    let params = CloudParams {
+        trail: 24.0,
+        trail_age: age,
+        ..Default::default()
+    };
+    let mut rig = CloudRig::new(device, queue, params);
+    let camera = cloud_camera(0.0, 0.0, Vec3::ZERO);
+    for image in 0..20 {
+        let edge = [88, 84][(image / 2) % 2];
+        let rect = CloudRect {
+            z: CLOUD_BOX,
+            texels: [24, 16, edge, 112],
+        };
+        let depth = cloud_depth(&camera, CLOUD_WALL, &[rect]);
+        let passes = rig.image(device, queue, &depth, camera, CLOUD_DT_NS);
+        if image > 0 {
+            assert_eq!(passes.map(|pass| pass.reason), [None; 2], "image {image}");
+        }
+    }
+    rig.display(queue, 0.3);
+    [0, 1].map(|eye| rig.mask(device, queue, eye, Some(rig.shown())))
+}
+
+// The user's desk: a static surface in the mask beside an edge that goes back and forth by 4 texels (as
+// depth noise or the hole the runtime cuts around a hand makes it). The zone opens along the edge on
+// both sides, also 3.5 texels inside the mask (texel 80), whatever `cloud_trail_age` says. With the age
+// test (16, the default) the trail hands nothing there to the key: that surface has been in the mask
+// since the start (count 255). Without it (0, the trail before the age test) it is handed, as the zone.
+// Only mask b differs
+#[test]
+fn cloud_trail_spares_old_surface() {
+    let (device, queue) = gpu_or_skip!();
+    assert_eq!(CloudParams::default().trail_age, 16);
+    let aged = cloud_flicker_masks(&device, &queue, 16);
+    let plain = cloud_flicker_masks(&device, &queue, 0);
+    for eye in 0..2 {
+        let (inside, y) = (80, 64);
+        let size = CLOUD_DEPTH_SIZE as usize;
+        assert_eq!(
+            aged[eye][(size - 1 - y) * size + inside][0],
+            255,
+            "eye {eye}: solid"
+        );
+        assert_eq!(cloud_zone_at(&aged[eye], inside, y), 255, "eye {eye}");
+        assert_eq!(cloud_trail_at(&aged[eye], inside, y), 0, "eye {eye}");
+        assert_eq!(cloud_trail_at(&plain[eye], inside, y), 255, "eye {eye}");
+        // Outside the mask (game side) the trail is the zone with and without the age test
+        assert_eq!(cloud_zone_at(&aged[eye], 87, y), 255, "eye {eye}");
+        assert_eq!(cloud_trail_at(&aged[eye], 87, y), 255, "eye {eye}");
+        for (a, b) in aged[eye].iter().zip(&plain[eye]) {
+            assert_eq!([a[0], a[1], a[3]], [b[0], b[1], b[3]], "eye {eye}");
+            assert!(a[2] <= b[2], "eye {eye}");
+        }
+    }
+}
+
+// A box 40 texels wide moves steadily 6 texels per image to the right over the room out of the region,
+// for 8 images (the texels of its first place, old after the start, have all left it). Every texel in
+// it arrived within the last 7 images: with the age test (16) the trail hands the border inside both
+// moved edges to the key (3.5 texels in at the trailing edge, texel 45, and at the leading one, 78), as
+// without it
+#[test]
+fn cloud_trail_takes_recent_surface() {
+    let (device, queue) = gpu_or_skip!();
+    let camera = cloud_camera(0.0, 0.0, Vec3::ZERO);
+    for age in [16, 0] {
+        let params = CloudParams {
+            trail: 24.0,
+            trail_age: age,
+            ..Default::default()
+        };
+        let mut rig = CloudRig::new(&device, &queue, params);
+        for image in 0..8 {
+            let x0 = 6 * image;
+            let rect = CloudRect {
+                z: CLOUD_BOX,
+                texels: [x0, 16, x0 + 40, 112],
+            };
+            let depth = cloud_depth(&camera, CLOUD_WALL, &[rect]);
+            rig.image(&device, &queue, &depth, camera, CLOUD_DT_NS);
+        }
+        // The counts of the cells inside the trailing edge: 7 and 6
+        for eye in 0..2 {
+            let field = rig.field(&device, &queue, eye);
+            assert_eq!(
+                [22, 23].map(|x| field[32 * CLOUD_CELLS + x][3]),
+                [7, 6],
+                "age {age} eye {eye}"
+            );
+        }
+        rig.display(&queue, 0.3);
+        for eye in 0..2 {
+            let mask = rig.mask(&device, &queue, eye, Some(rig.shown()));
+            for x in [45, 78] {
+                assert_eq!(
+                    cloud_zone_at(&mask, x, 64),
+                    255,
+                    "age {age} eye {eye} x {x}"
+                );
+                assert_eq!(
+                    cloud_trail_at(&mask, x, 64),
+                    255,
+                    "age {age} eye {eye} x {x}"
+                );
+            }
         }
     }
 }
@@ -6361,7 +6918,8 @@ fn cloud_vector_in_the_depth_uniforms() {
     assert_eq!(vector(&volume, false, cloud(1, true, true)), [0.0; 4]);
     assert_eq!(vector(&distance, true, cloud(1, true, true)), [0.0; 4]);
     assert_eq!(vector(&show_depth, true, cloud(1, false, true)), [0.0; 4]);
-    // `cloud_trail` in z, only while the zone is shown
+    // `cloud_trail` in z, only while the zone is shown, and `cloud_trail_age` (16 by default) in w only
+    // with it
     let trail = |cloud: Option<CloudInput>, trail| {
         cloud.map(|cloud| CloudInput {
             params: CloudParams {
@@ -6373,11 +6931,11 @@ fn cloud_vector_in_the_depth_uniforms() {
     };
     assert_eq!(
         vector(&volume, true, trail(cloud(1, false, true), 6.0)),
-        [1.0, 0.0, 6.0, 0.0]
+        [1.0, 0.0, 6.0, 16.0]
     );
     assert_eq!(
         vector(&volume, true, trail(cloud(2, true, true), 6.0)),
-        [2.0, 1.0, 6.0, 0.0]
+        [2.0, 1.0, 6.0, 16.0]
     );
     assert_eq!(
         vector(&volume, true, trail(cloud(1, true, false), 6.0)),

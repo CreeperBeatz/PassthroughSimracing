@@ -5,13 +5,19 @@
 // motion_cloud.rs). Three passes per new depth image and eye, all in the grid of the depth image:
 //   mark_main (D x D, Rgba16Float, ping-pong): r: depth (m, 0: no data), g: M, 1 where the surface is
 //     in the play region, b: Mp, the same for the previous image on this texel's world ray after the
-//     flip test, a: Mp before the flip test. The state is also the copy of the depth for the next image
+//     flip test, a: Mp before the flip test + 2 x the arrival count (the number of consecutive depth
+//     images this world ray has been in M, 0..255; exact in 16 bit floats). The state is also the copy
+//     of the depth for the next image. Only mark_main (textureLoad) and field_main (textureLoad) read a;
+//     rows_main samples g and b only, which stay 0 or 1
 //   rows_main (D/2 x D/2 cells of 2 x 2 texels, Rgba8Unorm): along the row, the distance (cells,
-//     0..12, 13: none in the window) to the nearest cell in and out of M, then of Mp
-//   field_main (D/2 x D/2, Rgba8Unorm, ping-pong): the field. r: 0.5 + 0.5 * phi / 24 (phi: signed
+//     0..W, W + 1: none in the window) to the nearest cell in and out of M, then of Mp
+//   field_main (D/2 x D/2, Rgba8Unorm, ping-pong): the field. r: 0.5 + 0.5 * phi / 2W (phi: signed
 //     distance to the edge of M, texels, + on the game side), g: held speed / 510 (texels per second),
 //     b: this pair's speed / 510 (see `cloud_onesided` in field_main for an edge in one mask only), a:
-//     0.5 + 0.5 * the edge's move towards the game / 24 (not used in v1)
+//     the smallest arrival count of the cell's four texels / 255 (`cloud_trail_age` in depth_mask.wgsl;
+//     255: old, as a cleared field)
+// W: half of the window (`cloud_window`, cells, cloud_u.reach.w; 12 by default: 24 texels). A field
+// is read (depth_mask.wgsl) with the W of the uniforms: a change of W starts the cloud over
 
 struct Immediate {
     view_idx: u32,
@@ -22,7 +28,7 @@ var<immediate> imm: Immediate;
 
 @group(0) @binding(0) var<uniform> depth_u: DepthUniforms;
 @group(0) @binding(1) var depth_texture: texture_2d_array<f32>;
-// mark_main: the state of the image before. rows_main: the state just written. field_main: not read
+// mark_main: the state of the image before. rows_main and field_main: the state just written
 @group(1) @binding(0) var state_texture: texture_2d<f32>;
 // field_main: the rows of this image (rows_main binds a placeholder: it writes them)
 @group(1) @binding(1) var rows_texture: texture_2d<f32>;
@@ -31,12 +37,9 @@ var<immediate> imm: Immediate;
 @group(1) @binding(3) var linear_sampler: sampler;
 @group(1) @binding(4) var<uniform> cloud_u: CloudUniforms;
 
-// Half of the window (cells). Loops over it have constant bounds (GLES)
-const WINDOW: i32 = 12;
-// The distance of rows_main when no cell of the kind is in the window
-const NO_CELL: f32 = 13.0;
-// phi is truncated at this (texels: the window)
-const TRUNCATION: f32 = 24.0;
+// The largest half window (cells). The loops run over it (constant bounds for GLES) and skip the taps
+// beyond the window of the uniforms
+const MAX_WINDOW: i32 = 24;
 // Speeds are stored as a share of this (texels per second)
 const SPEED_SCALE: f32 = 510.0;
 // Held speeds below this are 0 (texels per second)
@@ -50,6 +53,15 @@ const REPROJECT_STEPS: u32 = 3u;
 const RAY_TOLERANCE: f32 = 1.5;
 // Depth values from here on mean "no data", as in depth_mask.wgsl
 const MAX_DEPTH: f32 = 0.9999;
+// The largest arrival count: a texel in M after a reset or with an unknown previous state has it (taken
+// as static)
+const OLD_COUNT: f32 = 255.0;
+
+// Half of the window (cells, 1..MAX_WINDOW; 0 in the uniforms: 12, today's)
+fn window_cells() -> i32 {
+    let window = i32(round(cloud_u.reach.w));
+    return select(clamp(window, 1, MAX_WINDOW), 12, window <= 0);
+}
 
 @vertex
 fn vertex_main(@builtin(vertex_index) vertex_index: u32) -> @builtin(position) vec4f {
@@ -111,7 +123,8 @@ fn linearize_depth(depth: f32) -> f32 {
 }
 
 struct Previous {
-    // The state of the previous image on this ray (g: its M, a: its Mp before the flip test)
+    // The state of the previous image on this ray (g: its M, a: its Mp before the flip test + 2 x its
+    // arrival count)
     value: vec4f,
     known: bool,
 }
@@ -161,7 +174,9 @@ fn previous_state(tan_xy: vec2f, start: f32, size: vec2f) -> Previous {
 }
 
 // P1: M of this image, and of the previous one on the same world ray (head motion cancelled), with the
-// flip test: a texel that changed and changed back within three images claims no change
+// flip test: a texel that changed and changed back within three images claims no change. The arrival
+// count: 0 outside M; in M one more than the previous image's on the same ray (at most 255), 255 after
+// a reset or where the previous state is unknown (taken as static: the trail fails safe)
 @fragment
 fn mark_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     let eye = cloud_u.eyes[imm.view_idx];
@@ -180,23 +195,30 @@ fn mark_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     // Unknown or reset: no change claimed
     var mp_raw = m;
     var mpp = m;
+    var count = OLD_COUNT;
     if eye.pair.z < 0.5 {
         let previous = previous_state(tan_xy, select(START_DISTANCE, z, z > 0.0), size);
         if previous.known {
             mp_raw = previous.value.g;
-            mpp = previous.value.a;
+            // a = Mp before the flip test + 2 x the arrival count
+            let previous_count = floor(previous.value.a * 0.5);
+            mpp = previous.value.a - 2.0 * previous_count;
+            count = min(previous_count + 1.0, OLD_COUNT);
         }
+    }
+    if m < 0.5 {
+        count = 0.0;
     }
     var mp = mp_raw;
     if m == mpp && m != mp_raw {
         mp = m;
     }
-    return vec4f(z, m, mp, mp_raw);
+    return vec4f(z, m, mp, mp_raw + 2.0 * count);
 }
 
 // P2: along the row of this cell, the distance to the nearest cell in and out of M (state g) and of Mp
-// (state b), 0..12 cells, 13: none in the window. Cells outside the image are neither. A cell's value is
-// the mean of its four texels: one bilinear tap at their common corner
+// (state b), 0..W cells, W + 1: none in the window. Cells outside the image are neither. A cell's value
+// is the mean of its four texels: one bilinear tap at their common corner
 @fragment
 fn rows_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     let state_size = vec2i(textureDimensions(state_texture));
@@ -204,10 +226,11 @@ fn rows_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     let cell = vec2i(frag_coord.xy);
     let y = f32(2 * cell.y + 1) / f32(state_size.y);
 
-    var result = vec4f(NO_CELL);
-    for (var dx = -WINDOW; dx <= WINDOW; dx++) {
+    let window = window_cells();
+    var result = vec4f(f32(window + 1));
+    for (var dx = -MAX_WINDOW; dx <= MAX_WINDOW; dx++) {
         let x = cell.x + dx;
-        if x < 0 || x >= cells.x {
+        if abs(dx) > window || x < 0 || x >= cells.x {
             continue;
         }
         let uv = vec2f(f32(2 * x + 1) / f32(state_size.x), y);
@@ -229,7 +252,7 @@ fn rows_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
 
 // The signed distance of a cell (texels, + on the game side), not truncated: `own_in` its row distance
 // to an in cell (0: it is in), `in2` / `out2` the squared distance (cells) to the nearest in / out cell
-// (1e9: none in the window). Below TRUNCATION in size only where the edge is inside the window
+// (1e9: none in the window). Below the truncation (2W) in size only where the edge is inside the window
 fn signed_distance(own_in: f32, in2: f32, out2: f32) -> f32 {
     if own_in < 0.5 {
         return -2.0 * (sqrt(out2) - 0.5);
@@ -239,7 +262,8 @@ fn signed_distance(own_in: f32, in2: f32, out2: f32) -> f32 {
 
 // P3: the exact Euclidean distance inside the window from the rows, for M (phi) and Mp (phip); the
 // speed of the edge from their difference; the held speed carried from the previous field on the same
-// world ray (at the fetch distance, as the mask looks it up)
+// world ray (at the fetch distance, as the mask looks it up); the smallest arrival count of the cell's
+// four texels (a cell is old only if all of it is)
 @fragment
 fn field_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     let eye = cloud_u.eyes[imm.view_idx];
@@ -247,33 +271,36 @@ fn field_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     let cell = vec2i(frag_coord.xy);
 
     // Squared distances (cells) to the nearest in and out cell of M (x, y) and of Mp (z, w)
+    let window = window_cells();
+    // phi is truncated at this (texels: the window)
+    let truncation = 2.0 * f32(window);
     var nearest = vec4f(1e9);
     var own = vec4f(0.0);
-    for (var dy = -WINDOW; dy <= WINDOW; dy++) {
+    for (var dy = -MAX_WINDOW; dy <= MAX_WINDOW; dy++) {
         let y = cell.y + dy;
-        if y < 0 || y >= cells.y {
+        if abs(dy) > window || y < 0 || y >= cells.y {
             continue;
         }
         let row = round(textureLoad(rows_texture, vec2i(cell.x, y), 0) * 255.0);
         if dy == 0 {
             own = row;
         }
-        let found = row < vec4f(NO_CELL);
+        let found = row < vec4f(f32(window + 1));
         nearest = select(nearest, min(nearest, f32(dy * dy) + row * row), found);
     }
     let phi_raw = signed_distance(own.x, nearest.x, nearest.y);
     let phip_raw = signed_distance(own.z, nearest.z, nearest.w);
-    let phi = clamp(phi_raw, -TRUNCATION, TRUNCATION);
-    let phip = clamp(phip_raw, -TRUNCATION, TRUNCATION);
+    let phi = clamp(phi_raw, -truncation, truncation);
+    let phip = clamp(phip_raw, -truncation, truncation);
 
     // An edge in only one of the two masks inside the window (it entered or left the window or the
     // image, a lone cell that flipped in a uniform area, or a fast edge that moved farther than the
     // window) reads up to the truncation. `cloud_onesided` (reach.z): 0 a cell claims motion only where
     // both masks have an edge inside the window, 1 a cell with an edge in one of them only claims none
     // in the border band (cells whose window reaches outside the image), 2 every cell is measured
-    let inside = abs(phi_raw) < TRUNCATION;
-    let inside_p = abs(phip_raw) < TRUNCATION;
-    let border = any(cell < vec2i(WINDOW)) || any(cell >= cells - WINDOW);
+    let inside = abs(phi_raw) < truncation;
+    let inside_p = abs(phip_raw) < truncation;
+    let border = any(cell < vec2i(window)) || any(cell >= cells - window);
     let onesided_mode = cloud_u.reach.z;
     let refused = (onesided_mode < 0.5 && !(inside && inside_p))
         || (onesided_mode > 0.5 && onesided_mode < 1.5 && inside != inside_p && border);
@@ -303,10 +330,17 @@ fn field_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
         held_speed = 0.0;
     }
 
+    let state_size = vec2i(textureDimensions(state_texture));
+    var count = OLD_COUNT;
+    for (var i = 0; i < 4; i++) {
+        let texel = min(2 * cell + vec2i(i & 1, i >> 1u), state_size - 1);
+        count = min(count, floor(textureLoad(state_texture, texel, 0).a * 0.5));
+    }
+
     return vec4f(
-        0.5 + 0.5 * phi / TRUNCATION,
+        0.5 + 0.5 * phi / truncation,
         held_speed / SPEED_SCALE,
         speed / SPEED_SCALE,
-        0.5 + 0.5 * clamp((phip - phi) / TRUNCATION, -1.0, 1.0),
+        count / OLD_COUNT,
     );
 }

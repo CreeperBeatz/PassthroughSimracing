@@ -1230,7 +1230,7 @@ mod tests {
         // The depth cloud (version 7)
         assert!(
             json.contains(
-                r#""memory":null,"cloud":{"mode":1,"shown":false,"gain":150,"cap":14,"hold_ms":200,"dead":2.5,"lambda_ms":40,"fetch_mm":450,"fixed":0,"ab":true,"onesided":1,"trail":0,"eyes":[{"field_capture_ns":1000000000000,"prev_capture_ns":null,"dt_ms":0,"reset":"start","head_deg_s":0,"a_ms":15,"reach_ms":22.5,"stale":false},{"field_capture_ns":null,"#
+                r#""memory":null,"cloud":{"mode":1,"shown":false,"gain":150,"cap":14,"hold_ms":200,"dead":2.5,"lambda_ms":40,"fetch_mm":450,"fixed":0,"ab":true,"onesided":1,"trail":0,"trail_age":16,"window":12,"eyes":[{"field_capture_ns":1000000000000,"prev_capture_ns":null,"dt_ms":0,"reset":"start","head_deg_s":0,"a_ms":15,"reach_ms":22.5,"stale":false},{"field_capture_ns":null,"#
             ),
             "{json}"
         );

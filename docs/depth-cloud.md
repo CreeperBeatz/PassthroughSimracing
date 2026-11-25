@@ -27,18 +27,24 @@ moved poses) and is not new.
    The same world ray is followed back into the previous depth image of this eye in three fixed-point steps (as
    the room memory reprojects), so the head's own motion is cancelled. Where the previous surface is not on the
    ray (a texel uncovered beside a near thing), the texel is "unknown" and claims no change. A flip test drops
-   texels that changed and changed back within three depth images (noise).
+   texels that changed and changed back within three depth images (noise). Each texel in the region also counts
+   how many depth images in a row its world ray has been in it (its arrival count, 0..255, for the trail below);
+   after a reset, or where the previous image is unknown, it counts as 255 (static).
 2. **rows** (160 x 160 cells of 2 x 2 texels). Along each row, the distance to the nearest in and out cell, for the
-   new mask and for the previous one, within a window of 12 cells.
+   new mask and for the previous one, within a window of 12 cells (`cloud_window`). The window limits how far the
+   band can reach: the distances stop at 2 x the window in texels (24 texels = about 8 cm at 0.5 m by default),
+   and an edge that moved farther in one pair is seen by one mask only.
 3. **field** (160 x 160, two per eye). Along each column, the exact distance to the edge of both masks inside the
    window. The difference of the two distances is how far the nearest edge moved in this pair. Below a deadband
    (2.5 texels per pair) it counts as no motion; above it, divided by the time between the images, it is a speed
    in texels per second. The field keeps the largest speed of the last about 200 ms per world ray (the held speed
-   decays with `cloud_hold_ms`); below 15 texels per second it is 0.
+   decays with `cloud_hold_ms`); below 15 texels per second it is 0. Each cell also keeps the smallest arrival
+   count of its four texels (a cell is old only if all of it is).
 
 **The one-sided rule.** In some pairs a cell sees an edge in only one of the two masks inside its window: an edge
-that entered or left the window or the image, or one that moved more than 12 cells in one pair. `cloud_onesided`
-says what such a cell does: 0, it claims no speed anywhere; 1 (default), it claims none only in a 12-cell band
+that entered or left the window or the image, or one that moved more than the window (12 cells) in one pair.
+`cloud_onesided` says what such a cell does: 0, it claims no speed anywhere; 1 (default), it claims none only in a
+band as wide as the window
 along the border of the image, where edges enter and leave during head motion; 2, it claims a speed everywhere.
 Offline, mode 0 everywhere costs 3-4 points of "held" in the driving recordings and halves it in the fast wave,
 because a fast edge is one-sided too. The border-only default is reasoned, not measured: no recording has head
@@ -62,7 +68,8 @@ over (a reset that clears the history). The mask looks up the
 display ray in the field at `cloud_fetch_mm` (independent of the depth lookup), through the camera of that eye's
 own field. The zone is open where the distance to the edge is below speed x reach time (at most `cloud_cap`
 texels, with a soft edge of 1.5 texels), on both sides of the edge. It goes into the mask's g channel; coverage
-(r, b, a) is never changed. The stream pass raises the key's focus with it only inside the lower key layer, so
+(r, a) is never changed, and b (the depth data flag, read only by the Show depth view, which hides the cloud) only
+with the trail below. The stream pass raises the key's focus with it only inside the lower key layer, so
 the zone opens the upper game layer and the keyed passthrough shows what the colour table keeps. `solid` always
 wins. The Tint-mask view paints the zone green.
 
@@ -78,6 +85,16 @@ the field (looked up at `cloud_fetch_mm`) and the mask can disagree by a little,
 side can also reach into the mask. The Tint-mask view paints the border green like the rest of the zone; the
 playzone tint still follows the full mask.
 
+**The trail takes only surface that arrived recently** (`cloud_trail_age`, 16 depth images by default). An edge
+can seem to move while nothing does: depth noise, or the hole the runtime cuts around a hand, makes it ragged and
+flickering, the field measures a speed, and the trail handed up to N texels of a static desk beside it to the key,
+which does not keep desk colours. Inside the mask the trail now gives way only where the cell's arrival count is
+below the age (a soft step over the last 2 images): the late copy of a mover arrived a few images ago, a desk has
+been in the mask since long. The zone itself (g, the band on the game side and the key's focus) does not depend on
+the age. The mask carries the trail's strength in b while the trail is on (the zone, times "recent" inside the
+mask), and the stream takes the solid's reduction from it. A missing or cleared field counts as old (fails safe to
+today's solid mask). `cloud_trail_age 0` is the trail without the age test.
+
 While the cloud is on, an unset `key_layers` is 5 (the extra layers over the whole view) and an unset `key_crop`
 is 0 (not cropped to the hands): the zone only acts where the lower layer is drawn. Set values win.
 
@@ -89,15 +106,17 @@ All `adb shell setprop debug.alvr.<name> <value>`, read every 500 ms; each chang
 |---|---|---|---|
 | `cloud` | 0 | 0..2 | 0 or unset: off. 1: the depth cloud; today's arm shift is off while its zone shows (not in today's phase of `cloud_ab`, not with the Show depth view, which hides the zone). 2: the cloud on top of today's arm shift (comparison, not skeleton-free) |
 | `cloud_gain` | 150 | 0..400 | % of measured speed x age |
-| `cloud_cap` | 14 | 4..24 | largest reach, depth texels (14 texels = 5.5 degrees = 4.8 cm at 0.5 m) |
+| `cloud_cap` | 14 | 4..2 x `cloud_window` | largest reach, depth texels (14 texels = 5.5 degrees = 4.8 cm at 0.5 m); up to 24 by default, 48 with `cloud_window 24` |
 | `cloud_hold_ms` | 200 | 0..500 | decay of the held speed (0: the newest pair only) |
 | `cloud_dead` | 25 | 15..60 | deadband, tenths of a texel per depth pair |
 | `cloud_lambda_ms` | 40 | 0..120 | passthrough latency taken off the depth's age |
 | `cloud_fetch_mm` | 450 | 200..1500 | distance at which a display ray is looked up in the field |
 | `cloud_head_max` | 120 | 0..1000 | deg/s of head turn above which a pair claims no motion (0: no guard) |
-| `cloud_fixed` | 0 | 0..24 | N > 0: a constant reach of N texels wherever something moved recently |
+| `cloud_fixed` | 0 | 0..2 x `cloud_window` | N > 0: a constant reach of N texels wherever something moved recently |
 | `cloud_onesided` | 1 | 0..2 | the one-sided rule above |
-| `cloud_trail` | 0 | 0..24 | N > 0: inside the depth mask, a border of at most N texels (and at most the reach) along edges that moved is decided by the key instead of showing the room (the trail above). 0: off |
+| `cloud_trail` | 0 | 0..2 x `cloud_window` | N > 0: inside the depth mask, a border of at most N texels (and at most the reach) along edges that moved is decided by the key instead of showing the room (the trail above). 0: off |
+| `cloud_trail_age` | 16 | 0..255 | the trail hands only surface to the key that arrived in the mask within this many depth images (about 0.6-1 s at 15-25 images per second); 0: no age test (the trail before it). Only while `cloud_trail` is on |
+| `cloud_window` | 12 | 12..24 | half of the field's search window, cells of 2 x 2 depth texels: the band reaches at most 2 x this texels (24 = about 8 cm at 0.5 m; 48 = about 16 cm). A change starts the cloud over (both eyes reset, fields cleared). Cost: the rows and field passes read about twice as many texels with 24 |
 | `cloud_ab` | 0 | 0, 1 | 1: 2 s the cloud as set, 2 s today's picture (arm shift as set), with a green / red mark; the passes keep running |
 | `cloud_leak` | 0 | 0, 1 | 1: gain and cap scaled by the key's measured leak ("The key adapts" below); shown in the `cloud:` line, not logged on change |
 | `key_layers`, `key_crop` | 4, 1 | | unset while `cloud` is 1 or 2: 5 and 0 |
@@ -107,10 +126,12 @@ All `adb shell setprop debug.alvr.<name> <value>`, read every 500 ms; each chang
 Tag `ALVR_CAM`, every 2 s while `cloud` is set, and the parameters on each change:
 
 ```
-cloud: mode 1, gain 150 cap 14 hold 200 dead 2.5 lambda 40 fetch 450 fixed 0 ab 0 onesided 1 trail 0 | depth 17.0 /s
-(33 ms 41 %, 67 ms 59 %, 100 ms 0 %), age 136 ms, a 96 ms, stale 0 | pairs 34: reset 2 (start 1, dt 0, head 1,
-region 0) | layers 5 crop 0
+cloud: mode 1, gain 150 cap 14 hold 200 dead 2.5 lambda 40 fetch 450 fixed 0 ab 0 onesided 1 trail 0/16 window 12
+| depth 17.0 /s (33 ms 41 %, 67 ms 59 %, 100 ms 0 %), age 136 ms, a 96 ms, stale 0 | pairs 34: reset 2 (start 1,
+dt 0, head 1, region 0) | layers 5 crop 0
 ```
+
+`trail 0/16`: `cloud_trail` / `cloud_trail_age`.
 
 `depth`: new pairs of the left eye per second and the share of each interval between depth images (over its pairs
 other than start and dt resets); `age` and `a`: the mean age of the left eye's field at display and how far the live
@@ -125,7 +146,7 @@ off).
 
 Index version 7. Each display record has `"cloud": null` while the cloud is off or not running, else
 `{"mode", "shown", "gain", "cap", "hold_ms", "dead", "lambda_ms", "fetch_mm", "fixed", "ab", "onesided", "trail",
-"eyes": [{"field_capture_ns", "prev_capture_ns", "dt_ms", "reset": null | "start" | "dt" | "head" | "region",
+"trail_age", "window", "eyes": [{"field_capture_ns", "prev_capture_ns", "dt_ms", "reset": null | "start" | "dt" | "head" | "region",
 "head_deg_s", "a_ms", "reach_ms", "stale"} x 2]}` (`stale`: the field was older than 300 ms on that frame, no
 zone; `reach_ms` is then 0). With these, the depth frames and their poses, the field of every display
 frame can be rebuilt offline. `docs/tools/read_burst.py` reads it as `display["cloud_*"]` and still reads older
@@ -134,7 +155,7 @@ versions.
 ## Known limits
 
 - **Lone noise in the image interior can open a brief band** with the default `cloud_onesided 1`: a patch of depth
-  noise that flips into or out of the region where no edge was within 12 cells has an edge in one mask only, and
+  noise that flips into or out of the region where no edge was within the window has an edge in one mask only, and
   outside the border band such a cell is measured. The flip test drops it on the pair that removes it again, but the
   pair that brings it claims a speed, held for about 200 ms. This is the price of not losing fast motion (a fast edge
   is one-sided too); `cloud_onesided 0` removes it at that cost.
@@ -142,6 +163,10 @@ versions.
   A recentre whose change takes effect at a later time is not waited for: the fields are forgotten when the event
   arrives, so the pair that spans the actual change compares images from two reference spaces and can claim motion
   (only a turn above `cloud_head_max` is caught).
+- **Fast motion outruns the window.** The band reaches at most 2 x `cloud_window` texels from an edge: 24 texels,
+  about 8 cm at 0.5 m, by default, while a fast arm travels 8-16 cm in the depth's age. Its leading side then clips
+  into the game although the cap allows more. `cloud_window 24` doubles it (48 texels, about 16 cm at 0.5 m; with
+  `cloud_cap` up to 48) for about twice the texel reads of the rows and field passes.
 - **The first `cloud 1`** compiles the three pipelines of the passes on the render thread: one hitch when it is
   switched on. It is also the first real check of these shaders on the headset's GLES compiler (the PC tests only
   translate them to GLSL ES and run them through another backend).
@@ -149,8 +174,7 @@ versions.
 ## What v1 leaves out, and what comes after
 
 Left out on purpose: the trailing side as such (the late copy behind the arm stays as today unless `cloud_trail`
-hands a border of the mask to the key, on both sides of the edge alike; the field keeps the direction for a
-trailing-only rule); any change to the colour learner (a "mover" class); cropping and switching the extra layers from the zone
+hands a border of the mask to the key, on both sides of the edge alike, only on surface that arrived recently); any change to the colour learner (a "mover" class); cropping and switching the extra layers from the zone
 (v1 runs them over the whole view, about 85 % GPU load against 76-80 % today); a stats readback of the field; the
 field as a burst file, a speed debug view, a second lookup at the mover's depth, a neighbour maximum of the speed,
 a half-view A/B, the distance region.
@@ -234,6 +258,16 @@ offline check predicted (5-7 points of leak with the real table). The jitter fit
 re-anchored to the depth edge 15-17 times a second and grows between two depth images: with a key
 that kept only the arm this would not show, with patches inside it does. The ghosting is most likely
 the late depth copy behind the arm, which v1 leaves as it is.
+
+Later the same day, two findings that gave switches:
+
+- **Slow motion is pixel accurate, fast motion clips.** The user: "when im moving my arm slowly, the leading side
+  is very accurate - pixel accurate. When im moving it fast, the leading edge clips into VR from a not fast enough
+  depth mask." The cap was already at its largest (24): the band is limited by the field's window. This is the
+  reason for `cloud_window`.
+- **With `cloud_trail 24` a strip of the static desk** beside a ragged, flickering mask edge (hand at rest on the
+  desk, inside the play area) turned into game: an A/B of screenshots with the trail at 0 and 24. Fixed by the
+  arrival age (`cloud_trail_age`).
 
 Not judged yet: the A/B against today's arm, a smaller band (`cloud_cap 8`), the constant band
 (`cloud_fixed 8`), a longer hold, `cloud 2`, sleeves.

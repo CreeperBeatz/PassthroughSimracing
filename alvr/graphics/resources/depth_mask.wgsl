@@ -11,8 +11,10 @@
 //
 // Output: r: region coverage (0..1), g: proximity for the debug view (1: at the eye, 0: 3 m or
 // more), or with the depth cloud (`debug.alvr.cloud`) its zone, where the colour key decides (0..1),
-// b: whether there is depth data (0/1), a: how much of r comes from the remembered playzone (for the
-// debug view)
+// b: whether there is depth data (0/1; read by the Show depth view only, which hides the cloud), or
+// with the cloud's trail (`cloud_trail`, depth_u.cloud.z above 0) how much of the solid mask the
+// stream hands to the key (0..1, see cloud_zone), a: how much of r comes from the remembered playzone
+// (for the debug view)
 
 struct Immediate {
     view_idx: u32,
@@ -59,9 +61,14 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     var result = current_mask(uv);
 
     // The depth cloud replaces the proximity, which only the Show depth view reads (the cloud is off
-    // with it). Off (the default): nothing is read, the mask is today's
+    // with it), and with `cloud_trail` the depth data flag, read by that view only too. Off (the
+    // default): nothing is read, the mask is today's
     if depth_u.cloud.x > 0.5 {
-        result.g = cloud_zone(uv);
+        let zone = cloud_zone(uv);
+        result.g = zone.x;
+        if depth_u.cloud.z > 0.0 {
+            result.b = zone.y;
+        }
     }
 
     // The strip the runtime removes behind each wrist. Only adds, and with both gaps off (the default)
@@ -105,13 +112,15 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     return result;
 }
 
-// The field stores phi and speeds as shares of these (texels, texels per second), see motion_cloud.wgsl
-const CLOUD_TRUNCATION: f32 = 24.0;
+// The field stores speeds as a share of this (texels per second) and phi as a share of 2 x its window
+// (cloud_u.reach.w, cells: texels), see motion_cloud.wgsl
 const CLOUD_SPEED_SCALE: f32 = 510.0;
 // `cloud_fixed`: the full reach from this speed on (texels per second)
 const CLOUD_FIXED_SPEED: f32 = 30.0;
 // The zone fades out over this much of its reach (texels)
 const CLOUD_SOFT_EDGE: f32 = 1.5;
+// The arrival counts of the field are stored as a share of this (depth images)
+const CLOUD_OLD_COUNT: f32 = 255.0;
 
 // The zone of the depth cloud along the view ray of uv (0..1, design/depthcloud/final.md B.3): the ray
 // is looked up in the field of this eye at a fixed distance (independent of the depth lookup), and the
@@ -119,11 +128,14 @@ const CLOUD_SOFT_EDGE: f32 = 1.5;
 // With `cloud 2` the lookup point is moved back by the arm shift, as the depth is. Outside the field's
 // camera, for an eye without a field (zero matrices) or with a field older than 300 ms (pair.w 0, the
 // depth stalled; also with `cloud_fixed`), no zone. With `cloud_trail` (depth_u.cloud.z) the reach
-// inside the mask is at most the trail
-fn cloud_zone(uv: vec2f) -> f32 {
+// inside the mask is at most the trail. x: the zone. y: the trail, how much of the solid mask the stream
+// hands to the key: the zone, inside the mask (phi < 0) only where the surface arrived within the last
+// `cloud_trail_age` depth images (depth_u.cloud.w, 0: no age test, the zone): a static surface beside
+// an edge that only seems to move (depth noise, the hole the runtime cuts around a hand) stays solid
+fn cloud_zone(uv: vec2f) -> vec2f {
     let view_idx = imm.view_idx;
     if cloud_u.eyes[view_idx].pair.w < 0.5 {
-        return 0.0;
+        return vec2f(0.0);
     }
     let eye = depth_u.eyes[view_idx];
     let origin = eye.eye_position.xyz;
@@ -136,19 +148,23 @@ fn cloud_zone(uv: vec2f) -> f32 {
     let camera = cloud_u.eyes[view_idx].field;
     let view_point = (camera.world_to_view * vec4f(point, 1.0)).xyz;
     if view_point.z > -0.001 {
-        return 0.0;
+        return vec2f(0.0);
     }
     let tan_xy = view_point.xy / -view_point.z;
     var tex_uv = (tan_xy - camera.tangents.xz) / (camera.tangents.yw - camera.tangents.xz);
     if any(tex_uv < vec2f(0.0)) || any(tex_uv > vec2f(1.0)) {
-        return 0.0;
+        return vec2f(0.0);
     }
     if depth_u.depth.w > 0.5 {
         tex_uv.y = 1.0 - tex_uv.y;
     }
 
     let field = textureSampleLevel(cloud_field, linear_sampler, tex_uv, 0.0);
-    let phi = (2.0 * field.r - 1.0) * CLOUD_TRUNCATION;
+    // The window the field was built with (a change of `cloud_window` starts the cloud over), as
+    // window_cells() of motion_cloud.wgsl: 0 is 12 (24 texels), today's
+    let window = round(cloud_u.reach.w);
+    let truncation = 2.0 * select(clamp(window, 1.0, 24.0), 12.0, window <= 0.0);
+    let phi = (2.0 * field.r - 1.0) * truncation;
     let speed = field.g * CLOUD_SPEED_SCALE;
     var reach = min(speed * cloud_u.reach[view_idx], cloud_u.params.z);
     if cloud_u.params.w > 0.0 {
@@ -160,9 +176,16 @@ fn cloud_zone(uv: vec2f) -> f32 {
         reach = min(reach, depth_u.cloud.z);
     }
     if reach <= 0.0 {
-        return 0.0;
+        return vec2f(0.0);
     }
-    return 1.0 - smoothstep(reach - CLOUD_SOFT_EDGE, reach, abs(phi));
+    let zone = 1.0 - smoothstep(reach - CLOUD_SOFT_EDGE, reach, abs(phi));
+    // `cloud_trail_age`: the arrival count of the field (blended across cells like the rest)
+    var recent = 1.0;
+    let age = depth_u.cloud.w;
+    if age > 0.0 && phi < 0.0 {
+        recent = 1.0 - smoothstep(age - 2.0, age, field.a * CLOUD_OLD_COUNT);
+    }
+    return vec2f(zone, zone * recent);
 }
 
 // How much the lever windows show along a view ray: the most open of those it crosses in front of the

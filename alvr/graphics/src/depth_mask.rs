@@ -1084,8 +1084,8 @@ pub fn cloud_shown(
 }
 
 // The `cloud` vector of the depth uniforms: x the mode while the zone is shown (`cloud_shown`), y the
-// mark of `cloud_ab`, z `cloud_trail` while the zone is shown (texels, else 0). Zeros while the cloud
-// does not run
+// mark of `cloud_ab`, z `cloud_trail` while the zone is shown (texels, else 0), w `cloud_trail_age`
+// while the trail is on (depth images, else 0). Zeros while the cloud does not run
 fn cloud_vector(
     config: &DepthPassthroughConfig,
     input: &DepthRenderInput,
@@ -1115,7 +1115,12 @@ fn cloud_vector(
     } else {
         0.0
     };
-    [mode, mark, trail, 0.0]
+    let trail_age = if trail > 0.0 {
+        f32::from(cloud.params.trail_age)
+    } else {
+        0.0
+    };
+    [mode, mark, trail, trail_age]
 }
 
 // Distance of a point (in the space of the view) outside the side planes of the view (through its

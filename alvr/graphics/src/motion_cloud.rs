@@ -25,9 +25,12 @@
 
 use alvr_common::{ViewParams, glam::Quat};
 
-/// Half of the window of the distances of the field (cells of 2 x 2 depth texels)
-pub const CLOUD_WINDOW_CELLS: i32 = 12;
-/// The signed distances are truncated at this (depth texels: the window)
+/// Half of the window of the distances of the field (cells of 2 x 2 depth texels) by default
+/// (`cloud_window` unset)
+pub const CLOUD_WINDOW_CELLS: u8 = 12;
+/// The largest window (`cloud_window`, cells): the loops of motion_cloud.wgsl run over this
+pub const CLOUD_MAX_WINDOW_CELLS: u8 = 24;
+/// The signed distances are truncated at this with the default window (depth texels: the window)
 pub const CLOUD_TRUNCATION: f32 = 24.0;
 /// Speeds are stored as a share of this (depth texels per second: 2 per 8 bit step)
 pub const CLOUD_SPEED_SCALE: f32 = 510.0;
@@ -78,6 +81,20 @@ pub struct CloudParams {
     /// edges that moved is handed to the colour key instead of showing the room by itself (depth
     /// texels, 0: off)
     pub trail: f32,
+    /// `cloud_trail_age`: the trail hands only surface to the key that arrived in the depth mask within
+    /// this many depth images (the late copy of a mover); surface that has been in it longer (a static
+    /// desk beside an edge that only seems to move) stays solid. 0: no age test
+    pub trail_age: u8,
+    /// `cloud_window`: half of the window of the field's search (cells of 2 x 2 depth texels, 1..24;
+    /// 12: today's). The distances are truncated at 2 x this (depth texels), so the band reaches at
+    /// most that far. A change resets the cloud (`MotionCloud::plan`)
+    pub window: u8,
+}
+
+/// The truncation of the signed distances of a field built with `window` (depth texels: 2 x the
+/// window, which is taken as 1..`CLOUD_MAX_WINDOW_CELLS`)
+pub fn cloud_truncation(window: u8) -> f32 {
+    2.0 * f32::from(window.clamp(1, CLOUD_MAX_WINDOW_CELLS))
 }
 
 impl Default for CloudParams {
@@ -95,6 +112,8 @@ impl Default for CloudParams {
             ab: false,
             onesided: 1,
             trail: 0.0,
+            trail_age: 16,
+            window: CLOUD_WINDOW_CELLS,
         }
     }
 }
@@ -407,7 +426,7 @@ pub fn cloud_uniforms(
         finite(reach_s[0]).max(0.0),
         finite(reach_s[1]).max(0.0),
         f32::from(params.onesided.min(2)),
-        0.0,
+        f32::from(params.window.clamp(1, CLOUD_MAX_WINDOW_CELLS)),
     ]);
 
     data.try_into().unwrap()
@@ -466,10 +485,11 @@ pub fn cells_inside(texels: &[bool], width: usize, height: usize) -> (Vec<bool>,
 
 /// The signed distance of field_main on a grid of cells (in: true), in depth texels, positive on the
 /// game side: the exact Euclidean distance (cells) to the nearest cell of the other kind within the
-/// window of +-12 cells, as 2 * (d - 0.5), truncated at +-24. Cells outside the grid are neither. The
-/// reference of rows_main and field_main
-pub fn window_distance(inside: &[bool], width: usize, height: usize) -> Vec<f32> {
-    let window = CLOUD_WINDOW_CELLS as isize;
+/// window of +-`window` cells (`cloud_window`, 12 by default), as 2 * (d - 0.5), truncated at
+/// +-2 x `window`. Cells outside the grid are neither. The reference of rows_main and field_main
+pub fn window_distance(inside: &[bool], width: usize, height: usize, window: u8) -> Vec<f32> {
+    let truncation = cloud_truncation(window);
+    let window = isize::from(window.clamp(1, CLOUD_MAX_WINDOW_CELLS));
     let mut result = vec![0.0; width * height];
     for y in 0..height {
         for x in 0..width {
@@ -488,7 +508,7 @@ pub fn window_distance(inside: &[bool], width: usize, height: usize) -> Vec<f32>
             }
             let distance = 2.0 * (nearest - 0.5);
             let signed = if own { -distance } else { distance };
-            result[y * width + x] = signed.clamp(-CLOUD_TRUNCATION, CLOUD_TRUNCATION);
+            result[y * width + x] = signed.clamp(-truncation, truncation);
         }
     }
     result
@@ -498,7 +518,7 @@ pub fn window_distance(inside: &[bool], width: usize, height: usize) -> Vec<f32>
 /// computes it: `phi_raw` / `phip_raw` the signed distances of the cell to the edge of M and of the
 /// corrected Mp before the truncation (texels, `window_distance` without its clamp; beyond the
 /// truncation where no edge is inside the window), `border`: the cell's window reaches outside the image.
-/// The held speed is not part of it
+/// The window and its truncation are those of `params.window`. The held speed is not part of it
 pub fn pair_speed(
     phi_raw: f32,
     phip_raw: f32,
@@ -506,9 +526,10 @@ pub fn pair_speed(
     dt_s: f32,
     params: &CloudParams,
 ) -> f32 {
-    let truncated = |phi: f32| phi.clamp(-CLOUD_TRUNCATION, CLOUD_TRUNCATION);
-    let inside = phi_raw.abs() < CLOUD_TRUNCATION;
-    let inside_p = phip_raw.abs() < CLOUD_TRUNCATION;
+    let truncation = cloud_truncation(params.window);
+    let truncated = |phi: f32| phi.clamp(-truncation, truncation);
+    let inside = phi_raw.abs() < truncation;
+    let inside_p = phip_raw.abs() < truncation;
     let refused = match params.onesided {
         0 => !(inside && inside_p),
         1 => inside != inside_p && border,
@@ -628,6 +649,8 @@ impl CloudRecord {
             ("ab", params.ab.to_string()),
             ("onesided", params.onesided.to_string()),
             ("trail", number(params.trail)),
+            ("trail_age", params.trail_age.to_string()),
+            ("window", params.window.to_string()),
             ("eyes", array(self.eyes.map(|eye| eye.to_json()))),
         ])
     }
@@ -952,7 +975,10 @@ mod tests {
         assert_eq!(&data[72..76], &[0.067, 0.7, 1.0, 1.0]);
         // No right eye: zeros (also not open)
         assert!(data[76..152].iter().all(|value| *value == 0.0));
-        assert_eq!(&data[152..160], &[0.45, 2.5, 14.0, 0.0, 0.1, 0.2, 1.0, 0.0]);
+        assert_eq!(
+            &data[152..160],
+            &[0.45, 2.5, 14.0, 0.0, 0.1, 0.2, 1.0, 12.0]
+        );
         // A stale field: closed
         let data = cloud_uniforms(
             &[Some(eye), Some(eye)],
@@ -1025,7 +1051,7 @@ mod tests {
         let (width, height) = (40, 30);
         let mut inside = vec![false; width * height];
         inside[10 * width + 10] = true;
-        let phi = window_distance(&inside, width, height);
+        let phi = window_distance(&inside, width, height, CLOUD_WINDOW_CELLS);
         assert_eq!(phi[10 * width + 10], -1.0);
         assert_eq!(phi[10 * width + 11], 1.0);
         // 3 and 4 cells away: 5 cells, 9 texels
@@ -1034,7 +1060,7 @@ mod tests {
         assert_eq!(phi[10 * width + 30], CLOUD_TRUNCATION);
         // Nothing in: truncated everywhere
         assert!(
-            window_distance(&[false; 12], 4, 3)
+            window_distance(&[false; 12], 4, 3, CLOUD_WINDOW_CELLS)
                 .iter()
                 .all(|phi| *phi == CLOUD_TRUNCATION)
         );
@@ -1044,6 +1070,62 @@ mod tests {
         let (cells, w, h) = cells_inside(&texels, 4, 2);
         assert_eq!((w, h), (2, 1));
         assert_eq!(cells, [false, true]);
+    }
+
+    // `cloud_window 24`: the uniforms carry it (reach.w), the distances reach 24 cells and are truncated
+    // at 48 texels, and a pair is inside the window up to there
+    #[test]
+    fn window_24_reaches_twice_as_far() {
+        let wide = CloudParams {
+            window: 24,
+            ..Default::default()
+        };
+        assert_eq!(cloud_truncation(CLOUD_WINDOW_CELLS), CLOUD_TRUNCATION);
+        assert_eq!(cloud_truncation(24), 48.0);
+        let data = cloud_uniforms(&[None, None], &wide, [0.1, 0.2], [true; 2]);
+        assert_eq!(data.len() * 4, CLOUD_UNIFORMS_SIZE);
+        assert_eq!(&data[156..160], &[0.1, 0.2, 1.0, 24.0]);
+        // Out of range: at most the largest window
+        let data = cloud_uniforms(
+            &[None, None],
+            &CloudParams { window: 99, ..wide },
+            [0.0; 2],
+            [true; 2],
+        );
+        assert_eq!(data[159], 24.0);
+
+        let (width, height) = (60, 10);
+        let mut inside = vec![false; width * height];
+        for y in 0..height {
+            inside[y * width] = true;
+        }
+        let phi = window_distance(&inside, width, height, 24);
+        // 20 cells: 39 texels; 24 cells: 47; beyond: truncated at 48
+        assert_eq!(phi[5 * width + 20], 39.0);
+        assert_eq!(phi[5 * width + 24], 47.0);
+        assert_eq!(phi[5 * width + 25], 48.0);
+        let today = window_distance(&inside, width, height, CLOUD_WINDOW_CELLS);
+        assert_eq!(today[5 * width + 12], 23.0);
+        assert_eq!(today[5 * width + 20], CLOUD_TRUNCATION);
+
+        // A jump of 30 texels: mode 0 claims it only where both edges are inside the window
+        let dt = 0.0667;
+        let strict = CloudParams {
+            onesided: 0,
+            ..Default::default()
+        };
+        assert_eq!(pair_speed(-5.0, 25.0, false, dt, &strict), 0.0);
+        let speed = pair_speed(
+            -5.0,
+            25.0,
+            false,
+            dt,
+            &CloudParams {
+                window: 24,
+                ..strict
+            },
+        );
+        assert!((speed - 30.0 / dt).abs() < 1e-3, "{speed}");
     }
 
     #[test]
@@ -1075,7 +1157,10 @@ mod tests {
             "{json}"
         );
         assert!(json.contains(r#""fetch_mm":450"#), "{json}");
-        assert!(json.contains(r#""onesided":1,"trail":0,"eyes""#), "{json}");
+        assert!(
+            json.contains(r#""onesided":1,"trail":0,"trail_age":16,"window":12,"eyes""#),
+            "{json}"
+        );
         assert!(json.contains(r#""reset":"head""#), "{json}");
         assert!(
             json.contains(r#""reach_ms":136.5,"stale":false},"#),

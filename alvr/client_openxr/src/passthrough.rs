@@ -126,12 +126,15 @@ impl PassthroughLayer<'_> {
 ///   the depth mask that moved since the depth image before, a band of measured speed x age of the depth in
 ///   which the key decides; today's arm shift is off while it shows. 2: on top of today's arm shift. 0 or
 ///   unset: off, today's picture (the default). Needs the key and a play area of boxes. `cloud_gain`
-///   (150 %, 0..400), `cloud_cap` (14 depth texels, 4..24), `cloud_hold_ms` (200, 0..500), `cloud_dead`
-///   (25 tenths of a texel per pair, 15..60), `cloud_lambda_ms` (40, 0..120), `cloud_fetch_mm` (450,
-///   200..1500), `cloud_head_max` (120 deg/s, 0..1000, 0: no guard), `cloud_fixed` (0, 0..24 texels: a
-///   constant reach), `cloud_onesided` (1, 0..2: where an edge is in only one depth image of a pair, the pair
-///   claims no speed anywhere (0), none in the border band of the image (1) or a speed everywhere (2)),
-///   `cloud_ab 1`: 2 s the cloud, 2 s today's picture, with a green / red mark. A `cloud:` line every 2 s
+///   (150 %, 0..400), `cloud_cap` (14 depth texels, 4..2 x `cloud_window`), `cloud_hold_ms` (200, 0..500),
+///   `cloud_dead` (25 tenths of a texel per pair, 15..60), `cloud_lambda_ms` (40, 0..120), `cloud_fetch_mm`
+///   (450, 200..1500), `cloud_head_max` (120 deg/s, 0..1000, 0: no guard), `cloud_fixed` (0, 0..2 x
+///   `cloud_window` texels: a constant reach), `cloud_onesided` (1, 0..2: where an edge is in only one depth
+///   image of a pair, the pair claims no speed anywhere (0), none in the border band of the image (1) or a
+///   speed everywhere (2)), `cloud_window` (12 cells, 12..24: how far the field searches for edges; the band
+///   reaches at most 2 x this texels), `cloud_trail_age` (16 depth images, 0..255, 0: no age test: the trail
+///   hands only surface to the key that arrived in the mask within these), `cloud_ab 1`: 2 s the cloud, 2 s today's picture, with a green / red
+///   mark. A `cloud:` line every 2 s
 /// - `setprop debug.alvr.key_hands 0`: no hands in the GPU passes (to measure them)
 /// - `setprop debug.alvr.arm_shift 0`: plain depth for the arms, not shifted by the motion of the wrist (also
 ///   without the key, see `StreamContext`). 1 (default): shifted with the display-time wrist, a smoothstep to

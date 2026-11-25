@@ -197,12 +197,13 @@ fn depth_passthrough(stream_color: vec3f, uv: vec2f) -> vec4f {
         // Only where the lower layer is used: outside it a zone pixel would pack to the game
         // `cloud_trail` (depth_u.cloud.z > 0): inside the depth mask the zone is its border along edges
         // that moved, and there the mask no longer shows the room by itself: the key decides, as on the
-        // game side. The solid fill of the hands stays. Off (0): today's
+        // game side. How much (mask b): the zone, inside the mask only on surface that arrived recently
+        // (`cloud_trail_age`, depth_mask.wgsl). The solid fill of the hands stays. Off (0): today's
         var trail_zone = 0.0;
         if depth_u.cloud.x > 0.5 && in_lower {
             focus = max(focus, mask_sample.g);
             if depth_u.cloud.z > 0.0 {
-                trail_zone = mask_sample.g;
+                trail_zone = mask_sample.b;
             }
         }
         let solid = max(mask * (1.0 - trail_zone), hand.g);

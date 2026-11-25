@@ -9,8 +9,11 @@ use alvr_graphics::{CloudInput, CloudParams, CloudStatus, ResetReason};
 use std::{fmt::Write, time::Duration};
 
 pub const MAX_GAIN: i64 = 400;
+/// `cloud_window` (cells): 12, today's, up to 24. `cloud_cap`, `cloud_fixed` and `cloud_trail` go up to
+/// 2 x the window (depth texels: the truncation of the field's distances)
+pub const MIN_WINDOW: i64 = 12;
+pub const MAX_WINDOW: i64 = 24;
 pub const MIN_CAP: i64 = 4;
-pub const MAX_CAP: i64 = 24;
 pub const MAX_HOLD_MS: i64 = 500;
 /// Tenths of a depth texel per pair
 pub const MIN_DEAD: i64 = 15;
@@ -19,8 +22,8 @@ pub const MAX_LAMBDA_MS: i64 = 120;
 pub const MIN_FETCH_MM: i64 = 200;
 pub const MAX_FETCH_MM: i64 = 1500;
 pub const MAX_HEAD_DEG_S: i64 = 1000;
-pub const MAX_FIXED: i64 = 24;
-pub const MAX_TRAIL: i64 = 24;
+/// `cloud_trail_age` (depth images, 0: no age test)
+pub const MAX_TRAIL_AGE: i64 = 255;
 /// `cloud_ab 1` shows the cloud and today's picture for this long each
 pub const AB_PHASE: Duration = Duration::from_secs(2);
 
@@ -39,6 +42,8 @@ pub struct CloudValues {
     pub ab: Option<i64>,
     pub onesided: Option<i64>,
     pub trail: Option<i64>,
+    pub trail_age: Option<i64>,
+    pub window: Option<i64>,
 }
 
 /// `debug.alvr.cloud*`. None: `cloud` is unset or 0 (off, the default)
@@ -59,6 +64,8 @@ pub fn read_params() -> Option<CloudParams> {
         ab: debug_property("debug.alvr.cloud_ab"),
         onesided: debug_property("debug.alvr.cloud_onesided"),
         trail: debug_property("debug.alvr.cloud_trail"),
+        trail_age: debug_property("debug.alvr.cloud_trail_age"),
+        window: debug_property("debug.alvr.cloud_window"),
     })
 }
 
@@ -69,18 +76,23 @@ pub fn read_params() -> Option<CloudParams> {
 }
 
 /// Unset values are the defaults; out of range ones are clamped. `cloud` 1 is the depth cloud, 2 or more
-/// the cloud on top of today's arm shift; unset, 0 or negative: off
+/// the cloud on top of today's arm shift; unset, 0 or negative: off. The cap, `cloud_fixed` and
+/// `cloud_trail` go up to 2 x `cloud_window`
 pub fn params_from_values(values: &CloudValues) -> Option<CloudParams> {
     let mode = values.mode.filter(|mode| *mode >= 1)?.min(2) as u8;
     let defaults = CloudParams::default();
     let value = |value: Option<i64>, default: f32, min: i64, max: i64| {
         value.map_or(default, |value| value.clamp(min, max) as f32)
     };
+    let window = values.window.map_or(defaults.window, |window| {
+        window.clamp(MIN_WINDOW, MAX_WINDOW) as u8
+    });
+    let reach_max = 2 * i64::from(window);
 
     Some(CloudParams {
         mode,
         gain: value(values.gain, defaults.gain, 0, MAX_GAIN),
-        cap: value(values.cap, defaults.cap, MIN_CAP, MAX_CAP),
+        cap: value(values.cap, defaults.cap, MIN_CAP, reach_max),
         lambda_ms: value(values.lambda_ms, defaults.lambda_ms, 0, MAX_LAMBDA_MS),
         hold_ms: value(values.hold_ms, defaults.hold_ms, 0, MAX_HOLD_MS),
         dead: value(values.dead, defaults.dead * 10.0, MIN_DEAD, MAX_DEAD) / 10.0,
@@ -91,19 +103,23 @@ pub fn params_from_values(values: &CloudValues) -> Option<CloudParams> {
             MAX_FETCH_MM,
         ) / 1000.0,
         head_max: value(values.head_max, defaults.head_max, 0, MAX_HEAD_DEG_S),
-        fixed: value(values.fixed, defaults.fixed, 0, MAX_FIXED),
+        fixed: value(values.fixed, defaults.fixed, 0, reach_max),
         ab: values.ab.is_some_and(|ab| ab != 0),
         onesided: values
             .onesided
             .map_or(defaults.onesided, |onesided| onesided.clamp(0, 2) as u8),
-        trail: value(values.trail, defaults.trail, 0, MAX_TRAIL),
+        trail: value(values.trail, defaults.trail, 0, reach_max),
+        trail_age: values
+            .trail_age
+            .map_or(defaults.trail_age, |age| age.clamp(0, MAX_TRAIL_AGE) as u8),
+        window,
     })
 }
 
 fn params_part(params: &CloudParams) -> String {
     format!(
         "cloud: mode {}, gain {:.0} cap {:.0} hold {:.0} dead {:.1} lambda {:.0} fetch {:.0} fixed {:.0} ab {} \
-         onesided {} trail {:.0}",
+         onesided {} trail {:.0}/{} window {}",
         params.mode,
         params.gain,
         params.cap,
@@ -114,7 +130,9 @@ fn params_part(params: &CloudParams) -> String {
         params.fixed,
         u8::from(params.ab),
         params.onesided,
-        params.trail
+        params.trail,
+        params.trail_age,
+        params.window
     )
 }
 
@@ -392,10 +410,19 @@ mod tests {
         assert!((params.fetch_m - 0.45).abs() < 1e-6);
         assert_eq!((params.head_max, params.fixed), (120.0, 0.0));
         assert!(!params.ab);
-        assert_eq!((params.onesided, params.trail), (1, 0.0));
+        assert_eq!(
+            (
+                params.onesided,
+                params.trail,
+                params.trail_age,
+                params.window
+            ),
+            (1, 0.0, 16, 12)
+        );
         assert_eq!(
             params_text(Some(&params)),
-            "cloud: mode 1, gain 150 cap 14 hold 200 dead 2.5 lambda 40 fetch 450 fixed 0 ab 0 onesided 1 trail 0"
+            "cloud: mode 1, gain 150 cap 14 hold 200 dead 2.5 lambda 40 fetch 450 fixed 0 ab 0 onesided 1 trail 0/16 \
+             window 12"
         );
 
         // Clamped below
@@ -412,6 +439,8 @@ mod tests {
             ab: Some(0),
             onesided: Some(-1),
             trail: Some(-4),
+            trail_age: Some(-1),
+            window: Some(3),
         })
         .unwrap();
         assert_eq!(
@@ -421,7 +450,7 @@ mod tests {
         assert_eq!((low.dead, low.lambda_ms, low.head_max), (1.5, 0.0, 0.0));
         assert!((low.fetch_m - 0.2).abs() < 1e-6);
         assert_eq!((low.fixed, low.ab, low.onesided), (0.0, false, 0));
-        assert_eq!(low.trail, 0.0);
+        assert_eq!((low.trail, low.trail_age, low.window), (0.0, 0, 12));
 
         // Clamped above
         let high = params_from_values(&CloudValues {
@@ -437,19 +466,43 @@ mod tests {
             ab: Some(3),
             onesided: Some(9),
             trail: Some(99),
+            trail_age: Some(999),
+            window: Some(99),
         })
         .unwrap();
         assert_eq!(
             (high.mode, high.gain, high.cap, high.hold_ms),
-            (2, 400.0, 24.0, 500.0)
+            (2, 400.0, 48.0, 500.0)
         );
         assert_eq!(
             (high.dead, high.lambda_ms, high.head_max),
             (6.0, 120.0, 1000.0)
         );
         assert!((high.fetch_m - 1.5).abs() < 1e-6);
-        assert_eq!((high.fixed, high.ab, high.onesided), (24.0, true, 2));
-        assert_eq!(high.trail, 24.0);
+        assert_eq!((high.fixed, high.ab, high.onesided), (48.0, true, 2));
+        assert_eq!((high.trail, high.trail_age, high.window), (48.0, 255, 24));
+
+        // Without `cloud_window` the cap, the constant reach and the trail stop at 24 (today's)
+        let today = params_from_values(&CloudValues {
+            window: None,
+            ..high_values()
+        })
+        .unwrap();
+        assert_eq!(
+            (today.cap, today.fixed, today.trail, today.window),
+            (24.0, 24.0, 24.0, 12)
+        );
+        // `cloud_window 18`: up to 36
+        let window = params_from_values(&CloudValues {
+            window: Some(18),
+            ..high_values()
+        })
+        .unwrap();
+        assert_eq!(
+            (window.cap, window.fixed, window.trail, window.window),
+            (36.0, 36.0, 36.0, 18)
+        );
+        assert!(params_text(Some(&window)).ends_with(" trail 36/255 window 18"));
 
         // `cloud_onesided` 0 and 2 as set
         for onesided in [0, 2] {
@@ -468,7 +521,27 @@ mod tests {
         })
         .unwrap();
         assert_eq!(trail.trail, 6.0);
-        assert!(params_text(Some(&trail)).ends_with(" onesided 1 trail 6"));
+        assert!(params_text(Some(&trail)).ends_with(" onesided 1 trail 6/16 window 12"));
+    }
+
+    // Every value above its range (`cloud_window` 99: 24)
+    fn high_values() -> CloudValues {
+        CloudValues {
+            mode: Some(7),
+            gain: Some(1000),
+            cap: Some(99),
+            hold_ms: Some(9000),
+            dead: Some(200),
+            lambda_ms: Some(500),
+            fetch_mm: Some(5000),
+            head_max: Some(5000),
+            fixed: Some(50),
+            ab: Some(3),
+            onesided: Some(9),
+            trail: Some(99),
+            trail_age: Some(999),
+            window: Some(99),
+        }
     }
 
     #[test]
@@ -533,15 +606,18 @@ mod tests {
         assert!(
             text.starts_with(
                 "cloud: mode 1, gain 150 cap 14 hold 200 dead 2.5 lambda 40 fetch 450 fixed 0 ab 0 onesided 1 \
-                 trail 6 leak 0.08 x0.71 | depth "
+                 trail 6/16 window 12 leak 0.08 x0.71 | depth "
             ),
             "{text}"
         );
         let text = log.text(&params, Ok(&status), 2.0, (5, 0), Some(&none));
-        assert!(text.contains(" trail 6 leak - x1.00 | depth "), "{text}");
+        assert!(
+            text.contains(" trail 6/16 window 12 leak - x1.00 | depth "),
+            "{text}"
+        );
         // Off: unchanged
         let text = log.text(&params, Ok(&status), 2.0, (5, 0), None);
-        assert!(text.contains(" trail 6 | depth "), "{text}");
+        assert!(text.contains(" trail 6/16 window 12 | depth "), "{text}");
     }
 
     #[test]
@@ -651,8 +727,8 @@ mod tests {
         let text = log.text(&params, Ok(&status), 2.0, (5, 0), None);
         assert_eq!(
             text,
-            "cloud: mode 1, gain 150 cap 14 hold 200 dead 2.5 lambda 40 fetch 450 fixed 0 ab 0 onesided 1 trail 0 | \
-             depth 17.0 /s (33 ms 41 %, 67 ms 59 %, 100 ms 0 %), age 136 ms, a 96 ms, stale 0 | pairs 34: \
+            "cloud: mode 1, gain 150 cap 14 hold 200 dead 2.5 lambda 40 fetch 450 fixed 0 ab 0 onesided 1 trail 0/16 \
+             window 12 | depth 17.0 /s (33 ms 41 %, 67 ms 59 %, 100 ms 0 %), age 136 ms, a 96 ms, stale 0 | pairs 34: \
              reset 2 (start 1, dt 0, head 1, region 0) | layers 5 crop 0"
         );
 

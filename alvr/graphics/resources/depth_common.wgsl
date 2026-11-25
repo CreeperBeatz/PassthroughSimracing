@@ -100,7 +100,8 @@ struct DepthUniforms {
     // the zone of the field (mask g) opens the colour key, 2 the same with the fetch point moved by the
     // arm shift; y: mark of `cloud_ab` (0 none, 1 cloud phase, 2 today's phase); z: `cloud_trail` while
     // the zone is shown (depth texels, 0 off: inside the depth mask, the border of the zone along edges
-    // that moved is handed to the colour key); w: 0
+    // that moved is handed to the colour key); w: `cloud_trail_age` while the trail is on (depth images:
+    // only surface that arrived in the mask within these is handed; 0: no age test)
     cloud: vec4f,
     // Color key: part of each view where the lower game layer is shown, xy: min, zw: max view uv
     key_lower: array<vec4f, 2>,
@@ -141,7 +142,8 @@ struct CloudUniforms {
     params: vec4f,
     // x, y: reach time of eye 0 / 1 for this display frame (s), z: `cloud_onesided` (0: an edge in one
     // of the two masks only claims no motion, 1: only in the border band of the image, 2: always
-    // measured), w: unused
+    // measured), w: `cloud_window`, half of the window of the field's search (cells, 1..24, 12 by
+    // default; phi is stored and read as a share of 2 x this, texels)
     reach: vec4f,
 }
 
