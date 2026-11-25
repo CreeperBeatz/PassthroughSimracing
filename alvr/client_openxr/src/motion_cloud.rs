@@ -20,6 +20,7 @@ pub const MIN_FETCH_MM: i64 = 200;
 pub const MAX_FETCH_MM: i64 = 1500;
 pub const MAX_HEAD_DEG_S: i64 = 1000;
 pub const MAX_FIXED: i64 = 24;
+pub const MAX_TRAIL: i64 = 24;
 /// `cloud_ab 1` shows the cloud and today's picture for this long each
 pub const AB_PHASE: Duration = Duration::from_secs(2);
 
@@ -37,6 +38,7 @@ pub struct CloudValues {
     pub fixed: Option<i64>,
     pub ab: Option<i64>,
     pub onesided: Option<i64>,
+    pub trail: Option<i64>,
 }
 
 /// `debug.alvr.cloud*`. None: `cloud` is unset or 0 (off, the default)
@@ -56,6 +58,7 @@ pub fn read_params() -> Option<CloudParams> {
         fixed: debug_property("debug.alvr.cloud_fixed"),
         ab: debug_property("debug.alvr.cloud_ab"),
         onesided: debug_property("debug.alvr.cloud_onesided"),
+        trail: debug_property("debug.alvr.cloud_trail"),
     })
 }
 
@@ -93,13 +96,14 @@ pub fn params_from_values(values: &CloudValues) -> Option<CloudParams> {
         onesided: values
             .onesided
             .map_or(defaults.onesided, |onesided| onesided.clamp(0, 2) as u8),
+        trail: value(values.trail, defaults.trail, 0, MAX_TRAIL),
     })
 }
 
 fn params_part(params: &CloudParams) -> String {
     format!(
         "cloud: mode {}, gain {:.0} cap {:.0} hold {:.0} dead {:.1} lambda {:.0} fetch {:.0} fixed {:.0} ab {} \
-         onesided {}",
+         onesided {} trail {:.0}",
         params.mode,
         params.gain,
         params.cap,
@@ -109,7 +113,8 @@ fn params_part(params: &CloudParams) -> String {
         params.fetch_m * 1000.0,
         params.fixed,
         u8::from(params.ab),
-        params.onesided
+        params.onesided,
+        params.trail
     )
 }
 
@@ -332,10 +337,10 @@ mod tests {
         assert!((params.fetch_m - 0.45).abs() < 1e-6);
         assert_eq!((params.head_max, params.fixed), (120.0, 0.0));
         assert!(!params.ab);
-        assert_eq!(params.onesided, 1);
+        assert_eq!((params.onesided, params.trail), (1, 0.0));
         assert_eq!(
             params_text(Some(&params)),
-            "cloud: mode 1, gain 150 cap 14 hold 200 dead 2.5 lambda 40 fetch 450 fixed 0 ab 0 onesided 1"
+            "cloud: mode 1, gain 150 cap 14 hold 200 dead 2.5 lambda 40 fetch 450 fixed 0 ab 0 onesided 1 trail 0"
         );
 
         // Clamped below
@@ -351,6 +356,7 @@ mod tests {
             fixed: Some(-3),
             ab: Some(0),
             onesided: Some(-1),
+            trail: Some(-4),
         })
         .unwrap();
         assert_eq!(
@@ -360,6 +366,7 @@ mod tests {
         assert_eq!((low.dead, low.lambda_ms, low.head_max), (1.5, 0.0, 0.0));
         assert!((low.fetch_m - 0.2).abs() < 1e-6);
         assert_eq!((low.fixed, low.ab, low.onesided), (0.0, false, 0));
+        assert_eq!(low.trail, 0.0);
 
         // Clamped above
         let high = params_from_values(&CloudValues {
@@ -374,6 +381,7 @@ mod tests {
             fixed: Some(50),
             ab: Some(3),
             onesided: Some(9),
+            trail: Some(99),
         })
         .unwrap();
         assert_eq!(
@@ -386,6 +394,7 @@ mod tests {
         );
         assert!((high.fetch_m - 1.5).abs() < 1e-6);
         assert_eq!((high.fixed, high.ab, high.onesided), (24.0, true, 2));
+        assert_eq!(high.trail, 24.0);
 
         // `cloud_onesided` 0 and 2 as set
         for onesided in [0, 2] {
@@ -396,6 +405,15 @@ mod tests {
             .unwrap();
             assert_eq!(i64::from(params.onesided), onesided);
         }
+
+        // `cloud_trail` as set, in the line
+        let trail = params_from_values(&CloudValues {
+            trail: Some(6),
+            ..on
+        })
+        .unwrap();
+        assert_eq!(trail.trail, 6.0);
+        assert!(params_text(Some(&trail)).ends_with(" onesided 1 trail 6"));
     }
 
     #[test]
@@ -505,7 +523,7 @@ mod tests {
         let text = log.text(&params, Ok(&status), 2.0, (5, 0));
         assert_eq!(
             text,
-            "cloud: mode 1, gain 150 cap 14 hold 200 dead 2.5 lambda 40 fetch 450 fixed 0 ab 0 onesided 1 | \
+            "cloud: mode 1, gain 150 cap 14 hold 200 dead 2.5 lambda 40 fetch 450 fixed 0 ab 0 onesided 1 trail 0 | \
              depth 17.0 /s (33 ms 41 %, 67 ms 59 %, 100 ms 0 %), age 136 ms, a 96 ms, stale 0 | pairs 34: \
              reset 2 (start 1, dt 0, head 1, region 0) | layers 5 crop 0"
         );

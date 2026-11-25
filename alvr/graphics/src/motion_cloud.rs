@@ -74,6 +74,10 @@ pub struct CloudParams {
     /// one mask only claims none in the border band of the image (cells whose window reaches outside
     /// it). 2: every cell is measured as the plain rule says (see `pair_speed`)
     pub onesided: u8,
+    /// `cloud_trail`: inside the depth mask, a border of at most this much (and at most the reach) along
+    /// edges that moved is handed to the colour key instead of showing the room by itself (depth
+    /// texels, 0: off)
+    pub trail: f32,
 }
 
 impl Default for CloudParams {
@@ -90,6 +94,7 @@ impl Default for CloudParams {
             fixed: 0.0,
             ab: false,
             onesided: 1,
+            trail: 0.0,
         }
     }
 }
@@ -622,6 +627,7 @@ impl CloudRecord {
             ("fixed", number(params.fixed)),
             ("ab", params.ab.to_string()),
             ("onesided", params.onesided.to_string()),
+            ("trail", number(params.trail)),
             ("eyes", array(self.eyes.map(|eye| eye.to_json()))),
         ])
     }
@@ -1069,6 +1075,7 @@ mod tests {
             "{json}"
         );
         assert!(json.contains(r#""fetch_mm":450"#), "{json}");
+        assert!(json.contains(r#""onesided":1,"trail":0,"eyes""#), "{json}");
         assert!(json.contains(r#""reset":"head""#), "{json}");
         assert!(
             json.contains(r#""reach_ms":136.5,"stale":false},"#),

@@ -1084,7 +1084,8 @@ pub fn cloud_shown(
 }
 
 // The `cloud` vector of the depth uniforms: x the mode while the zone is shown (`cloud_shown`), y the
-// mark of `cloud_ab`. Zeros while the cloud does not run
+// mark of `cloud_ab`, z `cloud_trail` while the zone is shown (texels, else 0). Zeros while the cloud
+// does not run
 fn cloud_vector(
     config: &DepthPassthroughConfig,
     input: &DepthRenderInput,
@@ -1093,7 +1094,8 @@ fn cloud_vector(
     let Some(cloud) = input.cloud.filter(|_| cloud_allowed(input, || volume)) else {
         return [0.0; 4];
     };
-    let mode = if cloud_shown(config, Some(&cloud), true) {
+    let shown = cloud_shown(config, Some(&cloud), true);
+    let mode = if shown {
         f32::from(cloud.params.mode.min(2))
     } else {
         0.0
@@ -1103,7 +1105,17 @@ fn cloud_vector(
         (true, true) => 1.0,
         (true, false) => 2.0,
     };
-    [mode, mark, 0.0, 0.0]
+    let trail = if shown {
+        let trail = cloud.params.trail;
+        if trail.is_finite() {
+            trail.max(0.0)
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+    [mode, mark, trail, 0.0]
 }
 
 // Distance of a point (in the space of the view) outside the side planes of the view (through its

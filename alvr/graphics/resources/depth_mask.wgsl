@@ -118,7 +118,8 @@ const CLOUD_SOFT_EDGE: f32 = 1.5;
 // zone reaches speed x reach time (at most the cap) from the nearest edge of the field, on both sides.
 // With `cloud 2` the lookup point is moved back by the arm shift, as the depth is. Outside the field's
 // camera, for an eye without a field (zero matrices) or with a field older than 300 ms (pair.w 0, the
-// depth stalled; also with `cloud_fixed`), no zone
+// depth stalled; also with `cloud_fixed`), no zone. With `cloud_trail` (depth_u.cloud.z) the reach
+// inside the mask is at most the trail
 fn cloud_zone(uv: vec2f) -> f32 {
     let view_idx = imm.view_idx;
     if cloud_u.eyes[view_idx].pair.w < 0.5 {
@@ -152,6 +153,11 @@ fn cloud_zone(uv: vec2f) -> f32 {
     var reach = min(speed * cloud_u.reach[view_idx], cloud_u.params.z);
     if cloud_u.params.w > 0.0 {
         reach = cloud_u.params.w * clamp(speed / CLOUD_FIXED_SPEED, 0.0, 1.0);
+    }
+    // `cloud_trail`: inside the mask (phi < 0) the zone is at most this deep, as the stream hands it to
+    // the colour key there. Off (0): the zone of both sides is today's
+    if depth_u.cloud.z > 0.0 && phi < 0.0 {
+        reach = min(reach, depth_u.cloud.z);
     }
     if reach <= 0.0 {
         return 0.0;

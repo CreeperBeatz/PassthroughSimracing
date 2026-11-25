@@ -66,6 +66,18 @@ texels, with a soft edge of 1.5 texels), on both sides of the edge. It goes into
 the zone opens the upper game layer and the keyed passthrough shows what the colour table keeps. `solid` always
 wins. The Tint-mask view paints the zone green.
 
+**The trail** (`cloud_trail N`, off by default). Inside the depth mask, where the late depth still covers the place
+the arm has left, the plain passthrough shows the room behind the arm (a ghost) and the key cannot turn it into
+game. With N > 0 the zone on the mask side of an edge that moved reaches at most N texels (and at most the reach),
+and in that border the depth's part of `solid` gives way by the zone: the key decides there as on the game side
+(colours it keeps stay real, everything else becomes game). The hands' own solid fill stays. It is the first form of
+"the trailing side handed to the key", for both sides of the edge alike. Its cost: inside the border, parts of the
+arm whose colours the key does not keep (a sleeve) and static things in the region right beside a moving edge turn
+into game while the edge moves. The border is where the field puts the mask side: with eye and depth camera apart,
+the field (looked up at `cloud_fetch_mm`) and the mask can disagree by a little, and there the open zone of the game
+side can also reach into the mask. The Tint-mask view paints the border green like the rest of the zone; the
+playzone tint still follows the full mask.
+
 While the cloud is on, an unset `key_layers` is 5 (the extra layers over the whole view) and an unset `key_crop`
 is 0 (not cropped to the hands): the zone only acts where the lower layer is drawn. Set values win.
 
@@ -85,6 +97,7 @@ All `adb shell setprop debug.alvr.<name> <value>`, read every 500 ms; each chang
 | `cloud_head_max` | 120 | 0..1000 | deg/s of head turn above which a pair claims no motion (0: no guard) |
 | `cloud_fixed` | 0 | 0..24 | N > 0: a constant reach of N texels wherever something moved recently |
 | `cloud_onesided` | 1 | 0..2 | the one-sided rule above |
+| `cloud_trail` | 0 | 0..24 | N > 0: inside the depth mask, a border of at most N texels (and at most the reach) along edges that moved is decided by the key instead of showing the room (the trail above). 0: off |
 | `cloud_ab` | 0 | 0, 1 | 1: 2 s the cloud as set, 2 s today's picture (arm shift as set), with a green / red mark; the passes keep running |
 | `key_layers`, `key_crop` | 4, 1 | | unset while `cloud` is 1 or 2: 5 and 0 |
 
@@ -93,7 +106,7 @@ All `adb shell setprop debug.alvr.<name> <value>`, read every 500 ms; each chang
 Tag `ALVR_CAM`, every 2 s while `cloud` is set, and the parameters on each change:
 
 ```
-cloud: mode 1, gain 150 cap 14 hold 200 dead 2.5 lambda 40 fetch 450 fixed 0 ab 0 onesided 1 | depth 17.0 /s
+cloud: mode 1, gain 150 cap 14 hold 200 dead 2.5 lambda 40 fetch 450 fixed 0 ab 0 onesided 1 trail 0 | depth 17.0 /s
 (33 ms 41 %, 67 ms 59 %, 100 ms 0 %), age 136 ms, a 96 ms, stale 0 | pairs 34: reset 2 (start 1, dt 0, head 1,
 region 0) | layers 5 crop 0
 ```
@@ -110,7 +123,7 @@ off).
 ## The burst record
 
 Index version 7. Each display record has `"cloud": null` while the cloud is off or not running, else
-`{"mode", "shown", "gain", "cap", "hold_ms", "dead", "lambda_ms", "fetch_mm", "fixed", "ab", "onesided",
+`{"mode", "shown", "gain", "cap", "hold_ms", "dead", "lambda_ms", "fetch_mm", "fixed", "ab", "onesided", "trail",
 "eyes": [{"field_capture_ns", "prev_capture_ns", "dt_ms", "reset": null | "start" | "dt" | "head" | "region",
 "head_deg_s", "a_ms", "reach_ms", "stale"} x 2]}` (`stale`: the field was older than 300 ms on that frame, no
 zone; `reach_ms` is then 0). With these, the depth frames and their poses, the field of every display
@@ -134,15 +147,17 @@ versions.
 
 ## What v1 leaves out, and what comes after
 
-Left out on purpose: the trailing side (the late copy behind the arm stays as today; the field keeps the direction
-for it); any change to the colour learner (a "mover" class); cropping and switching the extra layers from the zone
+Left out on purpose: the trailing side as such (the late copy behind the arm stays as today unless `cloud_trail`
+hands a border of the mask to the key, on both sides of the edge alike; the field keeps the direction for a
+trailing-only rule); any change to the colour learner (a "mover" class); cropping and switching the extra layers from the zone
 (v1 runs them over the whole view, about 85 % GPU load against 76-80 % today); a stats readback of the field; the
 field as a burst file, a speed debug view, a second lookup at the mover's depth, a neighbour maximum of the speed,
 a half-view A/B, the distance region.
 
 Order after v1: (1) this build on the headset; (2) a stats readback, then crop and layer switching from the zone's
 rectangle, and a "mover" colour class learned from depth labels at capture time with its keep and leak published;
-(3) the trailing side, only with a measured key quality of 0.8 or more; (4) a second lookup at the mover's depth and
+(3) the trailing side, only with a measured key quality of 0.8 or more (`cloud_trail` is its first, switchable
+form, ahead of that measurement); (4) a second lookup at the mover's depth and
 a neighbour maximum of the speed behind a coherence test; (5) motion from the live camera inside the zone, the
 only way under the 125-240 ms onset delay.
 
@@ -207,6 +222,9 @@ day, the stream over a laptop hotspot.
 - **Arm moving in front of the game**, the user: the band appears on both sides and goes away, "there
   is some jitter, but generally yes. The forearm's edge feels a bit better, but there is ghosting in
   the background in some cases". And: "there were room patches and it was jittery at times".
+  And on what the zone cannot do: "The color mask doesn't make pixels from the depth mask into VR
+  space, and that feels more like a limitation. Maybe a small border around the depth mask, and then
+  a color mask?" This is the reason for `cloud_trail` (the trail in "How it works").
 - **Frame rate:** not a clean test. For part of the run the headset's GPU was clocked down and the
   client ran at 56-68 fps with the cloud off as well; later it was back at 72.
 

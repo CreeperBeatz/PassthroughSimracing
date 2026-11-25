@@ -726,6 +726,8 @@ struct MaskV2 {
     /// The mask is given a field that would open the zone everywhere in view (see `cloud_probe_group`)
     /// instead of the dummy of a renderer without the cloud
     cloud_probe: bool,
+    /// The cell (r: phi, g: held speed) of that field. None: on an edge at the largest speed
+    cloud_probe_cell: Option<[u8; 4]>,
 }
 
 /// `render_with_area` with the edge cut and the wrist gaps
@@ -1053,7 +1055,8 @@ fn render_v2(
         let depth_views = input
             .frame
             .map_or([view(depth_camera_position); 2], |frame| frame.depth_views);
-        cloud_probe_group(device, queue, &pipelines, depth_views[0])
+        let cell = mask_v2.cloud_probe_cell.unwrap_or(CLOUD_PROBE_CELL);
+        cloud_probe_group(device, queue, &pipelines, depth_views[0], cell)
     } else {
         stream::create_cloud_dummy_read_bind_group(device, queue, &pipelines)
     };
@@ -1157,14 +1160,19 @@ fn render_v2(
     }
 }
 
-/// Group 2 of the depth mask with a field that opens the zone everywhere it is looked up: a 1 x 1
-/// field on an edge (phi 0) at the largest speed, both eyes with the camera `camera`, a reach time of
-/// 1 s and the default cap (14 texels)
+/// The cell of `cloud_probe_group` that opens the zone everywhere: on an edge (phi 0) at the largest
+/// speed
+const CLOUD_PROBE_CELL: [u8; 4] = [128, 255, 255, 128];
+
+/// Group 2 of the depth mask with a field that is `cell` everywhere it is looked up (CLOUD_PROBE_CELL
+/// opens the zone everywhere): a 1 x 1 field, both eyes with the camera `camera`, a reach time of 1 s
+/// and the default cap (14 texels)
 fn cloud_probe_group(
     device: &Device,
     queue: &Queue,
     pipelines: &StreamPipelines,
     camera: ViewParams,
+    cell: [u8; 4],
 ) -> wgpu::BindGroup {
     let texture = device.create_texture(&TextureDescriptor {
         label: None,
@@ -1180,7 +1188,7 @@ fn cloud_probe_group(
         usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    write_texture_2d(queue, &texture, &[128, 255, 255, 128], 4, 1, 0);
+    write_texture_2d(queue, &texture, &cell, 4, 1, 0);
     let eye = CloudEyeUniform {
         field: camera,
         prev: camera,
@@ -6023,6 +6031,197 @@ fn cloud_zone_is_inert_outside_the_lower_layer() {
     assert_eq!(without.alpha(0.1, 0.1), 1.0);
 }
 
+/// Probe cells for `cloud_trail`: inside the mask 2.8 and 10.1 texels from the edge at the largest
+/// speed, and 2.8 texels inside at rest
+const CLOUD_TRAIL_NEAR: [u8; 4] = [112, 255, 255, 128];
+const CLOUD_TRAIL_DEEP: [u8; 4] = [74, 255, 255, 128];
+const CLOUD_TRAIL_STILL: [u8; 4] = [112, 0, 0, 128];
+
+/// The picture and the mask with a probe field of `cell` and `cloud_trail` `trail`: a box at 0.5 m in
+/// the region in the middle of the view (0.3..0.7), the room behind it out of the region, the lower
+/// layer in the left half of the view
+fn cloud_trail_render(device: &Device, queue: &Queue, cell: [u8; 4], trail: f32) -> Output {
+    let scene = Scene::new(3.0, [0.3, 0.3, 0.7, 0.7], 0.5);
+    let lower = (Vec2::ZERO, Vec2::new(0.5, 1.0));
+    render_v2(
+        device,
+        queue,
+        &cloud_config(),
+        &scene,
+        Vec3::ZERO,
+        Vec3::ZERO,
+        true,
+        Some(cloud_key()),
+        [None; 2],
+        None,
+        Some([lower; 2]),
+        false,
+        &[],
+        None,
+        0.0,
+        0.0,
+        MaskV2 {
+            cloud: Some(CloudInput {
+                params: CloudParams {
+                    trail,
+                    ..Default::default()
+                },
+                capture_ns: Some(0),
+                display_ns: 100_000_000,
+                shown: true,
+            }),
+            cloud_probe: true,
+            cloud_probe_cell: Some(cell),
+            ..Default::default()
+        },
+    )
+}
+
+/// The box of `cloud_zone_grows_with_the_age` moved 6 texels (edges now at texels 30, trailing, and
+/// 90, leading), with `cloud_trail` `trail`, at a reach time of `reach_s`: the masks of both eyes
+fn cloud_trail_masks(
+    device: &Device,
+    queue: &Queue,
+    trail: f32,
+    reach_s: f32,
+) -> [Vec<[u8; 4]>; 2] {
+    let params = CloudParams {
+        trail,
+        ..Default::default()
+    };
+    let mut rig = CloudRig::new(device, queue, params);
+    let camera = cloud_camera(0.0, 0.0, Vec3::ZERO);
+    let before = cloud_depth(&camera, CLOUD_WALL, &[cloud_box(CLOUD_BOX, 0)]);
+    let after = cloud_depth(&camera, CLOUD_WALL, &[cloud_box(CLOUD_BOX, 6)]);
+    rig.image(device, queue, &before, camera, CLOUD_DT_NS);
+    rig.image(device, queue, &after, camera, CLOUD_DT_NS);
+    rig.display(queue, reach_s);
+    [0, 1].map(|eye| rig.mask(device, queue, eye, Some(rig.shown())))
+}
+
+// `cloud_trail 0` (the default) is the picture of the cloud without it: (a) on the moving box the zone
+// inside the mask reaches as far as outside (14 texels at 0.3 s: 10.5 in at both moved edges); (b)
+// with the probe field, a cell inside the mask (2.8 or 10.1 texels) gives the same mask (all channels)
+// and picture as a cell on the edge, as the zone is the same on both sides. The control: with
+// `cloud_trail 6` the picture changes, and the cell 10.1 texels in differs from the one on the edge
+#[test]
+fn cloud_trail_off_is_the_same_picture() {
+    let (device, queue) = gpu_or_skip!();
+    assert_eq!(CloudParams::default().trail, 0.0);
+
+    // (a)
+    for (eye, mask) in cloud_trail_masks(&device, &queue, 0.0, 0.3)
+        .iter()
+        .enumerate()
+    {
+        for x in [26, 33, 40, 80, 87, 93] {
+            assert_eq!(cloud_zone_at(mask, x, 64), 255, "eye {eye} x {x}");
+        }
+    }
+
+    // (b)
+    let edge = cloud_trail_render(&device, &queue, CLOUD_PROBE_CELL, 0.0);
+    for cell in [CLOUD_TRAIL_NEAR, CLOUD_TRAIL_DEEP] {
+        let inside = cloud_trail_render(&device, &queue, cell, 0.0);
+        assert!(inside.mask == edge.mask, "{cell:?}: mask");
+        assert!(inside.pixels == edge.pixels, "{cell:?}: picture");
+    }
+    // Inside the box the mask shows the room: both layers open
+    assert_eq!(edge.alpha(0.4, 0.5), 0.0);
+    // The control: the trail changes the picture, and the cell 10.1 texels in is cut off by it
+    let edge_trail = cloud_trail_render(&device, &queue, CLOUD_PROBE_CELL, 6.0);
+    assert!(edge_trail.pixels != edge.pixels);
+    let deep = cloud_trail_render(&device, &queue, CLOUD_TRAIL_DEEP, 6.0);
+    assert!(deep.mask != edge_trail.mask);
+    assert!(deep.pixels != edge_trail.pixels);
+}
+
+// `cloud_trail 6` at a reach of 14 texels. (a) The mask of the moving box: the zone inside the mask is
+// at most 6 texels deep (3.5 texels in at both moved edges: open, 10.5 in: none), outside it as
+// without the trail; none inside the top edge the box slid along; only mask g changes, and only
+// downwards. (b) The picture with the probe field: inside the mask 2.8 texels from a moving edge the
+// lower game layer is opaque and the upper one open (packed 0.5: the key decides), 10.1 texels in or at
+// rest the mask still shows the room (0); outside the lower layer (right half) the picture is that of
+// `cloud_trail 0`
+#[test]
+fn cloud_trail_hands_the_inner_border_to_the_key() {
+    let (device, queue) = gpu_or_skip!();
+
+    // (a)
+    let today = cloud_trail_masks(&device, &queue, 0.0, 0.3);
+    let trail = cloud_trail_masks(&device, &queue, 6.0, 0.3);
+    for eye in 0..2 {
+        let zone = |x, y| cloud_zone_at(&trail[eye], x, y);
+        for x in [33, 87] {
+            assert_eq!(zone(x, 64), 255, "eye {eye} x {x}");
+        }
+        for x in [40, 80] {
+            assert_eq!(zone(x, 64), 0, "eye {eye} x {x}");
+        }
+        for x in [26, 93] {
+            assert_eq!(zone(x, 64), 255, "eye {eye} x {x}");
+        }
+        assert_eq!(zone(105, 64), 0, "eye {eye}");
+        // 3.5 texels inside the top edge, in the middle of the box
+        assert_eq!(zone(60, 108), 0, "eye {eye}");
+        for (a, b) in today[eye].iter().zip(&trail[eye]) {
+            assert_eq!([a[0], a[2], a[3]], [b[0], b[2], b[3]], "eye {eye}");
+            assert!(b[1] <= a[1], "eye {eye}");
+        }
+        assert!(today[eye] != trail[eye], "eye {eye}");
+    }
+
+    // (b)
+    let near = cloud_trail_render(&device, &queue, CLOUD_TRAIL_NEAR, 6.0);
+    assert!(
+        (near.alpha(0.4, 0.5) - 0.5).abs() < 0.003,
+        "{}",
+        near.alpha(0.4, 0.5)
+    );
+    assert_eq!(
+        cloud_trail_render(&device, &queue, CLOUD_TRAIL_NEAR, 0.0).alpha(0.4, 0.5),
+        0.0
+    );
+    for cell in [CLOUD_TRAIL_DEEP, CLOUD_TRAIL_STILL] {
+        assert_eq!(
+            cloud_trail_render(&device, &queue, cell, 6.0).alpha(0.4, 0.5),
+            0.0,
+            "{cell:?}"
+        );
+    }
+    for cell in [CLOUD_TRAIL_NEAR, CLOUD_TRAIL_DEEP] {
+        let off = cloud_trail_render(&device, &queue, cell, 0.0);
+        let on = cloud_trail_render(&device, &queue, cell, 6.0);
+        for (index, (a, b)) in off.pixels.iter().zip(&on.pixels).enumerate() {
+            if index as u32 % TARGET_SIZE >= TARGET_SIZE / 2 {
+                assert_eq!(a, b, "{cell:?} pixel {index}");
+            }
+        }
+    }
+}
+
+// The trail is at most the reach: at a reach time of 0.022 s (2 texels at 90 texels per second)
+// `cloud_trail 6` gives the mask of `cloud_trail 0` (all channels), open right inside the moved edges
+// and closed 3.5 texels in, where a border of 6 would still be open (as it is at 0.3 s)
+#[test]
+fn cloud_trail_is_capped_by_the_reach() {
+    let (device, queue) = gpu_or_skip!();
+    let today = cloud_trail_masks(&device, &queue, 0.0, 0.022);
+    let trail = cloud_trail_masks(&device, &queue, 6.0, 0.022);
+    let wide = cloud_trail_masks(&device, &queue, 6.0, 0.3);
+    for eye in 0..2 {
+        assert!(today[eye] == trail[eye], "eye {eye}");
+        let zone = |x| cloud_zone_at(&trail[eye], x, 64);
+        for x in [30, 89] {
+            assert!(zone(x) > 0, "eye {eye} x {x}");
+        }
+        for x in [33, 86] {
+            assert_eq!(zone(x), 0, "eye {eye} x {x}");
+            assert_eq!(cloud_zone_at(&wide[eye], x, 64), 255, "eye {eye} x {x}");
+        }
+    }
+}
+
 // `cloud_ab`: a square of 2 % of the view at (0.5, 0.4), green while the cloud is shown, red in today's
 // phase, nothing without `cloud_ab`
 #[test]
@@ -6162,6 +6361,38 @@ fn cloud_vector_in_the_depth_uniforms() {
     assert_eq!(vector(&volume, false, cloud(1, true, true)), [0.0; 4]);
     assert_eq!(vector(&distance, true, cloud(1, true, true)), [0.0; 4]);
     assert_eq!(vector(&show_depth, true, cloud(1, false, true)), [0.0; 4]);
+    // `cloud_trail` in z, only while the zone is shown
+    let trail = |cloud: Option<CloudInput>, trail| {
+        cloud.map(|cloud| CloudInput {
+            params: CloudParams {
+                trail,
+                ..cloud.params
+            },
+            ..cloud
+        })
+    };
+    assert_eq!(
+        vector(&volume, true, trail(cloud(1, false, true), 6.0)),
+        [1.0, 0.0, 6.0, 0.0]
+    );
+    assert_eq!(
+        vector(&volume, true, trail(cloud(2, true, true), 6.0)),
+        [2.0, 1.0, 6.0, 0.0]
+    );
+    assert_eq!(
+        vector(&volume, true, trail(cloud(1, true, false), 6.0)),
+        [0.0, 2.0, 0.0, 0.0]
+    );
+    for config in [&distance, &show_depth] {
+        assert_eq!(
+            vector(config, true, trail(cloud(1, false, true), 6.0)),
+            [0.0; 4]
+        );
+    }
+    assert_eq!(
+        vector(&volume, false, trail(cloud(1, false, true), 6.0)),
+        [0.0; 4]
+    );
     // Show depth only hides the zone: the passes run
     assert!(depth_mask::cloud_runs(
         &show_depth,

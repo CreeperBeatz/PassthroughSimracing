@@ -98,7 +98,9 @@ struct DepthUniforms {
     memory: vec4f,
     // The depth cloud (`debug.alvr.cloud`, motion_cloud.rs), all 0 when it is off: today's. x: 0 off, 1
     // the zone of the field (mask g) opens the colour key, 2 the same with the fetch point moved by the
-    // arm shift; y: mark of `cloud_ab` (0 none, 1 cloud phase, 2 today's phase); z, w: 0
+    // arm shift; y: mark of `cloud_ab` (0 none, 1 cloud phase, 2 today's phase); z: `cloud_trail` while
+    // the zone is shown (depth texels, 0 off: inside the depth mask, the border of the zone along edges
+    // that moved is handed to the colour key); w: 0
     cloud: vec4f,
     // Color key: part of each view where the lower game layer is shown, xy: min, zw: max view uv
     key_lower: array<vec4f, 2>,

@@ -195,10 +195,17 @@ fn depth_passthrough(stream_color: vec3f, uv: vec2f) -> vec4f {
         var focus = hand.r;
         // The zone of the depth cloud (`debug.alvr.cloud`, mask g) is keyed like the rim of the hands.
         // Only where the lower layer is used: outside it a zone pixel would pack to the game
+        // `cloud_trail` (depth_u.cloud.z > 0): inside the depth mask the zone is its border along edges
+        // that moved, and there the mask no longer shows the room by itself: the key decides, as on the
+        // game side. The solid fill of the hands stays. Off (0): today's
+        var trail_zone = 0.0;
         if depth_u.cloud.x > 0.5 && in_lower {
             focus = max(focus, mask_sample.g);
+            if depth_u.cloud.z > 0.0 {
+                trail_zone = mask_sample.g;
+            }
         }
-        let solid = max(mask, hand.g);
+        let solid = max(mask * (1.0 - trail_zone), hand.g);
         var lower_alpha = 1.0 - solid;
         var upper_alpha = 1.0 - max(solid, focus);
         var rgb = game_color;
