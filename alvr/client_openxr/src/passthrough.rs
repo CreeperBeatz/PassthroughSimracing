@@ -133,7 +133,9 @@ impl PassthroughLayer<'_> {
 ///   image of a pair, the pair claims no speed anywhere (0), none in the border band of the image (1) or a
 ///   speed everywhere (2)), `cloud_window` (12 cells, 12..24: how far the field searches for edges; the band
 ///   reaches at most 2 x this texels), `cloud_trail_age` (16 depth images, 0..255, 0: no age test: the trail
-///   hands only surface to the key that arrived in the mask within these), `cloud_ab 1`: 2 s the cloud, 2 s today's picture, with a green / red
+///   hands only surface to the key that arrived in the mask within these), `cloud_trail_hands` (1: the trail
+///   hands nothing to the key near a hand, scaled by 1 - the near-hand value; 0: as before, for an A/B;
+///   surface only the remembered playzone shows is never handed), `cloud_ab 1`: 2 s the cloud, 2 s today's picture, with a green / red
 ///   mark. A `cloud:` line every 2 s
 /// - `setprop debug.alvr.key_hands 0`: no hands in the GPU passes (to measure them)
 /// - `setprop debug.alvr.arm_shift 0`: plain depth for the arms, not shifted by the motion of the wrist (also

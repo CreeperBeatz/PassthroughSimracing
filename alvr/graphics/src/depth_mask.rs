@@ -1085,7 +1085,8 @@ pub fn cloud_shown(
 
 // The `cloud` vector of the depth uniforms: x the mode while the zone is shown (`cloud_shown`), y the
 // mark of `cloud_ab`, z `cloud_trail` while the zone is shown (texels, else 0), w `cloud_trail_age`
-// while the trail is on (depth images, else 0). Zeros while the cloud does not run
+// while the trail is on (depth images, else 0; with `cloud_trail_hands 0` -1 - the age, see
+// depth_common.wgsl). Zeros while the cloud does not run
 fn cloud_vector(
     config: &DepthPassthroughConfig,
     input: &DepthRenderInput,
@@ -1115,10 +1116,11 @@ fn cloud_vector(
     } else {
         0.0
     };
-    let trail_age = if trail > 0.0 {
-        f32::from(cloud.params.trail_age)
-    } else {
-        0.0
+    // `cloud_trail_hands 0` (the hands not spared) is stored as -1 - the age, so that age 0 keeps it
+    let trail_age = match (trail > 0.0, cloud.params.trail_hands) {
+        (false, _) => 0.0,
+        (true, true) => f32::from(cloud.params.trail_age),
+        (true, false) => -1.0 - f32::from(cloud.params.trail_age),
     };
     [mode, mark, trail, trail_age]
 }

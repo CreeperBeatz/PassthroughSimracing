@@ -101,7 +101,10 @@ struct DepthUniforms {
     // arm shift; y: mark of `cloud_ab` (0 none, 1 cloud phase, 2 today's phase); z: `cloud_trail` while
     // the zone is shown (depth texels, 0 off: inside the depth mask, the border of the zone along edges
     // that moved is handed to the colour key); w: `cloud_trail_age` while the trail is on (depth images:
-    // only surface that arrived in the mask within these is handed; 0: no age test)
+    // only surface that arrived in the mask within these is handed; 0: no age test). Negative:
+    // `cloud_trail_hands 0`, the trail also near the hands (as in commit 9abdada4), the age is -1 - w;
+    // 0 or more (the default): near the hands the trail is scaled by 1 - the near-hand value (focus area
+    // b). Decode with cloud_trail_age() and cloud_trail_spares_hands() of depth_mask.wgsl
     cloud: vec4f,
     // Color key: part of each view where the lower game layer is shown, xy: min, zw: max view uv
     key_lower: array<vec4f, 2>,

@@ -43,6 +43,7 @@ pub struct CloudValues {
     pub onesided: Option<i64>,
     pub trail: Option<i64>,
     pub trail_age: Option<i64>,
+    pub trail_hands: Option<i64>,
     pub window: Option<i64>,
 }
 
@@ -65,6 +66,7 @@ pub fn read_params() -> Option<CloudParams> {
         onesided: debug_property("debug.alvr.cloud_onesided"),
         trail: debug_property("debug.alvr.cloud_trail"),
         trail_age: debug_property("debug.alvr.cloud_trail_age"),
+        trail_hands: debug_property("debug.alvr.cloud_trail_hands"),
         window: debug_property("debug.alvr.cloud_window"),
     })
 }
@@ -112,6 +114,9 @@ pub fn params_from_values(values: &CloudValues) -> Option<CloudParams> {
         trail_age: values
             .trail_age
             .map_or(defaults.trail_age, |age| age.clamp(0, MAX_TRAIL_AGE) as u8),
+        trail_hands: values
+            .trail_hands
+            .map_or(defaults.trail_hands, |hands| hands != 0),
         window,
     })
 }
@@ -119,7 +124,7 @@ pub fn params_from_values(values: &CloudValues) -> Option<CloudParams> {
 fn params_part(params: &CloudParams) -> String {
     format!(
         "cloud: mode {}, gain {:.0} cap {:.0} hold {:.0} dead {:.1} lambda {:.0} fetch {:.0} fixed {:.0} ab {} \
-         onesided {} trail {:.0}/{} window {}",
+         onesided {} trail {:.0}/{}{} window {}",
         params.mode,
         params.gain,
         params.cap,
@@ -132,6 +137,12 @@ fn params_part(params: &CloudParams) -> String {
         params.onesided,
         params.trail,
         params.trail_age,
+        // `cloud_trail_hands 1`: "h" while the trail is on
+        if params.trail > 0.0 && params.trail_hands {
+            "h"
+        } else {
+            ""
+        },
         params.window
     )
 }
@@ -440,6 +451,7 @@ mod tests {
             onesided: Some(-1),
             trail: Some(-4),
             trail_age: Some(-1),
+            trail_hands: Some(-1),
             window: Some(3),
         })
         .unwrap();
@@ -451,6 +463,7 @@ mod tests {
         assert!((low.fetch_m - 0.2).abs() < 1e-6);
         assert_eq!((low.fixed, low.ab, low.onesided), (0.0, false, 0));
         assert_eq!((low.trail, low.trail_age, low.window), (0.0, 0, 12));
+        assert!(low.trail_hands);
 
         // Clamped above
         let high = params_from_values(&CloudValues {
@@ -467,6 +480,7 @@ mod tests {
             onesided: Some(9),
             trail: Some(99),
             trail_age: Some(999),
+            trail_hands: Some(7),
             window: Some(99),
         })
         .unwrap();
@@ -502,7 +516,7 @@ mod tests {
             (window.cap, window.fixed, window.trail, window.window),
             (36.0, 36.0, 36.0, 18)
         );
-        assert!(params_text(Some(&window)).ends_with(" trail 36/255 window 18"));
+        assert!(params_text(Some(&window)).ends_with(" trail 36/255h window 18"));
 
         // `cloud_onesided` 0 and 2 as set
         for onesided in [0, 2] {
@@ -521,7 +535,26 @@ mod tests {
         })
         .unwrap();
         assert_eq!(trail.trail, 6.0);
-        assert!(params_text(Some(&trail)).ends_with(" onesided 1 trail 6/16 window 12"));
+        assert!(params_text(Some(&trail)).ends_with(" onesided 1 trail 6/16h window 12"));
+
+        // `cloud_trail_hands`: 1 by default, 0 as set (no "h" in the line), anything else 1
+        assert!(trail.trail_hands);
+        let plain = params_from_values(&CloudValues {
+            trail: Some(6),
+            trail_hands: Some(0),
+            ..on
+        })
+        .unwrap();
+        assert!(!plain.trail_hands);
+        assert!(params_text(Some(&plain)).ends_with(" onesided 1 trail 6/16 window 12"));
+        for hands in [-1, 2] {
+            let params = params_from_values(&CloudValues {
+                trail_hands: Some(hands),
+                ..on
+            })
+            .unwrap();
+            assert!(params.trail_hands, "{hands}");
+        }
     }
 
     // Every value above its range (`cloud_window` 99: 24)
@@ -540,6 +573,7 @@ mod tests {
             onesided: Some(9),
             trail: Some(99),
             trail_age: Some(999),
+            trail_hands: Some(7),
             window: Some(99),
         }
     }
@@ -606,18 +640,18 @@ mod tests {
         assert!(
             text.starts_with(
                 "cloud: mode 1, gain 150 cap 14 hold 200 dead 2.5 lambda 40 fetch 450 fixed 0 ab 0 onesided 1 \
-                 trail 6/16 window 12 leak 0.08 x0.71 | depth "
+                 trail 6/16h window 12 leak 0.08 x0.71 | depth "
             ),
             "{text}"
         );
         let text = log.text(&params, Ok(&status), 2.0, (5, 0), Some(&none));
         assert!(
-            text.contains(" trail 6/16 window 12 leak - x1.00 | depth "),
+            text.contains(" trail 6/16h window 12 leak - x1.00 | depth "),
             "{text}"
         );
         // Off: unchanged
         let text = log.text(&params, Ok(&status), 2.0, (5, 0), None);
-        assert!(text.contains(" trail 6/16 window 12 | depth "), "{text}");
+        assert!(text.contains(" trail 6/16h window 12 | depth "), "{text}");
     }
 
     #[test]

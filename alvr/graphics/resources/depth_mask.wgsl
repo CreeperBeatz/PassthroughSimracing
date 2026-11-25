@@ -13,7 +13,8 @@
 // more), or with the depth cloud (`debug.alvr.cloud`) its zone, where the colour key decides (0..1),
 // b: whether there is depth data (0/1; read by the Show depth view only, which hides the cloud), or
 // with the cloud's trail (`cloud_trail`, depth_u.cloud.z above 0) how much of the solid mask the
-// stream hands to the key (0..1, see cloud_zone), a: how much of r comes from the remembered playzone
+// stream hands to the key (0..1, see cloud_zone; less near the hands with `cloud_trail_hands`, none on
+// what only the remembered playzone shows), a: how much of r comes from the remembered playzone
 // (for the debug view)
 
 struct Immediate {
@@ -82,17 +83,41 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     }
 
     // Near the hands, objects may be missing in the depth map
+    var near_hand = 0.0;
+    var near_hand_read = false;
+    // How much of r only the remembered playzone shows (not paled by `mem_view 2`), for the trail
+    var memory_only = 0.0;
     if depth_u.lighting2.z > 0.5 && depth_u.playzone.x > 0.5 && result.r < 1.0 {
-        let near_hand = textureSampleLevel(focus_area, linear_sampler, uv, 0.0).b;
+        near_hand = textureSampleLevel(focus_area, linear_sampler, uv, 0.0).b;
+        near_hand_read = true;
         if near_hand > 0.0 {
             let remembered = playzone_coverage(uv);
             let coverage = max(result.r, near_hand * remembered.x);
-            result.a = coverage - result.r;
+            memory_only = coverage - result.r;
+            result.a = memory_only;
             // `mem_view 2`: the debug tint of what only the memory shows is paler the older it is
             if depth_u.memory.y > 1.5 && remembered.x > 0.0 {
                 result.a *= remembered.y / remembered.x;
             }
             result.r = coverage;
+        }
+    }
+
+    // `cloud_trail` near the hands: the runtime removes the hands and a few cm around them from the
+    // depth, so real static surface there leaves the live depth and arrives again after the hand passed
+    // (its arrival count restarts). (1) `cloud_trail_hands 1` (the default): the trail is scaled by 1 -
+    // the near-hand value; 0: not (as in commit 9abdada4). (2) Always: the part of the coverage only the
+    // remembered playzone shows is never handed to the key (it has no arrival count). Off (cloud_trail
+    // 0): nothing is read, b stays the depth data flag
+    if depth_u.cloud.x > 0.5 && depth_u.cloud.z > 0.0 {
+        if cloud_trail_spares_hands() {
+            if !near_hand_read {
+                near_hand = textureSampleLevel(focus_area, linear_sampler, uv, 0.0).b;
+            }
+            result.b *= 1.0 - clamp(near_hand, 0.0, 1.0);
+        }
+        if memory_only > 0.0 {
+            result.b *= 1.0 - clamp(memory_only / max(result.r, 1e-3), 0.0, 1.0);
         }
     }
 
@@ -130,7 +155,7 @@ const CLOUD_OLD_COUNT: f32 = 255.0;
 // depth stalled; also with `cloud_fixed`), no zone. With `cloud_trail` (depth_u.cloud.z) the reach
 // inside the mask is at most the trail. x: the zone. y: the trail, how much of the solid mask the stream
 // hands to the key: the zone, inside the mask (phi < 0) only where the surface arrived within the last
-// `cloud_trail_age` depth images (depth_u.cloud.w, 0: no age test, the zone): a static surface beside
+// `cloud_trail_age` depth images (cloud_trail_age(), 0: no age test, the zone): a static surface beside
 // an edge that only seems to move (depth noise, the hole the runtime cuts around a hand) stays solid
 fn cloud_zone(uv: vec2f) -> vec2f {
     let view_idx = imm.view_idx;
@@ -181,11 +206,22 @@ fn cloud_zone(uv: vec2f) -> vec2f {
     let zone = 1.0 - smoothstep(reach - CLOUD_SOFT_EDGE, reach, abs(phi));
     // `cloud_trail_age`: the arrival count of the field (blended across cells like the rest)
     var recent = 1.0;
-    let age = depth_u.cloud.w;
+    let age = cloud_trail_age();
     if age > 0.0 && phi < 0.0 {
         recent = 1.0 - smoothstep(age - 2.0, age, field.a * CLOUD_OLD_COUNT);
     }
     return vec2f(zone, zone * recent);
+}
+
+// `cloud_trail_age` from depth_u.cloud.w (negative with `cloud_trail_hands 0`: -1 - the age)
+fn cloud_trail_age() -> f32 {
+    let w = depth_u.cloud.w;
+    return select(w, -1.0 - w, w < 0.0);
+}
+
+// `cloud_trail_hands`: whether the trail is scaled down near the hands (depth_u.cloud.w not negative)
+fn cloud_trail_spares_hands() -> bool {
+    return depth_u.cloud.w >= 0.0;
 }
 
 // How much the lever windows show along a view ray: the most open of those it crosses in front of the

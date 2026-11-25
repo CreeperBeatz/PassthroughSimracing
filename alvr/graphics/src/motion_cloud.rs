@@ -85,6 +85,11 @@ pub struct CloudParams {
     /// this many depth images (the late copy of a mover); surface that has been in it longer (a static
     /// desk beside an edge that only seems to move) stays solid. 0: no age test
     pub trail_age: u8,
+    /// `cloud_trail_hands`: the trail hands nothing to the key near a hand (scaled by 1 - the near-hand
+    /// value of the focus area), where the runtime removes real surface around the hand from the depth
+    /// and it arrives again after the hand passed. False: the trail of commit 9abdada4 there (for an
+    /// A/B). Surface only the remembered playzone shows is spared either way
+    pub trail_hands: bool,
     /// `cloud_window`: half of the window of the field's search (cells of 2 x 2 depth texels, 1..24;
     /// 12: today's). The distances are truncated at 2 x this (depth texels), so the band reaches at
     /// most that far. A change resets the cloud (`MotionCloud::plan`)
@@ -113,6 +118,7 @@ impl Default for CloudParams {
             onesided: 1,
             trail: 0.0,
             trail_age: 16,
+            trail_hands: true,
             window: CLOUD_WINDOW_CELLS,
         }
     }
@@ -650,6 +656,7 @@ impl CloudRecord {
             ("onesided", params.onesided.to_string()),
             ("trail", number(params.trail)),
             ("trail_age", params.trail_age.to_string()),
+            ("trail_hands", u8::from(params.trail_hands).to_string()),
             ("window", params.window.to_string()),
             ("eyes", array(self.eyes.map(|eye| eye.to_json()))),
         ])
@@ -1158,7 +1165,9 @@ mod tests {
         );
         assert!(json.contains(r#""fetch_mm":450"#), "{json}");
         assert!(
-            json.contains(r#""onesided":1,"trail":0,"trail_age":16,"window":12,"eyes""#),
+            json.contains(
+                r#""onesided":1,"trail":0,"trail_age":16,"trail_hands":1,"window":12,"eyes""#
+            ),
             "{json}"
         );
         assert!(json.contains(r#""reset":"head""#), "{json}");

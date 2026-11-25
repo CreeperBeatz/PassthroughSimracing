@@ -95,6 +95,12 @@ the age. The mask carries the trail's strength in b while the trail is on (the z
 mask), and the stream takes the solid's reduction from it. A missing or cleared field counts as old (fails safe to
 today's solid mask). `cloud_trail_age 0` is the trail without the age test.
 
+**The trail spares the hands** (`cloud_trail_hands`, on by default). The runtime removes the tracked hands and a few
+cm around them from the depth, so beside a moving hand real static surface leaves the live depth and arrives again
+after the hand passed, with a fresh arrival count; and what only the remembered playzone shows has no count at all.
+The trail is therefore scaled by 1 - the near-hand value of the focus area (b), and is 0 wherever the mask's
+coverage comes from the remembered playzone (scaled by 1 - its share of r, always, also with `cloud_trail_hands 0`).
+
 While the cloud is on, an unset `key_layers` is 5 (the extra layers over the whole view) and an unset `key_crop`
 is 0 (not cropped to the hands): the zone only acts where the lower layer is drawn. Set values win.
 
@@ -116,6 +122,7 @@ All `adb shell setprop debug.alvr.<name> <value>`, read every 500 ms; each chang
 | `cloud_onesided` | 1 | 0..2 | the one-sided rule above |
 | `cloud_trail` | 0 | 0..2 x `cloud_window` | N > 0: inside the depth mask, a border of at most N texels (and at most the reach) along edges that moved is decided by the key instead of showing the room (the trail above). 0: off |
 | `cloud_trail_age` | 16 | 0..255 | the trail hands only surface to the key that arrived in the mask within this many depth images (about 0.6-1 s at 15-25 images per second); 0: no age test (the trail before it). Only while `cloud_trail` is on |
+| `cloud_trail_hands` | 1 | 0, 1 | 1: the trail is scaled by 1 - the near-hand value (nothing handed to the key next to a hand); 0: the trail as before near the hands (A/B). Surface only the remembered playzone shows is spared either way. Only while `cloud_trail` is on |
 | `cloud_window` | 12 | 12..24 | half of the field's search window, cells of 2 x 2 depth texels: the band reaches at most 2 x this texels (24 = about 8 cm at 0.5 m; 48 = about 16 cm). A change starts the cloud over (both eyes reset, fields cleared). Cost: the rows and field passes read about twice as many texels with 24 |
 | `cloud_ab` | 0 | 0, 1 | 1: 2 s the cloud as set, 2 s today's picture (arm shift as set), with a green / red mark; the passes keep running |
 | `cloud_leak` | 0 | 0, 1 | 1: gain and cap scaled by the key's measured leak ("The key adapts" below); shown in the `cloud:` line, not logged on change |
@@ -131,7 +138,8 @@ cloud: mode 1, gain 150 cap 14 hold 200 dead 2.5 lambda 40 fetch 450 fixed 0 ab 
 dt 0, head 1, region 0) | layers 5 crop 0
 ```
 
-`trail 0/16`: `cloud_trail` / `cloud_trail_age`.
+`trail 0/16`: `cloud_trail` / `cloud_trail_age`, followed by `h` while the trail is on and spares the hands
+(`cloud_trail_hands 1`, e.g. `trail 24/16h`; no `h`: `cloud_trail_hands 0`).
 
 `depth`: new pairs of the left eye per second and the share of each interval between depth images (over its pairs
 other than start and dt resets); `age` and `a`: the mean age of the left eye's field at display and how far the live
@@ -146,7 +154,7 @@ off).
 
 Index version 7. Each display record has `"cloud": null` while the cloud is off or not running, else
 `{"mode", "shown", "gain", "cap", "hold_ms", "dead", "lambda_ms", "fetch_mm", "fixed", "ab", "onesided", "trail",
-"trail_age", "window", "eyes": [{"field_capture_ns", "prev_capture_ns", "dt_ms", "reset": null | "start" | "dt" | "head" | "region",
+"trail_age", "trail_hands" (0/1), "window", "eyes": [{"field_capture_ns", "prev_capture_ns", "dt_ms", "reset": null | "start" | "dt" | "head" | "region",
 "head_deg_s", "a_ms", "reach_ms", "stale"} x 2]}` (`stale`: the field was older than 300 ms on that frame, no
 zone; `reach_ms` is then 0). With these, the depth frames and their poses, the field of every display
 frame can be rebuilt offline. `docs/tools/read_burst.py` reads it as `display["cloud_*"]` and still reads older
@@ -268,6 +276,10 @@ Later the same day, two findings that gave switches:
 - **With `cloud_trail 24` a strip of the static desk** beside a ragged, flickering mask edge (hand at rest on the
   desk, inside the play area) turned into game: an A/B of screenshots with the trail at 0 and 24. Fixed by the
   arrival age (`cloud_trail_age`).
+- **After the arrival age, holes of game remained next to the hand** in the desk and the laptop (mask dump, trail
+  24/16: the trail 1.4-1.9 % of the view, 35-55 % of it near a hand, 33-51 % surface only the room memory shows):
+  the runtime cuts the hand and a few cm around it from the depth, so that surface arrives again behind the moving
+  hand. Fixed by `cloud_trail_hands` (no trail near a hand) and no trail on remembered surface.
 
 Not judged yet: the A/B against today's arm, a smaller band (`cloud_cap 8`), the constant band
 (`cloud_fixed 8`), a longer hold, `cloud 2`, sleeves.

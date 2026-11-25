@@ -6779,6 +6779,176 @@ fn cloud_trail_takes_recent_surface() {
     }
 }
 
+/// The probe pixel of the `cloud_trail_hands` tests: inside the box of `cloud_trail_render`, in the
+/// lower layer (left half)
+const CLOUD_HAND_PIXEL: (f32, f32) = (0.4, 0.5);
+
+/// A colour key with one hand: a ball of 1.5 cm at `center` (no solid fill, no rim)
+fn cloud_hand_key(center: Vec3) -> ColorKeyInput {
+    let point = center.extend(0.015);
+    ColorKeyInput {
+        hands: [
+            Some((
+                HandShape {
+                    segments: [[point; 2]; HAND_SEGMENTS],
+                },
+                HandZones {
+                    core: 0.0,
+                    falloff: 0.004,
+                    rim: 0.0,
+                    solid: [0.0; HAND_SEGMENTS],
+                    sweep: HandSweep::NONE,
+                },
+            )),
+            None,
+        ],
+        leak: [0.0; 2],
+        bridges: [None; 2],
+    }
+}
+
+/// A hand 3 cm beside the ray of CLOUD_HAND_PIXEL at 0.45 m (in front of the box): near the hand there
+/// (focus area b 1: within its radius + 3 cm), off its surface and rim
+const CLOUD_HAND_NEAR: Vec3 = Vec3::new(-0.06, 0.0, -0.45);
+/// A hand on the other side of the view: focus area b 0 at CLOUD_HAND_PIXEL
+const CLOUD_HAND_FAR: Vec3 = Vec3::new(0.2, 0.0, -0.45);
+
+/// `cloud_trail_render` (probe cell CLOUD_TRAIL_NEAR, `cloud_trail 6`, `cloud_trail_age` 16: recent
+/// surface) of the depth `current`, with the hand of `cloud_hand_key` at `hand`, `cloud_trail_hands`
+/// `hands` and the remembered playzone `playzone`
+fn cloud_trail_hand_render(
+    device: &Device,
+    queue: &Queue,
+    current: &Scene,
+    hand: Vec3,
+    hands: bool,
+    playzone: Option<&Scene>,
+) -> Output {
+    let lower = (Vec2::ZERO, Vec2::new(0.5, 1.0));
+    render_v2(
+        device,
+        queue,
+        &cloud_config(),
+        current,
+        Vec3::ZERO,
+        Vec3::ZERO,
+        true,
+        Some(cloud_hand_key(hand)),
+        [None; 2],
+        playzone,
+        Some([lower; 2]),
+        false,
+        &[],
+        None,
+        0.0,
+        0.0,
+        MaskV2 {
+            cloud: Some(CloudInput {
+                params: CloudParams {
+                    trail: 6.0,
+                    trail_hands: hands,
+                    ..Default::default()
+                },
+                capture_ns: Some(0),
+                display_ns: 100_000_000,
+                shown: true,
+            }),
+            cloud_probe: true,
+            cloud_probe_cell: Some(CLOUD_TRAIL_NEAR),
+            ..Default::default()
+        },
+    )
+}
+
+// `cloud_trail_hands`: the runtime removes the hands and a few cm around them from the depth, so real
+// surface there arrives again after the hand passed. A trail pixel inside the mask (the box, live
+// depth, no playzone) next to a hand (focus area b 1): with `cloud_trail_hands 1` (the default) the
+// trail is 0 there and the mask shows the room (alpha 0); with 0 it is handed to the key (packed 0.5,
+// mask b 255), as in commit 9abdada4. With the hand far away (b 0) the switch changes nothing there
+// (0.5, b 255); over the whole mask r, g and a never change and b only goes down
+#[test]
+fn cloud_trail_spares_the_hands() {
+    let (device, queue) = gpu_or_skip!();
+    assert!(CloudParams::default().trail_hands);
+    let scene = Scene::new(3.0, [0.3, 0.3, 0.7, 0.7], 0.5);
+    let (u, v) = CLOUD_HAND_PIXEL;
+    let trail_at = |output: &Output| mask_texel(&output.mask, u, v)[2];
+
+    let spared = cloud_trail_hand_render(&device, &queue, &scene, CLOUD_HAND_NEAR, true, None);
+    let plain = cloud_trail_hand_render(&device, &queue, &scene, CLOUD_HAND_NEAR, false, None);
+    assert_eq!(mask_texel(&spared.mask, u, v)[0], 255);
+    assert_eq!(trail_at(&spared), 0);
+    assert_eq!(spared.alpha(u, v), 0.0);
+    assert_eq!(trail_at(&plain), 255);
+    assert!(
+        (plain.alpha(u, v) - 0.5).abs() < 0.003,
+        "{}",
+        plain.alpha(u, v)
+    );
+
+    let far_spared = cloud_trail_hand_render(&device, &queue, &scene, CLOUD_HAND_FAR, true, None);
+    let far_plain = cloud_trail_hand_render(&device, &queue, &scene, CLOUD_HAND_FAR, false, None);
+    for far in [&far_spared, &far_plain] {
+        assert_eq!(trail_at(far), 255);
+        assert!((far.alpha(u, v) - 0.5).abs() < 0.003, "{}", far.alpha(u, v));
+    }
+    assert_eq!(far_spared.at(u, v), far_plain.at(u, v));
+
+    for (spared, plain) in [(&spared, &plain), (&far_spared, &far_plain)] {
+        for (a, b) in spared.mask.iter().zip(&plain.mask) {
+            assert_eq!([a[0], a[1], a[3]], [b[0], b[1], b[3]]);
+            assert!(a[2] <= b[2]);
+        }
+    }
+}
+
+// Surface that only the remembered playzone shows next to a hand (the box is gone from the live depth,
+// the playzone remembers it) has no arrival count: the trail never hands it to the key, whatever
+// `cloud_trail_hands` says (that switch only governs the near-hand factor). With `cloud_trail_hands 0`:
+// at the probe pixel the mask shows the room (alpha 0, mask b 0), while the same pixel covered by the
+// live depth is handed to the key (0.5); over the whole mask every texel whose coverage is the memory's
+// alone (a = r > 0), also where the hand is only partly near, has trail 0
+#[test]
+fn cloud_trail_spares_remembered_surface() {
+    let (device, queue) = gpu_or_skip!();
+    let live = Scene::new(3.0, [0.3, 0.3, 0.7, 0.7], 0.5);
+    let gone = Scene::new(3.0, [2.0, 2.0, 2.0, 2.0], 0.5);
+    let (u, v) = CLOUD_HAND_PIXEL;
+
+    for hands in [false, true] {
+        let memory =
+            cloud_trail_hand_render(&device, &queue, &gone, CLOUD_HAND_NEAR, hands, Some(&live));
+        let texel = mask_texel(&memory.mask, u, v);
+        assert_eq!([texel[0], texel[2], texel[3]], [255, 0, 255], "{hands}");
+        assert_eq!(memory.alpha(u, v), 0.0, "{hands}");
+        let mut memory_only = 0;
+        for texel in &memory.mask {
+            if texel[0] > 0 && texel[3] == texel[0] {
+                memory_only += 1;
+                assert_eq!(texel[2], 0, "{hands}: {texel:?}");
+            }
+        }
+        assert!(memory_only > 4, "{hands}: {memory_only}");
+    }
+    // The control: live coverage at the same pixel, same hand, `cloud_trail_hands 0`
+    let control =
+        cloud_trail_hand_render(&device, &queue, &live, CLOUD_HAND_NEAR, false, Some(&live));
+    assert_eq!(mask_texel(&control.mask, u, v)[3], 0);
+    assert_eq!(mask_texel(&control.mask, u, v)[2], 255);
+    assert!(
+        (control.alpha(u, v) - 0.5).abs() < 0.003,
+        "{}",
+        control.alpha(u, v)
+    );
+}
+
+/// The texel of an `Output` mask at view-space uv (origin top-left)
+fn mask_texel(mask: &[[u8; 4]], u: f32, v: f32) -> [u8; 4] {
+    let x = ((u * TARGET_SIZE as f32) as u32).min(TARGET_SIZE - 1);
+    let y = ((v * TARGET_SIZE as f32) as u32).min(TARGET_SIZE - 1);
+    mask[(y * TARGET_SIZE + x) as usize]
+}
+
 // `cloud_ab`: a square of 2 % of the view at (0.5, 0.4), green while the cloud is shown, red in today's
 // phase, nothing without `cloud_ab`
 #[test]
@@ -6940,6 +7110,41 @@ fn cloud_vector_in_the_depth_uniforms() {
     assert_eq!(
         vector(&volume, true, trail(cloud(1, true, false), 6.0)),
         [0.0, 2.0, 0.0, 0.0]
+    );
+    // `cloud_trail_hands 0`: w is -1 - the age (also for age 0), only while the trail is on
+    let no_hands = |cloud: Option<CloudInput>, trail_age| {
+        cloud.map(|cloud| CloudInput {
+            params: CloudParams {
+                trail_hands: false,
+                trail_age,
+                ..cloud.params
+            },
+            ..cloud
+        })
+    };
+    assert_eq!(
+        vector(
+            &volume,
+            true,
+            trail(no_hands(cloud(1, false, true), 16), 6.0)
+        ),
+        [1.0, 0.0, 6.0, -17.0]
+    );
+    assert_eq!(
+        vector(
+            &volume,
+            true,
+            trail(no_hands(cloud(1, false, true), 0), 6.0)
+        ),
+        [1.0, 0.0, 6.0, -1.0]
+    );
+    assert_eq!(
+        vector(
+            &volume,
+            true,
+            trail(no_hands(cloud(1, false, true), 16), 0.0)
+        ),
+        [1.0, 0.0, 0.0, 0.0]
     );
     for config in [&distance, &show_depth] {
         assert_eq!(
