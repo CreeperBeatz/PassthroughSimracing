@@ -349,6 +349,52 @@ What it cannot do:
   scaled by `key_auto_scene`.
 - Not run on the headset yet.
 
+## State at the end of 2026-11-25
+
+Build e918f6bd, one room (a co-working space with colours close to skin), bare forearms, stream over a
+laptop hotspot. The user after the last install, asked whether the arms were as good as with the inner
+border and the laptop stayed visible next to the hand: "yes, its good enough for now".
+
+**The settings that were judged** (all by property: the defaults in the code are still off, so they are
+gone after a reboot of the headset):
+
+| property | value | default |
+|---|---|---|
+| `cloud` | 1 | 0 |
+| `cloud_trail` / `cloud_trail_age` / `cloud_trail_hands` | 24 / 16 / 1 | 0 / 16 / 1 |
+| `cloud_window` | 24 | 12 |
+| `cloud_cap` / `cloud_gain` | 48 / 250 | 14 / 150 |
+| `key_auto` | 1 | 0 |
+| `cloud_leak` | 1 | 0 |
+| `key_layers` / `key_crop` | 5 / 0 | 4 / 1 (the cloud's own defaults while it is on: 5 / 0) |
+
+**What the user said on the way** (in order):
+- Big band (cap 24, gain 250): "the cloud trail is good, but the color mask doesn't seem to be working
+  that well"; the room showing was "the bigger problem", and the fix should be automatic.
+- With `key_auto`, trail 24: "works much better". Slow motion: "the leading side is very accurate -
+  pixel accurate"; fast: "the leading edge clips into VR from a not fast enough depth mask"; with the
+  trail at 6 "there is always a tail".
+- With the arrival age and the wide window: "when it works it works really well".
+- Trail off: the laptop "not a problem, but the arms tracking got bad".
+
+**Log of the last run:** depth 24 images per second, 113 ms old at display, no stale field; the key chose
+a bias of 1.50 there (skin kept 0.91, background 0.00, scene 0.00), earlier in the session 0.60 to
+1.25; leak scale 1.00 almost always; 70 fps on average over 90 s with 6 seconds below 65, GPU 82 %.
+
+**Not the cloud, but found on the way:** a leftover `lever_boxes 2` turned a newly added play-area box
+into a window on the room (a crisp rectangle of far room); an empty value switches it off. The play
+area needed the code again after the headset re-centred itself (the stage space turned by 43 degrees).
+
+**Open:**
+- The settings above are not defaults. Whether to make them the defaults is the user's call, after a
+  run at home and at the rig.
+- Never judged: sleeves, gloves, a wheel, a shifter, the A/B against the old arm shift, `cloud 2`.
+- The per-hand check of the key passes far more often for one hand than the other (8-18 % against
+  61-77 % of the updates); cause unknown.
+- The frame rate was not always 72 (GPU clock of the headset lower on battery; full-view key layers).
+- A fast arm still outruns the band at times; the first 125-240 ms of a motion have no band.
+- Ghosting "in places" that the user could not reproduce.
+
 ## Literature
 
 Read at abstract or snippet level; mechanisms only, no reported numbers used.
