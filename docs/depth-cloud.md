@@ -192,6 +192,33 @@ everything unset.
 After: `cloud 0` and `cloud_ab 0`. One word per step: better / same / worse than today. If a bare arm with a
 working key does not look better in steps 3-4, sleeves will not either: stop there.
 
+## First headset run (2026-11-25)
+
+Build a9a6191b, `cloud 1` with the defaults, bare forearm, a room the play area was placed in that
+day, the stream over a laptop hotspot.
+
+- **The shaders run on the headset.** The first `cloud 1` compiled the three pipelines without an
+  error; this was the one thing the PC tests could not check.
+- **The log** over about five minutes: depth 17 images per second (mostly 67 ms pairs), 141 ms old at
+  display, no stale field. Resets: the head guard on 87 pairs (the head turns of step 1), a depth gap
+  on 3, none for the region.
+- **At rest and while turning the head** (mask tint on), the user: "no green tint, except some very
+  minor details, like moving cables". So the border rule and the head guard hold in this room.
+- **Arm moving in front of the game**, the user: the band appears on both sides and goes away, "there
+  is some jitter, but generally yes. The forearm's edge feels a bit better, but there is ghosting in
+  the background in some cases". And: "there were room patches and it was jittery at times".
+- **Frame rate:** not a clean test. For part of the run the headset's GPU was clocked down and the
+  client ran at 56-68 fps with the cloud off as well; later it was back at 72.
+
+Reading (not measured): the room patches are the key keeping room colours inside the band, which the
+offline check predicted (5-7 points of leak with the real table). The jitter fits a band that is
+re-anchored to the depth edge 15-17 times a second and grows between two depth images: with a key
+that kept only the arm this would not show, with patches inside it does. The ghosting is most likely
+the late depth copy behind the arm, which v1 leaves as it is.
+
+Not judged yet: the A/B against today's arm, a smaller band (`cloud_cap 8`), the constant band
+(`cloud_fixed 8`), a longer hold, `cloud 2`, sleeves.
+
 ## Literature
 
 Read at abstract or snippet level; mechanisms only, no reported numbers used.
