@@ -40,7 +40,13 @@
 #          of the left eye's texels from its last stats, NaN: none yet), mem_stats_age_ms (K,),
 #          mem_oldest_frozen_s (K,), mem_hands (K, 2) (where the capsules at the depth's capture time came
 #          from: 0 none, 1 the arm's history, 2 the last known ones grown 3 cm; -1 off), mem_margin_mm (K,).
-#          The state is the renderer's after the frame
+#          The state is the renderer's after the frame. The depth cloud (`debug.alvr.cloud`, burst version 7;
+#          older bursts and frames with it off or not running: cloud_on False, -1, NaN): cloud (K,) the record
+#          as a dict or None, cloud_on (K,) bool, cloud_shown (K,) bool (False in today's phase of cloud_ab),
+#          cloud_mode (K,), cloud_field_capture_ns / cloud_prev_capture_ns (K, 2) per eye (-1: none),
+#          cloud_dt_ms, cloud_head_deg_s, cloud_a_ms, cloud_reach_ms (K, 2), cloud_reset (K, 2) (-1 off, 0
+#          measured, 1 start, 2 dt, 3 head, 4 region), cloud_stale (K, 2) bool (the field was older than
+#          300 ms: no zone; False where the record has no `stale`)
 # samples: the arm's own hand samples (burst version 4; empty for older bursts), a list per hand (0 left,
 #          1 right) of dicts of arrays in time order: time_ns (when the sample shows the hand), seen_ns (when
 #          the app got it first), wrist (N, 3), capture_time (N,) bool (time_ns is the runtime's capture
@@ -203,6 +209,18 @@ def load_burst(path, images=True):
         "mem_oldest_frozen_s": np.full(k, np.nan),
         "mem_hands": np.full((k, 2), -1, np.int64),
         "mem_margin_mm": np.full(k, np.nan),
+        "cloud": [None] * k,
+        "cloud_on": np.zeros(k, bool),
+        "cloud_shown": np.zeros(k, bool),
+        "cloud_mode": np.full(k, -1, np.int64),
+        "cloud_field_capture_ns": np.full((k, 2), -1, np.int64),
+        "cloud_prev_capture_ns": np.full((k, 2), -1, np.int64),
+        "cloud_dt_ms": np.full((k, 2), np.nan),
+        "cloud_reset": np.full((k, 2), -1, np.int64),
+        "cloud_head_deg_s": np.full((k, 2), np.nan),
+        "cloud_a_ms": np.full((k, 2), np.nan),
+        "cloud_reach_ms": np.full((k, 2), np.nan),
+        "cloud_stale": np.zeros((k, 2), bool),
     }
     new_samples = [[], []]
     for i, r in enumerate(display_records):
@@ -261,6 +279,22 @@ def load_burst(path, images=True):
                 display["mem_oldest_frozen_s"][i] = _float(stats["oldest_frozen_s"])
             display["mem_hands"][i] = [{"none": 0, "exact": 1, "fallback": 2}[h] for h in memory.get("hands", ["none", "none"])]
             display["mem_margin_mm"][i] = _float(memory.get("margin_mm"))
+        # Version 7: the depth cloud
+        cloud = r.get("cloud")
+        if cloud is not None:
+            display["cloud"][i] = cloud
+            display["cloud_on"][i] = True
+            display["cloud_shown"][i] = cloud["shown"]
+            display["cloud_mode"][i] = cloud["mode"]
+            for eye, field in enumerate(cloud["eyes"]):
+                display["cloud_field_capture_ns"][i, eye] = _optional_ns(field["field_capture_ns"])
+                display["cloud_prev_capture_ns"][i, eye] = _optional_ns(field["prev_capture_ns"])
+                display["cloud_dt_ms"][i, eye] = _float(field["dt_ms"])
+                display["cloud_reset"][i, eye] = {None: 0, "start": 1, "dt": 2, "head": 3, "region": 4}[field["reset"]]
+                display["cloud_head_deg_s"][i, eye] = _float(field["head_deg_s"])
+                display["cloud_a_ms"][i, eye] = _float(field["a_ms"])
+                display["cloud_reach_ms"][i, eye] = _float(field["reach_ms"])
+                display["cloud_stale"][i, eye] = bool(field.get("stale", False))
     # A reset in a record comes before its new samples
     resets = np.cumsum(display["arm_reset"], axis=0)
     samples = [
@@ -556,6 +590,37 @@ def summary(burst):
         lines.append(part)
     elif index.get("version", 1) >= 6:
         lines.append("room memory: off")
+    on = display["cloud_on"]
+    if on.any():
+        last = display["cloud"][np.flatnonzero(on)[-1]]
+        resets = display["cloud_reset"][on, 0]
+        lines.append(
+            "depth cloud (cloud %d) in %d of %d display frames, shown in %d, gain %g cap %g hold %g dead %g lambda %g fetch %g fixed %g ab %s onesided %s; left eye a %s, reach %s, stale in %d frames, frames whose left field came from a reset pair (start / dt / head / region) %d/%d/%d/%d"
+            % (
+                last["mode"],
+                int(on.sum()),
+                len(on),
+                int(display["cloud_shown"].sum()),
+                last["gain"],
+                last["cap"],
+                last["hold_ms"],
+                last["dead"],
+                last["lambda_ms"],
+                last["fetch_mm"],
+                last["fixed"],
+                last["ab"],
+                last.get("onesided", "-"),
+                _stats(display["cloud_a_ms"][on, 0]),
+                _stats(display["cloud_reach_ms"][on, 0]),
+                int(display["cloud_stale"][on, 0].sum()),
+                (resets == 1).sum(),
+                (resets == 2).sum(),
+                (resets == 3).sum(),
+                (resets == 4).sum(),
+            )
+        )
+    elif index.get("version", 1) >= 7:
+        lines.append("depth cloud: off")
     key_lut = burst.get("key_lut")
     if key_lut is None:
         lines.append("key table: none recorded")

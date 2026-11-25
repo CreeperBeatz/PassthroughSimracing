@@ -10,8 +10,9 @@
 // the boxes of the play area or the cockpit box of the settings).
 //
 // Output: r: region coverage (0..1), g: proximity for the debug view (1: at the eye, 0: 3 m or
-// more), b: whether there is depth data (0/1), a: how much of r comes from the remembered playzone
-// (for the debug view)
+// more), or with the depth cloud (`debug.alvr.cloud`) its zone, where the colour key decides (0..1),
+// b: whether there is depth data (0/1), a: how much of r comes from the remembered playzone (for the
+// debug view)
 
 struct Immediate {
     view_idx: u32,
@@ -28,6 +29,10 @@ var<immediate> imm: Immediate;
 @group(1) @binding(0) var playzone_texture: texture_2d<f32>;
 @group(1) @binding(1) var focus_area: texture_2d<f32>;
 @group(1) @binding(2) var linear_sampler: sampler;
+// The depth cloud (`debug.alvr.cloud`, motion_cloud.wgsl): the field of this eye and its cameras. A 1 x 1
+// field with nothing in it and zeros while it is off; not read unless depth_u.cloud.x is set
+@group(2) @binding(0) var cloud_field: texture_2d<f32>;
+@group(2) @binding(1) var<uniform> cloud_u: CloudUniforms;
 
 struct VertexOutput {
     @builtin(position) position: vec4f,
@@ -52,6 +57,12 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     }
 
     var result = current_mask(uv);
+
+    // The depth cloud replaces the proximity, which only the Show depth view reads (the cloud is off
+    // with it). Off (the default): nothing is read, the mask is today's
+    if depth_u.cloud.x > 0.5 {
+        result.g = cloud_zone(uv);
+    }
 
     // The strip the runtime removes behind each wrist. Only adds, and with both gaps off (the default)
     // nothing is done, so the mask is today's
@@ -92,6 +103,60 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     }
 
     return result;
+}
+
+// The field stores phi and speeds as shares of these (texels, texels per second), see motion_cloud.wgsl
+const CLOUD_TRUNCATION: f32 = 24.0;
+const CLOUD_SPEED_SCALE: f32 = 510.0;
+// `cloud_fixed`: the full reach from this speed on (texels per second)
+const CLOUD_FIXED_SPEED: f32 = 30.0;
+// The zone fades out over this much of its reach (texels)
+const CLOUD_SOFT_EDGE: f32 = 1.5;
+
+// The zone of the depth cloud along the view ray of uv (0..1, design/depthcloud/final.md B.3): the ray
+// is looked up in the field of this eye at a fixed distance (independent of the depth lookup), and the
+// zone reaches speed x reach time (at most the cap) from the nearest edge of the field, on both sides.
+// With `cloud 2` the lookup point is moved back by the arm shift, as the depth is. Outside the field's
+// camera, for an eye without a field (zero matrices) or with a field older than 300 ms (pair.w 0, the
+// depth stalled; also with `cloud_fixed`), no zone
+fn cloud_zone(uv: vec2f) -> f32 {
+    let view_idx = imm.view_idx;
+    if cloud_u.eyes[view_idx].pair.w < 0.5 {
+        return 0.0;
+    }
+    let eye = depth_u.eyes[view_idx];
+    let origin = eye.eye_position.xyz;
+    let dir = normalize((eye.uv_to_world_dir * vec4f(uv, 1.0, 0.0)).xyz);
+    var point = origin + dir * cloud_u.params.x;
+    if depth_u.cloud.x > 1.5 {
+        point -= arm_displacement(point);
+    }
+
+    let camera = cloud_u.eyes[view_idx].field;
+    let view_point = (camera.world_to_view * vec4f(point, 1.0)).xyz;
+    if view_point.z > -0.001 {
+        return 0.0;
+    }
+    let tan_xy = view_point.xy / -view_point.z;
+    var tex_uv = (tan_xy - camera.tangents.xz) / (camera.tangents.yw - camera.tangents.xz);
+    if any(tex_uv < vec2f(0.0)) || any(tex_uv > vec2f(1.0)) {
+        return 0.0;
+    }
+    if depth_u.depth.w > 0.5 {
+        tex_uv.y = 1.0 - tex_uv.y;
+    }
+
+    let field = textureSampleLevel(cloud_field, linear_sampler, tex_uv, 0.0);
+    let phi = (2.0 * field.r - 1.0) * CLOUD_TRUNCATION;
+    let speed = field.g * CLOUD_SPEED_SCALE;
+    var reach = min(speed * cloud_u.reach[view_idx], cloud_u.params.z);
+    if cloud_u.params.w > 0.0 {
+        reach = cloud_u.params.w * clamp(speed / CLOUD_FIXED_SPEED, 0.0, 1.0);
+    }
+    if reach <= 0.0 {
+        return 0.0;
+    }
+    return 1.0 - smoothstep(reach - CLOUD_SOFT_EDGE, reach, abs(phi));
 }
 
 // How much the lever windows show along a view ray: the most open of those it crosses in front of the
@@ -542,114 +607,4 @@ fn linearize_depth(depth: f32) -> f32 {
     }
 
     return 2.0 * near * far / ((far + near) - ndc * (far - near));
-}
-
-// The soft edge of the region (meters, on each side of its surface)
-fn region_feathering() -> f32 {
-    return max(depth_u.region.z, 0.0005);
-}
-
-// Distance from the surface of the region (meters, negative inside). Beyond the soft edge on either
-// side it may be only a bound, which gives the same mask (see area_signed_distance)
-fn region_signed_distance(world_point: vec3f, view_idx: u32) -> f32 {
-    if depth_u.region.x < 0.5 {
-        let dist = length(world_point - depth_u.eyes[view_idx].eye_position.xyz);
-        return dist - depth_u.region.y;
-    }
-    let area_point = (depth_u.world_to_area * vec4f(world_point, 1.0)).xyz;
-    return area_signed_distance(area_point, region_feathering());
-}
-
-// 1 inside the region, 0 outside, with a soft edge of `feathering` meters
-fn region_mask(world_point: vec3f, view_idx: u32) -> f32 {
-    let feathering = region_feathering();
-    let signed_distance = region_signed_distance(world_point, view_idx);
-    return 1.0 - smoothstep(-feathering, feathering, signed_distance);
-}
-
-// Larger than any distance in the room
-const FAR_DISTANCE: f32 = 1e9;
-
-// Distance from the surface of the union of the boxes of the play area (area frame), see play_area.rs.
-// A line-by-line copy of PlayArea::signed_distance: keep both the same. Below -feathering the value can
-// be too large, above +feathering too small: the mask is the same
-fn area_signed_distance(point: vec3f, feathering: f32) -> f32 {
-    // Outside the bounds of all boxes by the soft edge: that distance is a lower bound
-    let e = abs(point - depth_u.area_bounds[0].xyz) - depth_u.area_bounds[1].xyz;
-    let outside = length(max(e, vec3f(0.0)));
-    if outside >= feathering {
-        return outside;
-    }
-
-    var distance = FAR_DISTANCE;
-    let count = min(u32(depth_u.area.x), AREA_BOXES);
-    for (var i = 0u; i < count; i++) {
-        distance = min(distance, area_box_distance(point, i, feathering));
-        // Inside by the soft edge: the mask is 1 whatever the other boxes give
-        if distance <= -feathering {
-            break;
-        }
-    }
-    return distance;
-}
-
-// A box with its domes, a copy of AreaBox::signed_distance
-fn area_box_distance(point: vec3f, index: u32, feathering: f32) -> f32 {
-    let area_box = depth_u.area_boxes[index];
-    // Into the frame of the box: turned back by its yaw (turn_y of play_area.rs with minus the sine)
-    let offset = point - area_box.center.xyz;
-    let c = area_box.turn.x;
-    let s = area_box.turn.y;
-    let local = vec3f(c * offset.x - s * offset.z, offset.y, c * offset.z + s * offset.x);
-    let half = area_box.half.xyz;
-    let e = abs(local) - half;
-    let plain = length(max(e, vec3f(0.0))) + min(max(e.x, max(e.y, e.z)), 0.0);
-    let tallest = area_box.center.w;
-    // Deep inside, a dome only makes it more negative. Far outside no dome is within the soft edge,
-    // and every dome is within its height of the box: minus that is still a lower bound
-    if tallest <= 0.0 || plain <= -feathering {
-        return plain;
-    }
-    if plain >= tallest + feathering {
-        return plain - tallest;
-    }
-
-    // Of each axis only the side the point is on: the other one is farther than the box
-    let positive = local >= vec3f(0.0);
-    let radius = select(area_box.dome_radius_neg.xyz, area_box.dome_radius_pos.xyz, positive);
-    let depth = select(area_box.dome_depth_neg.xyz, area_box.dome_depth_pos.xyz, positive);
-    // Rim radius of the sides of each axis: half their shorter edge
-    let rim = vec3f(min(half.y, half.z), min(half.x, half.z), min(half.x, half.y));
-    var distance = plain;
-    distance = min(distance, area_dome_distance(e.x, e.yz, rim.x, radius.x, depth.x, 2.0 * half.x));
-    distance = min(distance, area_dome_distance(e.y, e.xz, rim.y, radius.y, depth.y, 2.0 * half.y));
-    distance = min(distance, area_dome_distance(e.z, e.xy, rim.z, radius.z, depth.z, 2.0 * half.z));
-    return distance;
-}
-
-// Distance from the dome of a side, a copy of dome_distance in play_area.rs: `height` above the plane
-// of the side, `aside` how far outside its edges in its plane (per in-plane axis), the rim radius, the
-// capsule (radius 0: flat), the edge of the box across the side. FAR_DISTANCE where the box itself is
-// the answer
-fn area_dome_distance(
-    height: f32,
-    aside: vec2f,
-    rim: f32,
-    radius: f32,
-    depth: f32,
-    thickness: f32,
-) -> f32 {
-    if radius <= 0.0 {
-        return FAR_DISTANCE;
-    }
-    // Distance from the axis in the plane of the side
-    let rho = length(max(aside + rim, vec2f(0.0)));
-    let y = height + depth;
-    // Inside the cone from the axis through the rim the nearest point of the capsule is on the dome.
-    // Under the side, inside the box, the capsule counts too, so that there is no seam at the side;
-    // never deeper than the opposite side (thickness + height below the point)
-    if depth * rho < rim * y || (height <= 0.0 && max(aside.x, aside.y) < 0.0) {
-        return max(max(length(vec2f(rho, y)) - radius, max(aside.x, aside.y)), -(thickness + height));
-    }
-    return FAR_DISTANCE;
 }

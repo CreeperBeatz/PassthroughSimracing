@@ -9,6 +9,7 @@ use crate::{
     depth_dump::{self, DEPTH_DUMP_TIMEOUT},
     depth_mask::{self, DepthFrame},
     key_dump::{array, number, numbers, object, pose, string},
+    motion_cloud::CloudRecord,
     room_memory::MemoryRecord,
     stream,
 };
@@ -102,6 +103,9 @@ pub struct BurstDisplay {
     /// The room memory (`debug.alvr.mem_roll`, U3 of design/universal/final.md): its camera, anchors and
     /// last shares as the renderer left them after this frame. None: off
     pub memory: Option<MemoryRecord>,
+    /// The depth cloud (`debug.alvr.cloud`, design/depthcloud/final.md): its properties, whether it was
+    /// shown, the field of each eye as the renderer left it after this frame. None: off
+    pub cloud: Option<CloudRecord>,
 }
 
 /// A hand sample of the arm's own history (step 1b of the arm plan)
@@ -459,6 +463,12 @@ impl BurstDisplay {
                     .as_ref()
                     .map_or("null".into(), MemoryRecord::to_json),
             ),
+            (
+                "cloud",
+                self.cloud
+                    .as_ref()
+                    .map_or("null".into(), CloudRecord::to_json),
+            ),
         ])
     }
 }
@@ -553,12 +563,13 @@ impl Burst {
         // plan: the arm's own sample history; `history_ns` / `wrist_history` of an arm in mode 2 are its
         // newest sample). Version 5: `clocks`, the headset's wall clock, monotonic clock and XrTime read
         // back to back at the start and at the end (`BurstClocks`). Version 6: the display records have
-        // `memory` (U3 of design/universal/final.md, `debug.alvr.mem_roll`; null when it is off)
+        // `memory` (U3 of design/universal/final.md, `debug.alvr.mem_roll`; null when it is off). Version 7:
+        // the display records have `cloud` (the depth cloud, `debug.alvr.cloud`; null when it is off)
         let clocks =
             |clocks: Option<BurstClocks>| clocks.map_or("null".into(), BurstClocks::to_json);
         object([
             ("format", string("alvr_burst")),
-            ("version", "6".into()),
+            ("version", "7".into()),
             ("n", n.to_string()),
             ("duration_ms", self.duration_ms.to_string()),
             ("start_ns", self.start_ns.to_string()),
@@ -1015,6 +1026,27 @@ mod tests {
                         params: Default::default(),
                         hands: [crate::CaptureHand::None, crate::CaptureHand::Exact],
                     }),
+                    // The depth cloud in the third frame only, in today's phase of `cloud_ab`
+                    cloud: (k == 2).then(|| CloudRecord {
+                        params: crate::CloudParams {
+                            ab: true,
+                            ..Default::default()
+                        },
+                        shown: false,
+                        eyes: [
+                            crate::CloudEyeRecord {
+                                field_capture_ns: Some(start_ns),
+                                prev_capture_ns: None,
+                                dt_ms: 0.0,
+                                reset: Some(crate::ResetReason::Start),
+                                head_deg_s: 0.0,
+                                a_ms: 15.0,
+                                reach_ms: 22.5,
+                                stale: false,
+                            },
+                            crate::CloudEyeRecord::default(),
+                        ],
+                    }),
                 }
             })
             .collect();
@@ -1142,7 +1174,7 @@ mod tests {
         let burst = synthetic_burst(7, UVec2::new(4, 3), 4);
         let json = burst.index_json();
         assert!(is_valid_json(&json), "{json}");
-        assert!(json.starts_with(r#"{"format":"alvr_burst","version":6,"n":7,"#));
+        assert!(json.starts_with(r#"{"format":"alvr_burst","version":7,"n":7,"#));
         // The clock pairs of version 5, right after the times they go with
         assert!(
             json.contains(
@@ -1182,7 +1214,7 @@ mod tests {
         );
         assert!(
             json.contains(
-                r#","wrist":[0.09,1,-0.4],"capture_time":true}],"capture_wrist":[0.08,1,-0.4],"estimator":2}],"memory":null}"#
+                r#","wrist":[0.09,1,-0.4],"capture_time":true}],"capture_wrist":[0.08,1,-0.4],"estimator":2}],"memory":null,"cloud":null}"#
             ),
             "{json}"
         );
@@ -1191,7 +1223,18 @@ mod tests {
             json.contains(r#""memory":{"camera":{"position":[0,1.2,0],"yaw_deg":0,"#),
             "{json}"
         );
-        assert!(json.contains(r#""hands":["none","exact"]}}"#), "{json}");
+        assert!(
+            json.contains(r#""hands":["none","exact"]},"cloud":null}"#),
+            "{json}"
+        );
+        // The depth cloud (version 7)
+        assert!(
+            json.contains(
+                r#""memory":null,"cloud":{"mode":1,"shown":false,"gain":150,"cap":14,"hold_ms":200,"dead":2.5,"lambda_ms":40,"fetch_mm":450,"fixed":0,"ab":true,"onesided":1,"eyes":[{"field_capture_ns":1000000000000,"prev_capture_ns":null,"dt_ms":0,"reset":"start","head_deg_s":0,"a_ms":15,"reach_ms":22.5,"stale":false},{"field_capture_ns":null,"#
+            ),
+            "{json}"
+        );
+        assert_eq!(json.matches(r#""cloud":{"#).count(), 1, "{json}");
         assert!(
             json.contains(
                 r#""counts":{"depth":4,"depth_read":3,"depth_skipped":1,"display":9,"camera":2,"region":1}"#

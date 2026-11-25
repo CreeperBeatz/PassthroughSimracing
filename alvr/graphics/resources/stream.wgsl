@@ -147,6 +147,10 @@ fn mask_edge(coverage: f32) -> f32 {
     return smoothstep(low, low + 0.3, coverage);
 }
 
+// The mark of `debug.alvr.cloud_ab`: a square of this size (view uv) around this point
+const CLOUD_MARK_CENTRE: vec2f = vec2f(0.5, 0.4);
+const CLOUD_MARK_SIZE: f32 = 0.02;
+
 fn depth_passthrough(stream_color: vec3f, uv: vec2f) -> vec4f {
     let debug_view = u32(depth_u.region.w + 0.5);
     // Dimmed while the play area is edited
@@ -186,7 +190,14 @@ fn depth_passthrough(stream_color: vec3f, uv: vec2f) -> vec4f {
         // elsewhere. They are unpacked by the color scale and bias of the layers (2a and 2a - 1).
         // Alpha is not premultiplied.
         let hand = textureSampleLevel(focus_area, stream_sampler, uv, 0.0);
-        let focus = hand.r;
+        let lower_rect = depth_u.key_lower[imm.view_idx];
+        let in_lower = all(uv >= lower_rect.xy) && all(uv < lower_rect.zw);
+        var focus = hand.r;
+        // The zone of the depth cloud (`debug.alvr.cloud`, mask g) is keyed like the rim of the hands.
+        // Only where the lower layer is used: outside it a zone pixel would pack to the game
+        if depth_u.cloud.x > 0.5 && in_lower {
+            focus = max(focus, mask_sample.g);
+        }
         let solid = max(mask, hand.g);
         var lower_alpha = 1.0 - solid;
         var upper_alpha = 1.0 - max(solid, focus);
@@ -217,11 +228,14 @@ fn depth_passthrough(stream_color: vec3f, uv: vec2f) -> vec4f {
             rgb = mix(rgb, problem.rgb, problem.a);
             lower_alpha = max(lower_alpha, problem.a);
         }
+        if depth_u.cloud.y > 0.5 && all(abs(uv - CLOUD_MARK_CENTRE) < vec2f(0.5 * CLOUD_MARK_SIZE)) {
+            // `cloud_ab`: green while the cloud is shown, red in today's phase
+            rgb = select(vec3f(0.0, 0.8, 0.0), vec3f(0.9, 0.0, 0.0), depth_u.cloud.y > 1.5);
+        }
         var alpha = 0.5 * (lower_alpha + upper_alpha);
         // Where the lower layer is cropped away or not used, the upper one shows what both would show
         // over colors that the key doesn't keep: upper + (1 - upper) * lower
-        let lower_rect = depth_u.key_lower[imm.view_idx];
-        if any(uv < lower_rect.xy) || any(uv >= lower_rect.zw) {
+        if !in_lower {
             let lower = min(2.0 * alpha, 1.0);
             let upper = max(2.0 * alpha - 1.0, 0.0);
             alpha = 0.5 + 0.5 * (upper + (1.0 - upper) * lower);

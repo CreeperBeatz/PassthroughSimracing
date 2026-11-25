@@ -7,6 +7,7 @@ use crate::{
     graphics::{self, ProjectionLayerAlphaConfig, ProjectionLayerBuilder},
     interaction::{self, InteractionContext, InteractionSourcesConfig},
     lever::{LeverHand, LeverParams, LeverWindows},
+    motion_cloud::{self, CloudLog, CloudOff},
     passthrough::{self, ColorKeyParams, ProblemViewParams, debug_property},
     room_memory::{self, MemoryLog},
 };
@@ -25,15 +26,16 @@ use alvr_common::{
 };
 use alvr_graphics::{
     ArmGap, ArmMotion, BridgeChoice, BurstArmSample, BurstArmSamples, BurstHand, BurstLut,
-    ColorKeyInput, DepthDumpFiles, DepthDumpRequest, DepthFrame, DepthRenderInput, DumpJoint,
-    EditorHand, EditorInput, GraphicsContext, HAND_SEGMENTS, HandRay, HandShape, HandZones,
-    LeakGains, LeverWindow, MAX_LEVER_WINDOWS, MemoryInput, MemoryParams, MemoryRecord,
-    OverlaySegment, PlacedArea, SEGMENT_JOINTS, StreamRenderer, StreamViewParams, WristBridge,
+    CloudInput, CloudParams, CloudRecord, ColorKeyInput, DepthDumpFiles, DepthDumpRequest,
+    DepthFrame, DepthRenderInput, DumpJoint, EditorHand, EditorInput, GraphicsContext,
+    HAND_SEGMENTS, HandRay, HandShape, HandZones, LeakGains, LeverWindow, MAX_LEVER_WINDOWS,
+    MemoryInput, MemoryParams, MemoryRecord, OverlaySegment, PlacedArea, SEGMENT_JOINTS,
+    StreamRenderer, StreamViewParams, WristBridge,
 };
 use alvr_packets::{ClientStreamConfig, RealTimeConfig, TrackingData};
 use alvr_session::{
     ClientsideFoveationConfig, ClientsideFoveationMode, ClientsidePostProcessingConfig, CodecType,
-    MediacodecProperty, PassthroughMode, UpscalingConfig,
+    DepthMaskRegion, MediacodecProperty, PassthroughMode, UpscalingConfig,
 };
 use alvr_system_info::Platform;
 use openxr as xr;
@@ -92,6 +94,8 @@ const ARM_LOG_INTERVAL: Duration = Duration::from_secs(2);
 const LEVER_LOG_INTERVAL: Duration = Duration::from_secs(2);
 // The `memory:` line is logged this often while the room memory is on (`debug.alvr.mem_roll`)
 const MEMORY_LOG_INTERVAL: Duration = Duration::from_secs(2);
+// The `cloud:` line is logged this often while the depth cloud is set (`debug.alvr.cloud`)
+const CLOUD_LOG_INTERVAL: Duration = Duration::from_secs(2);
 
 /// `debug.alvr.arm_shift` and the properties of its mode 2 (steps 1 and 1b of
 /// `docs/arm-mask-build-plan.md`)
@@ -453,6 +457,13 @@ pub struct StreamContext {
     last_known_joints: [Option<(i64, [Vec4; 26])>; 2],
     memory_log: MemoryLog,
     last_memory_log: Instant,
+    // `debug.alvr.cloud*` (design/depthcloud/final.md, motion_cloud.rs): the depth cloud's properties (None:
+    // off, the default: no pass, no line, today's picture), since when `cloud_ab` alternates, the `cloud:`
+    // line
+    cloud_params: Option<CloudParams>,
+    cloud_ab_start: Instant,
+    cloud_log: CloudLog,
+    last_cloud_log: Instant,
     // The wrists of the hand capsules of the key in this frame (display time minus `key_delay`), for
     // the distance to the wrist of the arm
     key_wrists: Cell<[Option<Vec3>; 2]>,
@@ -689,6 +700,10 @@ impl StreamContext {
             last_known_joints: [None; 2],
             memory_log: MemoryLog::default(),
             last_memory_log: Instant::now(),
+            cloud_params: None,
+            cloud_ab_start: Instant::now(),
+            cloud_log: CloudLog::default(),
+            last_cloud_log: Instant::now(),
             key_wrists: Cell::new([None; 2]),
             published_lut: None,
             lut_uploads: 0,
@@ -1097,6 +1112,23 @@ impl StreamContext {
             self.memory_params = memory_params;
             self.last_memory_log = Instant::now();
         }
+        // Logged on each change (unset: never, as before). `cloud_ab` starts with the cloud when it is
+        // switched on or the alternation is
+        let cloud_params = motion_cloud::read_params();
+        if cloud_params != self.cloud_params {
+            crate::stream_log(&motion_cloud::params_text(cloud_params.as_ref()));
+            let was_ab = self.cloud_params.is_some_and(|params| params.ab);
+            if self.cloud_params.is_none() {
+                self.cloud_log = CloudLog::default();
+                self.last_cloud_log = Instant::now();
+            }
+            if self.cloud_params.is_none()
+                || cloud_params.is_some_and(|params| params.ab && !was_ab)
+            {
+                self.cloud_ab_start = Instant::now();
+            }
+            self.cloud_params = cloud_params;
+        }
         self.playzone_auto = debug_property("debug.alvr.playzone_auto").unwrap_or(1) > 0;
 
         let dump = debug_property("debug.alvr.key_dump").unwrap_or(0);
@@ -1339,12 +1371,14 @@ impl StreamContext {
         }
     }
 
-    // How the arms moved since the depth image was captured. None if `debug.alvr.arm_shift` is 0
+    // How the arms moved since the depth image was captured. None if `debug.alvr.arm_shift` is 0, or
+    // while the zone of `debug.alvr.cloud 1` shows (`cloud`: of this frame, motion_cloud.rs)
     fn arm_motions(
         &mut self,
         display_time: xr::Time,
         capture_time: xr::Time,
         views: &[xr::View],
+        cloud: Option<&CloudInput>,
     ) -> [Option<ArmMotion>; 2] {
         // Bigger displacements are tracking errors: plain depth for this arm
         const MAX_DISPLACEMENT: f32 = 0.25;
@@ -1352,7 +1386,7 @@ impl StreamContext {
         const ELBOW_OFFSET: Vec3 = Vec3::new(0.2, -0.5, 0.05);
 
         let params = self.arm_params;
-        if params.shift == 0 {
+        if params.shift == 0 || !motion_cloud::arm_shift_on(cloud, self.cloud_zone_shown(cloud)) {
             return [None; 2];
         }
 
@@ -2150,6 +2184,85 @@ impl StreamContext {
         }
     }
 
+    // The depth cloud of this frame (`debug.alvr.cloud`, motion_cloud.rs). None: off. With `cloud_ab 1` it
+    // shows for 2 s, then today's picture for 2 s (its passes keep running)
+    fn cloud_input(&self, display_time: xr::Time) -> Option<CloudInput> {
+        let params = self.cloud_params?;
+
+        Some(CloudInput {
+            params,
+            capture_ns: self.depth_capture_time.map(|time| time.as_nanos()),
+            display_ns: display_time.as_nanos(),
+            shown: !params.ab || motion_cloud::ab_shown(self.cloud_ab_start.elapsed()),
+        })
+    }
+
+    // Whether the region of the mask is made of boxes: the play area placed from the marker, or the volume
+    // of the settings (as `depth_mask::cloud_runs` reads it)
+    fn region_is_volume(&self) -> bool {
+        self.region_override.is_some()
+            || alvr_graphics::depth_passthrough_config(self.config.passthrough.as_ref())
+                .is_some_and(|config| matches!(config.region, DepthMaskRegion::Volume(_)))
+    }
+
+    // Whether the depth cloud can run in this frame: with the colour key and a region of boxes (the renderer
+    // also needs a depth image)
+    fn cloud_can_run(&self) -> bool {
+        self.color_key.is_some() && self.region_is_volume()
+    }
+
+    // Whether the mask shows the zone of the depth cloud in this frame, as the renderer decides it
+    // (`alvr_graphics::cloud_shown`: it can run, not today's phase of `cloud_ab`, not the Show depth view)
+    fn cloud_zone_shown(&self, cloud: Option<&CloudInput>) -> bool {
+        cloud.is_some()
+            && alvr_graphics::depth_passthrough_config(self.config.passthrough.as_ref())
+                .is_some_and(|config| {
+                    alvr_graphics::cloud_shown(config, cloud, self.cloud_can_run())
+                })
+    }
+
+    // The `cloud:` line every 2 s while the depth cloud is set, and its part of the display record of a burst
+    // (null while it does not run), both after the renderer ran this frame
+    fn report_cloud(&mut self, display_time: xr::Time, input: Option<&DepthRenderInput>) {
+        let Some(params) = self.cloud_params else {
+            return;
+        };
+        let status = self.renderer.cloud_status();
+        if let Some(status) = &status {
+            self.cloud_log.count(status, display_time.as_nanos());
+            if self.burst.is_recording()
+                && let Some(cloud) = input.and_then(|input| input.cloud)
+            {
+                self.burst.set_display_cloud(
+                    display_time.as_nanos(),
+                    CloudRecord {
+                        params,
+                        shown: cloud.shown,
+                        eyes: status.eyes,
+                    },
+                );
+            }
+        }
+        let elapsed = self.last_cloud_log.elapsed();
+        if elapsed >= CLOUD_LOG_INTERVAL {
+            self.last_cloud_log = Instant::now();
+            let state = status.as_ref().ok_or_else(|| {
+                CloudOff::reason(
+                    input.is_some(),
+                    self.color_key.is_some(),
+                    self.region_is_volume(),
+                )
+            });
+            let layers = self
+                .color_key
+                .map_or((0, 0), |params| (params.layers, params.crop));
+            let text = self
+                .cloud_log
+                .text(&params, state, elapsed.as_secs_f32(), layers);
+            crate::stream_log(&text);
+        }
+    }
+
     // The lever windows of this frame (`debug.alvr.lever_boxes`, lever.rs) and the `lever:` line every 2 s.
     // Off (the default): nothing is located, no window. The hands at the display time (the key's are
     // earlier, by `passthrough_delay_ms`: the gate opens a little sooner, the safe side), in the frame of
@@ -2256,6 +2369,7 @@ impl StreamContext {
                         capture_playzone: false,
                         playzone_view: false,
                         memory: None,
+                        cloud: None,
                         key_lower_rects: None,
                         region_override: self.region_override,
                         game_dim: self.game_dim,
@@ -2284,8 +2398,9 @@ impl StreamContext {
         self.arm_samples = Default::default();
         self.poll_properties();
         self.update_arm_histories();
+        let cloud = self.cloud_input(display_time);
         let arms = self.depth_capture_time.map_or([None; 2], |time| {
-            self.arm_motions(display_time, time, current_headset_views)
+            self.arm_motions(display_time, time, current_headset_views, cloud.as_ref())
         });
 
         let eye_positions = [
@@ -2316,6 +2431,7 @@ impl StreamContext {
             capture_playzone,
             playzone_view,
             memory,
+            cloud,
             key_lower_rects: None,
             region_override: self.region_override,
             game_dim: self.game_dim,
@@ -2541,6 +2657,7 @@ impl StreamContext {
             &self.area_overlay,
         );
         self.report_memory(xr_vsync_time, depth_input.as_ref());
+        self.report_cloud(xr_vsync_time, depth_input.as_ref());
 
         if let Some((n, result)) = self.renderer.poll_depth_dump() {
             // The dump of the start of a burst goes into its folder

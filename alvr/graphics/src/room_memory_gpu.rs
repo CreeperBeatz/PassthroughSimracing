@@ -220,10 +220,10 @@ pub(crate) struct MemoryPasses {
 }
 
 // A depth image: its capture time, swapchain index and the positions of its two views (bits). As the
-// burst tells a new one
-type DepthKey = (Option<i64>, u32, [u32; 6]);
+// burst tells a new one. Also how the depth cloud tells one (motion_cloud_gpu.rs)
+pub(crate) type DepthKey = (Option<i64>, u32, [u32; 6]);
 
-fn depth_key(capture_ns: Option<i64>, frame: &DepthFrame) -> DepthKey {
+pub(crate) fn depth_key(capture_ns: Option<i64>, frame: &DepthFrame) -> DepthKey {
     let [a, b] = frame
         .depth_views
         .map(|view| view.pose.position.to_array().map(f32::to_bits));

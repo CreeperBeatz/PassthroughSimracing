@@ -4,6 +4,11 @@ use crate::{
     depth_dump::{self, DEPTH_DUMP_TIMEOUT, DepthDumpFiles, DepthDumpRequest, DumpReadback},
     depth_mask::{self, DEPTH_UNIFORMS_SIZE, DepthRenderInput},
     key_dump::{array, object, string},
+    motion_cloud::{CloudPasses, CloudStatus},
+    motion_cloud_gpu::{
+        CloudPipelines, MotionCloud, create_cloud_dummy_field, create_cloud_read_bind_group,
+        create_cloud_read_layout, create_cloud_uniform_buffer,
+    },
     overlay::{self, OVERLAY_UNIFORMS_SIZE, OverlayEye, OverlaySegment, SEGMENT_FLOAT_COUNT},
     problem_view::{self, ProblemViewData, ProblemViewGpu},
     room_memory::MemoryStatus,
@@ -87,6 +92,7 @@ const DEPTH_MASK_WGSL: &str = include_str!("../resources/depth_mask.wgsl");
 const FOCUS_AREA_WGSL: &str = include_str!("../resources/focus_area.wgsl");
 const PLAYZONE_COPY_WGSL: &str = include_str!("../resources/playzone_copy.wgsl");
 const ROOM_MEMORY_WGSL: &str = include_str!("../resources/room_memory.wgsl");
+const MOTION_CLOUD_WGSL: &str = include_str!("../resources/motion_cloud.wgsl");
 const DEPTH_DUMP_WGSL: &str = include_str!("../resources/depth_dump.wgsl");
 const STREAM_WGSL: &str = include_str!("../resources/stream.wgsl");
 const LIGHT_PROBE_LOCAL_WGSL: &str = include_str!("../resources/light_probe_local.wgsl");
@@ -109,6 +115,10 @@ pub(crate) fn playzone_copy_shader_source() -> String {
 
 pub(crate) fn room_memory_shader_source() -> String {
     format!("{ROOM_MEMORY_WGSL}\n{DEPTH_COMMON_WGSL}")
+}
+
+pub(crate) fn motion_cloud_shader_source() -> String {
+    format!("{MOTION_CLOUD_WGSL}\n{DEPTH_COMMON_WGSL}")
 }
 
 pub(crate) fn depth_dump_shader_source() -> String {
@@ -155,7 +165,7 @@ pub(crate) fn texture_entry(
     }
 }
 
-fn sampler_entry(binding: u32) -> BindGroupLayoutEntry {
+pub(crate) fn sampler_entry(binding: u32) -> BindGroupLayoutEntry {
     BindGroupLayoutEntry {
         binding,
         visibility: ShaderStages::FRAGMENT,
@@ -188,10 +198,12 @@ pub(crate) struct StreamPipelines {
     /// Group 2 of `main`: `debug.alvr.problem_view`, see problem_view.rs
     pub problem_layout: BindGroupLayout,
     pub main: RenderPipeline,
-    /// Uses `depth_layout` and `playzone_layout`
+    /// Uses `depth_layout`, `playzone_layout` and `cloud_read_layout`
     pub depth_mask: RenderPipeline,
     /// playzone depth, focus area, sampler
     pub playzone_layout: BindGroupLayout,
+    /// Group 2 of `depth_mask`: the field of the depth cloud, its uniforms (motion_cloud_gpu.rs)
+    pub cloud_read_layout: BindGroupLayout,
     /// Uses `depth_layout`
     pub playzone_copy: RenderPipeline,
     /// depth uniforms
@@ -324,12 +336,17 @@ impl StreamPipelines {
             cache: None,
         });
 
+        let cloud_read_layout = create_cloud_read_layout(device);
         let depth_mask_module = shader_module(device, "depth mask", depth_mask_shader_source());
         let depth_mask = device.create_render_pipeline(&RenderPipelineDescriptor {
             label: Some("depth mask"),
             layout: Some(&device.create_pipeline_layout(&PipelineLayoutDescriptor {
                 label: None,
-                bind_group_layouts: &[Some(&depth_layout), Some(&playzone_layout)],
+                bind_group_layouts: &[
+                    Some(&depth_layout),
+                    Some(&playzone_layout),
+                    Some(&cloud_read_layout),
+                ],
                 immediate_size: VIEW_IDX_IMMEDIATE_SIZE,
             })),
             vertex: VertexState {
@@ -556,6 +573,7 @@ impl StreamPipelines {
             main,
             depth_mask,
             playzone_layout,
+            cloud_read_layout,
             playzone_copy,
             focus_area_layout,
             focus_area,
@@ -865,6 +883,12 @@ pub struct StreamRenderer {
     // on (dropped when it is off)
     memory_pipelines: OnceCell<MemoryPipelines>,
     memory: RefCell<Option<RoomMemory>>,
+    // `debug.alvr.cloud` (motion_cloud.rs): the pipelines from its first use, the textures while it runs
+    // (dropped when it does not). While it does not run the mask reads the dummy: a 1 x 1 field with
+    // nothing in it and zeroed uniforms
+    cloud_pipelines: OnceCell<CloudPipelines>,
+    cloud: RefCell<Option<MotionCloud>>,
+    cloud_dummy_bind_group: BindGroup,
     problem_view: ProblemViewGpu,
 }
 
@@ -1039,6 +1063,8 @@ impl StreamRenderer {
         let overlay_buffer = create_overlay_buffer(device);
         let overlay_bind_group = create_overlay_bind_group(device, &pipelines, &overlay_buffer);
         let problem_view = ProblemViewGpu::new(device, &pipelines.problem_layout);
+        let cloud_dummy_bind_group =
+            create_cloud_dummy_read_bind_group(device, &context.queue, &pipelines);
 
         Self {
             context,
@@ -1070,6 +1096,9 @@ impl StreamRenderer {
             target_view_resolution,
             memory_pipelines: OnceCell::new(),
             memory: RefCell::new(None),
+            cloud_pipelines: OnceCell::new(),
+            cloud: RefCell::new(None),
+            cloud_dummy_bind_group,
             problem_view,
         }
     }
@@ -1113,21 +1142,77 @@ impl StreamRenderer {
             resolution,
         );
         self.depth_resolution = resolution;
+        // The depth cloud is created again for the size of these images
+        *self.cloud.borrow_mut() = None;
         self.clear_playzone();
     }
 
     pub fn clear_depth_swapchain(&mut self) {
         self.depth_bind_groups.clear();
         self.clear_playzone();
+        // No depth: the depth cloud is dropped (created again with the next depth image)
+        *self.cloud.borrow_mut() = None;
     }
 
     /// Forget the playzone, e.g. if the reference space changed. The room memory too: the next depth
-    /// image anchors it cleanly
+    /// image anchors it cleanly. And the fields of the depth cloud: its next pair starts over
     pub fn clear_playzone(&self) {
         self.playzone.set(None);
         if let Some(memory) = self.memory.borrow_mut().as_mut() {
             memory.forget();
         }
+        if let Some(cloud) = self.cloud.borrow_mut().as_mut() {
+            cloud.forget();
+        }
+    }
+
+    /// The depth cloud (`debug.alvr.cloud`) as the last frame left it. None: not running
+    pub fn cloud_status(&self) -> Option<CloudStatus> {
+        self.cloud.borrow().as_ref().map(MotionCloud::status)
+    }
+
+    // The depth cloud of this frame: created at the first frame it runs with a depth image (or created
+    // again for another depth size), dropped while it does not run (`depth_mask::cloud_runs`). Writes
+    // its uniforms. Its passes, None: not running. `uniforms`: the depth uniforms of this frame
+    fn plan_cloud(
+        &self,
+        config: &DepthPassthroughConfig,
+        input: &DepthRenderInput,
+        uniforms: &[f32],
+    ) -> Option<CloudPasses> {
+        let mut cloud = self.cloud.borrow_mut();
+        let Some(cloud_input) = input
+            .cloud
+            .filter(|_| depth_mask::cloud_runs(config, input))
+        else {
+            *cloud = None;
+            return None;
+        };
+        let size = self.depth_resolution.max(UVec2::ONE);
+        if cloud.as_ref().is_none_or(|cloud| cloud.depth_size != size) {
+            // Not before the first depth image
+            input.frame?;
+            let device = &self.context.device;
+            let cloud_pipelines = self
+                .cloud_pipelines
+                .get_or_init(|| CloudPipelines::new(device, &self.pipelines));
+            *cloud = Some(MotionCloud::new(
+                device,
+                &self.context.queue,
+                cloud_pipelines,
+                &self.pipelines.cloud_read_layout,
+                size,
+            ));
+        }
+
+        cloud.as_mut().map(|cloud| {
+            cloud.plan(
+                &self.context.queue,
+                &cloud_input,
+                input.frame.as_ref(),
+                uniforms,
+            )
+        })
     }
 
     /// The room memory (`debug.alvr.mem_roll`) as the last frame left it. None: off
@@ -1294,6 +1379,8 @@ impl StreamRenderer {
         let mut has_depth_frame = false;
         // `debug.alvr.mem_roll`: the passes of the room memory, None: off
         let mut memory_passes = None;
+        // `debug.alvr.cloud`: the passes of the depth cloud, None: not running
+        let mut cloud_passes = None;
         if let Some(config) = depth_config {
             let input = depth.copied().unwrap_or(DepthRenderInput {
                 frame: None,
@@ -1306,6 +1393,7 @@ impl StreamRenderer {
                 capture_playzone: false,
                 playzone_view: false,
                 memory: None,
+                cloud: None,
                 key_lower_rects: None,
                 region_override: None,
                 game_dim: 0.0,
@@ -1363,6 +1451,7 @@ impl StreamRenderer {
                 0,
                 &floats_to_bytes(&uniforms),
             );
+            cloud_passes = self.plan_cloud(config, &input, &uniforms);
 
             if let Some(frame) = &input.frame
                 && self.dump_readback.borrow().is_none()
@@ -1386,6 +1475,10 @@ impl StreamRenderer {
                 .to_json();
                 dump = Some((request.n, *frame, json));
             }
+        } else {
+            // Depth passthrough is off: the depth cloud does not run, its textures are dropped (and
+            // `cloud_status` says so)
+            *self.cloud.borrow_mut() = None;
         }
 
         let mut encoder = self
@@ -1400,6 +1493,16 @@ impl StreamRenderer {
         {
             memory.encode(&mut encoder, pipelines, depth_bind_group, passes);
         }
+        // Before the mask too, which reads the field; after the memory
+        if let Some(passes) = &cloud_passes
+            && let Some(cloud) = self.cloud.borrow_mut().as_mut()
+            && let Some(pipelines) = self.cloud_pipelines.get()
+        {
+            cloud.encode(&mut encoder, pipelines, depth_bind_group, passes);
+        }
+        let cloud = self.cloud.borrow();
+        // Its field while it runs, else the dummy
+        let cloud_read = cloud.as_ref().filter(|_| cloud_passes.is_some());
         let memory = self.memory.borrow();
         // The memory is read once it has a camera; while it is on today's playzone is not read
         let memory_read = memory
@@ -1461,6 +1564,9 @@ impl StreamRenderer {
                     depth_bind_group,
                     memory_read.map_or(&self.playzone_bind_groups[view_idx], |memory| {
                         memory.read_bind_group(view_idx)
+                    }),
+                    cloud_read.map_or(&self.cloud_dummy_bind_group, |cloud| {
+                        cloud.read_bind_group(view_idx)
                     }),
                     view_idx as u32,
                 );
@@ -1545,6 +1651,7 @@ impl StreamRenderer {
         // wgpu doesn't look at the GL errors (of an unsupported copy), and the next `check_error` would
         // abort
         drop(memory);
+        drop(cloud);
         let gl_error = if dump.is_some() || burst_encoded || stats_encoded {
             self.context.take_gl_error()
         } else {
@@ -1806,12 +1913,29 @@ fn create_view_bind_group(
     })
 }
 
+/// Group 2 of the depth mask while the depth cloud does not run: a 1 x 1 field with nothing in it and
+/// zeroed uniforms (the mask reads neither unless the cloud is on)
+pub(crate) fn create_cloud_dummy_read_bind_group(
+    device: &Device,
+    queue: &wgpu::Queue,
+    pipelines: &StreamPipelines,
+) -> BindGroup {
+    let field = create_cloud_dummy_field(device, queue);
+    create_cloud_read_bind_group(
+        device,
+        &pipelines.cloud_read_layout,
+        &field.create_view(&TextureViewDescriptor::default()),
+        &create_cloud_uniform_buffer(device),
+    )
+}
+
 pub(crate) fn encode_depth_mask(
     encoder: &mut wgpu::CommandEncoder,
     pipelines: &StreamPipelines,
     target: &TextureView,
     depth_bind_group: &BindGroup,
     playzone_bind_group: &BindGroup,
+    cloud_bind_group: &BindGroup,
     view_idx: u32,
 ) {
     let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
@@ -1830,6 +1954,7 @@ pub(crate) fn encode_depth_mask(
     pass.set_pipeline(&pipelines.depth_mask);
     pass.set_bind_group(0, depth_bind_group, &[]);
     pass.set_bind_group(1, playzone_bind_group, &[]);
+    pass.set_bind_group(2, cloud_bind_group, &[]);
     pass.set_immediates(0, &view_idx.to_le_bytes());
     pass.draw(0..3, 0..1);
 }

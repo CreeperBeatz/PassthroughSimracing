@@ -32,7 +32,7 @@ use alvr_common::{
 use alvr_graphics::{
     ArmGap, ArmMotion, BURST_DEFAULT_MS, BURST_MAX_DEPTH, BURST_MAX_DISPLAY, BURST_MAX_MS,
     BURST_MIN_MS, Burst, BurstArmSamples, BurstClocks, BurstDepth, BurstDisplay, BurstHand,
-    BurstLut, BurstRegion, CameraBurstSink, ColorKeyInput, DepthFrame, MemoryRecord,
+    BurstLut, BurstRegion, CameraBurstSink, CloudRecord, ColorKeyInput, DepthFrame, MemoryRecord,
     SharedCameraBurst,
 };
 use std::{
@@ -290,6 +290,7 @@ impl BurstRecorder {
             edge_cut: input.edge_cut,
             arm_samples: input.arm_samples,
             memory: None,
+            cloud: None,
         });
     }
 
@@ -304,6 +305,20 @@ impl BurstRecorder {
             .filter(|record| record.display_ns == display_ns)
         {
             record.memory = Some(memory);
+        }
+    }
+
+    /// The depth cloud (`debug.alvr.cloud`) of the display record of this frame, after the renderer ran.
+    /// Nothing if no record was added in this frame
+    pub fn set_display_cloud(&mut self, display_ns: i64, cloud: CloudRecord) {
+        if let Some(record) = self
+            .active
+            .as_mut()
+            .filter(|active| active.closing.is_none())
+            .and_then(|active| active.burst.display.last_mut())
+            .filter(|record| record.display_ns == display_ns)
+        {
+            record.cloud = Some(cloud);
         }
     }
 

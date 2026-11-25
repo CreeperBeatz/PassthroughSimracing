@@ -829,6 +829,7 @@ mod tests {
             capture_playzone: false,
             playzone_view: false,
             memory: None,
+            cloud: None,
             key_lower_rects: None,
             region_override: None,
             game_dim: 0.0,

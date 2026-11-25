@@ -9,6 +9,7 @@ use alvr_session::{DepthMaskRegion, DepthPassthroughConfig, DepthPassthroughDebu
 
 use crate::{
     AreaBox, PlacedArea, PlayArea,
+    motion_cloud::CloudInput,
     play_area::{AREA_FLOAT_COUNT, area_uniforms},
     room_memory::{MemoryInput, memory_read_uniform},
 };
@@ -653,6 +654,9 @@ pub struct DepthRenderInput {
     /// The room memory (`debug.alvr.mem_roll`, U3 of design/universal/final.md, room_memory.rs) instead of
     /// today's playzone copy. None: off (the default; the mask is then today's)
     pub memory: Option<MemoryInput>,
+    /// The depth cloud (`debug.alvr.cloud`, design/depthcloud/final.md, motion_cloud.rs). None: off (the
+    /// default; no pass runs and the mask is today's)
+    pub cloud: Option<CloudInput>,
     /// With the color key: the part of each view (min and max view uv) where the lower game layer is
     /// shown. Outside of it the upper layer shows what both would. None: the whole view
     pub key_lower_rects: Option<[(Vec2, Vec2); 2]>,
@@ -775,6 +779,7 @@ pub const DEPTH_UNIFORMS_FLOAT_COUNT: usize = 2 * EYE_FLOAT_COUNT
         + 6
         + 2
         + 2 * 9
+        + 1
         + 1
         + 1
         + 2
@@ -1004,6 +1009,9 @@ pub fn depth_uniforms(
     ]);
     // Zeros without the room memory: today's
     data.extend(memory_read_uniform(input.memory.as_ref()));
+    // Zeros without the depth cloud: today's
+    let volume = region_mode > 0.5;
+    data.extend(cloud_vector(config, input, volume));
     for (min, max) in input
         .key_lower_rects
         .unwrap_or([(Vec2::ZERO, Vec2::ONE); 2])
@@ -1044,6 +1052,58 @@ pub fn depth_uniforms(
     }
 
     data.try_into().unwrap()
+}
+
+/// Whether the depth cloud (`debug.alvr.cloud`) runs with this input: it is set (mode 1 or 2), the
+/// colour key is on (the zone only opens the key) and the region is made of boxes (the edge of the
+/// distance region moves with the eye). Its passes run while this holds, also in today's phase of
+/// `cloud_ab`
+pub fn cloud_runs(config: &DepthPassthroughConfig, input: &DepthRenderInput) -> bool {
+    cloud_allowed(input, || {
+        matches!(
+            effective_region(config, input),
+            EffectiveRegion::Volume { .. }
+        )
+    })
+}
+
+fn cloud_allowed(input: &DepthRenderInput, volume: impl FnOnce() -> bool) -> bool {
+    input.cloud.is_some_and(|cloud| cloud.params.mode >= 1) && input.color_key.is_some() && volume()
+}
+
+/// Whether the mask shows the zone of the depth cloud in this frame: it runs (`runs`, as `cloud_runs`
+/// tells), it is not today's phase of `cloud_ab`, and the Show depth view is off (it reads mask g as the
+/// proximity). The client switches today's arm shift off for `cloud 1` exactly then
+pub fn cloud_shown(
+    config: &DepthPassthroughConfig,
+    cloud: Option<&CloudInput>,
+    runs: bool,
+) -> bool {
+    runs && cloud.is_some_and(|cloud| cloud.params.mode >= 1 && cloud.shown)
+        && !matches!(config.debug_view, DepthPassthroughDebugView::ShowDepth)
+}
+
+// The `cloud` vector of the depth uniforms: x the mode while the zone is shown (`cloud_shown`), y the
+// mark of `cloud_ab`. Zeros while the cloud does not run
+fn cloud_vector(
+    config: &DepthPassthroughConfig,
+    input: &DepthRenderInput,
+    volume: bool,
+) -> [f32; 4] {
+    let Some(cloud) = input.cloud.filter(|_| cloud_allowed(input, || volume)) else {
+        return [0.0; 4];
+    };
+    let mode = if cloud_shown(config, Some(&cloud), true) {
+        f32::from(cloud.params.mode.min(2))
+    } else {
+        0.0
+    };
+    let mark = match (cloud.params.ab, cloud.shown) {
+        (false, _) => 0.0,
+        (true, true) => 1.0,
+        (true, false) => 2.0,
+    };
+    [mode, mark, 0.0, 0.0]
 }
 
 // Distance of a point (in the space of the view) outside the side planes of the view (through its
@@ -1401,10 +1461,12 @@ mod tests {
                 + 4 * 5 * 16
                 // The room memory's vector
                 + 16
+                // The depth cloud's vector
+                + 16
         );
         // 28 capsules per hand, the wrist gaps, the bridges from the wrists, the boxes of the play area,
-        // the lever windows, the room memory
-        assert_eq!(DEPTH_UNIFORMS_SIZE, 4512);
+        // the lever windows, the room memory, the depth cloud
+        assert_eq!(DEPTH_UNIFORMS_SIZE, 4528);
     }
 
     // Steps 1 and 2 of docs/mask-v2-design.md in the uniform block: off is all zeros, as before
@@ -1422,6 +1484,7 @@ mod tests {
             capture_playzone: false,
             playzone_view: false,
             memory: None,
+            cloud: None,
             key_lower_rects: None,
             region_override: None,
             game_dim: 0.0,
@@ -1632,6 +1695,7 @@ mod tests {
             capture_playzone: false,
             playzone_view: false,
             memory: None,
+            cloud: None,
             key_lower_rects: None,
             region_override: None,
             game_dim: 0.0,
@@ -1898,6 +1962,7 @@ mod tests {
             capture_playzone: false,
             playzone_view: false,
             memory: None,
+            cloud: None,
             key_lower_rects: None,
             region_override: None,
             game_dim: 0.0,
@@ -1967,6 +2032,7 @@ mod tests {
                 capture_playzone: false,
                 playzone_view: false,
                 memory: None,
+                cloud: None,
                 key_lower_rects: None,
                 region_override: Some(PlacedArea::from(region)),
                 game_dim: 0.0,
@@ -2052,6 +2118,7 @@ mod tests {
             capture_playzone: false,
             playzone_view: false,
             memory: None,
+            cloud: None,
             key_lower_rects: None,
             region_override: None,
             game_dim: 0.0,

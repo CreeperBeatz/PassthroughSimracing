@@ -118,9 +118,20 @@ impl PassthroughLayer<'_> {
 /// - `setprop debug.alvr.key_delay <ms>`: how late (may be negative) the passthrough image is, to locate the hands at
 ///   the moment it shows
 /// - `setprop debug.alvr.key_layers <n>`: 4: the extra layers only with hands in view, 2: never, 5: always,
-///   30 / 31: always, three layers for measurements (without the upper game layer / the keyed passthrough)
+///   30 / 31: always, three layers for measurements (without the upper game layer / the keyed passthrough).
+///   Unset while `debug.alvr.cloud` is 1 or more: 5
 /// - `setprop debug.alvr.key_crop 0`: don't crop the lower game layer to the hands, 2: crop with the y origin
-///   at the top of the image
+///   at the top of the image. Unset while `debug.alvr.cloud` is 1 or more: 0
+/// - `setprop debug.alvr.cloud 1`: the depth cloud (docs/depth-cloud.md, motion_cloud.rs): around the edges of
+///   the depth mask that moved since the depth image before, a band of measured speed x age of the depth in
+///   which the key decides; today's arm shift is off while it shows. 2: on top of today's arm shift. 0 or
+///   unset: off, today's picture (the default). Needs the key and a play area of boxes. `cloud_gain`
+///   (150 %, 0..400), `cloud_cap` (14 depth texels, 4..24), `cloud_hold_ms` (200, 0..500), `cloud_dead`
+///   (25 tenths of a texel per pair, 15..60), `cloud_lambda_ms` (40, 0..120), `cloud_fetch_mm` (450,
+///   200..1500), `cloud_head_max` (120 deg/s, 0..1000, 0: no guard), `cloud_fixed` (0, 0..24 texels: a
+///   constant reach), `cloud_onesided` (1, 0..2: where an edge is in only one depth image of a pair, the pair
+///   claims no speed anywhere (0), none in the border band of the image (1) or a speed everywhere (2)),
+///   `cloud_ab 1`: 2 s the cloud, 2 s today's picture, with a green / red mark. A `cloud:` line every 2 s
 /// - `setprop debug.alvr.key_hands 0`: no hands in the GPU passes (to measure them)
 /// - `setprop debug.alvr.arm_shift 0`: plain depth for the arms, not shifted by the motion of the wrist (also
 ///   without the key, see `StreamContext`). 1 (default): shifted with the display-time wrist, a smoothstep to
@@ -211,7 +222,8 @@ impl PassthroughLayer<'_> {
 ///   images of the learner, and one depth dump at the start (see burst.rs). Written after the burst. The
 ///   index (version 5 on) and the "burst: <n> started" / "ended" log lines carry the headset's wall clock,
 ///   monotonic clock and XrTime read back to back at the start and the end (`clocks`), to line up logs of
-///   other machines. Version 6: the display records have `memory` (`mem_roll`, null when off)
+///   other machines. Version 6: the display records have `memory` (`mem_roll`, null when off). Version 7: `cloud`
+///   (`debug.alvr.cloud`, null when off)
 /// - `setprop debug.alvr.hand_removal 0`: asks the runtime to keep the hands in the depth map with the key on.
 ///   It does not: on 2026-11-24 the hands were still removed with 0 (a probe; the answer is logged)
 /// - `setprop debug.alvr.key_wrist_len <mm>`: length of the key zone from the wrist towards the forearm, its
@@ -361,6 +373,12 @@ impl ColorKeyParams {
             .clamp(0, alvr_graphics::HAND_SEGMENTS as i64) as usize;
         let mut solid = [0.0; alvr_graphics::HAND_SEGMENTS];
         solid[..solid_count].fill(1.0);
+        // While the depth cloud is on, unset ones are 5 and 0 (motion_cloud.rs)
+        let (layers, crop) = crate::motion_cloud::key_layers(
+            debug_property("debug.alvr.key_layers"),
+            debug_property("debug.alvr.key_crop"),
+            debug_property("debug.alvr.cloud"),
+        );
 
         Self {
             zones: HandZones {
@@ -395,8 +413,8 @@ impl ColorKeyParams {
             // 0: the hands stay in the depth map with the key on. The runtime takes out an uneven zone
             // of 3-15 cm around the hands with them (legs under resting hands, a held object)
             hand_removal: debug_property("debug.alvr.hand_removal").unwrap_or(1) != 0,
-            layers: debug_property("debug.alvr.key_layers").unwrap_or(4),
-            crop: debug_property("debug.alvr.key_crop").unwrap_or(1),
+            layers,
+            crop,
             hands: debug_property("debug.alvr.key_hands").unwrap_or(1) != 0,
             leak_gain: percent("debug.alvr.key_leak", 0),
             leak_lo: percent("debug.alvr.key_leak_lo", 5),
