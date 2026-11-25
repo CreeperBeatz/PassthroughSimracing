@@ -4,7 +4,7 @@
 use crate::{
     camera::{self, CameraCalibration, CameraFrame, PassthroughCamera},
     interaction::InteractionContext,
-    passthrough::{WristParams, debug_property},
+    passthrough::{KeyAutoParams, WristParams, debug_property},
     stream::PALM_JOINTS,
 };
 use alvr_common::{
@@ -13,9 +13,9 @@ use alvr_common::{
     parking_lot::{Mutex, RwLock},
 };
 use alvr_graphics::{
-    BridgeChoice, BurstCamera, CameraView, ColorModel, DumpHand, DumpJoint, HAND_SEGMENTS,
-    HandColorSamples, HandShape, KeyDump, LeakMap, LeakSnapshot, LocatedHand, SEGMENT_JOINTS,
-    SampledHand, SharedCameraBurst, WristAxes,
+    AutoBias, BridgeChoice, BurstCamera, CameraView, ColorModel, DumpHand, DumpJoint,
+    HAND_SEGMENTS, HandColorSamples, HandShape, KeyDump, LeakMap, LeakSnapshot, LocatedHand,
+    SEGMENT_JOINTS, SampledHand, SharedCameraBurst, WristAxes,
 };
 use openxr as xr;
 use std::{
@@ -61,6 +61,8 @@ struct Verified {
     weights: HandWeights,
     leak: [f32; 2],
     bridges: [BridgeChoice; 2],
+    // See `AutoColorKey::key_leak`
+    key_leak: Option<f32>,
 }
 
 /// Segments of one hand by why they were or were not verified, and joint velocities without
@@ -168,6 +170,17 @@ impl AutoColorKey {
         match &*self.verified.lock() {
             Some(verified) if verified.time.elapsed() < BRIDGE_HOLD => verified.bridges,
             _ => [BridgeChoice::default(); 2],
+        }
+    }
+
+    /// How much of the room the key keeps, measured on the colours of the last pass: the larger of the
+    /// share of the colours around the hands and `key_auto_scene` x the share of the scene colours that
+    /// it keeps (as `background N kept X` and `scene N kept X` of the `auto key:` line). None before the
+    /// first LUT or if the learner did not run for a moment
+    pub fn key_leak(&self) -> Option<f32> {
+        match &*self.verified.lock() {
+            Some(verified) if verified.time.elapsed() < LEAK_HOLD => verified.key_leak,
+            _ => None,
         }
     }
 
@@ -343,6 +356,22 @@ fn learn_loop(context: &Context) {
             model.tightness = percent("debug.alvr.key_tight", 30);
             model.skin_smoothing = percent("debug.alvr.key_smooth", 100);
             model.confirm_tightness = percent("debug.alvr.key_confirm", 12);
+            // `key_auto`: the bias is chosen at each LUT update, `key_bias` is ignored
+            let key_auto = KeyAutoParams::load();
+            match (key_auto, &mut model.auto_bias) {
+                (Some(params), Some(auto_bias)) => {
+                    auto_bias.weight = params.weight;
+                    auto_bias.scene_share = params.scene_share;
+                }
+                (Some(params), None) => {
+                    model.auto_bias = Some(AutoBias::new(params.weight, params.scene_share));
+                }
+                (None, _) => model.auto_bias = None,
+            }
+            let scene_share = key_auto.map_or_else(
+                || KeyAutoParams::scene_share(debug_property("debug.alvr.key_auto_scene")),
+                |params| params.scene_share,
+            );
             model.add_samples(&samples, elapsed);
             let new_lut = if last_lut_update.elapsed() >= LUT_UPDATE_INTERVAL {
                 last_lut_update = Instant::now();
@@ -478,11 +507,13 @@ fn learn_loop(context: &Context) {
                 }
             }
 
+            let key_leak = model.measured_leak(&samples.background, &samples.scene, scene_share);
             *context.verified.lock() = Some(Verified {
                 time: Instant::now(),
                 weights,
                 leak,
                 bridges,
+                key_leak,
             });
 
             if last_log.elapsed() > LOG_INTERVAL {
@@ -535,11 +566,15 @@ fn learn_loop(context: &Context) {
                 } else {
                     String::new()
                 };
+                let auto_log = crate::passthrough::auto_bias_text(
+                    model.auto_bias.is_some(),
+                    model.auto_bias_status().as_ref(),
+                );
                 camera::log(&format!(
                     "auto key: skin {} kept {:.2} mean {:?}, background {} kept {:.2} mean {:?}, \
                      verified {:.2} {:.2}, leak {:.2} {:.2}, scene {} kept {:.2}, \
                      update {:.1} ms{wrist_log}{leak_map}, lost floor {lost_floor:.2} \
-                     bg {lost_background:.2}, gate L {left}, R {right}{confirm_log}",
+                     bg {lost_background:.2}, gate L {left}, R {right}{confirm_log}{auto_log}",
                     samples.skin.len(),
                     model.kept_fraction(&samples.skin),
                     mean(&samples.skin),
@@ -620,7 +655,15 @@ fn learn_loop(context: &Context) {
                         ("key_bias", model.skin_bias),
                         ("key_unknown", model.unknown_keep),
                         ("key_steady", f32::from(u8::from(steady))),
-                    ],
+                    ]
+                    .into_iter()
+                    // `key_auto`: the bias of the last LUT, only while it is on
+                    .chain(
+                        model
+                            .auto_bias_status()
+                            .map(|status| ("key_auto_bias", status.bias)),
+                    )
+                    .collect(),
                     counts: vec![
                         ("skin", samples.skin.len() as f32),
                         ("background", samples.background.len() as f32),

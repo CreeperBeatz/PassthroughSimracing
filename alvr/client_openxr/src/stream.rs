@@ -464,6 +464,9 @@ pub struct StreamContext {
     cloud_ab_start: Instant,
     cloud_log: CloudLog,
     last_cloud_log: Instant,
+    // `debug.alvr.cloud_leak` 1: the band's gain and cap are scaled by the key's measured leak
+    // (`motion_cloud::leak_scale`). 0, the default: as set
+    cloud_leak: bool,
     // The wrists of the hand capsules of the key in this frame (display time minus `key_delay`), for
     // the distance to the wrist of the arm
     key_wrists: Cell<[Option<Vec3>; 2]>,
@@ -704,6 +707,7 @@ impl StreamContext {
             cloud_ab_start: Instant::now(),
             cloud_log: CloudLog::default(),
             last_cloud_log: Instant::now(),
+            cloud_leak: false,
             key_wrists: Cell::new([None; 2]),
             published_lut: None,
             lut_uploads: 0,
@@ -1129,6 +1133,7 @@ impl StreamContext {
             }
             self.cloud_params = cloud_params;
         }
+        self.cloud_leak = debug_property("debug.alvr.cloud_leak").unwrap_or(0) > 0;
         self.playzone_auto = debug_property("debug.alvr.playzone_auto").unwrap_or(1) > 0;
 
         let dump = debug_property("debug.alvr.key_dump").unwrap_or(0);
@@ -2190,11 +2195,25 @@ impl StreamContext {
         let params = self.cloud_params?;
 
         Some(CloudInput {
-            params,
+            params: motion_cloud::frame_params(params, self.cloud_leak_follow().as_ref()),
             capture_ns: self.depth_capture_time.map(|time| time.as_nanos()),
             display_ns: display_time.as_nanos(),
             shown: !params.ab || motion_cloud::ab_shown(self.cloud_ab_start.elapsed()),
         })
+    }
+
+    // `debug.alvr.cloud_leak` 1: the key's fresh leak and the scale of the band's gain and cap (1 without a
+    // fresh leak). None: off
+    fn cloud_leak_follow(&self) -> Option<motion_cloud::LeakFollow> {
+        if !self.cloud_leak {
+            return None;
+        }
+        #[cfg(target_os = "android")]
+        let leak = self.auto_color_key.as_ref().and_then(|key| key.key_leak());
+        #[cfg(not(target_os = "android"))]
+        let leak = None;
+
+        Some(motion_cloud::LeakFollow::new(leak))
     }
 
     // Whether the region of the mask is made of boxes: the play area placed from the marker, or the volume
@@ -2233,10 +2252,11 @@ impl StreamContext {
             if self.burst.is_recording()
                 && let Some(cloud) = input.and_then(|input| input.cloud)
             {
+                // The parameters of this frame (with `cloud_leak` the scaled gain and cap)
                 self.burst.set_display_cloud(
                     display_time.as_nanos(),
                     CloudRecord {
-                        params,
+                        params: cloud.params,
                         shown: cloud.shown,
                         eyes: status.eyes,
                     },
@@ -2256,9 +2276,14 @@ impl StreamContext {
             let layers = self
                 .color_key
                 .map_or((0, 0), |params| (params.layers, params.crop));
-            let text = self
-                .cloud_log
-                .text(&params, state, elapsed.as_secs_f32(), layers);
+            let follow = self.cloud_leak_follow();
+            let text = self.cloud_log.text(
+                &params,
+                state,
+                elapsed.as_secs_f32(),
+                layers,
+                follow.as_ref(),
+            );
             crate::stream_log(&text);
         }
     }

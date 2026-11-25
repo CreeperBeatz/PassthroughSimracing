@@ -99,6 +99,7 @@ All `adb shell setprop debug.alvr.<name> <value>`, read every 500 ms; each chang
 | `cloud_onesided` | 1 | 0..2 | the one-sided rule above |
 | `cloud_trail` | 0 | 0..24 | N > 0: inside the depth mask, a border of at most N texels (and at most the reach) along edges that moved is decided by the key instead of showing the room (the trail above). 0: off |
 | `cloud_ab` | 0 | 0, 1 | 1: 2 s the cloud as set, 2 s today's picture (arm shift as set), with a green / red mark; the passes keep running |
+| `cloud_leak` | 0 | 0, 1 | 1: gain and cap scaled by the key's measured leak ("The key adapts" below); shown in the `cloud:` line, not logged on change |
 | `key_layers`, `key_crop` | 4, 1 | | unset while `cloud` is 1 or 2: 5 and 0 |
 
 ## The log line
@@ -236,6 +237,71 @@ the late depth copy behind the arm, which v1 leaves as it is.
 
 Not judged yet: the A/B against today's arm, a smaller band (`cloud_cap 8`), the constant band
 (`cloud_fixed 8`), a longer hold, `cloud 2`, sleeves.
+
+## The key adapts (key_auto, cloud_leak)
+
+Why: in one room whose colours are close to skin (one session, 2026-11-25) the fixed default `key_bias
+150` gave `skin kept 0.40-0.77, background kept 0.67-0.78, scene kept 0.30-0.51` in the `auto key:` line:
+the key let the room through beside the hands and inside the band. `key_bias 60`, set by hand, gave
+`skin kept 0.75-0.77, background kept 0.00, scene kept 0.00`. At home the default was fine (scene kept
+about 1 %). The user wants the settings found per scenario, live; over clutter a smaller band with some
+clipping is preferred to the opposite.
+
+**`key_auto 1`**: at every LUT update (about 5 per second) the learner chooses the bias itself
+(`key_bias` is ignored). Each candidate b of 0.30, 0.45, 0.60, 0.80, 1.00, 1.25, 1.50, 2.00 is scored
+with the same target formula as the LUT:
+
+```
+skin_kept(b)  = sum K x t_b / sum K     K: the skin colours of the last 5 s
+bg_kept(b)    = sum B x t_b / sum B     B: the colours around the hands of the last 3 s
+scene_kept(b) = sum S x t_b / sum S     S: the scene colours of the last 20 s (not reduced by the skin)
+leak(b) = max(bg_kept(b), scene_share x scene_kept(b))
+J(b)    = skin_kept(b) - weight x leak(b)
+```
+
+(t_b: the target of a colour cell with bias b, 0..1; an empty density keeps 0.) The best J wins; of
+equal ones (within 0.0001) the higher bias, so colours that are apart keep the hand as before. Another
+candidate is taken only if it is better by more than 0.01. The bias in use moves a quarter of the way
+(in log space) towards the chosen one at each update (every 180 ms), 90 % of the way in about 1.5 s;
+0.30..2.00. The
+`auto key:` line ends with `, auto bias 0.62 (cand 0.60, skin 0.76 leak 0.01)` (the bias in use, the
+chosen candidate and its skin kept and leak; `, auto bias -` before the first LUT), a key dump has
+`key_auto_bias`. Off (unset): the LUT is bit for bit today's. Cost: one more pass over the cells that
+have a colour, measured on a PC (release build): +0.5-1 ms with about 5800 such cells, +3.4 ms with
+all 32768 (today 5 ms).
+
+**`cloud_leak 1`**: the depth cloud's gain and cap are both multiplied by
+`clamp(1 - (leak - 0.03) / (0.20 - 0.03), 0.30, 1.00)`: 1 up to a leak of 0.03, 0.71 at 0.08, 0.5 at
+0.115, the floor 0.30 from 0.149 on. The leak is published by the learner after each pass (about 16 per
+second), whether `key_auto` is on or not: the larger of the share of this pass's colours around the
+hands that the key keeps and `key_auto_scene` x the share of its scene colours that it keeps (the
+`background N kept X` and `scene N kept X` of the `auto key:` line, measured on the learner's table, which
+the uploaded LUT follows within 10 / 255). Older than 1 s or none (no LUT yet, no learner): scale 1. The
+`cloud:` line shows ` leak 0.08 x0.71` after the parameters (` leak - x1.00` without one); the burst
+record has the gain and cap of each frame, scaled.
+
+| property | default | range | meaning |
+|---|---|---|---|
+| `key_auto` | 0 | 0, 1 | 1: the learner chooses the bias, `key_bias` is ignored |
+| `key_auto_weight` | 300 | 0..1000 | % : what a leak costs against the skin kept (300: 1 % of leak = 3 % of skin) |
+| `key_auto_scene` | 50 | 0..100 | % of the scene kept that counts as leak (for `key_auto` and for the leak of `cloud_leak`) |
+| `cloud_leak` | 0 | 0, 1 | 1: the band shrinks with the leak |
+
+Offline (unit test, synthetic colours): a hand of two tones over a backdrop of mostly the main tone.
+Fixed 1.5: skin kept 1.00, background kept 0.80. `key_auto`: candidate 0.30, skin kept 0.15 (most of the
+darker tone, a quarter of the hand), background kept 0.00. Colours far apart: candidate 2.00, skin kept
+1.00, leak 0.
+
+What it cannot do:
+- **One bias for all colours.** It trades hand against room for every colour at once: where the room
+  shares the hand's main tone it keeps the room out by losing that part of the hand (the test above). It
+  does not learn which colours to drop, only how far to lean.
+- **It does not know the arm.** The skin class is the hand; it does not learn the arm's or a sleeve's
+  colours, and it does not know the backdrop along the forearm: the background class is a ring of
+  20-70 mm around the hand. A leak along the arm that the ring does not see is not measured.
+- The scene term counts every colour of the view outside the hands and arms (a still room included),
+  scaled by `key_auto_scene`.
+- Not run on the headset yet.
 
 ## Literature
 

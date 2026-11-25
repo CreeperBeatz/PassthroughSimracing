@@ -126,6 +126,57 @@ pub fn params_text(params: Option<&CloudParams>) -> String {
     }
 }
 
+// `cloud_leak`: up to this leak of the key the band is as set; at the upper one it has its smallest scale
+const LEAK_FULL: f32 = 0.03;
+const LEAK_SMALLEST: f32 = 0.20;
+const MIN_LEAK_SCALE: f32 = 0.30;
+
+/// `debug.alvr.cloud_leak` 1: the scale of the band's gain and cap for the key's measured leak (0..1, see
+/// `AutoColorKey::key_leak`): 1 up to 0.03, then down linearly, at least 0.30
+pub fn leak_scale(leak: f32) -> f32 {
+    (1.0 - (leak - LEAK_FULL) / (LEAK_SMALLEST - LEAK_FULL)).clamp(MIN_LEAK_SCALE, 1.0)
+}
+
+/// `debug.alvr.cloud_leak`: the key's leak and the scale it gives (1 without a fresh leak), for the
+/// parameters of a frame and the `cloud:` line
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LeakFollow {
+    pub leak: Option<f32>,
+    pub scale: f32,
+}
+
+impl LeakFollow {
+    /// `leak`: the fresh leak of the key, None if there is none
+    pub fn new(leak: Option<f32>) -> Self {
+        Self {
+            leak,
+            scale: leak.map_or(1.0, leak_scale),
+        }
+    }
+
+    /// The parameters with the gain and the cap scaled
+    pub fn apply(&self, params: CloudParams) -> CloudParams {
+        CloudParams {
+            gain: params.gain * self.scale,
+            cap: params.cap * self.scale,
+            ..params
+        }
+    }
+
+    /// The part of the `cloud:` line after the parameters
+    fn text(&self) -> String {
+        match self.leak {
+            Some(leak) => format!(" leak {leak:.2} x{:.2}", self.scale),
+            None => format!(" leak - x{:.2}", self.scale),
+        }
+    }
+}
+
+/// The parameters of a frame: with `cloud_leak` (`follow`) on, the gain and cap scaled by the key's leak
+pub fn frame_params(params: CloudParams, follow: Option<&LeakFollow>) -> CloudParams {
+    follow.map_or(params, |follow| follow.apply(params))
+}
+
 /// `cloud_ab 1`: whether the cloud shows (true) or today's picture (false), `elapsed` since the
 /// alternation started: the cloud first, then 2 s each
 pub fn ab_shown(elapsed: Duration) -> bool {
@@ -222,13 +273,14 @@ impl CloudLog {
 
     /// The `cloud:` line every 2 s while `cloud` is set, `seconds` since the last one. `state`: the
     /// renderer's status while the cloud runs, else why not. `layers`: the key layers and crop in use.
-    /// Empties the counts
+    /// `follow`: the key's leak and its scale with `cloud_leak` on (None: off). Empties the counts
     pub fn text(
         &mut self,
         params: &CloudParams,
         state: Result<&CloudStatus, CloudOff>,
         seconds: f32,
         layers: (i64, i64),
+        follow: Option<&LeakFollow>,
     ) -> String {
         let status = match state {
             Ok(status) => status,
@@ -240,6 +292,9 @@ impl CloudLog {
             }
         };
         let mut text = params_part(params);
+        if let Some(follow) = follow {
+            text.push_str(&follow.text());
+        }
         let seconds = seconds.max(1e-3);
         // The renderer's counts start again from 0 when it creates the cloud again (another depth size,
         // switched off and on): if any count went back, the line counts from 0
@@ -417,6 +472,79 @@ mod tests {
     }
 
     #[test]
+    fn leak_scale_points() {
+        let close = |leak: f32, expected: f32| {
+            let scale = leak_scale(leak);
+            assert!((scale - expected).abs() < 1e-5, "{leak}: {scale}");
+        };
+        close(0.0, 1.0);
+        close(0.03, 1.0);
+        close(0.08, 1.0 - 0.05 / 0.17);
+        close(0.115, 0.5);
+        // The floor from 0.03 + 0.7 x 0.17 = 0.149 on
+        close(0.149, 0.3);
+        close(0.17, 0.3);
+        close(0.2, 0.3);
+        close(1.0, 0.3);
+        assert!(leak_scale(0.148) > 0.3);
+    }
+
+    #[test]
+    fn cloud_leak_scales_gain_and_cap() {
+        let params = CloudParams {
+            trail: 6.0,
+            ..Default::default()
+        };
+        // Off: as set
+        assert_eq!(frame_params(params, None), params);
+        // On without a fresh leak: as set
+        let none = LeakFollow::new(None);
+        assert_eq!(none.scale, 1.0);
+        assert_eq!(frame_params(params, Some(&none)), params);
+        // A small leak: as set
+        assert_eq!(
+            frame_params(params, Some(&LeakFollow::new(Some(0.02)))),
+            params
+        );
+        // Half: the gain and the cap only
+        let half = frame_params(params, Some(&LeakFollow::new(Some(0.115))));
+        assert!((half.gain - 75.0).abs() < 1e-3 && (half.cap - 7.0).abs() < 1e-4);
+        assert_eq!(
+            CloudParams {
+                gain: params.gain,
+                cap: params.cap,
+                ..half
+            },
+            params
+        );
+        let floor = frame_params(params, Some(&LeakFollow::new(Some(0.5))));
+        assert!((floor.gain - 45.0).abs() < 1e-3 && (floor.cap - 4.2).abs() < 1e-4);
+
+        // The line shows it after the parameters
+        let status = CloudStatus::default();
+        let mut log = CloudLog::default();
+        let text = log.text(
+            &params,
+            Ok(&status),
+            2.0,
+            (5, 0),
+            Some(&LeakFollow::new(Some(0.08))),
+        );
+        assert!(
+            text.starts_with(
+                "cloud: mode 1, gain 150 cap 14 hold 200 dead 2.5 lambda 40 fetch 450 fixed 0 ab 0 onesided 1 \
+                 trail 6 leak 0.08 x0.71 | depth "
+            ),
+            "{text}"
+        );
+        let text = log.text(&params, Ok(&status), 2.0, (5, 0), Some(&none));
+        assert!(text.contains(" trail 6 leak - x1.00 | depth "), "{text}");
+        // Off: unchanged
+        let text = log.text(&params, Ok(&status), 2.0, (5, 0), None);
+        assert!(text.contains(" trail 6 | depth "), "{text}");
+    }
+
+    #[test]
     fn cloud_ab_alternates() {
         let ms = Duration::from_millis;
         // The cloud first, then today's picture, 2 s each
@@ -520,7 +648,7 @@ mod tests {
         log.count(&status, 1131 * ms);
         status.eyes[0].a_ms = 101.0;
         log.count(&status, 1141 * ms);
-        let text = log.text(&params, Ok(&status), 2.0, (5, 0));
+        let text = log.text(&params, Ok(&status), 2.0, (5, 0), None);
         assert_eq!(
             text,
             "cloud: mode 1, gain 150 cap 14 hold 200 dead 2.5 lambda 40 fetch 450 fixed 0 ab 0 onesided 1 trail 0 | \
@@ -533,7 +661,7 @@ mod tests {
         status.resets[0][1] += 1;
         status.resets[1][1] += 1;
         status.intervals[1] += 1;
-        let text = log.text(&params, Ok(&status), 2.0, (4, 1));
+        let text = log.text(&params, Ok(&status), 2.0, (4, 1), None);
         assert!(
             text.ends_with(
                 "| depth 1.0 /s (33 ms 0 %, 67 ms 100 %, 100 ms 0 %), age -, a -, stale 0 | pairs 2: \
@@ -548,7 +676,7 @@ mod tests {
         status.eyes[0].stale = true;
         log.count(&status, 1400 * ms);
         log.count(&status, 1600 * ms);
-        let text = log.text(&params, Ok(&status), 2.0, (5, 0));
+        let text = log.text(&params, Ok(&status), 2.0, (5, 0), None);
         assert!(
             text.contains(
                 "| depth 0.0 /s, age 417 ms, a 250 ms, stale 2 | pairs 0: reset 0 (start 0, dt 0, \
@@ -564,7 +692,7 @@ mod tests {
             intervals: [2, 0, 0],
             ..Default::default()
         };
-        let text = log.text(&params, Ok(&again), 2.0, (5, 0));
+        let text = log.text(&params, Ok(&again), 2.0, (5, 0), None);
         assert!(
             text.contains(
                 "| depth 1.5 /s (33 ms 100 %, 67 ms 0 %, 100 ms 0 %), age -, a -, stale 0 | pairs 3: \
@@ -574,8 +702,8 @@ mod tests {
         );
         // Also after a line without a cloud (dropped): its next one counts from 0, though its counts
         // did not go back below the last line's
-        log.text(&params, Err(CloudOff::NoDepth), 2.0, (5, 0));
-        let text = log.text(&params, Ok(&again), 2.0, (5, 0));
+        log.text(&params, Err(CloudOff::NoDepth), 2.0, (5, 0), None);
+        let text = log.text(&params, Ok(&again), 2.0, (5, 0), None);
         assert!(text.contains("| depth 1.5 /s"), "{text}");
         assert!(text.contains("| pairs 3: reset 1 (start 1,"), "{text}");
 
@@ -586,6 +714,7 @@ mod tests {
                 Err(CloudOff::reason(depth, key, volume)),
                 2.0,
                 (5, 0),
+                None,
             )
         };
         assert_eq!(off(true, false, true), "cloud: mode 1, off: no colour key");

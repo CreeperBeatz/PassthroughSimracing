@@ -322,6 +322,60 @@ fn percent(property: &str, default: i64) -> f32 {
     debug_property(property).unwrap_or(default).clamp(0, 100) as f32 / 100.0
 }
 
+/// `debug.alvr.key_auto` 1: the colour learner chooses the bias itself (`key_bias` is ignored), see
+/// `alvr_graphics::AutoBias`
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(all(not(target_os = "android"), not(test)), expect(dead_code))]
+pub struct KeyAutoParams {
+    /// `key_auto_weight`, percent (0..1000, default 300): how much a leak costs against the skin kept
+    pub weight: f32,
+    /// `key_auto_scene`, see `scene_share`
+    pub scene_share: f32,
+}
+
+impl KeyAutoParams {
+    /// None while it is off (the default)
+    #[cfg_attr(not(target_os = "android"), expect(dead_code))]
+    pub fn load() -> Option<Self> {
+        Self::from_values(
+            debug_property("debug.alvr.key_auto"),
+            debug_property("debug.alvr.key_auto_weight"),
+            debug_property("debug.alvr.key_auto_scene"),
+        )
+    }
+
+    /// From the property values, None: unset. Off unless `auto` is 1 or more
+    #[cfg_attr(all(not(target_os = "android"), not(test)), expect(dead_code))]
+    pub fn from_values(auto: Option<i64>, weight: Option<i64>, scene: Option<i64>) -> Option<Self> {
+        (auto.unwrap_or(0) > 0).then(|| Self {
+            weight: weight.unwrap_or(300).clamp(0, 1000) as f32 / 100.0,
+            scene_share: Self::scene_share(scene),
+        })
+    }
+
+    /// `key_auto_scene`, percent (0..100, default 50): how much of the scene that the key keeps counts as a
+    /// leak. Also for the leak published to the depth cloud (`debug.alvr.cloud_leak`) while `key_auto` is
+    /// off
+    #[cfg_attr(all(not(target_os = "android"), not(test)), expect(dead_code))]
+    pub fn scene_share(scene: Option<i64>) -> f32 {
+        scene.unwrap_or(50).clamp(0, 100) as f32 / 100.0
+    }
+}
+
+/// The end of the `auto key:` line while `key_auto` is on (`on`), nothing while it is off. `status`: of the
+/// last LUT, None before the first one
+#[cfg_attr(all(not(target_os = "android"), not(test)), expect(dead_code))]
+pub fn auto_bias_text(on: bool, status: Option<&alvr_graphics::AutoBiasStatus>) -> String {
+    match (on, status) {
+        (false, _) => String::new(),
+        (true, None) => ", auto bias -".into(),
+        (true, Some(status)) => format!(
+            ", auto bias {:.2} (cand {:.2}, skin {:.2} leak {:.2})",
+            status.bias, status.candidate, status.skin_kept, status.leak
+        ),
+    }
+}
+
 /// `debug.alvr.problem_view`, see the properties above
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ProblemViewParams {
@@ -577,6 +631,63 @@ mod tests {
         assert_eq!(
             (params.lo, params.hi, params.room, params.dim),
             (0.1, 1.0, 0.0, 1.0)
+        );
+    }
+
+    #[test]
+    fn key_auto_params_defaults_and_clamps() {
+        // Unset, 0 or negative: off, whatever the others say
+        assert_eq!(KeyAutoParams::from_values(None, None, None), None);
+        assert_eq!(KeyAutoParams::from_values(Some(0), Some(100), None), None);
+        assert_eq!(KeyAutoParams::from_values(Some(-1), None, Some(20)), None);
+        assert_eq!(
+            KeyAutoParams::from_values(Some(1), None, None),
+            Some(KeyAutoParams {
+                weight: 3.0,
+                scene_share: 0.5,
+            })
+        );
+        assert_eq!(
+            KeyAutoParams::from_values(Some(1), Some(-5), Some(250)),
+            Some(KeyAutoParams {
+                weight: 0.0,
+                scene_share: 1.0,
+            })
+        );
+        assert_eq!(
+            KeyAutoParams::from_values(Some(1), Some(5000), Some(-3)),
+            Some(KeyAutoParams {
+                weight: 10.0,
+                scene_share: 0.0,
+            })
+        );
+        assert_eq!(
+            KeyAutoParams::from_values(Some(1), Some(150), Some(20)),
+            Some(KeyAutoParams {
+                weight: 1.5,
+                scene_share: 0.2,
+            })
+        );
+        assert_eq!(KeyAutoParams::scene_share(None), 0.5);
+    }
+
+    #[test]
+    fn auto_bias_log_text() {
+        let status = alvr_graphics::AutoBiasStatus {
+            bias: 0.6213,
+            candidate: 0.6,
+            skin_kept: 0.7612,
+            background_kept: 0.004,
+            scene_kept: 0.02,
+            leak: 0.01,
+        };
+        // Off: the line is unchanged
+        assert_eq!(auto_bias_text(false, Some(&status)), "");
+        assert_eq!(auto_bias_text(false, None), "");
+        assert_eq!(auto_bias_text(true, None), ", auto bias -");
+        assert_eq!(
+            auto_bias_text(true, Some(&status)),
+            ", auto bias 0.62 (cand 0.60, skin 0.76 leak 0.01)"
         );
     }
 }

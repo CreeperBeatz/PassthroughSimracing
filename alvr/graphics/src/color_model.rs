@@ -40,6 +40,14 @@ const MIN_SAMPLES: usize = 300;
 const MIN_RING_COLORS: usize = 50;
 // A segment is only checked if this many of its points are in the image
 const MIN_SEGMENT_POINTS: usize = 8;
+/// The values of `skin_bias` that `AutoBias` chooses from
+pub const AUTO_BIAS_CANDIDATES: [f32; 8] = [0.30, 0.45, 0.60, 0.80, 1.00, 1.25, 1.50, 2.00];
+// Another candidate is only chosen if its score is better by more than this
+const AUTO_BIAS_HYSTERESIS: f32 = 0.01;
+// Scores this close are equal (rounding of the sums)
+const AUTO_BIAS_TIE: f32 = 1e-4;
+// Share of the way (in log space) from the bias in use to the chosen candidate at each update
+const AUTO_BIAS_STEP: f32 = 0.25;
 
 struct Density {
     // Sums up to 1 (or it's all zeros)
@@ -120,6 +128,134 @@ fn smooth(values: &[f32], sigma: f32) -> Vec<f32> {
     current
 }
 
+/// `debug.alvr.key_auto`: the model chooses `skin_bias` itself at each LUT update, from the colours of
+/// the hands, around them and of the scene. Of `AUTO_BIAS_CANDIDATES` the one with the best
+/// skin kept - `weight` x leak, where the leak is the larger of the background kept and `scene_share`
+/// x the scene kept. The bias in use moves towards it gradually.
+#[derive(Clone, Copy, Debug)]
+pub struct AutoBias {
+    /// How much a leak costs against the skin that is kept
+    pub weight: f32,
+    /// How much of the scene that is kept counts as a leak (0..1)
+    pub scene_share: f32,
+    // Index of the chosen candidate
+    chosen: Option<usize>,
+    status: Option<AutoBiasStatus>,
+}
+
+/// What `AutoBias` chose at the last LUT update
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AutoBiasStatus {
+    /// The `skin_bias` of the last LUT
+    pub bias: f32,
+    /// The chosen candidate, which the bias moves towards
+    pub candidate: f32,
+    /// Of the chosen candidate: the shares of the skin, background and scene densities that its targets
+    /// keep, and the leak it was judged by
+    pub skin_kept: f32,
+    pub background_kept: f32,
+    pub scene_kept: f32,
+    pub leak: f32,
+}
+
+impl AutoBias {
+    pub fn new(weight: f32, scene_share: f32) -> Self {
+        Self {
+            weight,
+            scene_share,
+            chosen: None,
+            status: None,
+        }
+    }
+
+    /// None before the first LUT
+    pub fn status(&self) -> Option<AutoBiasStatus> {
+        self.status
+    }
+
+    // `kept`: for each candidate the kept shares of skin, background and scene (see `kept_shares`).
+    // Returns the bias for this LUT
+    fn update(&mut self, kept: &[[f32; 3]; AUTO_BIAS_CANDIDATES.len()]) -> f32 {
+        let leak = |kept: &[f32; 3]| kept[1].max(self.scene_share * kept[2]);
+        let score = |index: usize| kept[index][0] - self.weight * leak(&kept[index]);
+        // Of equal ones the one that prefers the skin most: e.g. when all of them keep all of the skin and
+        // none of the room, which a higher bias does with more of the skin colours that were not seen
+        let max_score = (0..kept.len()).map(score).fold(f32::MIN, f32::max);
+        let best = (0..kept.len())
+            .rev()
+            .find(|index| score(*index) >= max_score - AUTO_BIAS_TIE)
+            .unwrap_or(0);
+        let chosen = match self.chosen {
+            Some(current) if score(best) <= score(current) + AUTO_BIAS_HYSTERESIS => current,
+            _ => best,
+        };
+        let candidate = AUTO_BIAS_CANDIDATES[chosen];
+        let bias = self
+            .status
+            .map_or(candidate, |status| {
+                (status.bias.ln() + (candidate.ln() - status.bias.ln()) * AUTO_BIAS_STEP).exp()
+            })
+            .clamp(
+                AUTO_BIAS_CANDIDATES[0],
+                AUTO_BIAS_CANDIDATES[kept.len() - 1],
+            );
+        self.chosen = Some(chosen);
+        self.status = Some(AutoBiasStatus {
+            bias,
+            candidate,
+            skin_kept: kept[chosen][0],
+            background_kept: kept[chosen][1],
+            scene_kept: kept[chosen][2],
+            leak: leak(&kept[chosen]),
+        });
+
+        bias
+    }
+}
+
+// For each of `AUTO_BIAS_CANDIDATES`: the shares of the `skin`, `background` and `scene` densities that
+// its targets keep, 0 for a density that is all zeros. `densities` gives the skin and background of a
+// cell as the target sees them, `target` the target of these with a bias. Cells where all three are 0
+// are skipped
+fn kept_shares(
+    skin: &[f32],
+    background: &[f32],
+    scene: &[f32],
+    densities: impl Fn(usize) -> (f32, f32),
+    target: impl Fn(f32, f32, f32) -> f32,
+) -> [[f32; 3]; AUTO_BIAS_CANDIDATES.len()] {
+    let mut sums = [[0.0_f64; 3]; AUTO_BIAS_CANDIDATES.len()];
+    let mut totals = [0.0_f64; 3];
+    for i in 0..TEXEL_COUNT {
+        let weights = [skin[i], background[i], scene[i]].map(f64::from);
+        if weights == [0.0; 3] {
+            continue;
+        }
+        for (total, weight) in totals.iter_mut().zip(weights) {
+            *total += weight;
+        }
+        let (skin_left, background) = densities(i);
+        // Without skin the bias changes nothing
+        let same = (skin_left == 0.0).then(|| target(0.0, background, 1.0));
+        for (sums, bias) in sums.iter_mut().zip(AUTO_BIAS_CANDIDATES) {
+            let kept = f64::from(same.unwrap_or_else(|| target(skin_left, background, bias)));
+            for (sum, weight) in sums.iter_mut().zip(weights) {
+                *sum += weight * kept;
+            }
+        }
+    }
+
+    sums.map(|sums| {
+        [0, 1, 2].map(|k| {
+            if totals[k] > 0.0 {
+                (sums[k] / totals[k]) as f32
+            } else {
+                0.0
+            }
+        })
+    })
+}
+
 // Move the alpha of a table towards the new targets, or start with them
 fn blend(alpha: Option<Vec<f32>>, targets: Vec<f32>) -> Vec<f32> {
     if let Some(mut alpha) = alpha {
@@ -161,6 +297,8 @@ pub struct ColorModel {
     /// the same colors and formula. Below `tightness` it keeps everything the key keeps and more of
     /// the rare skin colors. 0: off, the key table is used.
     pub confirm_tightness: f32,
+    /// `debug.alvr.key_auto`: chooses the bias instead of `skin_bias`. None: off, `skin_bias` is used
+    pub auto_bias: Option<AutoBias>,
 }
 
 impl Default for ColorModel {
@@ -179,6 +317,7 @@ impl Default for ColorModel {
             tightness: 0.2,
             skin_smoothing: 1.0,
             confirm_tightness: 0.0,
+            auto_bias: None,
         }
     }
 }
@@ -248,26 +387,43 @@ impl ColorModel {
             .collect::<Vec<_>>();
         let background = smooth(&background, BACKGROUND_SMOOTHING);
         let scene = smooth(&self.scene.values, BACKGROUND_SMOOTHING);
-        let skin_bias = self.skin_bias;
         let unknown_keep = self.unknown_keep.clamp(0.01, 0.99);
         let unknown_ratio = (unknown_keep / (1.0 - unknown_keep)).powf(LIKELIHOOD_SOFTNESS);
         let skin_floor = floor * unknown_ratio;
-        let target = |skin: f32, background: f32, floor: f32| {
+        let target_with_bias = |skin: f32, background: f32, floor: f32, skin_bias: f32| {
             let score = ((background + floor) / (skin * skin_bias + floor * unknown_ratio)).ln();
             let keep = 1.0 / (1.0 + (score / LIKELIHOOD_SOFTNESS).clamp(-30.0, 30.0).exp());
             // Make it steeper
             ((keep - 0.3) / 0.4).clamp(0.0, 1.0)
         };
+        // Remove the part of each that can be explained by samples of the other one
+        let densities = |i: usize| {
+            let scene = (scene[i] * SCENE_WEIGHT - skin[i] * SCENE_CONTAMINATION).max(0.0);
+            (
+                (skin[i] - background[i] * CONTAMINATION).max(0.0),
+                (background[i] - skin[i] * CONTAMINATION).max(scene),
+            )
+        };
+        // Chosen from how much of the current colours of the skin, around the hands and of the scene
+        // (not smoothed, the scene not reduced by the skin) each candidate would keep
+        let skin_bias = match &mut self.auto_bias {
+            Some(auto_bias) => auto_bias.update(&kept_shares(
+                &self.skin.values,
+                &self.background.values,
+                &self.scene.values,
+                densities,
+                |skin, background, bias| target_with_bias(skin, background, floor, bias),
+            )),
+            None => self.skin_bias,
+        };
+        let target = |skin: f32, background: f32, floor: f32| {
+            target_with_bias(skin, background, floor, skin_bias)
+        };
 
         let mut targets = Vec::with_capacity(TEXEL_COUNT);
         let mut confirm_targets = Vec::with_capacity(confirm_floor.map_or(0, |_| TEXEL_COUNT));
         for (i, kept_without_background) in self.kept_without_background.iter_mut().enumerate() {
-            // Remove the part of each that can be explained by samples of the other one
-            let scene = (scene[i] * SCENE_WEIGHT - skin[i] * SCENE_CONTAMINATION).max(0.0);
-            let (skin_left, background) = (
-                (skin[i] - background[i] * CONTAMINATION).max(0.0),
-                (background[i] - skin[i] * CONTAMINATION).max(scene),
-            );
+            let (skin_left, background) = densities(i);
             targets.push(target(skin_left, background, floor));
             if let Some(confirm_floor) = confirm_floor {
                 confirm_targets.push(target(skin_left, background, confirm_floor));
@@ -466,6 +622,31 @@ impl ColorModel {
         }
 
         lost.map(|count| count as f32 / colors.len().max(1) as f32)
+    }
+
+    /// What `auto_bias` chose at the last LUT update. None while it is off or before the first LUT
+    pub fn auto_bias_status(&self) -> Option<AutoBiasStatus> {
+        self.auto_bias.as_ref().and_then(AutoBias::status)
+    }
+
+    /// How much of the room the current LUT keeps, measured on the colours of a pass: the larger of the
+    /// share of the `background` colours and `scene_share` x the share of the `scene` colours that it
+    /// keeps (as `kept_fraction`). Without colours of one kind only the other one counts. None without a
+    /// LUT or without any colours
+    pub fn measured_leak(
+        &self,
+        background: &[[u8; 3]],
+        scene: &[[u8; 3]],
+        scene_share: f32,
+    ) -> Option<f32> {
+        let alpha = self.alpha.as_ref()?;
+        let background = (!background.is_empty()).then(|| kept_by(alpha, background));
+        let scene = (!scene.is_empty()).then(|| scene_share * kept_by(alpha, scene));
+
+        match (background, scene) {
+            (Some(background), Some(scene)) => Some(background.max(scene)),
+            (background, scene) => background.or(scene),
+        }
     }
 }
 
@@ -1220,6 +1401,255 @@ mod tests {
         let after = model.update_lut().unwrap();
 
         assert_eq!(before, after);
+    }
+
+    // The client's defaults of `key_tight` and `key_confirm`, `key_auto` with `weight` and `scene_share`
+    fn auto_model(weight: f32, scene_share: f32) -> ColorModel {
+        ColorModel {
+            tightness: 0.3,
+            confirm_tightness: 0.12,
+            auto_bias: Some(AutoBias::new(weight, scene_share)),
+            ..Default::default()
+        }
+    }
+
+    // Hand and room in distant colours
+    fn apart_samples() -> HandColorSamples {
+        let mut samples = samples(SKIN, GREEN_WALL);
+        samples.scene = [GREEN_WALL, [200, 30, 40], [30, 90, 200]]
+            .iter()
+            .flat_map(|color| noisy(*color, 200))
+            .collect();
+        samples
+    }
+
+    // Skin of two tones; around the hands mostly the main tone (denser there than on the hand) and a wall,
+    // the same colours in the scene
+    const DARK_SKIN: [u8; 3] = [118, 78, 58];
+    fn skin_like_samples() -> HandColorSamples {
+        let mut skin = noisy(SKIN, 450);
+        skin.extend(noisy(DARK_SKIN, 150));
+        let mut background = noisy(SKIN, 480);
+        background.extend(noisy(WHITE_WALL, 120));
+        HandColorSamples {
+            skin,
+            scene: background.clone(),
+            background,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn key_auto_off_is_todays_lut() {
+        let mut mixed = samples(SKIN, GREEN_WALL);
+        mixed.skin.extend(noisy(GREEN_WALL, 150));
+        mixed.background.extend(noisy(SKIN, 150));
+        mixed.scene = noisy([200, 30, 40], 300);
+        let steps = [
+            (samples(SKIN, WHITE_WALL), 3),
+            (skin_like_samples(), 3),
+            (mixed, 3),
+            (apart_samples(), 3),
+        ];
+        let mut today = ColorModel {
+            tightness: 0.3,
+            confirm_tightness: 0.12,
+            ..Default::default()
+        };
+        // Off unless it is set
+        assert!(ColorModel::default().auto_bias.is_none());
+        assert!(today.auto_bias.is_none());
+        let mut on = auto_model(3.0, 0.5);
+        for (samples, count) in &steps {
+            for _ in 0..*count {
+                today.add_samples(samples, 0.12);
+                on.add_samples(samples, 0.12);
+                // The formula from before `key_auto`, with `skin_bias`
+                let expected = reference_alpha(&today);
+                let lut = today.update_lut().unwrap();
+                assert!(today.alpha.as_ref().unwrap() == &expected);
+                let bytes = expected
+                    .iter()
+                    .map(|alpha| (alpha * 255.0).round() as u8)
+                    .collect::<Vec<_>>();
+                assert!(lut.chunks(4).map(|texel| texel[3]).eq(bytes));
+                assert_eq!(today.auto_bias_status(), None);
+                on.update_lut().unwrap();
+            }
+        }
+        // Not the same with it on (the skin-like steps choose another bias)
+        assert!(on.auto_bias_status().is_some());
+        assert!(on.alpha != today.alpha);
+    }
+
+    #[test]
+    fn key_auto_prefers_skin_when_colours_are_apart() {
+        let mut model = auto_model(3.0, 0.5);
+        assert_eq!(model.auto_bias_status(), None);
+        for _ in 0..20 {
+            model.add_samples(&apart_samples(), 0.12);
+            model.update_lut().unwrap();
+        }
+        let status = model.auto_bias_status().unwrap();
+        assert!(status.candidate >= 1.5, "{status:?}");
+        assert!(status.skin_kept >= 0.9, "{status:?}");
+        assert!(status.leak <= 0.02, "{status:?}");
+        assert!(status.bias >= 1.5, "{status:?}");
+    }
+
+    #[test]
+    fn key_auto_goes_strict_when_the_background_is_skin_like() {
+        let samples = skin_like_samples();
+        let mut fixed = ColorModel {
+            tightness: 0.3,
+            confirm_tightness: 0.12,
+            ..Default::default()
+        };
+        let mut auto = auto_model(3.0, 0.5);
+        for _ in 0..30 {
+            fixed.add_samples(&samples, 0.12);
+            fixed.update_lut().unwrap();
+            auto.add_samples(&samples, 0.12);
+            auto.update_lut().unwrap();
+        }
+        let status = auto.auto_bias_status().unwrap();
+        let kept = |model: &ColorModel| {
+            [
+                model.kept_fraction(&samples.skin),
+                model.kept_fraction(&samples.background),
+                model.kept_fraction(&samples.scene),
+            ]
+        };
+        let ([fixed_skin, fixed_background, _], [auto_skin, auto_background, auto_scene]) =
+            (kept(&fixed), kept(&auto));
+        println!(
+            "fixed 1.5: skin kept {fixed_skin:.3} background kept {fixed_background:.3}; auto \
+             {status:?}: skin kept {auto_skin:.3} background kept {auto_background:.3} scene kept \
+             {auto_scene:.3}"
+        );
+        assert!(status.candidate <= 0.6, "{status:?}");
+        assert!(fixed_background >= 0.5, "{fixed_background}");
+        assert!(auto_background <= 0.1, "{auto_background}");
+        // Most of the darker tone of the hand (a quarter of its colours) stays
+        assert!(auto_skin >= 0.12, "{auto_skin}");
+    }
+
+    #[test]
+    fn key_auto_moves_gradually_and_holds() {
+        let mut model = auto_model(3.0, 0.5);
+        for _ in 0..20 {
+            model.add_samples(&apart_samples(), 0.12);
+            model.update_lut().unwrap();
+        }
+        let mut last = model.auto_bias_status().unwrap();
+        assert!(last.candidate >= 1.5, "{last:?}");
+        // The hands go in front of a skin-like backdrop
+        let mut steps = 0;
+        for _ in 0..60 {
+            model.add_samples(&skin_like_samples(), 0.12);
+            model.update_lut().unwrap();
+            let status = model.auto_bias_status().unwrap();
+            let moved = status.bias.ln() - last.bias.ln();
+            let distance = status.candidate.ln() - last.bias.ln();
+            assert!(
+                moved.abs() <= AUTO_BIAS_STEP * distance.abs() + 1e-5 && moved * distance >= 0.0,
+                "{last:?} {status:?}"
+            );
+            if status.bias < last.bias {
+                steps += 1;
+            }
+            last = status;
+        }
+        assert!(last.candidate <= 0.6, "{last:?}");
+        assert!(last.bias < 0.65, "{last:?}");
+        // Gradually: not in a few updates
+        assert!(steps >= 8, "{steps}");
+
+        // Scores that differ by less than the hysteresis keep the candidate
+        let mut auto_bias = AutoBias::new(1.0, 0.5);
+        let mut kept = [[0.5, 0.0, 0.0]; AUTO_BIAS_CANDIDATES.len()];
+        kept[2] = [0.8, 0.0, 0.0];
+        auto_bias.update(&kept);
+        assert_eq!(
+            auto_bias.status().unwrap().candidate,
+            AUTO_BIAS_CANDIDATES[2]
+        );
+        kept[5] = [0.809, 0.0, 0.0];
+        auto_bias.update(&kept);
+        assert_eq!(
+            auto_bias.status().unwrap().candidate,
+            AUTO_BIAS_CANDIDATES[2]
+        );
+        kept[5] = [0.82, 0.0, 0.0];
+        auto_bias.update(&kept);
+        let status = auto_bias.status().unwrap();
+        assert_eq!(status.candidate, AUTO_BIAS_CANDIDATES[5]);
+        // A quarter of the way from 0.60 to 1.25, in log space
+        let expected = (0.6_f32.ln() + (1.25_f32.ln() - 0.6_f32.ln()) * 0.25).exp();
+        assert!((status.bias - expected).abs() < 1e-5, "{status:?}");
+    }
+
+    #[test]
+    fn key_auto_weight_and_scene_share() {
+        // More skin costs more leak
+        let kept = std::array::from_fn(|i| {
+            let x = i as f32 / (AUTO_BIAS_CANDIDATES.len() - 1) as f32;
+            [0.3 + 0.7 * x, 0.5 * x * x, 0.9 * x]
+        });
+        // Weight 0: the most skin
+        let mut auto_bias = AutoBias::new(0.0, 0.5);
+        auto_bias.update(&kept);
+        let status = auto_bias.status().unwrap();
+        assert_eq!(status.candidate, 2.0);
+        assert!((status.skin_kept - 1.0).abs() < 1e-6);
+        // The scene counts: strict
+        let mut auto_bias = AutoBias::new(3.0, 1.0);
+        auto_bias.update(&kept);
+        assert_eq!(auto_bias.status().unwrap().candidate, 0.3);
+        // Scene share 0: only the background counts. 0.7 x - 1.5 x^2 is best at x = 0.23, of the
+        // candidates at 2/7 (0.60)
+        let mut auto_bias = AutoBias::new(3.0, 0.0);
+        auto_bias.update(&kept);
+        let status = auto_bias.status().unwrap();
+        assert_eq!(status.candidate, 0.6);
+        assert_eq!(status.leak, status.background_kept);
+
+        // In the model: weight 0 keeps the most skin of the candidates
+        let mut model = auto_model(0.0, 0.5);
+        for _ in 0..5 {
+            model.add_samples(&skin_like_samples(), 0.12);
+            model.update_lut().unwrap();
+        }
+        let status = model.auto_bias_status().unwrap();
+        assert_eq!(status.candidate, 2.0, "{status:?}");
+        // A scene of skin colours with scene share 0: the leak is the background's alone
+        let mut model = auto_model(3.0, 0.0);
+        let mut samples = apart_samples();
+        samples.scene = noisy(SKIN, 600);
+        for _ in 0..5 {
+            model.add_samples(&samples, 0.12);
+            model.update_lut().unwrap();
+        }
+        let status = model.auto_bias_status().unwrap();
+        assert_eq!(status.leak, status.background_kept, "{status:?}");
+        assert!(status.scene_kept > 0.5, "{status:?}");
+        assert!(status.candidate >= 1.5, "{status:?}");
+    }
+
+    #[test]
+    fn measured_leak_of_background_and_scene() {
+        let mut model = ColorModel::default();
+        assert_eq!(model.measured_leak(&noisy(SKIN, 100), &[], 0.5), None);
+        model.add_samples(&samples(SKIN, WHITE_WALL), 0.1);
+        model.update_lut().unwrap();
+        let skin = noisy(SKIN, 100);
+        let wall = noisy(WHITE_WALL, 100);
+        assert_eq!(model.measured_leak(&[], &[], 0.5), None);
+        assert_eq!(model.measured_leak(&wall, &wall, 0.5), Some(0.0));
+        assert_eq!(model.measured_leak(&skin, &wall, 0.5), Some(1.0));
+        assert_eq!(model.measured_leak(&wall, &skin, 0.5), Some(0.5));
+        assert_eq!(model.measured_leak(&[], &skin, 0.5), Some(0.5));
+        assert_eq!(model.measured_leak(&skin, &[], 0.0), Some(1.0));
     }
 
     #[test]
