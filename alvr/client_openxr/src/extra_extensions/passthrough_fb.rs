@@ -17,7 +17,7 @@ pub struct PassthroughFB {
     lut_fns: Option<raw::PassthroughColorLutMETA>,
     key: Option<KeyedLayer>,
     // `debug.alvr.green_boxes`: the base layer keyed by monitor green, see `set_green_key`
-    green: Option<KeyedLayer>,
+    green: Option<GreenLayer>,
     session: sys::Session,
 }
 
@@ -25,6 +25,42 @@ struct KeyedLayer {
     layer_handle: sys::PassthroughLayerFB,
     layer: sys::CompositionLayerPassthroughFB,
     lut: sys::PassthroughColorLutMETA,
+}
+
+/// How the green-keyed base layer is made (`debug.alvr.green_layer`). Seen on the Quest 3
+/// (2026-11-26): with a layer of its own (`Separate`) the green stays opaque while the colour keyed
+/// layer of the hands is submitted too, and is keyed once that layer is left out
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum GreenLayerMode {
+    /// The LUT is the style of the base layer itself: two passthrough layers, as without the zone
+    #[default]
+    InPlace,
+    /// A third passthrough layer with the LUT, submitted instead of the plain base layer
+    Separate,
+    /// As `Separate`, and the plain base layer is paused while the third one exists
+    SeparatePaused,
+}
+
+impl GreenLayerMode {
+    /// `debug.alvr.green_layer`: unset or 1 in place, 0 a layer of its own, 2 that with the plain
+    /// layer paused
+    pub fn from_property(value: Option<i64>) -> Self {
+        match value {
+            Some(0) => Self::Separate,
+            Some(2) => Self::SeparatePaused,
+            _ => Self::InPlace,
+        }
+    }
+}
+
+enum GreenLayer {
+    InPlace {
+        lut: sys::PassthroughColorLutMETA,
+    },
+    Separate {
+        keyed: KeyedLayer,
+        base_paused: bool,
+    },
 }
 
 impl PassthroughFB {
@@ -121,12 +157,12 @@ impl PassthroughFB {
         }
     }
 
-    /// `debug.alvr.green_boxes` (green_screen.rs): create, replace or remove the green-keyed base layer, a
-    /// passthrough layer of its own with a colour LUT style (`COLOR_KEY_SIZE` bytes) that is submitted
-    /// instead of the plain base layer while it exists. The plain base layer itself is never styled, so
-    /// without this layer the base is exactly today's
-    pub fn set_green_key(&mut self, data: Option<&[u8]>) -> xr::Result<()> {
-        self.lut_fns
+    /// `debug.alvr.green_boxes` (green_screen.rs): create, replace or remove the green-keyed base layer:
+    /// the base passthrough with a colour LUT style (`COLOR_KEY_SIZE` bytes), made as `mode` says.
+    /// Without it the base layer is plain, exactly as before the zone
+    pub fn set_green_key(&mut self, data: Option<&[u8]>, mode: GreenLayerMode) -> xr::Result<()> {
+        let lut_fns = self
+            .lut_fns
             .ok_or(sys::Result::ERROR_EXTENSION_NOT_PRESENT)?;
 
         self.destroy_green_key();
@@ -134,7 +170,26 @@ impl PassthroughFB {
         let Some(data) = data else {
             return Ok(());
         };
-        self.green = Some(self.create_lut_layer(data)?);
+        self.green = Some(match mode {
+            GreenLayerMode::InPlace => {
+                let lut = self.create_lut(data)?;
+                if let Err(e) = self.set_layer_style(self.layer_handle, Some(lut)) {
+                    unsafe { (lut_fns.destroy_passthrough_color_lut)(lut) };
+                    return Err(e);
+                }
+                GreenLayer::InPlace { lut }
+            }
+            GreenLayerMode::Separate | GreenLayerMode::SeparatePaused => {
+                let keyed = self.create_lut_layer(data)?;
+                // A failed pause leaves the plain layer running, as in `Separate`
+                let base_paused = mode == GreenLayerMode::SeparatePaused
+                    && unsafe {
+                        super::xr_res((self.ext_fns.passthrough_layer_pause)(self.layer_handle))
+                    }
+                    .is_ok();
+                GreenLayer::Separate { keyed, base_paused }
+            }
+        });
 
         Ok(())
     }
@@ -142,25 +197,43 @@ impl PassthroughFB {
     /// Replace the LUT of the green-keyed base layer in place, if it exists
     pub fn update_green_key(&mut self, data: &[u8]) -> xr::Result<()> {
         match &self.green {
-            Some(green) => self.update_lut(green.lut, data),
+            Some(GreenLayer::InPlace { lut }) => self.update_lut(*lut, data),
+            Some(GreenLayer::Separate { keyed, .. }) => self.update_lut(keyed.lut, data),
             None => Ok(()),
         }
     }
 
     fn destroy_green_key(&mut self) {
-        if let Some(green) = self.green.take() {
-            self.destroy_lut_layer(green);
+        match self.green.take() {
+            Some(GreenLayer::InPlace { lut }) => {
+                // The base layer goes back to no colour mapping. A runtime that kept applying the LUT
+                // of a style it no longer has would keep keying green: the table is made opaque first
+                self.update_lut(lut, &opaque_identity_lut()).ok();
+                self.set_layer_style(self.layer_handle, None).ok();
+                if let Some(lut_fns) = &self.lut_fns {
+                    unsafe { (lut_fns.destroy_passthrough_color_lut)(lut) };
+                }
+            }
+            Some(GreenLayer::Separate { keyed, base_paused }) => {
+                if base_paused {
+                    unsafe { (self.ext_fns.passthrough_layer_resume)(self.layer_handle) };
+                }
+                self.destroy_lut_layer(keyed);
+            }
+            None => (),
         }
     }
 
     /// The green-keyed base layer, while it exists
     pub fn green_layer(&self) -> Option<&sys::CompositionLayerPassthroughFB> {
-        self.green.as_ref().map(|green| &green.layer)
+        match &self.green {
+            Some(GreenLayer::InPlace { .. }) => Some(&self.layer),
+            Some(GreenLayer::Separate { keyed, .. }) => Some(&keyed.layer),
+            None => None,
+        }
     }
 
-    /// A new running passthrough layer on the passthrough of this one, styled with a new colour LUT made
-    /// from `data`, and its composition struct (the flags of the base layer). Nothing is left on error
-    fn create_lut_layer(&self, data: &[u8]) -> xr::Result<KeyedLayer> {
+    fn create_lut(&self, data: &[u8]) -> xr::Result<sys::PassthroughColorLutMETA> {
         let lut_fns = self
             .lut_fns
             .ok_or(sys::Result::ERROR_EXTENSION_NOT_PRESENT)?;
@@ -186,6 +259,46 @@ impl PassthroughFB {
                 &mut lut,
             ))?;
         }
+
+        Ok(lut)
+    }
+
+    /// The style of a passthrough layer: mapped by this colour LUT, or (None) no colour mapping
+    fn set_layer_style(
+        &self,
+        layer_handle: sys::PassthroughLayerFB,
+        lut: Option<sys::PassthroughColorLutMETA>,
+    ) -> xr::Result<()> {
+        let color_map = lut.map(|color_lut| sys::PassthroughColorMapLutMETA {
+            ty: sys::PassthroughColorMapLutMETA::TYPE,
+            next: ptr::null(),
+            color_lut,
+            weight: 1.0,
+        });
+        let style = sys::PassthroughStyleFB {
+            ty: sys::PassthroughStyleFB::TYPE,
+            next: color_map
+                .as_ref()
+                .map_or(ptr::null(), |color_map| ptr::from_ref(color_map).cast()),
+            texture_opacity_factor: 1.0,
+            edge_color: sys::Color4f::default(),
+        };
+
+        unsafe {
+            super::xr_res((self.ext_fns.passthrough_layer_set_style)(
+                layer_handle,
+                &style,
+            ))
+        }
+    }
+
+    /// A new running passthrough layer on the passthrough of this one, styled with a new colour LUT made
+    /// from `data`, and its composition struct (the flags of the base layer). Nothing is left on error
+    fn create_lut_layer(&self, data: &[u8]) -> xr::Result<KeyedLayer> {
+        let lut_fns = self
+            .lut_fns
+            .ok_or(sys::Result::ERROR_EXTENSION_NOT_PRESENT)?;
+        let lut = self.create_lut(data)?;
 
         let mut layer_handle = sys::PassthroughLayerFB::NULL;
         let info = sys::PassthroughLayerCreateInfoFB {
@@ -217,25 +330,7 @@ impl PassthroughFB {
             lut,
         };
 
-        let color_map = sys::PassthroughColorMapLutMETA {
-            ty: sys::PassthroughColorMapLutMETA::TYPE,
-            next: ptr::null(),
-            color_lut: lut,
-            weight: 1.0,
-        };
-        let style = sys::PassthroughStyleFB {
-            ty: sys::PassthroughStyleFB::TYPE,
-            next: (&raw const color_map).cast(),
-            texture_opacity_factor: 1.0,
-            edge_color: sys::Color4f::default(),
-        };
-        let result = unsafe {
-            super::xr_res((self.ext_fns.passthrough_layer_set_style)(
-                layer_handle,
-                &style,
-            ))
-        };
-        if let Err(e) = result {
+        if let Err(e) = self.set_layer_style(layer_handle, Some(lut)) {
             self.destroy_lut_layer(keyed);
             return Err(e);
         }
@@ -281,6 +376,23 @@ impl PassthroughFB {
     pub fn layer(&self) -> &sys::CompositionLayerPassthroughFB {
         &self.layer
     }
+}
+
+/// A LUT that changes nothing: every colour itself, opaque (`[b][g][r]`, RGBA)
+fn opaque_identity_lut() -> Vec<u8> {
+    let n = COLOR_KEY_RESOLUTION as usize;
+    let step = |index: usize| (index * 255 / (n - 1)) as u8;
+    let mut lut = Vec::with_capacity(COLOR_KEY_SIZE);
+    for cell in 0..n * n * n {
+        lut.extend_from_slice(&[
+            step(cell % n),
+            step(cell / n % n),
+            step(cell / (n * n)),
+            255,
+        ]);
+    }
+
+    lut
 }
 
 impl Drop for PassthroughFB {

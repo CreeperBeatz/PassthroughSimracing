@@ -1,4 +1,4 @@
-use crate::extra_extensions::{COLOR_KEY_SIZE, PassthroughFB, PassthroughHTC};
+use crate::extra_extensions::{COLOR_KEY_SIZE, GreenLayerMode, PassthroughFB, PassthroughHTC};
 use alvr_common::{
     anyhow::{Result, bail},
     error,
@@ -23,6 +23,9 @@ pub struct PassthroughLayer<'a> {
     // (None: none, the plain base layer), and its table, reused for the updates
     green_key: Option<GreenKeyParams>,
     green_lut: Vec<u8>,
+    // `debug.alvr.green_layer`: how that layer is made, and the calls until the property is read again
+    green_mode: GreenLayerMode,
+    green_mode_poll: u32,
     _marker: PhantomData<&'a ()>,
 }
 
@@ -46,6 +49,8 @@ impl PassthroughLayer<'_> {
             color_key_version: 0,
             green_key: None,
             green_lut: Vec::new(),
+            green_mode: GreenLayerMode::default(),
+            green_mode_poll: 0,
             _marker: PhantomData,
         })
     }
@@ -94,16 +99,34 @@ impl PassthroughLayer<'_> {
         let Some(handle) = &mut self.handle_fb else {
             return false;
         };
+        // `debug.alvr.green_layer` (unset or 1: the LUT on the base layer itself, 0: a third layer, 2: a
+        // third layer and the plain one paused), read about twice a second; a change makes the layer anew
+        if self.green_mode_poll == 0 {
+            self.green_mode_poll = 36;
+            let mode = GreenLayerMode::from_property(debug_property("debug.alvr.green_layer"));
+            if mode != self.green_mode {
+                self.green_mode = mode;
+                if self.green_key.is_some() {
+                    // Made again below, the new way
+                    handle.set_green_key(None, mode).ok();
+                    self.green_key = None;
+                }
+            }
+        }
+        self.green_mode_poll -= 1;
+
         if params != self.green_key {
+            let mode = self.green_mode;
             let result = match params {
-                None => handle.set_green_key(None),
+                None => handle.set_green_key(None, mode),
                 Some(params) => {
                     self.green_lut.resize(COLOR_KEY_SIZE, 0);
                     alvr_graphics::fill_green_key_lut(&params, &mut self.green_lut);
                     if handle.green_layer().is_some() {
                         handle.update_green_key(&self.green_lut)
                     } else {
-                        handle.set_green_key(Some(&self.green_lut))
+                        crate::stream_log(&format!("green: the base layer is keyed as {mode:?}"));
+                        handle.set_green_key(Some(&self.green_lut), mode)
                     }
                 }
             };
