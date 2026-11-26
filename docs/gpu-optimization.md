@@ -271,7 +271,7 @@ protocol above.
   not bound by shading in the periphery. Not worth more work before the rest is cut.
 - 3.28 ms is the floor of the current pipeline at this resolution; everything above it is the depth path.
 
-## Stage S3: work removal (2026-11-26, not yet run on the headset)
+## Stage S3: work removal (2026-11-26; measured in the evening, see "Measured on the headset (2026-11-26 evening" below)
 
 Three properties, each off by default. With all unset the layers, every shader's output and the picture
 are what they were at `90b11cae` (the uniform block grows by 80 bytes of zeros, the stream shader gets
@@ -402,6 +402,37 @@ while looking ahead (game), down at the wheel, and up:
 
 Expected if R covers the lower half while looking ahead: about 0.9 ms of the mask's 1.8 ms, most of the main
 pass's 1.1 ms outside R, 0.65 ms of compositor time for the lower layer's crop; `fast_srgb` up to 0.4 ms.
+
+### Measured on the headset (2026-11-26 evening, build `bfb5f3e2`, at home)
+
+The build streams at 72 fps; the headset's shader compiler accepts the shaders of S3, the edge fill and
+`cloud_own`. One property at a time, 15 to 20 s averages (`tools/avg.sh`), GPU level 2. The drift between two
+base runs of one series was up to 0.4 ms (the headset warmed from 37 to 58 C in 20 minutes), so differences
+below that are not findings.
+
+| Case | Setting | App ms | TW ms | GPU % | `rect:` share |
+|---|---|---|---|---|---|
+| No box placed (region of the settings), on the desk, 4 layers | base | 7.36, repeat 6.93 | 3.99 / 4.02 | 84 / 82 | |
+| | `gpu_rect 1` | 7.27 | 3.72 | 82 | 100 % |
+| | `fast_srgb 1` | 7.47 | 3.72 | 84 | |
+| | both | 7.64 | 3.68 | 85 | 100 % |
+| | `edge_fill 20` | 7.24 | 3.91 | 83 | |
+| | all three | 7.28 | 3.68 | 82 | 100 % |
+| One thin box 0.6 m away, worn, hands in view at times, green key on, 5 layers | base | 6.68, repeat 6.75 | 4.30 / 4.23 | 82 | |
+| | `gpu_rect 1` | 6.46 | 4.41 | 81 | mean 70 %, max 100 % |
+| | `gpu_rect 1` + `fast_srgb 1` | 7.54 (fps 69, min 60) | 4.32 | 87 | 100 % |
+
+What this says:
+- `gpu_rect`: 0.2 ms at a 70 % share, nothing at 100 %. The compositor time of the cropped lower layer went
+  from 4.0 to 3.7 ms in the first series. Hands in view widen the rectangle (their focus region is part of
+  it), and a box around the head makes it the full view: the rig layout of 2026-11-25 has box #0 around the
+  driver's head. For driving (both hands and the wheel box in view) the rectangle cannot be small, so this
+  cut does not pay as built.
+- `fast_srgb`: no gain; every run with it was equal to or slower than its base. Not worth switching on.
+- `edge_fill 20`: no measurable cost.
+- The one bad sample (fps 69, minimum 60) was the run with both cuts on at a 100 % share at 57 C; not
+  repeated, cause not known (thermal step or the settings).
+- Raw lines: `logs/gpu-ablation-s3-20261126.txt` (outside the repo).
 
 ### Part C (`fast_mask`), not built
 
