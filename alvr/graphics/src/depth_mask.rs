@@ -537,6 +537,11 @@ pub const MAX_LEVER_WINDOWS: usize = 4;
 /// from stage space into the frame of the window, its half extents and how open it is
 pub(crate) const LEVER_WINDOW_FLOAT_COUNT: usize = 16 + 4;
 pub(crate) const LEVER_FLOAT_COUNT: usize = MAX_LEVER_WINDOWS * LEVER_WINDOW_FLOAT_COUNT;
+/// Most boxes of the green-screen zone (`debug.alvr.green_boxes`, green_screen.rs)
+pub const MAX_GREEN_WINDOWS: usize = 2;
+/// Floats of the green-screen zone at the end of the uniform block: its vector (x: the number of boxes)
+/// and its boxes, each as a lever window (`LeverWindow` in depth_common.wgsl, always fully open)
+pub(crate) const GREEN_FLOAT_COUNT: usize = 4 + MAX_GREEN_WINDOWS * LEVER_WINDOW_FLOAT_COUNT;
 
 /// A lever window (U2 of design/universal/final.md, `debug.alvr.lever_boxes`): while a hand is near the
 /// box of a lever, every view ray that crosses this box shows the real room, whatever the depth says.
@@ -589,7 +594,7 @@ impl LeverWindow {
 /// origin of the frame (slab test). A component of the direction near 0 is replaced by a tiny positive
 /// one, as in the shader: inside that pair of sides the ray crosses it at every distance, outside of
 /// them never near
-fn ray_crosses_box(origin: Vec3, direction: Vec3, half: Vec3) -> bool {
+pub(crate) fn ray_crosses_box(origin: Vec3, direction: Vec3, half: Vec3) -> bool {
     let tiny = Vec3::splat(1e-6);
     let d = Vec3::select(direction.abs().cmplt(tiny), tiny, direction);
     let t1 = (-half - origin) / d;
@@ -647,6 +652,11 @@ pub struct DepthRenderInput {
     /// Lever windows (`debug.alvr.lever_boxes`): every ray through an open one shows the real room.
     /// None: no window (the default; the mask is then today's)
     pub lever_windows: [Option<LeverWindow>; MAX_LEVER_WINDOWS],
+    /// The boxes of the green-screen zone (`debug.alvr.green_boxes`, green_screen.rs), stage space:
+    /// every view ray through one shows the room whatever the depth says, and nothing in the mask hands
+    /// it to the colour key or the trail (r 1, g, b and a 0). None: no zone (the default; the mask is
+    /// then today's). Only given while the colour-key layers are in use
+    pub green_windows: [Option<RegionOverride>; MAX_GREEN_WINDOWS],
     /// Remember the current depth image as the playzone. There must be no hands in it
     pub capture_playzone: bool,
     /// Debug view (with "Tint mask" and the color key): what only the playzone shows is blue
@@ -787,7 +797,8 @@ pub const DEPTH_UNIFORMS_FLOAT_COUNT: usize = 2 * EYE_FLOAT_COUNT
         + 2 * 2
         + 1)
     + AREA_FLOAT_COUNT
-    + LEVER_FLOAT_COUNT;
+    + LEVER_FLOAT_COUNT
+    + GREEN_FLOAT_COUNT;
 pub const DEPTH_UNIFORMS_SIZE: usize = DEPTH_UNIFORMS_FLOAT_COUNT * size_of::<f32>();
 
 pub(crate) fn pose_to_mat4(pose: Pose) -> Mat4 {
@@ -1046,6 +1057,28 @@ pub fn depth_uniforms(
         if let Some(window) = window {
             data.extend(window.region.volume_to_world.inverse().to_cols_array());
             data.extend(window.region.half_extents.extend(window.open).to_array());
+        } else {
+            data.extend([0.0; LEVER_WINDOW_FLOAT_COUNT]);
+        }
+    }
+    // The green-screen zone: its boxes packed at the start of their array, always fully open; none (the
+    // default): all zeros
+    let mut greens = [None; MAX_GREEN_WINDOWS];
+    let mut green_count = 0;
+    for window in input
+        .green_windows
+        .iter()
+        .flatten()
+        .filter_map(|&region| LeverWindow { region, open: 1.0 }.checked())
+    {
+        greens[green_count] = Some(window);
+        green_count += 1;
+    }
+    data.extend([green_count as f32, 0.0, 0.0, 0.0]);
+    for window in greens {
+        if let Some(window) = window {
+            data.extend(window.region.volume_to_world.inverse().to_cols_array());
+            data.extend(window.region.half_extents.extend(1.0).to_array());
         } else {
             data.extend([0.0; LEVER_WINDOW_FLOAT_COUNT]);
         }
@@ -1482,10 +1515,13 @@ mod tests {
                 + 16
                 // The depth cloud's vector
                 + 16
+                // The green-screen zone: its vector and 2 boxes as lever windows
+                + 16
+                + 2 * 5 * 16
         );
         // 28 capsules per hand, the wrist gaps, the bridges from the wrists, the boxes of the play area,
-        // the lever windows, the room memory, the depth cloud
-        assert_eq!(DEPTH_UNIFORMS_SIZE, 4528);
+        // the lever windows, the room memory, the depth cloud, the green-screen zone
+        assert_eq!(DEPTH_UNIFORMS_SIZE, 4704);
     }
 
     // Steps 1 and 2 of docs/mask-v2-design.md in the uniform block: off is all zeros, as before
@@ -1500,6 +1536,7 @@ mod tests {
             arm_gaps: [None; 2],
             edge_cut: 0.0,
             lever_windows: [None; MAX_LEVER_WINDOWS],
+            green_windows: [None; MAX_GREEN_WINDOWS],
             capture_playzone: false,
             playzone_view: false,
             memory: None,
@@ -1711,6 +1748,7 @@ mod tests {
             arm_gaps: [None; 2],
             edge_cut: 0.0,
             lever_windows: [None; MAX_LEVER_WINDOWS],
+            green_windows: [None; MAX_GREEN_WINDOWS],
             capture_playzone: false,
             playzone_view: false,
             memory: None,
@@ -1721,7 +1759,7 @@ mod tests {
             game_see: 0.0,
         };
         let area_w = 2 * EYE_FLOAT_COUNT + 16 + 3;
-        let levers = DEPTH_UNIFORMS_FLOAT_COUNT - LEVER_FLOAT_COUNT;
+        let levers = DEPTH_UNIFORMS_FLOAT_COUNT - LEVER_FLOAT_COUNT - GREEN_FLOAT_COUNT;
         let uniforms =
             |input: &DepthRenderInput| depth_uniforms(&cfg, &[view(), view()], input, None, false);
 
@@ -1768,6 +1806,59 @@ mod tests {
             let base = levers + index * LEVER_WINDOW_FLOAT_COUNT;
             assert_eq!(data[base + 19], 1.0);
         }
+    }
+
+    // The green-screen zone in the uniform block: off is all zeros (green.x 0, today's block); its boxes
+    // are packed at the start, always fully open, one that cannot be drawn left out, and nothing else of
+    // the block changes
+    #[test]
+    fn green_windows_in_the_uniforms() {
+        let cfg = config(DepthMaskRegion::Distance { max_distance: 0.9 });
+        let mut input = DepthRenderInput {
+            frame: None,
+            eye_positions: [Vec3::ZERO; 2],
+            color_key: None,
+            arms: [None; 2],
+            arm_gaps: [None; 2],
+            edge_cut: 0.0,
+            lever_windows: [None; MAX_LEVER_WINDOWS],
+            green_windows: [None; MAX_GREEN_WINDOWS],
+            capture_playzone: false,
+            playzone_view: false,
+            memory: None,
+            cloud: None,
+            key_lower_rects: None,
+            region_override: None,
+            game_dim: 0.0,
+            game_see: 0.0,
+        };
+        let green = DEPTH_UNIFORMS_FLOAT_COUNT - GREEN_FLOAT_COUNT;
+        let uniforms =
+            |input: &DepthRenderInput| depth_uniforms(&cfg, &[view(), view()], input, None, false);
+        let off = uniforms(&input);
+        assert!(off[green..].iter().all(|&value| value == 0.0));
+
+        let volume_to_world =
+            Mat4::from_rotation_translation(Quat::from_rotation_y(-0.3), Vec3::new(0.1, 1.1, -0.7));
+        let region = RegionOverride {
+            volume_to_world,
+            half_extents: Vec3::new(0.2, 0.1, 0.01),
+        };
+        let flat = RegionOverride {
+            half_extents: Vec3::new(0.2, 0.0, 0.01),
+            ..region
+        };
+        input.green_windows = [Some(flat), Some(region)];
+        let data = uniforms(&input);
+        assert_eq!(&data[green..green + 4], &[1.0, 0.0, 0.0, 0.0]);
+        let world_to_window = Mat4::from_cols_slice(&data[green + 4..green + 20]);
+        assert!(world_to_window.abs_diff_eq(volume_to_world.inverse(), 1e-6));
+        assert_eq!(&data[green + 20..green + 24], &[0.2, 0.1, 0.01, 1.0]);
+        assert!(data[green + 24..].iter().all(|&value| value == 0.0));
+        assert_eq!(&data[..green], &off[..green]);
+
+        input.green_windows = [Some(region); MAX_GREEN_WINDOWS];
+        assert_eq!(uniforms(&input)[green], 2.0);
     }
 
     #[test]
@@ -1978,6 +2069,7 @@ mod tests {
             arm_gaps: [None; 2],
             edge_cut: 0.0,
             lever_windows: [None; MAX_LEVER_WINDOWS],
+            green_windows: [None; MAX_GREEN_WINDOWS],
             capture_playzone: false,
             playzone_view: false,
             memory: None,
@@ -2004,7 +2096,9 @@ mod tests {
 
         // One box, centered in that frame
         assert_eq!(&data[base + 16..base + 20], &[1.0, 0.0, 0.0, 0.0]);
-        let boxes = DEPTH_UNIFORMS_FLOAT_COUNT - LEVER_FLOAT_COUNT - AREA_FLOAT_COUNT + 8;
+        let boxes =
+            DEPTH_UNIFORMS_FLOAT_COUNT - LEVER_FLOAT_COUNT - GREEN_FLOAT_COUNT - AREA_FLOAT_COUNT
+                + 8;
         assert_eq!(
             &data[boxes..boxes + 8],
             &[0.0, 0.0, 0.0, 0.0, 0.5, 0.5, 1.0, 0.0]
@@ -2048,6 +2142,7 @@ mod tests {
                 arm_gaps: [None; 2],
                 edge_cut: 0.0,
                 lever_windows: [None; MAX_LEVER_WINDOWS],
+                green_windows: [None; MAX_GREEN_WINDOWS],
                 capture_playzone: false,
                 playzone_view: false,
                 memory: None,
@@ -2064,7 +2159,11 @@ mod tests {
                 "{world_to_volume}"
             );
             assert_eq!(data[base + 16], 1.0);
-            let boxes = DEPTH_UNIFORMS_FLOAT_COUNT - LEVER_FLOAT_COUNT - AREA_FLOAT_COUNT + 8;
+            let boxes = DEPTH_UNIFORMS_FLOAT_COUNT
+                - LEVER_FLOAT_COUNT
+                - GREEN_FLOAT_COUNT
+                - AREA_FLOAT_COUNT
+                + 8;
             assert_eq!(&data[boxes + 4..boxes + 7], &[0.6, 0.45, 0.5]);
             assert_eq!(data[base + 20], 1.0);
             assert_eq!(data[base + 21], 0.0);
@@ -2134,6 +2233,7 @@ mod tests {
             arm_gaps: [None; 2],
             edge_cut: 0.0,
             lever_windows: [None; MAX_LEVER_WINDOWS],
+            green_windows: [None; MAX_GREEN_WINDOWS],
             capture_playzone: false,
             playzone_view: false,
             memory: None,

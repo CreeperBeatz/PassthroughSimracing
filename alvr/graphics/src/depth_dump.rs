@@ -669,6 +669,17 @@ impl DumpFrame<'_> {
                 array(self.input.lever_windows.each_ref().map(lever_window)),
             ));
         }
+        // `debug.alvr.green_boxes`: only with a zone, so that other dumps stay as they were
+        if self.input.green_windows.iter().any(Option::is_some) {
+            fields.push((
+                "green_windows",
+                array(self.input.green_windows.each_ref().map(|region| {
+                    lever_window(
+                        &region.map(|region| depth_mask::LeverWindow { region, open: 1.0 }),
+                    )
+                })),
+            ));
+        }
         // U3 (`debug.alvr.mem_roll`): only with the memory, so that other dumps stay as they were
         if let Some(memory) = &self.memory {
             fields.push(("memory", memory.clone()));
@@ -826,6 +837,7 @@ mod tests {
             ],
             edge_cut: 0.65,
             lever_windows: [None; depth_mask::MAX_LEVER_WINDOWS],
+            green_windows: [None; depth_mask::MAX_GREEN_WINDOWS],
             capture_playzone: false,
             playzone_view: false,
             memory: None,
@@ -922,6 +934,18 @@ mod tests {
         assert!(
             json.contains(
                 r#""lever_windows":[null,{"center":[0.25,0.5,-0.5],"half":[0.1,0.15,0.1],"yaw_deg":0,"open":0.5},null,null]"#
+            ),
+            "{json}"
+        );
+        // The green-screen zone likewise, only with a box, always open
+        assert!(!dump(&input).contains("green_windows"));
+        let mut green_input = input;
+        green_input.green_windows[0] = lever_input.lever_windows[1].map(|window| window.region);
+        let json = dump(&green_input);
+        assert!(is_valid_json(&json), "{json}");
+        assert!(
+            json.contains(
+                r#""green_windows":[{"center":[0.25,0.5,-0.5],"half":[0.1,0.15,0.1],"yaw_deg":0,"open":1},null]"#
             ),
             "{json}"
         );

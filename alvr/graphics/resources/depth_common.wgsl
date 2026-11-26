@@ -8,6 +8,8 @@ const HAND_SEGMENTS: u32 = 28u;
 const AREA_BOXES: u32 = 8u;
 // Lever windows, see `LeverWindow` in depth_mask.rs
 const LEVER_WINDOWS: u32 = 4u;
+// Boxes of the green-screen zone, see `MAX_GREEN_WINDOWS` in depth_mask.rs
+const GREEN_WINDOWS: u32 = 2u;
 
 // All positions/poses are in the stage reference space
 struct DepthEye {
@@ -124,6 +126,11 @@ struct DepthUniforms {
     area_boxes: array<AreaBox, AREA_BOXES>,
     // Only the first area.w are used
     lever_windows: array<LeverWindow, LEVER_WINDOWS>,
+    // The green-screen zone (`debug.alvr.green_boxes`, green_screen.rs), all 0 when it is off: today's.
+    // x: number of boxes in green_windows
+    green: vec4f,
+    // Only the first green.x are used, each fully open (half.w 1)
+    green_windows: array<LeverWindow, GREEN_WINDOWS>,
 }
 
 // The depth cloud (`debug.alvr.cloud`, motion_cloud.rs, motion_cloud.wgsl). One eye's field: the camera
@@ -148,6 +155,31 @@ struct CloudUniforms {
     // measured), w: `cloud_window`, half of the window of the field's search (cells, 1..24, 12 by
     // default; phi is stored and read as a share of 2 x this, texels)
     reach: vec4f,
+}
+
+// Whether a view ray crosses a box of the green-screen zone in front of the eye (or starts inside it),
+// whatever the depth says: the slab test of lever_coverage in depth_mask.wgsl. Read by depth_mask.wgsl
+// (the zone) and stream.wgsl (its debug tint)
+fn in_green_zone(origin: vec3f, dir: vec3f) -> bool {
+    let count = min(u32(depth_u.green.x), GREEN_WINDOWS);
+    for (var i = 0u; i < count; i++) {
+        let window = depth_u.green_windows[i];
+        let o = (window.world_to_window * vec4f(origin, 1.0)).xyz;
+        let d = (window.world_to_window * vec4f(dir, 0.0)).xyz;
+        let tiny = vec3f(1e-6);
+        let safe = select(d, tiny, abs(d) < tiny);
+        let half = window.half.xyz;
+        let t1 = (-half - o) / safe;
+        let t2 = (half - o) / safe;
+        let t_min = min(t1, t2);
+        let t_max = max(t1, t2);
+        let near = max(max(t_min.x, t_min.y), t_min.z);
+        let far = min(min(t_max.x, t_max.y), t_max.z);
+        if far >= max(near, 0.0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // The region of the depth mask, read by depth_mask.wgsl and motion_cloud.wgsl

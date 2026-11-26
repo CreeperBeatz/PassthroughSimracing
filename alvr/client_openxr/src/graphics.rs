@@ -191,6 +191,9 @@ pub struct ProjectionLayerBuilder<'a> {
     layers: [xr::CompositionLayerProjectionView<'a, xr::OpenGlEs>; 2],
     // The lower color key layer may only show the part with the hands
     lower_key_layers: Option<[xr::CompositionLayerProjectionView<'a, xr::OpenGlEs>; 2]>,
+    // `debug.alvr.green_boxes` (green_screen.rs): the opaque layer under the green-keyed passthrough, the
+    // views cropped to the zone. None: no such layer (the default)
+    green_under_layers: Option<[xr::CompositionLayerProjectionView<'a, xr::OpenGlEs>; 2]>,
     alpha: Option<ProjectionLayerAlphaConfig>,
     composition_layer_settings: Option<xr::sys::CompositionLayerSettingsFB>,
     lower_key_alpha: xr::sys::CompositionLayerColorScaleBiasKHR,
@@ -220,6 +223,7 @@ impl<'a> ProjectionLayerBuilder<'a> {
             reference_space,
             layers,
             lower_key_layers: None,
+            green_under_layers: None,
             alpha,
             composition_layer_settings,
             lower_key_alpha: alpha_scale_bias(2.0, 0.0),
@@ -253,6 +257,26 @@ impl<'a> ProjectionLayerBuilder<'a> {
     ) -> Self {
         self.lower_key_layers = Some(layers);
         self
+    }
+
+    /// `debug.alvr.green_boxes`: the views of the layer under the green-keyed passthrough (same poses
+    /// and swapchains, the zone's part of each view)
+    pub fn with_green_under(
+        mut self,
+        layers: [xr::CompositionLayerProjectionView<'a, xr::OpenGlEs>; 2],
+    ) -> Self {
+        self.green_under_layers = Some(layers);
+        self
+    }
+
+    /// The layer under the green-keyed passthrough, if `with_green_under` gave its views: the same
+    /// image as the other game layers, opaque (no blend flag: its alpha, the packed one of the colour
+    /// key, is ignored), nothing chained. Where the passthrough above it keys the monitor's green, the
+    /// game shows
+    pub fn build_green_under(&self) -> Option<xr::CompositionLayerProjection<'_, xr::OpenGlEs>> {
+        self.green_under_layers.as_ref().map(|layers| {
+            self.build_with_next(xr::CompositionLayerFlags::EMPTY, ptr::null(), layers)
+        })
     }
 
     /// Layers below and above the color keyed passthrough. They show the same image with different

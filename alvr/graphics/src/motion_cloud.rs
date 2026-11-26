@@ -442,7 +442,10 @@ pub fn cloud_uniforms(
 /// of the area, the number of boxes, the region mode, max distance and soft edge, the boxes. Another
 /// value: the region changed
 pub fn region_signature(depth_uniforms: &[f32]) -> u64 {
-    use crate::{depth_mask::LEVER_FLOAT_COUNT, play_area::AREA_FLOAT_COUNT};
+    use crate::{
+        depth_mask::{GREEN_FLOAT_COUNT, LEVER_FLOAT_COUNT},
+        play_area::AREA_FLOAT_COUNT,
+    };
     use std::hash::{DefaultHasher, Hasher};
 
     // world_to_area right after the two eyes of `DepthEye`, then `area` and `region`
@@ -454,13 +457,14 @@ pub fn region_signature(depth_uniforms: &[f32]) -> u64 {
         }
     };
     let len = depth_uniforms.len();
-    if len < AREA_START + 24 + AREA_FLOAT_COUNT + LEVER_FLOAT_COUNT {
+    if len < AREA_START + 24 + AREA_FLOAT_COUNT + LEVER_FLOAT_COUNT + GREEN_FLOAT_COUNT {
         add(depth_uniforms);
         return hasher.finish();
     }
     add(&depth_uniforms[AREA_START..AREA_START + 17]);
     add(&depth_uniforms[AREA_START + 20..AREA_START + 23]);
-    let boxes_end = len - LEVER_FLOAT_COUNT;
+    // The lever windows and the green-screen zone come after the boxes
+    let boxes_end = len - LEVER_FLOAT_COUNT - GREEN_FLOAT_COUNT;
     add(&depth_uniforms[boxes_end - AREA_FLOAT_COUNT..boxes_end]);
     hasher.finish()
 }
@@ -1044,8 +1048,15 @@ mod tests {
         other[3] = 2.0;
         other[300] = 2.0;
         assert_eq!(region_signature(&other), signature);
+        // A lever window, the green-screen zone: the same
+        other[count - crate::depth_mask::GREEN_FLOAT_COUNT - 1] = 2.0;
+        other[count - 1] = 2.0;
+        other[count - crate::depth_mask::GREEN_FLOAT_COUNT] = 1.0;
+        assert_eq!(region_signature(&other), signature);
         // The transform of the area, the soft edge, a box: another
-        for index in [112, 134, count - crate::depth_mask::LEVER_FLOAT_COUNT - 1] {
+        let boxes_end =
+            count - crate::depth_mask::LEVER_FLOAT_COUNT - crate::depth_mask::GREEN_FLOAT_COUNT;
+        for index in [112, 134, boxes_end - 1] {
             let mut other = base.clone();
             other[index] = 2.0;
             assert_ne!(region_signature(&other), signature, "{index}");

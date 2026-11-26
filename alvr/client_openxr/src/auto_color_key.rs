@@ -3,6 +3,7 @@
 
 use crate::{
     camera::{self, CameraCalibration, CameraFrame, PassthroughCamera},
+    green_screen::SharedGreenCamera,
     interaction::InteractionContext,
     passthrough::{KeyAutoParams, WristParams, debug_property},
     stream::PALM_JOINTS,
@@ -105,6 +106,8 @@ struct Context {
     leak_map: Arc<Mutex<SharedLeakMap>>,
     // `debug.alvr.burst`: takes the camera image of each pass while a burst runs
     camera_burst: SharedCameraBurst,
+    // `debug.alvr.green_boxes` (green_screen.rs): the zone, and what each pass saw through it
+    green: SharedGreenCamera,
 }
 
 pub struct AutoColorKey {
@@ -116,12 +119,14 @@ pub struct AutoColorKey {
 }
 
 impl AutoColorKey {
-    /// `camera_burst`: see `debug.alvr.burst` (burst.rs)
+    /// `camera_burst`: see `debug.alvr.burst` (burst.rs). `green`: see `debug.alvr.green_boxes`
+    /// (green_screen.rs)
     pub fn new(
         stage_space: Arc<xr::Space>,
         view_space: Arc<xr::Space>,
         interaction_context: Arc<RwLock<InteractionContext>>,
         camera_burst: SharedCameraBurst,
+        green: SharedGreenCamera,
     ) -> Self {
         let running = Arc::new(RelaxedAtomic::new(true));
         let lut = Arc::new(Mutex::new(None));
@@ -136,6 +141,7 @@ impl AutoColorKey {
             verified: Arc::clone(&verified),
             leak_map: Arc::clone(&leak_map),
             camera_burst,
+            green,
         };
 
         Self {
@@ -321,6 +327,25 @@ fn learn_loop(context: &Context) {
             else {
                 continue;
             };
+            // `debug.alvr.green_boxes` (green_screen.rs): what the camera sees through the zone, at most
+            // `GREEN_CAMERA_SAMPLES` pixels of the image (nothing allocated), for the `green:` line
+            let green_zone = context.green.lock().zone;
+            if let Some(zone) = green_zone {
+                let stats = alvr_graphics::green_camera_stats(
+                    &view,
+                    camera.calibration.width,
+                    camera.calibration.height,
+                    zone.boxes(),
+                    &zone.key,
+                    alvr_graphics::GREEN_CAMERA_SAMPLES,
+                    |x, y| frame.rgb(x, y),
+                );
+                let mut shared = context.green.lock();
+                // Not for a zone that changed meanwhile
+                if shared.zone == Some(zone) {
+                    shared.stats = Some((Instant::now(), stats));
+                }
+            }
             // The conversion to RGB (320 x 240 pixels) runs on this thread, not on the render thread;
             // the pass is that much later
             if burst_wants && let Some(&(head, located_hands)) = located.as_deref() {

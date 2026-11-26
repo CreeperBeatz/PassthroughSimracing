@@ -1457,6 +1457,7 @@ impl StreamRenderer {
                 arm_gaps: [None; 2],
                 edge_cut: 0.0,
                 lever_windows: [None; depth_mask::MAX_LEVER_WINDOWS],
+                green_windows: [None; depth_mask::MAX_GREEN_WINDOWS],
                 capture_playzone: false,
                 playzone_view: false,
                 memory: None,

@@ -5,6 +5,7 @@ use crate::{
     burst::{self, BurstRecorder},
     extra_extensions::EnvironmentDepthMETA,
     graphics::{self, ProjectionLayerAlphaConfig, ProjectionLayerBuilder},
+    green_screen::{GreenConditions, GreenFrame, GreenLayers, GreenScreen},
     interaction::{self, InteractionContext, InteractionSourcesConfig},
     lever::{LeverHand, LeverParams, LeverWindows},
     motion_cloud::{self, CloudLog, CloudOff},
@@ -29,9 +30,9 @@ use alvr_graphics::{
     ArmGap, ArmMotion, BridgeChoice, BurstArmSample, BurstArmSamples, BurstHand, BurstLut,
     CloudInput, CloudParams, CloudRecord, ColorKeyInput, DepthDumpFiles, DepthDumpRequest,
     DepthFrame, DepthRenderInput, DumpJoint, EditorHand, EditorInput, GraphicsContext,
-    HAND_SEGMENTS, HandRay, HandShape, HandZones, LeakGains, LeverWindow, MAX_LEVER_WINDOWS,
-    MemoryInput, MemoryParams, MemoryRecord, OverlaySegment, PlacedArea, RenderAblation,
-    SEGMENT_JOINTS, StreamRenderer, StreamViewParams, WristBridge,
+    GreenKeyParams, HAND_SEGMENTS, HandRay, HandShape, HandZones, LeakGains, LeverWindow,
+    MAX_GREEN_WINDOWS, MAX_LEVER_WINDOWS, MemoryInput, MemoryParams, MemoryRecord, OverlaySegment,
+    PlacedArea, RenderAblation, SEGMENT_JOINTS, StreamRenderer, StreamViewParams, WristBridge,
 };
 use alvr_packets::{ClientStreamConfig, RealTimeConfig, TrackingData};
 use alvr_session::{
@@ -351,6 +352,9 @@ pub struct ColorKeyFrame {
     pub hands_in_view: bool,
     /// Applied zones of each hand, for the log
     pub hand_zones: [Option<HandZones>; 2],
+    /// `debug.alvr.green_boxes` (green_screen.rs): the rule of the green-keyed base passthrough while the
+    /// zone is on. None: the plain base layer (the default)
+    pub green_key: Option<GreenKeyParams>,
 }
 
 pub struct ParsedStreamConfig {
@@ -540,6 +544,9 @@ pub struct StreamContext {
     last_perf_log: Instant,
     ablation: RenderAblation,
     last_ablation_poll: Instant,
+    // `debug.alvr.green_boxes` (green_screen.rs): the green-screen key's properties, the camera learner's
+    // share, the `green:` line. Unset (the default): nothing per frame
+    green: GreenScreen,
 }
 
 impl StreamContext {
@@ -786,6 +793,7 @@ impl StreamContext {
             last_perf_log: Instant::now(),
             ablation: RenderAblation::default(),
             last_ablation_poll: Instant::now(),
+            green: GreenScreen::default(),
         };
         // From the first frame
         this.poll_ablation(true);
@@ -831,8 +839,36 @@ impl StreamContext {
                 Arc::clone(&self.view_reference_space),
                 Arc::clone(&self.interaction_context),
                 self.burst.camera_sink(),
+                self.green.camera(),
             ));
         }
+    }
+
+    /// `debug.alvr.green_boxes`: what lib.rs submitted in the frame before (for the `green:` line)
+    pub fn report_green_layers(&mut self, layers: GreenLayers) {
+        self.green.report_layers(layers);
+    }
+
+    // `debug.alvr.green_boxes` (green_screen.rs): the zone of this frame and the `green:` line, None while
+    // the property is unset. `views`: the pose and fov the game layers are submitted with
+    fn green_frame(&mut self, views: &[ViewParams; 2]) -> Option<GreenFrame> {
+        self.green.poll();
+        let conditions = GreenConditions {
+            depth: self.uses_depth_passthrough(),
+            color_key: self.color_key.is_some(),
+            custom_reprojection: self.use_custom_reprojection,
+        };
+        let frame = self
+            .green
+            .frame(conditions, self.region_override.as_ref(), views)?;
+        #[cfg(target_os = "android")]
+        let learner = self.auto_color_key.is_some();
+        #[cfg(not(target_os = "android"))]
+        let learner = false;
+        self.green
+            .log(&frame, learner, self.region_override.as_ref());
+
+        Some(frame)
     }
 
     /// The play area placed from a marker on the rig (its boxes), used for the depth mask instead of
@@ -2541,6 +2577,7 @@ impl StreamContext {
                         arm_gaps: [None; 2],
                         edge_cut: 0.0,
                         lever_windows: [None; MAX_LEVER_WINDOWS],
+                        green_windows: [None; MAX_GREEN_WINDOWS],
                         capture_playzone: false,
                         playzone_view: false,
                         memory: None,
@@ -2603,6 +2640,8 @@ impl StreamContext {
             arm_gaps,
             edge_cut,
             lever_windows,
+            // Set by `render` while the green-screen zone is on
+            green_windows: [None; MAX_GREEN_WINDOWS],
             capture_playzone,
             playzone_view,
             memory,
@@ -2737,6 +2776,14 @@ impl StreamContext {
                 *last = rect;
             }
         }
+        // `debug.alvr.green_boxes`: the zone's boxes go to the depth mask while it is on
+        let green = self.green_frame(&output_view_params);
+        if let Some(green) = &green
+            && let Ok(windows) = green.state
+            && let Some(input) = &mut depth_input
+        {
+            input.green_windows = windows;
+        }
         let key_frame = ColorKeyFrame {
             tracked_hands: self.hand_bounds.get().map(|bounds| bounds.is_some()),
             playzone_age: self.renderer.playzone_age(),
@@ -2750,6 +2797,7 @@ impl StreamContext {
                 .map_or([None; 2], |key| {
                     key.hands.map(|hand| hand.map(|(_, zones)| zones))
                 }),
+            green_key: green.as_ref().and_then(|green| green.key),
         };
 
         // Outside the hands the lower color key layer is covered by the upper one, or shows the same
@@ -2929,6 +2977,45 @@ impl StreamContext {
             layer.crop_lower_key_layer([0, 1].map(|i| {
                 let (offset, size, fov) =
                     crops[i].unwrap_or((UVec2::ZERO, resolution, output_view_params[i].fov));
+
+                xr::CompositionLayerProjectionView::new()
+                    .pose(crate::to_xr_pose(output_view_params[i].pose))
+                    .fov(crate::to_xr_fov(fov))
+                    .sub_image(
+                        xr::SwapchainSubImage::new()
+                            .swapchain(&swapchains[i])
+                            .image_array_index(0)
+                            .image_rect(xr::Rect2Di {
+                                offset: xr::Offset2Di {
+                                    x: offset.x as _,
+                                    y: offset.y as _,
+                                },
+                                extent: xr::Extent2Di {
+                                    width: size.x as _,
+                                    height: size.y as _,
+                                },
+                            }),
+                    )
+            }))
+        } else {
+            layer
+        };
+
+        // `debug.alvr.green_boxes`: the layer under the green-keyed passthrough, the zone's part of each
+        // view (padded) with the pose of the other game layers. The y origin of the image rect as the
+        // lower layer's crop (`key_crop 2`: at the top)
+        let top_origin = self.color_key.is_some_and(|params| params.crop == 2);
+        let green_under = green.and_then(|green| Some((green.under?, green.pad)));
+        let layer = if let Some((rects, pad)) = green_under {
+            let swapchains = &self.swapchains;
+            layer.with_green_under([0, 1].map(|i| {
+                let (offset, size, fov) = alvr_graphics::green_under_crop(
+                    output_view_params[i].fov,
+                    resolution,
+                    rects[i],
+                    pad,
+                    top_origin,
+                );
 
                 xr::CompositionLayerProjectionView::new()
                     .pose(crate::to_xr_pose(output_view_params[i].pose))

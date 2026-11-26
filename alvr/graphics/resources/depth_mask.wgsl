@@ -15,7 +15,8 @@
 // with the cloud's trail (`cloud_trail`, depth_u.cloud.z above 0) how much of the solid mask the
 // stream hands to the key (0..1, see cloud_zone; less near the hands with `cloud_trail_hands`, none on
 // what only the remembered playzone shows), a: how much of r comes from the remembered playzone
-// (for the debug view)
+// (for the debug view). In the green-screen zone (`debug.alvr.green_boxes`) r 1, g, b and a 0, see
+// fragment_main
 
 struct Immediate {
     view_idx: u32,
@@ -55,6 +56,18 @@ fn vertex_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 
 @fragment
 fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
+    // The green-screen zone (`debug.alvr.green_boxes`, green_screen.rs): every view ray through one of
+    // its boxes shows the room, whatever the depth says (also before the first depth image), and nothing
+    // hands it to the colour key or its trail, nor calls it remembered: both game layers get a hole and
+    // the green-keyed passthrough below them decides. Without a box (the default) nothing is done
+    if depth_u.green.x > 0.0 {
+        let eye = depth_u.eyes[imm.view_idx];
+        let dir = normalize((eye.uv_to_world_dir * vec4f(uv, 1.0, 0.0)).xyz);
+        if in_green_zone(eye.eye_position.xyz, dir) {
+            return vec4f(1.0, 0.0, 0.0, 0.0);
+        }
+    }
+
     if depth_u.depth.z < 0.5 {
         return vec4f(0.0);
     }

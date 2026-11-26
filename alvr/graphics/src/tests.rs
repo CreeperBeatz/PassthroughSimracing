@@ -7,8 +7,8 @@ use crate::{
     depth_dump::{DumpReadback, DumpSource},
     depth_mask::{
         self, ArmGap, ArmMotion, ColorKeyInput, DepthFrame, DepthRenderInput, HAND_SEGMENTS,
-        HandShape, HandSweep, HandZones, LeverWindow, MAX_LEVER_WINDOWS, RegionOverride,
-        SweepParams, WristBridge,
+        HandShape, HandSweep, HandZones, LeverWindow, MAX_GREEN_WINDOWS, MAX_LEVER_WINDOWS,
+        RegionOverride, SweepParams, WristBridge,
     },
     motion_cloud::{
         CLOUD_EYE_FLOAT_COUNT, CLOUD_SPEED_FLOOR, CLOUD_SPEED_SCALE, CLOUD_TRUNCATION,
@@ -171,10 +171,14 @@ fn depth_uniforms_layout_matches_the_shader() {
     };
     let (_, box_size) = struct_of("AreaBox");
     assert_eq!(box_size, 4 * play_area::AREA_BOX_FLOAT_COUNT);
-    // The lever windows last, after the play area
+    // The green-screen zone last (its vector, then its boxes), the lever windows before it, after the
+    // play area
+    let green_start = depth_mask::DEPTH_UNIFORMS_SIZE - 4 * depth_mask::GREEN_FLOAT_COUNT;
+    assert_eq!(offset("green"), green_start);
+    assert_eq!(offset("green_windows"), green_start + 16);
     let (_, lever_size) = struct_of("LeverWindow");
     assert_eq!(lever_size, 4 * depth_mask::LEVER_WINDOW_FLOAT_COUNT);
-    let levers_start = depth_mask::DEPTH_UNIFORMS_SIZE - 4 * depth_mask::LEVER_FLOAT_COUNT;
+    let levers_start = green_start - 4 * depth_mask::LEVER_FLOAT_COUNT;
     assert_eq!(offset("lever_windows"), levers_start);
     let area_start = levers_start - 4 * play_area::AREA_FLOAT_COUNT;
     assert_eq!(offset("area_bounds"), area_start);
@@ -188,7 +192,7 @@ fn depth_uniforms_layout_matches_the_shader() {
     assert_eq!(offset("memory"), offset("playzone") + 16);
     assert_eq!(offset("cloud"), offset("memory") + 16);
     assert_eq!(offset("key_lower"), offset("cloud") + 16);
-    assert_eq!(depth_mask::DEPTH_UNIFORMS_SIZE, 4528);
+    assert_eq!(depth_mask::DEPTH_UNIFORMS_SIZE, 4704);
     // Where the box of the settings was: 2 eyes, then the transform and the number of boxes
     let eyes = 2 * 4 * (16 + 4 + 16 + 16 + 4);
     assert_eq!(offset("world_to_area"), eyes);
@@ -720,6 +724,8 @@ struct MaskV2 {
     depth_yaw: f32,
     /// The lever windows (U2 of design/universal/final.md). Default: none
     lever_windows: [Option<LeverWindow>; MAX_LEVER_WINDOWS],
+    /// The green-screen zone (`debug.alvr.green_boxes`). Default: none
+    green_windows: [Option<RegionOverride>; MAX_GREEN_WINDOWS],
     /// The room memory's input (U3). Default: none, today's playzone
     memory: Option<MemoryInput>,
     /// The depth cloud's input. Default: none, off
@@ -926,6 +932,7 @@ fn render_v2(
         arm_gaps: mask_v2.arm_gaps,
         edge_cut: mask_v2.edge_cut,
         lever_windows: mask_v2.lever_windows,
+        green_windows: mask_v2.green_windows,
         capture_playzone: false,
         playzone_view,
         memory: mask_v2.memory,
@@ -2802,6 +2809,7 @@ fn depth_dump_reads_back_meters_and_masks() {
         arm_gaps: [None; 2],
         edge_cut: 0.0,
         lever_windows: [None; MAX_LEVER_WINDOWS],
+        green_windows: [None; MAX_GREEN_WINDOWS],
         capture_playzone: false,
         playzone_view: false,
         memory: None,
@@ -3809,6 +3817,7 @@ impl MemoryRig {
             arm_gaps: [None; 2],
             edge_cut: 0.0,
             lever_windows: [None; MAX_LEVER_WINDOWS],
+            green_windows: [None; MAX_GREEN_WINDOWS],
             capture_playzone: false,
             playzone_view: false,
             memory,
@@ -4411,6 +4420,7 @@ fn memory_off_reads_the_playzone_as_today() {
         arm_gaps: [None; 2],
         edge_cut: 0.0,
         lever_windows: [None; MAX_LEVER_WINDOWS],
+        green_windows: [None; MAX_GREEN_WINDOWS],
         capture_playzone: false,
         playzone_view: false,
         memory,
@@ -4775,6 +4785,7 @@ impl CloudRig {
             arm_gaps: [None; 2],
             edge_cut: 0.0,
             lever_windows: [None; MAX_LEVER_WINDOWS],
+            green_windows: [None; MAX_GREEN_WINDOWS],
             capture_playzone: false,
             playzone_view: false,
             memory: None,
@@ -4902,6 +4913,7 @@ impl CloudRig {
             arm_gaps: [None; 2],
             edge_cut: 0.0,
             lever_windows: [None; MAX_LEVER_WINDOWS],
+            green_windows: [None; MAX_GREEN_WINDOWS],
             capture_playzone: false,
             playzone_view: false,
             memory: None,
@@ -6279,6 +6291,132 @@ fn cloud_zone_is_inert_outside_the_lower_layer() {
     assert_eq!(without.alpha(0.1, 0.1), 1.0);
 }
 
+/// The picture and the mask with the depth cloud's zone and trail open everywhere (the probe field, a
+/// cell inside the mask at the largest speed), the box of `cloud_zone_is_inert_outside_the_lower_layer`
+/// and the lower layer in the left half of the view, with the green-screen zone `green`
+fn green_zone_render(
+    device: &Device,
+    queue: &Queue,
+    config: &DepthPassthroughConfig,
+    green: [Option<RegionOverride>; MAX_GREEN_WINDOWS],
+) -> Output {
+    let scene = Scene::new(3.0, [0.3, 0.3, 0.7, 0.7], 0.5);
+    let lower = (Vec2::ZERO, Vec2::new(0.5, 1.0));
+    render_v2(
+        device,
+        queue,
+        config,
+        &scene,
+        Vec3::ZERO,
+        Vec3::ZERO,
+        true,
+        Some(cloud_key()),
+        [None; 2],
+        None,
+        Some([lower; 2]),
+        false,
+        &[],
+        None,
+        0.0,
+        0.0,
+        MaskV2 {
+            cloud: Some(CloudInput {
+                params: CloudParams {
+                    trail: 6.0,
+                    trail_age: 0,
+                    ..Default::default()
+                },
+                capture_ns: Some(0),
+                display_ns: 100_000_000,
+                shown: true,
+            }),
+            cloud_probe: true,
+            cloud_probe_cell: Some(CLOUD_TRAIL_NEAR),
+            green_windows: green,
+            ..Default::default()
+        },
+    )
+}
+
+// `debug.alvr.green_boxes`: along every view ray through a box of the green-screen zone the mask is r 1,
+// g, b, a 0 whatever the depth, the cloud's zone or its trail say, so both game layers are open there
+// (packed alpha 0 where the lower layer is used, 0.5 beside it: the upper layer alone, open). Elsewhere
+// the mask and the picture are today's. With the Tint mask view the zone's game colour is blue
+#[test]
+fn green_zone_opens_both_layers_through_its_box() {
+    let (device, queue) = gpu_or_skip!();
+    let config = cloud_config();
+    // A slab 100 x 30 x 2 cm, 1 m ahead and 30 cm up (view uv 0.25..0.75 x 0.28..0.43): across both
+    // halves of the view, partly over the box of the scene and partly over the room
+    let zone = RegionOverride {
+        volume_to_world: Mat4::from_translation(Vec3::new(0.0, 0.3, -1.0)),
+        half_extents: Vec3::new(0.5, 0.15, 0.01),
+    };
+    let without = green_zone_render(&device, &queue, &config, [None; MAX_GREEN_WINDOWS]);
+    let with = green_zone_render(&device, &queue, &config, [None, Some(zone)]);
+    // Off is the picture of the shaders before the zone: the cloud opens something in this scene
+    assert!(without.pixels.iter().any(|pixel| pixel[3] != 255));
+
+    let window = LeverWindow {
+        region: zone,
+        open: 1.0,
+    };
+    let ray = |x: f32, y: f32| {
+        let (u, v) = (x / TARGET_SIZE as f32, y / TARGET_SIZE as f32);
+        Vec3::new(2.0 * u - 1.0, 1.0 - 2.0 * v, -1.0).normalize()
+    };
+    let (mut inside, mut changed, mut beside_lower) = (0, 0, 0);
+    for y in 0..TARGET_SIZE {
+        for x in 0..TARGET_SIZE {
+            let (cx, cy) = (x as f32 + 0.5, y as f32 + 0.5);
+            let covered = |dx: f32, dy: f32| window.ray_coverage(Vec3::ZERO, ray(cx + dx, cy + dy));
+            let centre = covered(0.0, 0.0);
+            // The mask is filtered: a pixel from the outline either side may blend
+            if [(-1.5, 0.0), (1.5, 0.0), (0.0, -1.5), (0.0, 1.5)]
+                .iter()
+                .any(|&(dx, dy)| covered(dx, dy) != centre)
+            {
+                continue;
+            }
+            let index = (y * TARGET_SIZE + x) as usize;
+            if centre > 0.0 {
+                inside += 1;
+                assert_eq!(with.mask[index], [255, 0, 0, 0], "{x} {y}");
+                let alpha = with.pixels[index][3];
+                if cx < 0.5 * TARGET_SIZE as f32 {
+                    assert_eq!(alpha, 0, "{x} {y}");
+                } else {
+                    beside_lower += 1;
+                    assert!(alpha.abs_diff(128) <= 1, "{x} {y} {alpha}");
+                }
+                // The game colour stays in the image: the layer under the passthrough shows it
+                assert_eq!(&with.pixels[index][..3], &without.pixels[index][..3]);
+                if with.pixels[index] != without.pixels[index] {
+                    changed += 1;
+                }
+            } else {
+                assert_eq!(with.mask[index], without.mask[index], "{x} {y}");
+                assert_eq!(with.pixels[index], without.pixels[index], "{x} {y}");
+            }
+        }
+    }
+    assert!(inside > 100, "{inside}");
+    assert!(beside_lower > 40, "{beside_lower}");
+    assert!(changed > 40, "{changed}");
+
+    // The debug tint: blue in the zone only
+    let tint = DepthPassthroughConfig {
+        debug_view: DepthPassthroughDebugView::TintMask,
+        ..config.clone()
+    };
+    let tint_without = green_zone_render(&device, &queue, &tint, [None; MAX_GREEN_WINDOWS]);
+    let tint_with = green_zone_render(&device, &queue, &tint, [Some(zone), None]);
+    let [r, g, b, _] = tint_with.at(0.4, 0.35);
+    assert!(b > 150 && r < 80 && g < 80, "{r} {g} {b}");
+    assert_eq!(tint_with.at(0.3, 0.8), tint_without.at(0.3, 0.8));
+    assert_eq!(tint_with.at(0.9, 0.1), tint_without.at(0.9, 0.1));
+}
+
 /// Probe cells for `cloud_trail`: inside the mask 2.8 and 10.1 texels from the edge at the largest
 /// speed, and 2.8 texels inside at rest; all on surface that just arrived (arrival count 0, a recent
 /// one for `cloud_trail_age`)
@@ -7035,6 +7173,7 @@ fn cloud_vector_in_the_depth_uniforms() {
         arm_gaps: [None; 2],
         edge_cut: 0.0,
         lever_windows: [None; MAX_LEVER_WINDOWS],
+        green_windows: [None; MAX_GREEN_WINDOWS],
         capture_playzone: false,
         playzone_view: false,
         memory: None,

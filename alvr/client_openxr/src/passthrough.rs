@@ -3,7 +3,7 @@ use alvr_common::{
     anyhow::{Result, bail},
     error,
 };
-use alvr_graphics::{HandSweep, HandZones, SweepParams};
+use alvr_graphics::{GreenKeyParams, HandSweep, HandZones, SweepParams};
 use alvr_system_info::Platform;
 use openxr::{self as xr};
 use std::{
@@ -19,6 +19,10 @@ pub struct PassthroughLayer<'a> {
     handle_htc: Option<PassthroughHTC>,
     // Version of the applied color key, 0: none
     color_key_version: u32,
+    // `debug.alvr.green_boxes` (green_screen.rs): the rule of the green-keyed base layer last asked for
+    // (None: none, the plain base layer), and its table, reused for the updates
+    green_key: Option<GreenKeyParams>,
+    green_lut: Vec<u8>,
     _marker: PhantomData<&'a ()>,
 }
 
@@ -40,6 +44,8 @@ impl PassthroughLayer<'_> {
             handle_fb,
             handle_htc,
             color_key_version: 0,
+            green_key: None,
+            green_lut: Vec::new(),
             _marker: PhantomData,
         })
     }
@@ -77,6 +83,48 @@ impl PassthroughLayer<'_> {
         let layer = self.handle_fb.as_ref()?.color_key_layer()?;
 
         Some(unsafe { &*ptr::from_ref(layer).cast() })
+    }
+
+    /// `debug.alvr.green_boxes` (green_screen.rs): key the base passthrough by monitor green with this
+    /// rule (Some), or go back to the plain base layer (None: the green layer and its LUT are destroyed).
+    /// The runtime is called only when the rule changes: a new rule updates the LUT in place. A failure
+    /// is logged and not retried until the rule changes. Returns whether the green-keyed base layer is
+    /// in use (then `base_layer` is it)
+    pub fn update_green_key(&mut self, params: Option<GreenKeyParams>) -> bool {
+        let Some(handle) = &mut self.handle_fb else {
+            return false;
+        };
+        if params != self.green_key {
+            let result = match params {
+                None => handle.set_green_key(None),
+                Some(params) => {
+                    self.green_lut.resize(COLOR_KEY_SIZE, 0);
+                    alvr_graphics::fill_green_key_lut(&params, &mut self.green_lut);
+                    if handle.green_layer().is_some() {
+                        handle.update_green_key(&self.green_lut)
+                    } else {
+                        handle.set_green_key(Some(&self.green_lut))
+                    }
+                }
+            };
+            if let Err(e) = result {
+                error!("Passthrough green key: {e}");
+                crate::stream_log(&format!("green: the green-keyed base layer failed: {e}"));
+            }
+            self.green_key = params;
+        }
+
+        handle.green_layer().is_some()
+    }
+
+    /// The bottom passthrough layer: the green-keyed one while `update_green_key` says it is in use,
+    /// else the plain one (`Deref`)
+    pub fn base_layer(&self) -> &xr::CompositionLayerBase<'_, xr::OpenGlEs> {
+        if let Some(layer) = self.handle_fb.as_ref().and_then(PassthroughFB::green_layer) {
+            unsafe { &*ptr::from_ref(layer).cast() }
+        } else {
+            self
+        }
     }
 }
 

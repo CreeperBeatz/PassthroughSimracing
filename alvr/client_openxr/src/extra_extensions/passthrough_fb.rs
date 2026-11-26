@@ -16,6 +16,8 @@ pub struct PassthroughFB {
     ext_fns: raw::PassthroughFB,
     lut_fns: Option<raw::PassthroughColorLutMETA>,
     key: Option<KeyedLayer>,
+    // `debug.alvr.green_boxes`: the base layer keyed by monitor green, see `set_green_key`
+    green: Option<KeyedLayer>,
     session: sys::Session,
 }
 
@@ -83,6 +85,7 @@ impl PassthroughFB {
             ext_fns,
             lut_fns: session.instance().exts().meta_passthrough_color_lut,
             key: None,
+            green: None,
             session: session.as_raw(),
         })
     }
@@ -91,8 +94,7 @@ impl PassthroughFB {
     /// channel of a LUT (`COLOR_KEY_SIZE` bytes). The key is applied by the compositor to the image
     /// it displays, so it doesn't lag behind it.
     pub fn set_color_key(&mut self, data: Option<&[u8]>) -> xr::Result<()> {
-        let lut_fns = self
-            .lut_fns
+        self.lut_fns
             .ok_or(sys::Result::ERROR_EXTENSION_NOT_PRESENT)?;
 
         self.destroy_color_key();
@@ -100,6 +102,68 @@ impl PassthroughFB {
         let Some(data) = data else {
             return Ok(());
         };
+        self.key = Some(self.create_lut_layer(data)?);
+
+        Ok(())
+    }
+
+    /// Replace the LUT of the color keyed layer, if it exists
+    pub fn update_color_key(&mut self, data: &[u8]) -> xr::Result<()> {
+        match &self.key {
+            Some(key) => self.update_lut(key.lut, data),
+            None => Ok(()),
+        }
+    }
+
+    fn destroy_color_key(&mut self) {
+        if let Some(key) = self.key.take() {
+            self.destroy_lut_layer(key);
+        }
+    }
+
+    /// `debug.alvr.green_boxes` (green_screen.rs): create, replace or remove the green-keyed base layer, a
+    /// passthrough layer of its own with a colour LUT style (`COLOR_KEY_SIZE` bytes) that is submitted
+    /// instead of the plain base layer while it exists. The plain base layer itself is never styled, so
+    /// without this layer the base is exactly today's
+    pub fn set_green_key(&mut self, data: Option<&[u8]>) -> xr::Result<()> {
+        self.lut_fns
+            .ok_or(sys::Result::ERROR_EXTENSION_NOT_PRESENT)?;
+
+        self.destroy_green_key();
+
+        let Some(data) = data else {
+            return Ok(());
+        };
+        self.green = Some(self.create_lut_layer(data)?);
+
+        Ok(())
+    }
+
+    /// Replace the LUT of the green-keyed base layer in place, if it exists
+    pub fn update_green_key(&mut self, data: &[u8]) -> xr::Result<()> {
+        match &self.green {
+            Some(green) => self.update_lut(green.lut, data),
+            None => Ok(()),
+        }
+    }
+
+    fn destroy_green_key(&mut self) {
+        if let Some(green) = self.green.take() {
+            self.destroy_lut_layer(green);
+        }
+    }
+
+    /// The green-keyed base layer, while it exists
+    pub fn green_layer(&self) -> Option<&sys::CompositionLayerPassthroughFB> {
+        self.green.as_ref().map(|green| &green.layer)
+    }
+
+    /// A new running passthrough layer on the passthrough of this one, styled with a new colour LUT made
+    /// from `data`, and its composition struct (the flags of the base layer). Nothing is left on error
+    fn create_lut_layer(&self, data: &[u8]) -> xr::Result<KeyedLayer> {
+        let lut_fns = self
+            .lut_fns
+            .ok_or(sys::Result::ERROR_EXTENSION_NOT_PRESENT)?;
         if data.len() != COLOR_KEY_SIZE {
             return Err(sys::Result::ERROR_VALIDATION_FAILURE);
         }
@@ -143,15 +207,15 @@ impl PassthroughFB {
             return Err(e);
         }
 
-        // From here on, destroy_color_key() takes care of the cleanup
-        self.key = Some(KeyedLayer {
+        // From here on, destroy_lut_layer() takes care of the cleanup
+        let keyed = KeyedLayer {
             layer_handle,
             layer: sys::CompositionLayerPassthroughFB {
                 layer_handle,
                 ..self.layer
             },
             lut,
-        });
+        };
 
         let color_map = sys::PassthroughColorMapLutMETA {
             ty: sys::PassthroughColorMapLutMETA::TYPE,
@@ -171,16 +235,16 @@ impl PassthroughFB {
                 &style,
             ))
         };
-        if result.is_err() {
-            self.destroy_color_key();
+        if let Err(e) = result {
+            self.destroy_lut_layer(keyed);
+            return Err(e);
         }
 
-        result
+        Ok(keyed)
     }
 
-    /// Replace the LUT of the color keyed layer, if it exists
-    pub fn update_color_key(&mut self, data: &[u8]) -> xr::Result<()> {
-        let (Some(lut_fns), Some(key)) = (&self.lut_fns, &self.key) else {
+    fn update_lut(&self, lut: sys::PassthroughColorLutMETA, data: &[u8]) -> xr::Result<()> {
+        let Some(lut_fns) = &self.lut_fns else {
             return Ok(());
         };
         if data.len() != COLOR_KEY_SIZE {
@@ -196,16 +260,15 @@ impl PassthroughFB {
             },
         };
 
-        unsafe { super::xr_res((lut_fns.update_passthrough_color_lut)(key.lut, &info)) }
+        unsafe { super::xr_res((lut_fns.update_passthrough_color_lut)(lut, &info)) }
     }
 
-    fn destroy_color_key(&mut self) {
-        if let Some(key) = self.key.take() {
-            unsafe {
-                (self.ext_fns.destroy_passthrough_layer)(key.layer_handle);
-                if let Some(lut_fns) = &self.lut_fns {
-                    (lut_fns.destroy_passthrough_color_lut)(key.lut);
-                }
+    // The layer first: its style refers to the LUT
+    fn destroy_lut_layer(&self, layer: KeyedLayer) {
+        unsafe {
+            (self.ext_fns.destroy_passthrough_layer)(layer.layer_handle);
+            if let Some(lut_fns) = &self.lut_fns {
+                (lut_fns.destroy_passthrough_color_lut)(layer.lut);
             }
         }
     }
@@ -223,6 +286,7 @@ impl PassthroughFB {
 impl Drop for PassthroughFB {
     fn drop(&mut self) {
         self.destroy_color_key();
+        self.destroy_green_key();
 
         unsafe {
             (self.ext_fns.destroy_passthrough_layer)(self.layer_handle);

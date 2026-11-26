@@ -210,7 +210,21 @@ fn depth_passthrough(stream_color: vec3f, uv: vec2f) -> vec4f {
         var lower_alpha = 1.0 - solid;
         var upper_alpha = 1.0 - max(solid, focus);
         var rgb = game_color;
+        // The green-screen zone (`debug.alvr.green_boxes`): the mask holds both layers open there (r 1, g,
+        // b, a 0). Looked up per pixel only for the problem view and the Tint mask view, which would
+        // otherwise draw over it. No zone (the default): false
+        var green_zone = false;
+        if depth_u.green.x > 0.0 && (problem_on || debug_view == DEBUG_VIEW_TINT_MASK) {
+            let eye = depth_u.eyes[imm.view_idx];
+            let dir = normalize((eye.uv_to_world_dir * vec4f(uv, 1.0, 0.0)).xyz);
+            green_zone = in_green_zone(eye.eye_position.xyz, dir);
+        }
         if debug_view == DEBUG_VIEW_TINT_MASK {
+            // The game blue in the zone: the layer under the green-keyed passthrough shows this colour,
+            // so exactly the pixels where the camera's green was keyed are blue
+            if green_zone {
+                rgb = mix(rgb, vec3f(0.0, 0.1, 1.0), 0.6);
+            }
             rgb = mix(rgb, vec3f(0.0, 0.8, 0.0), 0.5 * focus);
             // Where the rim is narrowed
             rgb = mix(rgb, vec3f(0.9, 0.0, 0.0), 0.7 * hand.a);
@@ -231,8 +245,9 @@ fn depth_passthrough(stream_color: vec3f, uv: vec2f) -> vec4f {
             lower_alpha = min(lower_alpha, 1.0 - see);
             upper_alpha = 0.0;
         }
-        if problem_on {
-            // In the lower layer, which alone can be part way (upper is 0 while the room shows)
+        if problem_on && !green_zone {
+            // In the lower layer, which alone can be part way (upper is 0 while the room shows). Not in
+            // the green-screen zone: it would cover the green-keyed passthrough
             rgb = mix(rgb, problem.rgb, problem.a);
             lower_alpha = max(lower_alpha, problem.a);
         }

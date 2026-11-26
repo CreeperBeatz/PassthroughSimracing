@@ -9,6 +9,7 @@ mod c_api;
 mod camera;
 mod extra_extensions;
 mod graphics;
+mod green_screen;
 mod interaction;
 mod lever;
 mod lobby;
@@ -560,6 +561,8 @@ pub fn entry_point() {
         let mut headset_is_worn = true;
         let mut color_key_loader = ColorKeyLoader::new();
         let mut last_key_log = Instant::now();
+        // `debug.alvr.green_boxes`: what the last frame submitted, for the `green:` line of the stream
+        let mut green_layers = green_screen::GreenLayers::default();
         'render_loop: loop {
             while let Some(event) = xr_instance.poll_event(&mut event_storage).unwrap() {
                 match event {
@@ -922,6 +925,7 @@ pub fn entry_point() {
                 .as_mut()
                 .is_some_and(|layer| layer.update_color_key(color_key));
             if let Some(stream) = &mut stream_context {
+                stream.report_green_layers(green_layers);
                 let color_key = color_key.filter(|_| use_color_key);
                 stream.set_color_key(
                     color_key.map(|key| key.params),
@@ -963,35 +967,69 @@ pub fn entry_point() {
                 )
             };
 
-            let key_layers;
-            let layers: &[&xr::CompositionLayerBase<_>] =
-                if let Some(passthrough_layer) = &passthrough_layer {
-                    if use_color_key
-                        && let Some(params) = key_params
-                        && let Some(color_key_layer) = passthrough_layer.color_key_layer()
-                    {
-                        // See the color key in stream.wgsl
-                        key_layers = layer.build_color_key();
-                        let [lower, upper] = &key_layers;
-                        // Without the extra layers, look like the four layers away from the hands:
-                        // there only the upper one is visible if the lower one is cropped
-                        // (the shader writes the alpha for this, see `key_lower_rects`)
-                        let single = if params.crop > 0 { upper } else { lower };
-                        if !params.extra_layers(key_frame.hands_in_view) {
-                            &[passthrough_layer, single]
-                        } else {
-                            match params.layers {
-                                30 => &[passthrough_layer, lower, color_key_layer],
-                                31 => &[passthrough_layer, lower, upper],
-                                _ => &[passthrough_layer, lower, color_key_layer, upper],
-                            }
-                        }
-                    } else {
-                        &[passthrough_layer, &layer.build()]
-                    }
-                } else {
-                    &[&layer.build()]
-                };
+            // `debug.alvr.green_boxes` (green_screen.rs): while the zone is on the base passthrough is the
+            // green-keyed layer (the runtime is called only when its rule changes), and the under layer
+            // goes at the very bottom. Off (the default): the plain base layer and today's list
+            let green_base = passthrough_layer.as_mut().is_some_and(|passthrough_layer| {
+                passthrough_layer.update_green_key(key_frame.green_key.filter(|_| use_color_key))
+            });
+            let key_layout = passthrough_layer
+                .as_ref()
+                .filter(|passthrough_layer| {
+                    use_color_key && passthrough_layer.color_key_layer().is_some()
+                })
+                .and(key_params)
+                .map(|params| green_screen::KeyLayout {
+                    layers: params.layers,
+                    crop: params.crop,
+                    extra: params.extra_layers(key_frame.hands_in_view),
+                });
+            // See the color key in stream.wgsl
+            let key_layers = key_layout.map(|_| layer.build_color_key());
+            let under_layer = layer
+                .build_green_under()
+                .filter(|_| green_base && key_layout.is_some());
+            let order = green_screen::layer_order(
+                passthrough_layer.is_some(),
+                key_layout,
+                under_layer.is_some(),
+            );
+            let plain_layer = order
+                .as_slice()
+                .contains(&green_screen::LayerKind::Plain)
+                .then(|| layer.build());
+            green_layers = green_screen::GreenLayers {
+                base_keyed: green_base,
+                under_submitted: under_layer.is_some(),
+            };
+            let resolve = |kind| -> Option<&xr::CompositionLayerBase<'_, xr::OpenGlEs>> {
+                use green_screen::LayerKind::*;
+                match kind {
+                    GreenUnder => under_layer.as_deref(),
+                    Passthrough => passthrough_layer.as_ref().map(|layer| layer.base_layer()),
+                    Lower => key_layers.as_ref().map(|[lower, _]| &**lower),
+                    ColorKey => passthrough_layer
+                        .as_ref()
+                        .and_then(|layer| layer.color_key_layer()),
+                    Upper => key_layers.as_ref().map(|[_, upper]| &**upper),
+                    Plain => plain_layer.as_deref(),
+                }
+            };
+            let mut layer_refs = [None; green_screen::MAX_LAYERS];
+            let mut layer_count = 0;
+            for layer in order.as_slice().iter().filter_map(|&kind| resolve(kind)) {
+                layer_refs[layer_count] = Some(layer);
+                layer_count += 1;
+            }
+            let layer_list: [&xr::CompositionLayerBase<'_, xr::OpenGlEs>;
+                green_screen::MAX_LAYERS];
+            let layers: &[&xr::CompositionLayerBase<_>] = match layer_refs[0] {
+                Some(first) => {
+                    layer_list = layer_refs.map(|layer| layer.unwrap_or(first));
+                    &layer_list[..layer_count]
+                }
+                None => &[],
+            };
 
             if use_color_key && last_key_log.elapsed() > Duration::from_secs(2) {
                 last_key_log = Instant::now();
