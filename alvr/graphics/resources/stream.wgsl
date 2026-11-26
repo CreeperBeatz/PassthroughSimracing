@@ -145,7 +145,7 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     } else if imm.passthrough_mode == PASSTHROUGH_MODE_DEPTH {
         // Note: requires premultiplied alpha in the XR layer
         if in_margin {
-            return edge_fill_margin(color);
+            return edge_fill_margin(color, uv, stream_uv);
         }
         return depth_passthrough(color, uv);
     }
@@ -378,14 +378,42 @@ fn depth_passthrough(stream_color: vec3f, uv: vec2f) -> vec4f {
     return vec4f(rgb, 1.0 - shown * brightness);
 }
 
-// `debug.alvr.edge_fill`: a pixel of the margin outside the stream view. Opaque game in every layer (alpha
-// 1 packs to 1 in both key layers and is opaque on the premultiplied path), no mask, focus or zone lookup:
-// no room can show there. Magenta with the Tint mask debug view, to see where the margin shows
-fn edge_fill_margin(stream_color: vec3f) -> vec4f {
+// `debug.alvr.edge_fill`: a pixel of the margin outside the stream view (uv: the stream uv outside 0..1,
+// stream_uv: clamped). Opaque game in every layer (alpha 1 packs to 1 in both key layers and is opaque on
+// the premultiplied path), no mask, focus or zone lookup: no room can show there. Except while the play
+// area is edited or the problem view is on: the room through the game by `see`, dimmed, as in
+// depth_passthrough with a mask of 0 (without the leak map's tint). Magenta with the Tint mask debug view,
+// to see where the margin shows
+fn edge_fill_margin(stream_color: vec3f, uv: vec2f, stream_uv: vec2f) -> vec4f {
     if u32(depth_u.region.w + 0.5) == DEBUG_VIEW_TINT_MASK {
         return vec4f(1.0, 0.0, 1.0, 1.0);
     }
-    return vec4f(stream_color * (1.0 - depth_u.lighting2.w), 1.0);
+    var game_color = stream_color * (1.0 - depth_u.lighting2.w);
+    var see = depth_u.area.y;
+    if problem_u.anchor.w > 0.5 {
+        see = max(see, problem_u.look.x);
+        game_color = game_color * (1.0 - problem_u.look.y);
+    }
+    if see <= 0.0 {
+        return vec4f(game_color, 1.0);
+    }
+    if depth_u.lighting2.z > 0.5 {
+        // Only the lower layer can be part way: where it covers the margin lower 1 - see, upper 0 (alpha
+        // 0.5 * (1 - see)). Uncropped (key_lower exactly the stream view, 0..1) it covers the whole wider
+        // view; cropped, its rect in stream uv. Elsewhere the upper layer alone: lower 1, upper 1 - see
+        let rect = depth_u.key_lower[imm.view_idx];
+        let full = all(rect == vec4f(0.0, 0.0, 1.0, 1.0));
+        if full || (all(uv >= rect.xy) && all(uv < rect.zw)) {
+            return vec4f(game_color, 0.5 * (1.0 - see));
+        }
+        return vec4f(game_color, 1.0 - 0.5 * see);
+    }
+    // Premultiplied: out = rgb + (1 - a) * passthrough
+    var brightness = 1.0;
+    if depth_u.lighting.x > 0.5 {
+        brightness = passthrough_brightness(stream_uv);
+    }
+    return vec4f(game_color * (1.0 - see), 1.0 - see * brightness);
 }
 
 // The rays of the leak map start at its anchor and see the room this far away, as in leak_map.rs

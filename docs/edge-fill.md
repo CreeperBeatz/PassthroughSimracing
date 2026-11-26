@@ -32,6 +32,10 @@ rotation. It only gives the game layers more picture beyond the edge.
     smears the border outward (the clamp comes before the foveated-encoding decode), with alpha 1. Alpha 1
     packs to an opaque lower and upper layer, and on the premultiplied path (no key) it is opaque too. No
     mask, focus or zone lookup is done there, so no room can show in the margin.
+  - Except while the play area is edited or the problem view is on (`see` above 0): the margin then shows
+    the room through the dimmed game by `see` as the rest of the view outside the mask does (premultiplied:
+    rgb and alpha times 1 - see; key: lower 1 - see and upper 0 where the lower layer covers the margin,
+    uncropped or inside its crop, else lower 1 and upper 1 - see). The leak map's tint is not drawn there.
   - With the streamer's debug view **Tint mask** the margin is **magenta**, to see where it shows.
   - Only the Depth passthrough mode makes the margin opaque. Blend and the chroma keys get the smeared colour
     with their usual alpha rule.
@@ -121,6 +125,8 @@ unchanged: it samples per display pixel.
   the main pass alone and the renderer's transform:
   - `edge_fill_fills_the_margin_and_keeps_the_view`: the inner region equals the off picture resampled, and
     the margin is opaque with the border colour (magenta with Tint mask), on the key and the no-key path.
+  - `edge_fill_margin_shows_the_room_while_editing`: while editing, the margin's colour and alpha, without
+    the key, with the key uncropped and with a crop that reaches into the margin.
   - `edge_fill_off_is_the_shader_before`: with the fill off, the main pass is bit for bit the shader without
     the edge-fill lines, on 15 cases: key, no key, key crop, the editing look, Tint mask, lighting.
   - The headset's GLES compiler is stricter.

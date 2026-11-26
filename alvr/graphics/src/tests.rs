@@ -769,7 +769,7 @@ fn shader_without_edge_fill(source: String) -> String {
             "    let stream_uv = uv;\n",
         ),
         (
-            "        if in_margin {\n            return edge_fill_margin(color);\n        }\n",
+            "        if in_margin {\n            return edge_fill_margin(color, uv, stream_uv);\n        }\n",
             "",
         ),
     ] {
@@ -7683,6 +7683,111 @@ fn edge_fill_fills_the_margin_and_keeps_the_view() {
         // ... and the on picture too, at the same stream uv
         let near = edge_fill::stream_to_output_uv(fov(), output_fov, Vec2::new(0.5, 0.25));
         assert_eq!(on.alpha(near.x, near.y), 0.0, "{case}");
+    }
+}
+
+// `debug.alvr.edge_fill` while the play area is edited (`game_see`): the margin shows the room through the
+// dimmed game as the rest of the view outside the mask does, instead of a band of opaque game. Premultiplied:
+// rgb and alpha times 1 - see. Colour key: where the lower layer covers the margin (uncropped, or inside its
+// crop) lower 1 - see and upper 0, elsewhere lower 1 and upper 1 - see
+#[test]
+fn edge_fill_margin_shows_the_room_while_editing() {
+    let (device, queue) = gpu_or_skip!();
+    let key = ColorKeyInput {
+        hands: [None; 2],
+        leak: [0.0; 2],
+        bridges: [None; 2],
+    };
+    let (dim, see) = (0.3_f32, 0.45_f32);
+    let output_fov = edge_fill::widen_fov(fov(), edge_fill::edge_fill_radians(60));
+    let pixel = 1.0 / TARGET_SIZE as f32;
+    // The crop reaches into the bottom margin between u 0.2 and 0.8
+    let crop = (Vec2::new(0.2, 0.5), Vec2::new(0.8, 1.3));
+    let config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
+
+    for (color_key, lower_rects) in [
+        (None, None),
+        (Some(key), None),
+        (Some(key), Some([crop; 2])),
+    ] {
+        let on = render_v2(
+            &device,
+            &queue,
+            &config,
+            &hand_scene(),
+            Vec3::ZERO,
+            Vec3::ZERO,
+            true,
+            color_key,
+            [None; 2],
+            None,
+            lower_rects,
+            false,
+            &[],
+            None,
+            dim,
+            see,
+            MaskV2 {
+                stream_ramp: true,
+                edge_output_fov: Some(output_fov),
+                ..Default::default()
+            },
+        );
+        let case = format!(
+            "key {}, crop {}",
+            color_key.is_some(),
+            lower_rects.is_some()
+        );
+        let (mut margin, mut in_crop) = (0, 0);
+        for y in 0..TARGET_SIZE {
+            for x in 0..TARGET_SIZE {
+                let output_uv = (Vec2::new(x as f32, y as f32) + 0.5) * pixel;
+                let stream_uv = edge_fill::output_to_stream_uv(fov(), output_fov, output_uv);
+                if !(stream_uv.cmplt(Vec2::splat(-0.5 * pixel)).any()
+                    || stream_uv.cmpgt(Vec2::splat(1.0 + 0.5 * pixel)).any())
+                {
+                    continue;
+                }
+                margin += 1;
+                let got = on.pixels[(y * TARGET_SIZE + x) as usize];
+                let ramp = stream_ramp_at(stream_uv.clamp(Vec2::ZERO, Vec2::ONE));
+                let game = Vec3::new(ramp.x, ramp.y, 128.0) * (1.0 - dim);
+                let (rgb, alpha) = match lower_rects {
+                    None if color_key.is_none() => (game * (1.0 - see), 1.0 - see),
+                    None => (game, 0.5 * (1.0 - see)),
+                    Some(_) => {
+                        let inside = stream_uv.cmpge(crop.0).all() && stream_uv.cmplt(crop.1).all();
+                        // Pixels within one pixel of the crop's sides are not checked
+                        let near_side = (stream_uv - crop.0).abs().min_element() < pixel
+                            || (stream_uv - crop.1).abs().min_element() < pixel;
+                        if near_side {
+                            continue;
+                        }
+                        in_crop += usize::from(inside);
+                        (
+                            game,
+                            if inside {
+                                0.5 * (1.0 - see)
+                            } else {
+                                1.0 - 0.5 * see
+                            },
+                        )
+                    }
+                };
+                let expected = [rgb.x, rgb.y, rgb.z, 255.0 * alpha];
+                assert!(
+                    (0..4).all(|c| (f32::from(got[c]) - expected[c]).abs() <= 3.0),
+                    "{case}: at {x}, {y}: {got:?}, expected {expected:?}"
+                );
+            }
+        }
+        assert!(margin > 4 * 5 * 52, "{case}: {margin} margin pixels");
+        if lower_rects.is_some() {
+            assert!(
+                in_crop > 2 * 20,
+                "{case}: {in_crop} margin pixels in the crop"
+            );
+        }
     }
 }
 
