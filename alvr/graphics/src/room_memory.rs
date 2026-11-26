@@ -30,7 +30,7 @@
 use crate::{HAND_SEGMENTS, HandShape};
 use alvr_common::{
     Fov, Pose, ViewParams,
-    glam::{Quat, Vec3, Vec4},
+    glam::{Quat, Vec3},
 };
 use wgpu::TextureFormat;
 
@@ -316,15 +316,7 @@ pub fn memory_uniforms(
         dt,
         live_tolerance(params.size),
     ]);
-    for hand in hands {
-        data.extend(hand.map_or(Vec4::ZERO, |shape| shape.bounds()).to_array());
-    }
-    for hand in hands {
-        let segments = hand.map_or([[Vec4::ZERO; 2]; HAND_SEGMENTS], |shape| shape.segments);
-        for point in segments.as_flattened() {
-            data.extend(point.to_array());
-        }
-    }
+    crate::depth_mask::push_hand_capsules(&mut data, hands);
 
     data.try_into().unwrap()
 }
@@ -491,6 +483,7 @@ pub fn update_cost(size: u32) -> (u32, u32) {
 mod tests {
     use super::*;
     use crate::depth_mask::fov_tangents;
+    use alvr_common::glam::Vec4;
 
     fn depth_views(position: Vec3, yaw_deg: f32, pitch_deg: f32) -> [ViewParams; 2] {
         let orientation = Quat::from_rotation_y(yaw_deg.to_radians())

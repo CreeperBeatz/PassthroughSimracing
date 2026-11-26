@@ -799,11 +799,15 @@ pub const DEPTH_UNIFORMS_FLOAT_COUNT: usize = 2 * EYE_FLOAT_COUNT
     + AREA_FLOAT_COUNT
     + LEVER_FLOAT_COUNT
     + GREEN_FLOAT_COUNT
-    + GPU_RECT_FLOAT_COUNT;
+    + GPU_RECT_FLOAT_COUNT
+    + OWN_FLOAT_COUNT;
 pub const DEPTH_UNIFORMS_SIZE: usize = DEPTH_UNIFORMS_FLOAT_COUNT * size_of::<f32>();
-/// Floats of `debug.alvr.gpu_rect` at the very end of the uniform block (gpu_rect.rs): its vector, then the
-/// rectangles of the mask taps and of the focus taps of both eyes. Zeros while it is off
+/// Floats of `debug.alvr.gpu_rect` near the end of the uniform block (gpu_rect.rs), before `cloud_own`: its
+/// vector, then the rectangles of the mask taps and of the focus taps of both eyes. Zeros while it is off
 pub(crate) const GPU_RECT_FLOAT_COUNT: usize = 4 + 2 * 4 + 2 * 4;
+/// Floats of `debug.alvr.cloud_own` at the very end of the uniform block (`own_uniforms`): its vector, the
+/// bounding sphere of each hand at the depth's capture time, then their capsules. Zeros while it is off
+pub const OWN_FLOAT_COUNT: usize = 4 + 2 * 4 + 2 * 2 * HAND_SEGMENTS * 4;
 /// Where `key_lower` starts in the uniform block (floats): after the eyes, the area transform, 5 vectors,
 /// the hands, the arms, the gaps, the playzone cameras and the vectors of the playzone, the memory and
 /// the cloud (checked against the shader's layout by a test)
@@ -827,8 +831,10 @@ pub(crate) fn set_key_lower(
 pub(crate) fn gpu_rect_uniforms(
     uniforms: &mut [f32; DEPTH_UNIFORMS_FLOAT_COUNT],
 ) -> &mut [f32; GPU_RECT_FLOAT_COUNT] {
-    let start = DEPTH_UNIFORMS_FLOAT_COUNT - GPU_RECT_FLOAT_COUNT;
-    (&mut uniforms[start..]).try_into().unwrap()
+    let start = DEPTH_UNIFORMS_FLOAT_COUNT - OWN_FLOAT_COUNT - GPU_RECT_FLOAT_COUNT;
+    (&mut uniforms[start..start + GPU_RECT_FLOAT_COUNT])
+        .try_into()
+        .unwrap()
 }
 
 pub(crate) fn pose_to_mat4(pose: Pose) -> Mat4 {
@@ -990,20 +996,7 @@ pub fn depth_uniforms(
     for hand in &hands {
         data.extend(hand.map_or([0.0; HAND_SEGMENTS], |(_, zones)| zones.solid));
     }
-    for hand in &hands {
-        data.extend(
-            hand.map_or(Vec4::ZERO, |(shape, _)| shape.bounds())
-                .to_array(),
-        );
-    }
-    for hand in &hands {
-        let segments = hand.map_or([[Vec4::ZERO; 2]; HAND_SEGMENTS], |(shape, _)| {
-            shape.segments
-        });
-        for point in segments.as_flattened() {
-            data.extend(point.to_array());
-        }
-    }
+    push_hand_capsules(&mut data, &hands.map(|hand| hand.map(|(shape, _)| shape)));
     // The `w` of the third vec4 is the length of the linear weight (0: the smoothstep of mode 1)
     let gaps = input.arm_gaps.map(|gap| gap.and_then(ArmGap::checked));
     for (arm, gap) in input.arms.iter().zip(&gaps) {
@@ -1052,7 +1045,8 @@ pub fn depth_uniforms(
     data.extend(memory_read_uniform(input.memory.as_ref()));
     // Zeros without the depth cloud: today's
     let volume = region_mode > 0.5;
-    data.extend(cloud_vector(config, input, volume));
+    let cloud = cloud_vector(config, input, volume);
+    data.extend(cloud);
     for (min, max) in input
         .key_lower_rects
         .unwrap_or([(Vec2::ZERO, Vec2::ONE); 2])
@@ -1115,9 +1109,62 @@ pub fn depth_uniforms(
     }
     // `debug.alvr.gpu_rect`: off here, the renderer fills it in while it is on (gpu_rect.rs)
     data.extend([0.0; GPU_RECT_FLOAT_COUNT]);
+    // `debug.alvr.cloud_own`: zeros while off, today's
+    own_uniforms(&mut data, input, cloud[0] > 0.5);
 
     data.try_into().unwrap()
 }
+
+/// The bounding sphere of each hand (xyz, w: radius; zeros: no hand), then the start and end of each of
+/// their capsules (zeros for no hand): `hand_bounds` and `hand_points` of the depth uniforms, the capture
+/// time capsules of `cloud_own` and of the room memory's uniforms
+pub(crate) fn push_hand_capsules(data: &mut Vec<f32>, hands: &[Option<HandShape>; 2]) {
+    for hand in hands {
+        data.extend(hand.map_or(Vec4::ZERO, |shape| shape.bounds()).to_array());
+    }
+    for hand in hands {
+        let segments = hand.map_or([[Vec4::ZERO; 2]; HAND_SEGMENTS], |shape| shape.segments);
+        for point in segments.as_flattened() {
+            data.extend(point.to_array());
+        }
+    }
+}
+
+/// The `debug.alvr.cloud_own` part of the depth uniforms (`OWN_FLOAT_COUNT` floats, depth_common.wgsl
+/// `own`, `capture_bounds`, `capture_points`). All zeros (off, today's) unless the cloud's zone is shown
+/// (`zone_shown`), `cloud_own` is above 0 and the room memory gives the capsules at the depth's capture
+/// time. Then the distance and the fade (m) and the gate of each hand, and the capsules of each hand that
+/// come from its own sample history at that time (`CaptureHand::Exact`; zeros for the others: the rule is
+/// off for that hand)
+fn own_uniforms(data: &mut Vec<f32>, input: &DepthRenderInput, zone_shown: bool) {
+    let on = input
+        .cloud
+        .filter(|cloud| zone_shown && cloud.params.own.is_finite() && cloud.params.own > 0.0)
+        .zip(input.memory);
+    let Some((cloud, memory)) = on else {
+        data.extend([0.0; OWN_FLOAT_COUNT]);
+        return;
+    };
+    let gates = cloud.own_gate.map(|gate| {
+        if gate.is_finite() {
+            gate.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    });
+    data.extend([
+        cloud.params.own.min(MAX_CLOUD_OWN_M),
+        crate::CLOUD_OWN_FADE_M,
+        gates[0],
+        gates[1],
+    ]);
+    let hands = [0, 1]
+        .map(|i| memory.hands[i].filter(|_| memory.hand_sources[i] == crate::CaptureHand::Exact));
+    push_hand_capsules(data, &hands);
+}
+
+/// The largest `cloud_own` (m)
+pub const MAX_CLOUD_OWN_M: f32 = 0.04;
 
 /// Whether the depth cloud (`debug.alvr.cloud`) runs with this input: it is set (mode 1 or 2), the
 /// colour key is on (the zone only opens the key) and the region is made of boxes (the edge of the
@@ -1553,10 +1600,16 @@ mod tests {
                 // `gpu_rect`: its vector, the mask and focus rectangles of both eyes
                 + 16
                 + 2 * 2 * 16
+                // `cloud_own`: its vector, the bounds and capsules of both hands at the capture time
+                + 16
+                + 2 * 16
+                + 2 * 2 * HAND_SEGMENTS * 16
         );
         // 28 capsules per hand, the wrist gaps, the bridges from the wrists, the boxes of the play area,
-        // the lever windows, the room memory, the depth cloud, the green-screen zone, `gpu_rect`
-        assert_eq!(DEPTH_UNIFORMS_SIZE, 4784);
+        // the lever windows, the room memory, the depth cloud, the green-screen zone, `gpu_rect`,
+        // `cloud_own` (1840 bytes)
+        assert_eq!(DEPTH_UNIFORMS_SIZE, 4784 + 1840);
+        assert_eq!(OWN_FLOAT_COUNT * 4, 1840);
     }
 
     // Steps 1 and 2 of docs/mask-v2-design.md in the uniform block: off is all zeros, as before
@@ -1797,7 +1850,8 @@ mod tests {
         let levers = DEPTH_UNIFORMS_FLOAT_COUNT
             - LEVER_FLOAT_COUNT
             - GREEN_FLOAT_COUNT
-            - GPU_RECT_FLOAT_COUNT;
+            - GPU_RECT_FLOAT_COUNT
+            - OWN_FLOAT_COUNT;
         let uniforms =
             |input: &DepthRenderInput| depth_uniforms(&cfg, &[view(), view()], input, None, false);
 
@@ -1870,7 +1924,8 @@ mod tests {
             game_dim: 0.0,
             game_see: 0.0,
         };
-        let green = DEPTH_UNIFORMS_FLOAT_COUNT - GREEN_FLOAT_COUNT - GPU_RECT_FLOAT_COUNT;
+        let green =
+            DEPTH_UNIFORMS_FLOAT_COUNT - GREEN_FLOAT_COUNT - GPU_RECT_FLOAT_COUNT - OWN_FLOAT_COUNT;
         let uniforms =
             |input: &DepthRenderInput| depth_uniforms(&cfg, &[view(), view()], input, None, false);
         let off = uniforms(&input);
@@ -1897,6 +1952,122 @@ mod tests {
 
         input.green_windows = [Some(region); MAX_GREEN_WINDOWS];
         assert_eq!(uniforms(&input)[green], 2.0);
+    }
+
+    // `debug.alvr.cloud_own` at the end of the uniform block: all zeros unless the cloud's zone is shown,
+    // `cloud_own` is above 0 and the room memory gives the capture-time capsules; then the distance, the
+    // fade, the gates (clamped), and the bounds and capsules of the hands from the history only
+    #[test]
+    fn cloud_own_in_the_uniforms() {
+        use crate::{CLOUD_OWN_FADE_M, CaptureHand, CloudInput, CloudParams, MemoryParams};
+
+        let cfg = DepthPassthroughConfig {
+            region: DepthMaskRegion::Volume(alvr_session::CockpitVolumeConfig {
+                center_x: 0.0,
+                center_y: 0.0,
+                center_z: -0.5,
+                yaw_deg: 0.0,
+                width: 1.0,
+                height: 1.0,
+                depth: 0.5,
+            }),
+            ..config(DepthMaskRegion::Distance { max_distance: 0.9 })
+        };
+        let shape = |x: f32| HandShape {
+            segments: std::array::from_fn(|i| {
+                [
+                    Vec4::new(x, 0.01 * i as f32, -0.5, 0.01),
+                    Vec4::new(x + 0.02, 0.01 * i as f32, -0.5, 0.008),
+                ]
+            }),
+        };
+        let mut input = DepthRenderInput {
+            frame: None,
+            eye_positions: [Vec3::ZERO; 2],
+            color_key: Some(ColorKeyInput {
+                hands: [None; 2],
+                leak: [0.0; 2],
+                bridges: [None; 2],
+            }),
+            arms: [None; 2],
+            arm_gaps: [None; 2],
+            edge_cut: 0.0,
+            lever_windows: [None; MAX_LEVER_WINDOWS],
+            green_windows: [None; MAX_GREEN_WINDOWS],
+            capture_playzone: false,
+            playzone_view: false,
+            memory: Some(MemoryInput {
+                params: MemoryParams::default(),
+                capture_ns: Some(0),
+                hands: [Some(shape(-0.1)), Some(shape(0.1))],
+                hand_sources: [CaptureHand::Exact, CaptureHand::Fallback],
+                reach: [0.0; 2],
+                hands_away: false,
+            }),
+            cloud: Some(CloudInput {
+                params: CloudParams {
+                    own: 0.02,
+                    ..Default::default()
+                },
+                capture_ns: Some(0),
+                display_ns: 0,
+                shown: true,
+                own_gate: [0.7, 3.0],
+            }),
+            key_lower_rects: None,
+            region_override: None,
+            game_dim: 0.0,
+            game_see: 0.0,
+        };
+        let uniforms = |cfg: &DepthPassthroughConfig, input: &DepthRenderInput| {
+            depth_uniforms(cfg, &[view(), view()], input, None, false)
+        };
+        let own = DEPTH_UNIFORMS_FLOAT_COUNT - OWN_FLOAT_COUNT;
+
+        let on = uniforms(&cfg, &input);
+        assert_eq!(&on[own..own + 4], &[0.02, CLOUD_OWN_FADE_M, 0.7, 1.0]);
+        assert_eq!(&on[own + 4..own + 8], &shape(-0.1).bounds().to_array());
+        assert!(on[own + 8..own + 12].iter().all(|&value| value == 0.0));
+        let points = own + 12;
+        assert_eq!(&on[points..points + 4], &[-0.1, 0.0, -0.5, 0.01]);
+        assert_eq!(
+            &on[points + 4..points + 8],
+            &[-0.1 + 0.02, 0.0, -0.5, 0.008]
+        );
+        // The second hand's capsules (not from the history): zeros
+        let second = points + 2 * HAND_SEGMENTS * 4;
+        assert!(on[second..].iter().all(|&value| value == 0.0));
+        // Everything before it is the block without `cloud_own`
+        let mut plain = input;
+        plain.cloud.as_mut().unwrap().params.own = 0.0;
+        let off = uniforms(&cfg, &plain);
+        assert_eq!(&on[..own], &off[..own]);
+        assert!(off[own..].iter().all(|&value| value == 0.0));
+
+        // Off: no memory, today's phase of `cloud_ab`, no colour key (the cloud does not run), the Show
+        // depth view
+        let mut no_memory = input;
+        no_memory.memory = None;
+        let mut today_phase = input;
+        today_phase.cloud.as_mut().unwrap().shown = false;
+        let mut no_key = input;
+        no_key.color_key = None;
+        let show_depth = DepthPassthroughConfig {
+            debug_view: DepthPassthroughDebugView::ShowDepth,
+            ..cfg.clone()
+        };
+        for (cfg, case) in [
+            (&cfg, &no_memory),
+            (&cfg, &today_phase),
+            (&cfg, &no_key),
+            (&show_depth, &input),
+        ] {
+            let data = uniforms(cfg, case);
+            assert!(data[own..].iter().all(|&value| value == 0.0));
+        }
+        // A distance above the largest is clamped
+        input.cloud.as_mut().unwrap().params.own = 0.5;
+        assert_eq!(uniforms(&cfg, &input)[own], MAX_CLOUD_OWN_M);
     }
 
     #[test]
@@ -2138,6 +2309,7 @@ mod tests {
             - LEVER_FLOAT_COUNT
             - GREEN_FLOAT_COUNT
             - GPU_RECT_FLOAT_COUNT
+            - OWN_FLOAT_COUNT
             - AREA_FLOAT_COUNT
             + 8;
         assert_eq!(
@@ -2204,6 +2376,7 @@ mod tests {
                 - LEVER_FLOAT_COUNT
                 - GREEN_FLOAT_COUNT
                 - GPU_RECT_FLOAT_COUNT
+                - OWN_FLOAT_COUNT
                 - AREA_FLOAT_COUNT
                 + 8;
             assert_eq!(&data[boxes + 4..boxes + 7], &[0.6, 0.45, 0.5]);

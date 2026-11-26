@@ -123,6 +123,7 @@ All `adb shell setprop debug.alvr.<name> <value>`, read every 500 ms; each chang
 | `cloud_trail` | 0 | 0..2 x `cloud_window` | N > 0: inside the depth mask, a border of at most N texels (and at most the reach) along edges that moved is decided by the key instead of showing the room (the trail above). 0: off |
 | `cloud_trail_age` | 16 | 0..255 | the trail hands only surface to the key that arrived in the mask within this many depth images (about 0.6-1 s at 15-25 images per second); 0: no age test (the trail before it). Only while `cloud_trail` is on |
 | `cloud_trail_hands` | 1 | 0, 1 | 1: the trail is scaled by 1 - the near-hand value (nothing handed to the key next to a hand); 0: the trail as before near the hands (A/B). Surface only the remembered playzone shows is spared either way. Only while `cloud_trail` is on |
+| `cloud_own` | 0 | 0..40 | N > 0 (try 20): depth surface within N mm of a hand's capsules at the depth's capture time is that hand, late, and goes to the key while the hand's wrist has moved 1.5 cm or more since the capture ("The hand's own late depth" below). Needs `mem_roll 1`. 0 or unset: off |
 | `cloud_window` | 12 | 12..24 | half of the field's search window, cells of 2 x 2 depth texels: the band reaches at most 2 x this texels (24 = about 8 cm at 0.5 m; 48 = about 16 cm). A change starts the cloud over (both eyes reset, fields cleared). Cost: the rows and field passes read about twice as many texels with 24 |
 | `cloud_ab` | 0 | 0, 1 | 1: 2 s the cloud as set, 2 s today's picture (arm shift as set), with a green / red mark; the passes keep running |
 | `cloud_leak` | 0 | 0, 1 | 1: gain and cap scaled by the key's measured leak ("The key adapts" below); shown in the `cloud:` line, not logged on change |
@@ -139,7 +140,8 @@ dt 0, head 1, region 0) | layers 5 crop 0
 ```
 
 `trail 0/16`: `cloud_trail` / `cloud_trail_age`, followed by `h` while the trail is on and spares the hands
-(`cloud_trail_hands 1`, e.g. `trail 24/16h`; no `h`: `cloud_trail_hands 0`).
+(`cloud_trail_hands 1`, e.g. `trail 24/16h`; no `h`: `cloud_trail_hands 0`). `own 20` after the window while
+`cloud_own` is set (nothing while it is 0).
 
 `depth`: new pairs of the left eye per second and the share of each interval between depth images (over its pairs
 other than start and dt resets); `age` and `a`: the mean age of the left eye's field at display and how far the live
@@ -154,7 +156,7 @@ off).
 
 Index version 7. Each display record has `"cloud": null` while the cloud is off or not running, else
 `{"mode", "shown", "gain", "cap", "hold_ms", "dead", "lambda_ms", "fetch_mm", "fixed", "ab", "onesided", "trail",
-"trail_age", "trail_hands" (0/1), "window", "eyes": [{"field_capture_ns", "prev_capture_ns", "dt_ms", "reset": null | "start" | "dt" | "head" | "region",
+"trail_age", "trail_hands" (0/1), "window", "own_mm", "eyes": [{"field_capture_ns", "prev_capture_ns", "dt_ms", "reset": null | "start" | "dt" | "head" | "region",
 "head_deg_s", "a_ms", "reach_ms", "stale"} x 2]}` (`stale`: the field was older than 300 ms on that frame, no
 zone; `reach_ms` is then 0). With these, the depth frames and their poses, the field of every display
 frame can be rebuilt offline. `docs/tools/read_burst.py` reads it as `display["cloud_*"]` and still reads older
@@ -394,6 +396,50 @@ area needed the code again after the headset re-centred itself (the stage space 
 - The frame rate was not always 72 (GPU clock of the headset lower on battery; full-view key layers).
 - A fast arm still outruns the band at times; the first 125-240 ms of a motion have no band.
 - Ghosting "in places" that the user could not reproduce.
+
+## The hand's own late depth (`cloud_own`)
+
+**The ghost.** In the rig video of 2026-11-25 (156.3-156.7 s) a fast hand drew finger-wide stripes and a hand-sized
+patch of the real monitor beside it, on the side it came from. It is the hand itself in the depth: a fast hand is not
+always removed by the runtime (burst 16, wrist 0.5 m/s and more: about half of the late-depth ghost lay on the hand's
+own capsules), the depth is about 100 ms behind the picture, and `cloud_trail_hands 1` keeps the trail away from
+exactly that place, so the late copy stays solid room and shows what is behind the hand now
+(design study of 2026-11-26).
+
+**The rule.** Depth surface that lies within `cloud_own` mm of a hand's capsules *as they were at the depth's capture
+time* (fading out over the next 15 mm) is the hand. Its part of the mask's coverage is taken out and handed to the
+key (mask g), as everywhere else around a hand: the palm stays solid from the capsules, fingers and edges are
+keyed. The test is in 3D on the depth's own surface point with both sides of the same instant, so a laptop or desk
+beside the hand is not on the capsules. It runs after the cloud's zone and before the remembered playzone, so a
+surface the room memory holds on that ray is put back. Only the coverage of the depth itself is removed, only where
+there was some (so the active rectangle of `gpu_rect` needs nothing new: its bound of the region coverage already
+holds every texel the rule can open). The capsules come from the room memory (`mem_roll 1`, the hand's own sample
+history at the capture time, "exact"); a hand with "fallback" or no capsules is left alone.
+
+**The gate.** Only while that hand's wrist has moved 1.5 cm or more between the depth's capture and its newest
+sample (full from 3 cm; about 0.25 m/s at the rig's timing). A hand at rest is never touched, so the surface its
+fingers rest on (the laptop of 2026-11-25) stays. Offline (burst 18) the rule without the gate took 115-123 static
+texels per frame under resting fingers; with it 0. A gate on the wrist's speed instead removed 11 % instead of 59 %.
+
+**Offline on the home bursts** (left eye, 20 mm, the study's `owncheck.py`): burst 16, wrist 0.5 m/s and more,
+59 % of the late-depth ghost removed, 0.38 % of the static surface taken; below 0.2 m/s nothing; bursts 17 and 18
+(hand at the laptop, slow): 0 texels changed. 30 mm removed 64 % at 0.84 % static taken.
+
+**What it does not fix.** The forearm's late copy (the rule ends at the wrist; a forearm capsule is a later stage,
+bare arms only); the larger, still patch beside a still hand or the patch that stays where a hand left (ghost 2 of
+the study, probably the room memory: test it with `mem_roll 0` / `mem_margin_mm 20`); frames without capsules from
+the history; a hand the tracking puts in the wrong place (a hand-shaped piece of whatever is there goes to the key
+while it moves). A hand sliding fast along the wheel rim hands the rim within 2-3.5 cm of where it was 0.1 s ago to
+the key unless the memory holds it: lower to 10 if the rim opens.
+
+**Headset test (20 s gesture, A/B `cloud_own 0` / `20`, with `cloud 1` and `mem_roll 1`).** Seated, game running,
+looking at the dash: (a) right hand 25-35 cm in front of the face, open, still for 3 s; (b) wave it left-right over
+about 20 cm, two swings per second, for 5 s; (c) look up and pinch near the top of the windscreen for 3 s; (d) drop
+the hand fast to the wheel. Watch for monitor-coloured stripes or a hand shape beside the moving hand in (b): they
+should be gone or clearly smaller with 20, and nothing new may appear next to the still hand in (a) and (c). Then a
+hand resting on the laptop and both hands steering fast, same A/B: the laptop and the rim must stay. Cost: two
+sphere tests per texel with coverage, 28 segment tests inside a hand's sphere; expected under 0.05 ms, to be
+checked with the same A/B and a waving hand. Not run on the headset yet.
 
 ## Literature
 

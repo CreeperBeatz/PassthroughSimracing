@@ -183,7 +183,10 @@ impl PassthroughLayer<'_> {
 ///   reaches at most 2 x this texels), `cloud_trail_age` (16 depth images, 0..255, 0: no age test: the trail
 ///   hands only surface to the key that arrived in the mask within these), `cloud_trail_hands` (1: the trail
 ///   hands nothing to the key near a hand, scaled by 1 - the near-hand value; 0: as before, for an A/B;
-///   surface only the remembered playzone shows is never handed), `cloud_ab 1`: 2 s the cloud, 2 s today's picture, with a green / red
+///   surface only the remembered playzone shows is never handed), `cloud_own <mm>` (0..40, unset or 0: off;
+///   try 20: depth surface within that of a hand's capsules at the depth's capture time is the hand itself,
+///   late, and goes to the key while that hand's wrist has moved 1.5 cm or more since the capture; needs
+///   `mem_roll 1`), `cloud_ab 1`: 2 s the cloud, 2 s today's picture, with a green / red
 ///   mark. A `cloud:` line every 2 s
 /// - `setprop debug.alvr.key_hands 0`: no hands in the GPU passes (to measure them)
 /// - `setprop debug.alvr.arm_shift 0`: plain depth for the arms, not shifted by the motion of the wrist (also

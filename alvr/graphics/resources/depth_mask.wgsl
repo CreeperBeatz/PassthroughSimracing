@@ -10,7 +10,8 @@
 // the boxes of the play area or the cockpit box of the settings).
 //
 // Output: r: region coverage (0..1), g: proximity for the debug view (1: at the eye, 0: 3 m or
-// more), or with the depth cloud (`debug.alvr.cloud`) its zone, where the colour key decides (0..1),
+// more), or with the depth cloud (`debug.alvr.cloud`) its zone, where the colour key decides (0..1; with
+// `cloud_own` also the late depth of a moving hand itself, taken out of r),
 // b: whether there is depth data (0/1; read by the Show depth view only, which hides the cloud), or
 // with the cloud's trail (`cloud_trail`, depth_u.cloud.z above 0) how much of the solid mask the
 // stream hands to the key (0..1, see cloud_zone; less near the hands with `cloud_trail_hands`, none on
@@ -73,6 +74,10 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     }
 
     var result = current_mask(uv);
+    // `cloud_own`: the depth's surface of this texel, before the cloud writes over g (the proximity, exact
+    // under 3 m) and b (the depth flag)
+    let surface_t = (1.0 - result.g) * 3.0;
+    let surface_known = result.b > 0.5 && result.g > 0.0;
 
     // The depth cloud replaces the proximity, which only the Show depth view reads (the cloud is off
     // with it), and with `cloud_trail` the depth data flag, read by that view only too. Off (the
@@ -83,6 +88,20 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         if depth_u.cloud.z > 0.0 {
             result.b = zone.y;
         }
+    }
+
+    // `cloud_own` (docs/depth-cloud.md): depth surface on a hand's capsules as they were at the depth's
+    // capture time is that hand itself, late (the runtime left a fast hand in the depth), while the hand
+    // has moved since. Its part of the depth's coverage goes to the colour key (the zone, g), as around
+    // the hands everywhere. Before the remembered playzone, which puts back what it holds on this ray,
+    // and the wrist gap, which only adds. Only removes from r, and only where r was set. Off (own.x 0, the
+    // default): nothing is read, the mask is today's
+    if depth_u.cloud.x > 0.5 && depth_u.own.x > 0.0 && surface_known && result.r > 0.0 {
+        let eye = depth_u.eyes[imm.view_idx];
+        let dir = normalize((eye.uv_to_world_dir * vec4f(uv, 1.0, 0.0)).xyz);
+        let own = own_hand(eye.eye_position.xyz + dir * surface_t);
+        result.r *= 1.0 - own;
+        result.g = max(result.g, own);
     }
 
     // The strip the runtime removes behind each wrist. Only adds, and with both gaps off (the default)
@@ -224,6 +243,49 @@ fn cloud_zone(uv: vec2f) -> vec2f {
         recent = 1.0 - smoothstep(age - 2.0, age, field.a * CLOUD_OLD_COUNT);
     }
     return vec2f(zone, zone * recent);
+}
+
+// `cloud_own`: how much a point of the depth's surface is a hand itself at the depth's capture time
+// (0..1): 1 within own.x of that hand's capsules then, fading to 0 over own.y beyond, times the hand's
+// gate. A hand without capsules from its history (bounds w 0) or with gate 0 gives nothing; a point
+// outside its bounding sphere grown by the reach is not tested further. Same as `own_weight` in
+// motion_cloud.rs
+fn own_hand(point: vec3f) -> f32 {
+    let reach = depth_u.own.x + depth_u.own.y;
+    var own = 0.0;
+    for (var hand = 0u; hand < 2u; hand++) {
+        let gate = select(depth_u.own.z, depth_u.own.w, hand == 1u);
+        let bounds = depth_u.capture_bounds[hand];
+        if bounds.w <= 0.0 || gate <= 0.0 || length(point - bounds.xyz) > bounds.w + reach {
+            continue;
+        }
+        var nearest = FAR_DISTANCE;
+        for (var i = 0u; i < HAND_SEGMENTS; i++) {
+            let base = (hand * HAND_SEGMENTS + i) * 2u;
+            nearest = min(
+                nearest,
+                point_capsule_distance(
+                    point,
+                    depth_u.capture_points[base],
+                    depth_u.capture_points[base + 1u],
+                ),
+            );
+        }
+        own = max(own, gate * (1.0 - smoothstep(depth_u.own.x, reach, nearest)));
+    }
+    return own;
+}
+
+// Distance of a point from the surface of a tapered capsule (xyz: position, w: radius), negative inside.
+// Same as `point_capsule_distance` in motion_cloud.rs
+fn point_capsule_distance(point: vec3f, start: vec4f, end: vec4f) -> f32 {
+    let axis = end.xyz - start.xyz;
+    let c = dot(axis, axis);
+    var s = 0.0;
+    if c > 1e-9 {
+        s = clamp(dot(point - start.xyz, axis) / c, 0.0, 1.0);
+    }
+    return length(point - (start.xyz + axis * s)) - mix(start.w, end.w, s);
 }
 
 // `cloud_trail_age` from depth_u.cloud.w (negative with `cloud_trail_hands 0`: -1 - the age)

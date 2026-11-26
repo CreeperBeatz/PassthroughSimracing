@@ -172,10 +172,15 @@ fn depth_uniforms_layout_matches_the_shader() {
     };
     let (_, box_size) = struct_of("AreaBox");
     assert_eq!(box_size, 4 * play_area::AREA_BOX_FLOAT_COUNT);
-    // `gpu_rect` last (its vector, then the rectangles of the mask and of the focus taps), the
-    // green-screen zone before it (its vector, then its boxes), the lever windows before that, after the
-    // play area
-    let gpu_rect_start = depth_mask::DEPTH_UNIFORMS_SIZE - 4 * depth_mask::GPU_RECT_FLOAT_COUNT;
+    // `cloud_own` last (its vector, the bounds and the capsules of the hands at the capture time),
+    // `gpu_rect` before it (its vector, then the rectangles of the mask and of the focus taps), the
+    // green-screen zone before that (its vector, then its boxes), then the lever windows, after the play
+    // area
+    let own_start = depth_mask::DEPTH_UNIFORMS_SIZE - 4 * depth_mask::OWN_FLOAT_COUNT;
+    assert_eq!(offset("own"), own_start);
+    assert_eq!(offset("capture_bounds"), own_start + 16);
+    assert_eq!(offset("capture_points"), own_start + 16 + 2 * 16);
+    let gpu_rect_start = own_start - 4 * depth_mask::GPU_RECT_FLOAT_COUNT;
     assert_eq!(offset("gpu_rect"), gpu_rect_start);
     assert_eq!(offset("gpu_rect_mask"), gpu_rect_start + 16);
     assert_eq!(offset("gpu_rect_focus"), gpu_rect_start + 16 + 2 * 16);
@@ -199,7 +204,7 @@ fn depth_uniforms_layout_matches_the_shader() {
     assert_eq!(offset("cloud"), offset("memory") + 16);
     assert_eq!(offset("key_lower"), offset("cloud") + 16);
     assert_eq!(offset("key_lower"), 4 * depth_mask::KEY_LOWER_FLOAT_OFFSET);
-    assert_eq!(depth_mask::DEPTH_UNIFORMS_SIZE, 4784);
+    assert_eq!(depth_mask::DEPTH_UNIFORMS_SIZE, 6624);
     // Where the box of the settings was: 2 eyes, then the transform and the number of boxes
     let eyes = 2 * 4 * (16 + 4 + 16 + 16 + 4);
     assert_eq!(offset("world_to_area"), eyes);
@@ -4929,6 +4934,7 @@ impl CloudRig {
                 capture_ns: Some(self.capture_ns),
                 display_ns: self.capture_ns + 100_000_000 + display * 13_888_889,
                 shown: true,
+                own_gate: [0.0; 2],
             };
             let passes = self
                 .cloud
@@ -4968,6 +4974,7 @@ impl CloudRig {
             capture_ns: Some(self.capture_ns),
             display_ns: self.capture_ns + age_ns,
             shown: true,
+            own_gate: [0.0; 2],
         };
         let frame = same_frame.then_some(frame);
         let passes = self.cloud.plan(queue, &input, frame, uniforms);
@@ -5067,6 +5074,7 @@ impl CloudRig {
             capture_ns: Some(self.capture_ns),
             display_ns: self.capture_ns,
             shown: true,
+            own_gate: [0.0; 2],
         }
     }
 }
@@ -6266,6 +6274,7 @@ fn cloud_off_is_today() {
         capture_ns: Some(0),
         display_ns: 100_000_000,
         shown: true,
+        own_gate: [0.0; 2],
     };
     let today_phase = CloudInput {
         shown: false,
@@ -6361,6 +6370,7 @@ fn cloud_zone_is_inert_outside_the_lower_layer() {
             capture_ns: Some(0),
             display_ns: 100_000_000,
             shown: true,
+            own_gate: [0.0; 2],
         }),
         cloud_probe: true,
         ..Default::default()
@@ -6422,6 +6432,7 @@ fn green_zone_render(
                 capture_ns: Some(0),
                 display_ns: 100_000_000,
                 shown: true,
+                own_gate: [0.0; 2],
             }),
             cloud_probe: true,
             cloud_probe_cell: Some(CLOUD_TRAIL_NEAR),
@@ -6549,6 +6560,7 @@ fn cloud_trail_render(device: &Device, queue: &Queue, cell: [u8; 4], trail: f32)
                 capture_ns: Some(0),
                 display_ns: 100_000_000,
                 shown: true,
+                own_gate: [0.0; 2],
             }),
             cloud_probe: true,
             cloud_probe_cell: Some(cell),
@@ -7084,6 +7096,7 @@ fn cloud_trail_hand_render(
                 capture_ns: Some(0),
                 display_ns: 100_000_000,
                 shown: true,
+                own_gate: [0.0; 2],
             }),
             cloud_probe: true,
             cloud_probe_cell: Some(CLOUD_TRAIL_NEAR),
@@ -7174,6 +7187,195 @@ fn cloud_trail_spares_remembered_surface() {
     );
 }
 
+// `debug.alvr.cloud_own`: the late hand. The box at 0.5 m (in the region) stands for the depth of a fast
+// hand the runtime left in it; the hand's capsule at the depth's capture time lies on it: from
+// CLOUD_OWN_START to CLOUD_OWN_END, 1 cm thick
+const CLOUD_OWN_START: Vec3 = Vec3::new(-0.09, 0.0, -0.5);
+const CLOUD_OWN_END: Vec3 = Vec3::new(-0.03, 0.0, -0.5);
+/// A pixel on the capsule's axis (-0.06 m at 0.5 m) and one on the box 14 cm to its right, 11 cm from the
+/// capsule's end: the static thing beside the hand (a laptop)
+const CLOUD_OWN_ON: (f32, f32) = (0.44, 0.5);
+const CLOUD_OWN_BESIDE: (f32, f32) = (0.58, 0.5);
+
+/// The box of `Scene::new` in the cloud's region, the colour key without tracked hands (the focus area is
+/// empty), the cloud shown without a field (its zone is 0 everywhere), `cloud_own` `own` m with the gates
+/// `gates`, and the room memory's capsules at the capture time from `source` (None: no memory input)
+fn cloud_own_render(
+    device: &Device,
+    queue: &Queue,
+    own: f32,
+    gates: [f32; 2],
+    source: Option<CaptureHand>,
+) -> Output {
+    let scene = Scene::new(3.0, [0.3, 0.3, 0.7, 0.7], 0.5);
+    let hand = HandShape {
+        segments: [[CLOUD_OWN_START.extend(0.01), CLOUD_OWN_END.extend(0.01)]; HAND_SEGMENTS],
+    };
+    let memory = source.map(|source| MemoryInput {
+        params: MemoryParams::default(),
+        capture_ns: Some(0),
+        hands: [Some(hand), None],
+        hand_sources: [source, CaptureHand::None],
+        reach: [0.0; 2],
+        hands_away: false,
+    });
+    render_v2(
+        device,
+        queue,
+        &cloud_config(),
+        &scene,
+        Vec3::ZERO,
+        Vec3::ZERO,
+        true,
+        Some(ColorKeyInput {
+            hands: [None; 2],
+            leak: [0.0; 2],
+            bridges: [None; 2],
+        }),
+        [None; 2],
+        None,
+        None,
+        false,
+        &[],
+        None,
+        0.0,
+        0.0,
+        MaskV2 {
+            memory,
+            cloud: Some(CloudInput {
+                params: CloudParams {
+                    own,
+                    ..Default::default()
+                },
+                capture_ns: Some(0),
+                display_ns: 100_000_000,
+                shown: true,
+                own_gate: gates,
+            }),
+            ..Default::default()
+        },
+    )
+}
+
+// `cloud_own 20` with the hand's wrist past the gate (gate 1): the box's surface on the capture-time
+// capsule leaves the mask's coverage (r 0) and is the colour key's (g 255: the key decides, packed 0.5),
+// and coverage only goes down, zone only up, b and a never change. The surface 11 cm beside the capsule
+// stays solid room. Half open gate (wrist 2.25 cm): half of each. Wrist at rest (gate 0): the mask is
+// that of `cloud_own` unset, bit for bit, so a static surface next to a resting hand is untouched; so it
+// is without the memory input (`mem_roll 0`) and with capsules that are not from the history
+#[test]
+fn cloud_own_hands_the_late_hand_to_the_key() {
+    let (device, queue) = gpu_or_skip!();
+    assert_eq!(CloudParams::default().own, 0.0);
+    let exact = Some(CaptureHand::Exact);
+    let unset = cloud_own_render(&device, &queue, 0.0, [1.0; 2], exact);
+    let moving = cloud_own_render(&device, &queue, 0.02, [1.0, 0.0], exact);
+    let half = cloud_own_render(&device, &queue, 0.02, [0.5, 0.0], exact);
+    let (u, v) = CLOUD_OWN_ON;
+    let (bu, bv) = CLOUD_OWN_BESIDE;
+
+    // Unset: the box is solid room on and beside the capsule, no zone
+    for (u, v) in [CLOUD_OWN_ON, CLOUD_OWN_BESIDE] {
+        let texel = mask_texel(&unset.mask, u, v);
+        assert_eq!([texel[0], texel[1]], [255, 0], "{u} {v}");
+        assert_eq!(unset.alpha(u, v), 0.0);
+    }
+    // Moving: on the capsule handed to the key, beside it unchanged
+    let on = mask_texel(&moving.mask, u, v);
+    assert_eq!([on[0], on[1]], [0, 255]);
+    assert!(
+        (moving.alpha(u, v) - 0.5).abs() < 0.003,
+        "{}",
+        moving.alpha(u, v)
+    );
+    assert_eq!(
+        mask_texel(&moving.mask, bu, bv),
+        mask_texel(&unset.mask, bu, bv)
+    );
+    assert_eq!(moving.at(bu, bv), unset.at(bu, bv));
+    let mut taken = 0;
+    for (a, b) in moving.mask.iter().zip(&unset.mask) {
+        assert!(
+            a[0] <= b[0] && a[1] >= b[1] && a[2] == b[2] && a[3] == b[3],
+            "{a:?} {b:?}"
+        );
+        taken += usize::from(a[0] < b[0]);
+    }
+    // About 1 cm + 2 cm + 1.5 cm of fade on each side of a 6 cm axis, 1.56 cm per texel at 0.5 m
+    assert!((8..150).contains(&taken), "{taken}");
+    // Half the gate: half of it
+    let texel = mask_texel(&half.mask, u, v);
+    assert!(
+        (126..=129).contains(&texel[0]) && (126..=129).contains(&texel[1]),
+        "{texel:?}"
+    );
+
+    // The wrist at rest, no memory, capsules not from the history: today's mask and picture
+    for (gates, source) in [
+        ([0.0; 2], exact),
+        ([1.0; 2], None),
+        ([1.0; 2], Some(CaptureHand::Fallback)),
+        ([1.0; 2], Some(CaptureHand::None)),
+    ] {
+        let off = cloud_own_render(&device, &queue, 0.02, gates, source);
+        assert!(off.mask == unset.mask, "{gates:?} {source:?}");
+        assert!(off.pixels == unset.pixels, "{gates:?} {source:?}");
+    }
+    // `cloud_own` without the cloud shown (today's phase of `cloud_ab`) writes nothing either: its
+    // uniforms are all zeros
+    let config = cloud_config();
+    let mut input = DepthRenderInput {
+        frame: None,
+        eye_positions: [Vec3::ZERO; 2],
+        color_key: Some(ColorKeyInput {
+            hands: [None; 2],
+            leak: [0.0; 2],
+            bridges: [None; 2],
+        }),
+        arms: [None; 2],
+        arm_gaps: [None; 2],
+        edge_cut: 0.0,
+        lever_windows: [None; MAX_LEVER_WINDOWS],
+        green_windows: [None; MAX_GREEN_WINDOWS],
+        capture_playzone: false,
+        playzone_view: false,
+        memory: Some(MemoryInput {
+            params: MemoryParams::default(),
+            capture_ns: Some(0),
+            hands: [
+                Some(HandShape {
+                    segments: [[Vec4::ONE; 2]; HAND_SEGMENTS],
+                }),
+                None,
+            ],
+            hand_sources: [CaptureHand::Exact; 2],
+            reach: [0.0; 2],
+            hands_away: false,
+        }),
+        cloud: Some(CloudInput {
+            params: CloudParams {
+                own: 0.02,
+                ..Default::default()
+            },
+            capture_ns: Some(0),
+            display_ns: 0,
+            shown: true,
+            own_gate: [1.0; 2],
+        }),
+        key_lower_rects: None,
+        region_override: None,
+        game_dim: 0.0,
+        game_see: 0.0,
+    };
+    let own_part = |input: &DepthRenderInput| {
+        let data = depth_mask::depth_uniforms(&config, &[view(Vec3::ZERO); 2], input, None, false);
+        data[data.len() - depth_mask::OWN_FLOAT_COUNT..].to_vec()
+    };
+    assert_eq!(&own_part(&input)[..4], &[0.02, 0.015, 1.0, 1.0]);
+    input.cloud.as_mut().unwrap().shown = false;
+    assert!(own_part(&input).iter().all(|&value| value == 0.0));
+}
+
 /// The texel of an `Output` mask at view-space uv (origin top-left)
 fn mask_texel(mask: &[[u8; 4]], u: f32, v: f32) -> [u8; 4] {
     let x = ((u * TARGET_SIZE as f32) as u32).min(TARGET_SIZE - 1);
@@ -7197,6 +7399,7 @@ fn cloud_ab_marks_the_phase() {
             capture_ns: Some(0),
             display_ns: 100_000_000,
             shown,
+            own_gate: [0.0; 2],
         };
         render_v2(
             &device,
@@ -7291,6 +7494,7 @@ fn cloud_vector_in_the_depth_uniforms() {
             capture_ns: None,
             display_ns: 0,
             shown,
+            own_gate: [0.0; 2],
         })
     };
     let volume = cloud_config();

@@ -24,6 +24,8 @@ pub const MAX_FETCH_MM: i64 = 1500;
 pub const MAX_HEAD_DEG_S: i64 = 1000;
 /// `cloud_trail_age` (depth images, 0: no age test)
 pub const MAX_TRAIL_AGE: i64 = 255;
+/// `cloud_own` (mm from the capsules, 0: off)
+pub const MAX_OWN_MM: i64 = 40;
 /// `cloud_ab 1` shows the cloud and today's picture for this long each
 pub const AB_PHASE: Duration = Duration::from_secs(2);
 
@@ -45,6 +47,7 @@ pub struct CloudValues {
     pub trail_age: Option<i64>,
     pub trail_hands: Option<i64>,
     pub window: Option<i64>,
+    pub own: Option<i64>,
 }
 
 /// `debug.alvr.cloud*`. None: `cloud` is unset or 0 (off, the default)
@@ -68,6 +71,7 @@ pub fn read_params() -> Option<CloudParams> {
         trail_age: debug_property("debug.alvr.cloud_trail_age"),
         trail_hands: debug_property("debug.alvr.cloud_trail_hands"),
         window: debug_property("debug.alvr.cloud_window"),
+        own: debug_property("debug.alvr.cloud_own"),
     })
 }
 
@@ -79,7 +83,7 @@ pub fn read_params() -> Option<CloudParams> {
 
 /// Unset values are the defaults; out of range ones are clamped. `cloud` 1 is the depth cloud, 2 or more
 /// the cloud on top of today's arm shift; unset, 0 or negative: off. The cap, `cloud_fixed` and
-/// `cloud_trail` go up to 2 x `cloud_window`
+/// `cloud_trail` go up to 2 x `cloud_window`. `cloud_own` in mm, 0..`MAX_OWN_MM` (unset or 0: off)
 pub fn params_from_values(values: &CloudValues) -> Option<CloudParams> {
     let mode = values.mode.filter(|mode| *mode >= 1)?.min(2) as u8;
     let defaults = CloudParams::default();
@@ -118,11 +122,14 @@ pub fn params_from_values(values: &CloudValues) -> Option<CloudParams> {
             .trail_hands
             .map_or(defaults.trail_hands, |hands| hands != 0),
         window,
+        own: values
+            .own
+            .map_or(defaults.own, |own| own.clamp(0, MAX_OWN_MM) as f32 / 1000.0),
     })
 }
 
 fn params_part(params: &CloudParams) -> String {
-    format!(
+    let mut text = format!(
         "cloud: mode {}, gain {:.0} cap {:.0} hold {:.0} dead {:.1} lambda {:.0} fetch {:.0} fixed {:.0} ab {} \
          onesided {} trail {:.0}/{}{} window {}",
         params.mode,
@@ -144,7 +151,12 @@ fn params_part(params: &CloudParams) -> String {
             ""
         },
         params.window
-    )
+    );
+    // `cloud_own`: only while set, so that the line is today's without it
+    if params.own > 0.0 {
+        let _ = write!(text, " own {:.0}", params.own * 1000.0);
+    }
+    text
 }
 
 /// The `cloud:` line of the settings, on each change
@@ -453,6 +465,7 @@ mod tests {
             trail_age: Some(-1),
             trail_hands: Some(-1),
             window: Some(3),
+            own: Some(-5),
         })
         .unwrap();
         assert_eq!(
@@ -464,6 +477,8 @@ mod tests {
         assert_eq!((low.fixed, low.ab, low.onesided), (0.0, false, 0));
         assert_eq!((low.trail, low.trail_age, low.window), (0.0, 0, 12));
         assert!(low.trail_hands);
+        assert_eq!(low.own, 0.0);
+        assert!(!params_text(Some(&low)).contains(" own"));
 
         // Clamped above
         let high = params_from_values(&CloudValues {
@@ -482,6 +497,7 @@ mod tests {
             trail_age: Some(999),
             trail_hands: Some(7),
             window: Some(99),
+            own: Some(400),
         })
         .unwrap();
         assert_eq!(
@@ -495,6 +511,8 @@ mod tests {
         assert!((high.fetch_m - 1.5).abs() < 1e-6);
         assert_eq!((high.fixed, high.ab, high.onesided), (48.0, true, 2));
         assert_eq!((high.trail, high.trail_age, high.window), (48.0, 255, 24));
+        assert!((high.own - 0.04).abs() < 1e-6);
+        assert!(params_text(Some(&high)).ends_with(" trail 48/255h window 24 own 40"));
 
         // Without `cloud_window` the cap, the constant reach and the trail stop at 24 (today's)
         let today = params_from_values(&CloudValues {
@@ -555,6 +573,19 @@ mod tests {
             .unwrap();
             assert!(params.trail_hands, "{hands}");
         }
+
+        // `cloud_own`: off by default (0, not in the line), mm as set, in the line after the window
+        assert_eq!(params.own, 0.0);
+        let own = params_from_values(&CloudValues {
+            own: Some(20),
+            ..on
+        })
+        .unwrap();
+        assert!((own.own - 0.02).abs() < 1e-6);
+        assert!(params_text(Some(&own)).ends_with(" onesided 1 trail 0/16 window 12 own 20"));
+        let zero = params_from_values(&CloudValues { own: Some(0), ..on }).unwrap();
+        assert_eq!(zero.own, 0.0);
+        assert_eq!(params_text(Some(&zero)), params_text(Some(&params)));
     }
 
     // Every value above its range (`cloud_window` 99: 24)
@@ -575,6 +606,7 @@ mod tests {
             trail_age: Some(999),
             trail_hands: Some(7),
             window: Some(99),
+            own: None,
         }
     }
 
@@ -682,6 +714,7 @@ mod tests {
             capture_ns: Some(0),
             display_ns: 100_000_000,
             shown,
+            own_gate: [0.0; 2],
         };
         // The zone is shown as the renderer decides it (`cloud_shown`)
         let config = DepthPassthroughConfig {

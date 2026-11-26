@@ -23,7 +23,10 @@
 //!
 //! Pure maths, so it can be tested on the PC.
 
-use alvr_common::{ViewParams, glam::Quat};
+use alvr_common::{
+    ViewParams,
+    glam::{Quat, Vec3, Vec4},
+};
 
 /// Half of the window of the distances of the field (cells of 2 x 2 depth texels) by default
 /// (`cloud_window` unset)
@@ -94,6 +97,67 @@ pub struct CloudParams {
     /// 12: today's). The distances are truncated at 2 x this (depth texels), so the band reaches at
     /// most that far. A change resets the cloud (`MotionCloud::plan`)
     pub window: u8,
+    /// `cloud_own` (m, 0: off): depth surface within this of a hand's capsules at the depth's capture time
+    /// is the hand itself, late (the runtime left a fast hand in the depth): its part of the mask is handed
+    /// to the key while that hand's wrist has moved since the capture (`own_gate`). Fades out over
+    /// `CLOUD_OWN_FADE_M` beyond it. Needs the room memory (its capture-time capsules)
+    pub own: f32,
+}
+
+/// `cloud_own`: the rule fades out over this beyond the distance (m)
+pub const CLOUD_OWN_FADE_M: f32 = 0.015;
+/// `cloud_own`: the gate of a hand opens from this travel of its wrist since the depth's capture (m) and is
+/// full from the second: a hand at rest (or slow) is never touched
+pub const CLOUD_OWN_GATE_M: [f32; 2] = [0.015, 0.030];
+
+/// `cloud_own`: the gate of a hand from its wrist's travel between the depth's capture time and the newest
+/// sample (m, None: not known): 0 up to 1.5 cm, linear to 1 at 3 cm
+pub fn own_gate(travel: Option<f32>) -> f32 {
+    let Some(travel) = travel.filter(|travel| travel.is_finite()) else {
+        return 0.0;
+    };
+    let [from, full] = CLOUD_OWN_GATE_M;
+    ((travel - from) / (full - from)).clamp(0.0, 1.0)
+}
+
+/// Distance of a point from the surface of a tapered capsule (xyz: position, w: radius), negative inside.
+/// Same as `point_capsule_distance` in depth_mask.wgsl
+pub fn point_capsule_distance(point: Vec3, start: Vec4, end: Vec4) -> f32 {
+    let axis = (end - start).truncate();
+    let c = axis.dot(axis);
+    let s = if c > 1e-9 {
+        ((point - start.truncate()).dot(axis) / c).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    point.distance(start.truncate() + axis * s) - (start.w + (end.w - start.w) * s)
+}
+
+/// `cloud_own`: how much of the depth's surface at `point` is the hand itself (0..1): 1 within `own` of the
+/// capsules of a hand at the capture time, fading to 0 over `fade` beyond, times that hand's gate. Hands
+/// without capsules (None) or with gate 0 give nothing. Same as `own_hand` in depth_mask.wgsl (without its
+/// bounding-sphere shortcut, which gives the same value)
+pub fn own_weight(
+    point: Vec3,
+    hands: &[Option<crate::HandShape>; 2],
+    gates: [f32; 2],
+    own: f32,
+    fade: f32,
+) -> f32 {
+    let mut weight = 0.0_f32;
+    for (hand, gate) in hands.iter().zip(gates) {
+        let Some(hand) = hand.filter(|_| gate > 0.0 && own > 0.0) else {
+            continue;
+        };
+        let nearest = hand
+            .segments
+            .iter()
+            .map(|[start, end]| point_capsule_distance(point, *start, *end))
+            .fold(f32::MAX, f32::min);
+        let t = ((nearest - own) / fade).clamp(0.0, 1.0);
+        weight = weight.max(gate * (1.0 - t * t * (3.0 - 2.0 * t)));
+    }
+    weight
 }
 
 /// The truncation of the signed distances of a field built with `window` (depth texels: 2 x the
@@ -120,6 +184,7 @@ impl Default for CloudParams {
             trail_age: 16,
             trail_hands: true,
             window: CLOUD_WINDOW_CELLS,
+            own: 0.0,
         }
     }
 }
@@ -134,6 +199,8 @@ pub struct CloudInput {
     pub display_ns: i64,
     /// False in the "today" phase of `cloud_ab`: the passes run, the mask does not read the field
     pub shown: bool,
+    /// `cloud_own`: the gate of each hand (0..1, `own_gate`; 0 without `cloud_own`)
+    pub own_gate: [f32; 2],
 }
 
 /// Why a pair claimed no motion
@@ -443,7 +510,7 @@ pub fn cloud_uniforms(
 /// value: the region changed
 pub fn region_signature(depth_uniforms: &[f32]) -> u64 {
     use crate::{
-        depth_mask::{GPU_RECT_FLOAT_COUNT, GREEN_FLOAT_COUNT, LEVER_FLOAT_COUNT},
+        depth_mask::{GPU_RECT_FLOAT_COUNT, GREEN_FLOAT_COUNT, LEVER_FLOAT_COUNT, OWN_FLOAT_COUNT},
         play_area::AREA_FLOAT_COUNT,
     };
     use std::hash::{DefaultHasher, Hasher};
@@ -457,14 +524,14 @@ pub fn region_signature(depth_uniforms: &[f32]) -> u64 {
         }
     };
     let len = depth_uniforms.len();
-    let tail = LEVER_FLOAT_COUNT + GREEN_FLOAT_COUNT + GPU_RECT_FLOAT_COUNT;
+    let tail = LEVER_FLOAT_COUNT + GREEN_FLOAT_COUNT + GPU_RECT_FLOAT_COUNT + OWN_FLOAT_COUNT;
     if len < AREA_START + 24 + AREA_FLOAT_COUNT + tail {
         add(depth_uniforms);
         return hasher.finish();
     }
     add(&depth_uniforms[AREA_START..AREA_START + 17]);
     add(&depth_uniforms[AREA_START + 20..AREA_START + 23]);
-    // The lever windows, the green-screen zone and `gpu_rect` come after the boxes
+    // The lever windows, the green-screen zone, `gpu_rect` and `cloud_own` come after the boxes
     let boxes_end = len - tail;
     add(&depth_uniforms[boxes_end - AREA_FLOAT_COUNT..boxes_end]);
     hasher.finish()
@@ -663,6 +730,7 @@ impl CloudRecord {
             ("trail_age", params.trail_age.to_string()),
             ("trail_hands", u8::from(params.trail_hands).to_string()),
             ("window", params.window.to_string()),
+            ("own_mm", number(params.own * 1000.0)),
             ("eyes", array(self.eyes.map(|eye| eye.to_json()))),
         ])
     }
@@ -1049,12 +1117,15 @@ mod tests {
         other[3] = 2.0;
         other[300] = 2.0;
         assert_eq!(region_signature(&other), signature);
-        // A lever window, the green-screen zone, `gpu_rect`: the same
-        let green_end = count - crate::depth_mask::GPU_RECT_FLOAT_COUNT;
+        // A lever window, the green-screen zone, `gpu_rect`, `cloud_own`: the same
+        let own_start = count - crate::depth_mask::OWN_FLOAT_COUNT;
+        other[own_start] = 0.02;
+        other[count - 1] = 2.0;
+        let green_end = own_start - crate::depth_mask::GPU_RECT_FLOAT_COUNT;
         other[green_end - crate::depth_mask::GREEN_FLOAT_COUNT - 1] = 2.0;
         other[green_end - 1] = 2.0;
         other[green_end - crate::depth_mask::GREEN_FLOAT_COUNT] = 1.0;
-        other[count - 1] = 2.0;
+        other[own_start - 1] = 2.0;
         other[green_end] = 1.0;
         assert_eq!(region_signature(&other), signature);
         // The transform of the area, the soft edge, a box: another
@@ -1150,6 +1221,60 @@ mod tests {
         assert!((speed - 30.0 / dt).abs() < 1e-3, "{speed}");
     }
 
+    // `cloud_own`: the gate opens from 1.5 cm of wrist travel, is full from 3 cm, and is closed without a
+    // known travel
+    #[test]
+    fn own_gate_ramps_with_the_travel() {
+        assert_eq!(own_gate(None), 0.0);
+        assert_eq!(own_gate(Some(f32::NAN)), 0.0);
+        assert_eq!(own_gate(Some(0.0)), 0.0);
+        assert_eq!(own_gate(Some(0.015)), 0.0);
+        assert!((own_gate(Some(0.0225)) - 0.5).abs() < 1e-5);
+        assert_eq!(own_gate(Some(0.03)), 1.0);
+        assert_eq!(own_gate(Some(0.5)), 1.0);
+    }
+
+    // The CPU twin of `own_hand` (depth_mask.wgsl): a point on the capsule is the hand (1), one 5 cm
+    // beside it is not (0, beyond 2 + 1.5 cm), one at the middle of the fade is half, and a gate of 0 (the
+    // hand at rest) or no capsules give nothing anywhere
+    #[test]
+    fn own_weight_takes_only_the_hand_itself() {
+        let start = Vec3::new(0.0, 0.0, -0.5).extend(0.01);
+        let end = Vec3::new(0.06, 0.0, -0.5).extend(0.008);
+        // Tapered: the radius at the middle is 9 mm
+        let middle = Vec3::new(0.03, 0.0, -0.5);
+        assert!((point_capsule_distance(middle, start, end) + 0.009).abs() < 1e-6);
+        assert!((point_capsule_distance(middle + Vec3::Y * 0.05, start, end) - 0.041).abs() < 1e-6);
+        // Beyond the end: from the end's ball
+        assert!(
+            (point_capsule_distance(Vec3::new(0.08, 0.0, -0.5), start, end) - 0.012).abs() < 1e-6
+        );
+
+        let hand = crate::HandShape {
+            segments: [[start, end]; crate::HAND_SEGMENTS],
+        };
+        let hands = [None, Some(hand)];
+        let weight =
+            |point: Vec3, gates: [f32; 2]| own_weight(point, &hands, gates, 0.02, CLOUD_OWN_FADE_M);
+        assert_eq!(weight(middle, [0.0, 1.0]), 1.0);
+        assert_eq!(weight(middle + Vec3::Y * 0.025, [0.0, 1.0]), 1.0);
+        assert_eq!(weight(middle + Vec3::Y * 0.05, [0.0, 1.0]), 0.0);
+        let fade = middle + Vec3::Y * (0.009 + 0.02 + 0.0075);
+        assert!((weight(fade, [0.0, 1.0]) - 0.5).abs() < 1e-3);
+        // The gate scales it; the hand at rest and a hand without capsules give nothing
+        assert!((weight(middle, [0.0, 0.4]) - 0.4).abs() < 1e-6);
+        assert_eq!(weight(middle, [1.0, 0.0]), 0.0);
+        assert_eq!(
+            own_weight(middle, &[None, None], [1.0; 2], 0.02, CLOUD_OWN_FADE_M),
+            0.0
+        );
+        // `cloud_own 0`: off
+        assert_eq!(
+            own_weight(middle, &hands, [1.0; 2], 0.0, CLOUD_OWN_FADE_M),
+            0.0
+        );
+    }
+
     #[test]
     fn record_json_is_valid() {
         let record = CloudRecord {
@@ -1181,7 +1306,7 @@ mod tests {
         assert!(json.contains(r#""fetch_mm":450"#), "{json}");
         assert!(
             json.contains(
-                r#""onesided":1,"trail":0,"trail_age":16,"trail_hands":1,"window":12,"eyes""#
+                r#""onesided":1,"trail":0,"trail_age":16,"trail_hands":1,"window":12,"own_mm":0,"eyes""#
             ),
             "{json}"
         );

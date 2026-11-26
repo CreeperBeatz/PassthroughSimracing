@@ -595,7 +595,7 @@ def summary(burst):
         last = display["cloud"][np.flatnonzero(on)[-1]]
         resets = display["cloud_reset"][on, 0]
         lines.append(
-            "depth cloud (cloud %d) in %d of %d display frames, shown in %d, gain %g cap %g hold %g dead %g lambda %g fetch %g fixed %g ab %s onesided %s trail %s; left eye a %s, reach %s, stale in %d frames, frames whose left field came from a reset pair (start / dt / head / region) %d/%d/%d/%d"
+            "depth cloud (cloud %d) in %d of %d display frames, shown in %d, gain %g cap %g hold %g dead %g lambda %g fetch %g fixed %g ab %s onesided %s trail %s own %s; left eye a %s, reach %s, stale in %d frames, frames whose left field came from a reset pair (start / dt / head / region) %d/%d/%d/%d"
             % (
                 last["mode"],
                 int(on.sum()),
@@ -611,6 +611,7 @@ def summary(burst):
                 last["ab"],
                 last.get("onesided", "-"),
                 last.get("trail", "-"),
+                last.get("own_mm", "-"),
                 _stats(display["cloud_a_ms"][on, 0]),
                 _stats(display["cloud_reach_ms"][on, 0]),
                 int(display["cloud_stale"][on, 0].sum()),

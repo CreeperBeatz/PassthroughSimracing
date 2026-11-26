@@ -140,6 +140,8 @@ struct RectScene {
     srgb: bool,
     crop_lower: bool,
     pad: f32,
+    /// `cloud_own` is on (with capture-time capsules on the depth's surface)
+    own: bool,
 }
 
 fn depth_fov() -> Fov {
@@ -642,6 +644,7 @@ fn random_scene(seed: u64) -> RectScene {
             capture_ns: Some(0),
             display_ns: 0,
             shown: true,
+            own_gate: [0.0; 2],
         }),
         key_lower_rects: key_crop,
         region_override: Some(region),
@@ -660,7 +663,7 @@ fn random_scene(seed: u64) -> RectScene {
         .flat_map(|_| [r.byte(), r.byte(), r.byte(), 255])
         .collect();
 
-    RectScene {
+    let mut scene = RectScene {
         config,
         input,
         views,
@@ -677,7 +680,87 @@ fn random_scene(seed: u64) -> RectScene {
         } else {
             r.range(0.0, 0.03)
         },
+        own: false,
+    };
+    // Drawn last, so that the scenes before `cloud_own` are unchanged
+    random_own(r, &mut scene);
+    scene
+}
+
+/// `debug.alvr.cloud_own` in 60 % of the scenes with the cloud: the room memory's capture-time capsules of
+/// each hand (often from the history, the rule's case) lie on a surface of this eye's depth image, the
+/// gates are random (often full), the distance 5-40 mm. A scene without the memory gets one
+fn random_own(r: &mut Lcg, scene: &mut RectScene) {
+    let (Some(cloud), Some(frame)) = (&mut scene.input.cloud, scene.input.frame) else {
+        return;
+    };
+    if !r.chance(0.6) {
+        return;
     }
+    cloud.params.own = r.range(0.005, 0.04);
+    cloud.own_gate = [0, 1].map(|_| if r.chance(0.5) { 1.0 } else { r.next() });
+    let mut memory = scene.input.memory.unwrap_or(MemoryInput {
+        params: crate::MemoryParams {
+            size: 64,
+            ..Default::default()
+        },
+        capture_ns: None,
+        hands: [None; 2],
+        hand_sources: [crate::CaptureHand::None; 2],
+        reach: [0.0; 2],
+        hands_away: false,
+    });
+    // A point of the depth image as the mask reads it (row 0 at the bottom unless flipped)
+    let camera = frame.depth_views[scene.view_idx];
+    let size = RECT_DEPTH as usize;
+    let depth = &scene.depth[scene.view_idx];
+    let to_world = depth_mask::pose_to_mat4(camera.pose);
+    let (lo, hi) = (
+        Vec2::new(camera.fov.left.tan(), camera.fov.down.tan()),
+        Vec2::new(camera.fov.right.tan(), camera.fov.up.tan()),
+    );
+    for hand in 0..2 {
+        memory.hands[hand] = None;
+        memory.hand_sources[hand] = crate::CaptureHand::None;
+        if !r.chance(0.8) {
+            continue;
+        }
+        let (x, y) = (
+            (r.next() * size as f32) as usize,
+            (r.next() * size as f32) as usize,
+        );
+        let encoded = depth[y.min(size - 1) * size + x.min(size - 1)];
+        if encoded <= 0.0 {
+            continue;
+        }
+        // encode_depth with an infinite far plane, inverted
+        let z = 2.0 * NEAR / (2.0 - 2.0 * encoded);
+        let mut ndc = Vec2::new(
+            (x as f32 + 0.5) / size as f32,
+            (y as f32 + 0.5) / size as f32,
+        );
+        if scene.config.flip_depth_y {
+            ndc.y = 1.0 - ndc.y;
+        }
+        let tangent = lo + (hi - lo) * ndc;
+        let centre = to_world.transform_point3((tangent * z).extend(-z));
+        let radius = r.range(0.006, 0.02);
+        memory.hands[hand] = Some(HandShape {
+            segments: std::array::from_fn(|_| {
+                [
+                    (centre + r.unit() * r.range(0.0, 0.05)).extend(radius),
+                    (centre + r.unit() * r.range(0.0, 0.05)).extend(radius),
+                ]
+            }),
+        });
+        memory.hand_sources[hand] = if r.chance(0.85) {
+            crate::CaptureHand::Exact
+        } else {
+            crate::CaptureHand::Fallback
+        };
+    }
+    scene.input.memory = Some(memory);
+    scene.own = true;
 }
 
 fn texture(
@@ -1118,6 +1201,7 @@ fn bare(mut scene: RectScene) -> RectScene {
     scene.input.cloud = None;
     scene.cloud = None;
     scene.pad = 0.0;
+    scene.own = false;
     scene
 }
 
@@ -1131,10 +1215,24 @@ fn gpu_rect_bounds_every_scene() {
     let (mut full, mut empty, mut share_sum, mut share_max, mut nonzero_mask) =
         (0, 0, 0.0_f64, 0.0_f32, 0);
     let mut reasons = std::collections::BTreeMap::new();
+    // `cloud_own`: the scenes with it on, and the mask texels it changed in them
+    let (mut own_scenes, mut own_changed) = (0, 0);
     for seed in 0..scenes {
         let scene = random_scene(seed);
         let scene = if seed % 5 < 2 { bare(scene) } else { scene };
         let run = run_scene(&device, &queue, &pipelines, &scene, false);
+        if scene.own {
+            own_scenes += 1;
+            let mut off = random_scene(seed);
+            off.input.cloud.as_mut().unwrap().params.own = 0.0;
+            let off = run_scene(&device, &queue, &pipelines, &off, false);
+            own_changed += run
+                .mask_full
+                .iter()
+                .zip(&off.mask_full)
+                .filter(|(a, b)| a != b)
+                .count();
+        }
         let rect = run.rects[scene.view_idx];
         if let Some(reason) = rect.full {
             full += 1;
@@ -1208,11 +1306,13 @@ fn gpu_rect_bounds_every_scene() {
     let bounded = scenes as usize - full;
     eprintln!(
         "gpu_rect: {scenes} scenes, {full} full view ({reasons:?}), {empty} empty, bounded share of the view \
-         mean {:.1} % max {:.1} %, {nonzero_mask} mask texels with coverage",
+         mean {:.1} % max {:.1} %, {nonzero_mask} mask texels with coverage; cloud_own in \
+         {own_scenes} scenes, {own_changed} mask texels changed by it",
         100.0 * share_sum / bounded.max(1) as f64,
         100.0 * share_max
     );
     assert!(bounded > scenes as usize / 2);
+    assert!(own_scenes >= 20 && own_changed > 0);
 }
 
 // `gpu_rect 2` with the Tint mask view draws the rectangles' borders, and nothing else changes

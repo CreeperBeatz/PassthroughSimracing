@@ -29,6 +29,8 @@
 //    cap + 8 depth texels of a texel of M (in the region), whose ray from the field's camera C_F crosses
 //    the boxes with domes. The angle between P - E and P - C_F is at most asin(|C_F - E| / L). Held
 //    speeds anywhere do not matter. A field of another region or one that may not open: see the code.
+//    `cloud_own` (the hand's own late depth, after the zone): it runs only where r of 3 is above 0, lowers r
+//    and raises g there, and leaves b and a. So every texel it opens is inside the bound of 3 already.
 // 5. The wrist gap: a ray within GAP_REACH of the gap segment (from 0.05 m on): the capsule.
 // 6. Near the hands (focus area b, only with the key and a playzone): inside the focus pass's rectangle.
 // 7. The lever windows: a ray through an open lever box. Bound: the boxes seen from the eye.

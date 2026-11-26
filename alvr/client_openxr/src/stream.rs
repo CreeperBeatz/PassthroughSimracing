@@ -2482,15 +2482,29 @@ impl StreamContext {
     }
 
     // The depth cloud of this frame (`debug.alvr.cloud`, motion_cloud.rs). None: off. With `cloud_ab 1` it
-    // shows for 2 s, then today's picture for 2 s (its passes keep running)
+    // shows for 2 s, then today's picture for 2 s (its passes keep running). With `cloud_own` the gate of
+    // each hand: its newest wrist against its wrist at the depth's capture time (0 without either)
     fn cloud_input(&self, display_time: xr::Time) -> Option<CloudInput> {
         let params = self.cloud_params?;
+        let capture_ns = self.depth_capture_time.map(|time| time.as_nanos());
+        let own_gate = [0, 1].map(|i| {
+            if params.own <= 0.0 {
+                return 0.0;
+            }
+            let history = &self.arm_histories[i];
+            let travel = capture_ns.and_then(|time| {
+                let (then, _) = history.at(time)?;
+                Some(history.newest()?.wrist.distance(then))
+            });
+            alvr_graphics::own_gate(travel)
+        });
 
         Some(CloudInput {
             params: motion_cloud::frame_params(params, self.cloud_leak_follow().as_ref()),
-            capture_ns: self.depth_capture_time.map(|time| time.as_nanos()),
+            capture_ns,
             display_ns: display_time.as_nanos(),
             shown: !params.ab || motion_cloud::ab_shown(self.cloud_ab_start.elapsed()),
+            own_gate,
         })
     }
 

@@ -139,6 +139,14 @@ struct DepthUniforms {
     // them (gpu_rect.rs bounds every source; the depth mask pass is scissored to the first)
     gpu_rect_mask: array<vec4f, 2>,
     gpu_rect_focus: array<vec4f, 2>,
+    // `debug.alvr.cloud_own` (`own_hand` of depth_mask.wgsl, `own_uniforms` in depth_mask.rs), all 0 when
+    // it is off: today's. x: distance from the capsules (m, 0: off), y: fade beyond it (m), z, w: gate of
+    // the left / right hand (0..1, from its wrist's travel since the depth's capture)
+    own: vec4f,
+    // Bounding sphere of each hand's capsules at the depth's capture time, xyz: centre, w: radius (0: none)
+    capture_bounds: array<vec4f, 2>,
+    // As hand_points, at the depth's capture time (from the room memory's capsules)
+    capture_points: array<vec4f, 2u * 2u * HAND_SEGMENTS>,
 }
 
 // The depth cloud (`debug.alvr.cloud`, motion_cloud.rs, motion_cloud.wgsl). One eye's field: the camera
