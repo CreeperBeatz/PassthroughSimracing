@@ -10,7 +10,8 @@
 //   r: distance from the camera plane (m, 0: nothing known)
 //   g: moving: 1 when the live depth changed by more than 3 cm with no hand within 20 cm (legs, the
 //      seat; final.md 2.1), falling to 0 over 5 s
-//   b: frozen: 1 when the texel was kept at the last update because a hand was near
+//   b: frozen: 1 when the texel was kept at the last update because a hand was near; with `cloud_own`
+//      0.25 / 0.75 instead of 0 / 1 where the value is the runtime's fill (MEMORY_FILL, depth_common.wgsl)
 //   a: seconds since the last live write (above about 2 minutes not exact: 16 bit float)
 //
 // Entry points: `update_main` (mode 0: one update; mode 1: the memory of the `source` camera re-projected
@@ -339,20 +340,28 @@ fn update_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
         hand = hand_distance(camera, point, max(margin, outer));
     }
 
+    // `cloud_own` (depth_u.own.x above 0): the runtime's fill is marked (MEMORY_FILL, depth_common.wgsl),
+    // so that the mask never takes it for what lies behind a late hand. A mark is kept while the value is
+    // kept; only marks are kept, so without `cloud_own` b is 0 or 1 as before
+    let old_fill = memory_is_fill(old.b);
+    let frozen = select(1.0, MEMORY_FROZEN_FILL, old_fill);
     if remembered && hand.x < margin {
-        return vec4f(z_old, moving, 1.0, aged);
+        return vec4f(z_old, moving, frozen, aged);
     }
     if !live.valid {
-        return vec4f(z_old, moving, 0.0, aged);
+        return vec4f(z_old, moving, select(0.0, MEMORY_FILL, old_fill), aged);
     }
     if remembered && hand.x < outer && live.z > z_old + FILL_BEHIND {
-        return vec4f(z_old, moving, 1.0, aged);
+        return vec4f(z_old, moving, frozen, aged);
     }
     var moved = moving;
     if remembered && abs(live.z - z_old) > MOVING_CHANGE && hand.y > MOVING_HAND {
         moved = 1.0;
     }
-    return vec4f(live.z, moved, 0.0, 0.0);
+    // Near a hand with nothing remembered, or only the marked fill, the live depth is the runtime's fill (or
+    // the hand)
+    let fill = depth_u.own.x > 0.0 && (!remembered || old_fill) && hand.x < max(margin, outer);
+    return vec4f(live.z, moved, select(0.0, MEMORY_FILL, fill), 0.0);
 }
 
 // Shares of one cell of STATS_CELLS x STATS_CELLS, in a target 2 * STATS_CELLS wide. Even columns: x

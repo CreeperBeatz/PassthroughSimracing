@@ -100,7 +100,8 @@ pub struct CloudParams {
     /// `cloud_own` (m, 0: off): depth surface within this of a hand's capsules at the depth's capture time
     /// is the hand itself, late (the runtime left a fast hand in the depth): its part of the mask is handed
     /// to the key while that hand's wrist has moved since the capture (`own_gate`). Fades out over
-    /// `CLOUD_OWN_FADE_M` beyond it. Needs the room memory (its capture-time capsules)
+    /// `CLOUD_OWN_FADE_M` beyond it. Needs the room memory (its capture-time capsules), and acts only as far
+    /// as the memory knows a surface outside the region behind (not its marked fill, depth_common.wgsl)
     pub own: f32,
 }
 

@@ -226,6 +226,18 @@ fn region_mask(world_point: vec3f, view_idx: u32) -> f32 {
 // Larger than any distance in the room
 const FAR_DISTANCE: f32 = 1e9;
 
+// The b channel of the room memory (room_memory.wgsl). With `cloud_own` the runtime's fill, written near a
+// hand where nothing was remembered, is marked: MEMORY_FILL while not frozen, MEMORY_FROZEN_FILL frozen
+// (above 0.5: frozen for every reader that tests b > 0.5). A mark stays until the live depth is written
+// there with no hand near. Without `cloud_own` nothing is marked: b is 0 or 1, as before
+const MEMORY_FILL: f32 = 0.25;
+const MEMORY_FROZEN_FILL: f32 = 0.75;
+
+// Whether the room memory's b marks the runtime's fill (never seen without a hand)
+fn memory_is_fill(b: f32) -> bool {
+    return abs(b - MEMORY_FILL) < 0.125 || abs(b - MEMORY_FROZEN_FILL) < 0.125;
+}
+
 // Distance from the surface of the union of the boxes of the play area (area frame), see play_area.rs.
 // A line-by-line copy of PlayArea::signed_distance: keep both the same. Below -feathering the value can
 // be too large, above +feathering too small: the mask is the same

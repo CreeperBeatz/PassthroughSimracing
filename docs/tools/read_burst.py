@@ -68,7 +68,8 @@
 #          is above 2^53: parse the index with Python's json (ints exact), not a float-based JSON reader
 # load_memory_dump(dump_json_path): the room memory of a depth dump (`debug.alvr.key_dump`, or the dump at the
 #          start of a burst) taken with `mem_roll 1`, None without: texels (2, S, S, 4) float32 per eye (r:
-#          distance from the camera plane, 0 nothing; g: moving 0..1; b: frozen 0/1; a: seconds since the
+#          distance from the camera plane, 0 nothing; g: moving 0..1; b: frozen 0/1 (with `cloud_own` the
+#          runtime's fill near a hand 0.25 / 0.75 frozen); a: seconds since the
 #          last live write), rows in the order of the texture (row 0 = the down side of the camera unless
 #          flip_y), status (the JSON), world_to_view / view_to_world (4, 4) row major, tangents (left, right,
 #          down, up)

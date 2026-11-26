@@ -3865,6 +3865,12 @@ struct MemoryRig {
     current: usize,
     memory_uniforms: wgpu::Buffer,
     depth_uniforms: wgpu::Buffer,
+    /// `cloud_own` (m) in the depth uniforms, as the renderer writes it while it is on (0: off): the update
+    /// marks the runtime's fill
+    own: f32,
+    /// With `own`: the mask runs the rule too (the cloud shown with mode 1 and no field), with this hand's
+    /// capsules at the depth's capture time and this gate
+    own_hand: Option<(HandShape, f32)>,
 }
 
 impl MemoryRig {
@@ -3888,6 +3894,8 @@ impl MemoryRig {
             current: 0,
             memory_uniforms: create_memory_uniform_buffer(device),
             depth_uniforms: stream::create_depth_uniform_buffer(device),
+            own: 0.0,
+            own_hand: None,
         }
     }
 
@@ -3927,13 +3935,26 @@ impl MemoryRig {
         };
         let config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
         let playzone = camera.map(|camera| [camera.view_params(); 2]);
-        let uniforms = depth_mask::depth_uniforms(
+        let mut uniforms = depth_mask::depth_uniforms(
             &config,
             &[view(Vec3::ZERO); 2],
             &input,
             playzone.as_ref(),
             false,
         );
+        // `cloud_own` (own_uniforms in depth_mask.rs, which needs the cloud and a region of boxes)
+        if self.own > 0.0 {
+            let own = depth_mask::DEPTH_UNIFORMS_FLOAT_COUNT - depth_mask::OWN_FLOAT_COUNT;
+            uniforms[own] = self.own;
+            if let Some((hand, gate)) = self.own_hand {
+                // The cloud's vector, before `key_lower`: mode 1
+                uniforms[depth_mask::KEY_LOWER_FLOAT_OFFSET - 4] = 1.0;
+                uniforms[own + 1..own + 4].copy_from_slice(&[crate::CLOUD_OWN_FADE_M, gate, 0.0]);
+                let mut capsules = vec![];
+                depth_mask::push_hand_capsules(&mut capsules, &[Some(hand), None]);
+                uniforms[own + 4..].copy_from_slice(&capsules);
+            }
+        }
         queue.write_buffer(&self.depth_uniforms, 0, &floats_to_bytes(&uniforms));
     }
 
@@ -7199,7 +7220,8 @@ const CLOUD_OWN_BESIDE: (f32, f32) = (0.58, 0.5);
 
 /// The box of `Scene::new` in the cloud's region, the colour key without tracked hands (the focus area is
 /// empty), the cloud shown without a field (its zone is 0 everywhere), `cloud_own` `own` m with the gates
-/// `gates`, and the room memory's capsules at the capture time from `source` (None: no memory input)
+/// `gates`, and the room memory's capsules at the capture time from `source` (None: no memory input). The
+/// remembered playzone is the wall at 3 m only (outside the region): what the late hand hides is the game
 fn cloud_own_render(
     device: &Device,
     queue: &Queue,
@@ -7208,6 +7230,33 @@ fn cloud_own_render(
     source: Option<CaptureHand>,
 ) -> Output {
     let scene = Scene::new(3.0, [0.3, 0.3, 0.7, 0.7], 0.5);
+    cloud_own_render_in(
+        device,
+        queue,
+        own,
+        gates,
+        source,
+        &scene,
+        Some(&cloud_own_wall()),
+    )
+}
+
+/// The wall at 3 m without the box: what the room memory saw behind the hand (the rig's monitor)
+fn cloud_own_wall() -> Scene {
+    Scene::new(3.0, [2.0, 2.0, 2.0, 2.0], 0.5)
+}
+
+/// As `cloud_own_render` over the live depth `scene`, with the remembered playzone `playzone` (today's copy:
+/// every texel a surface seen without a hand; None: nothing remembered)
+fn cloud_own_render_in(
+    device: &Device,
+    queue: &Queue,
+    own: f32,
+    gates: [f32; 2],
+    source: Option<CaptureHand>,
+    scene: &Scene,
+    playzone: Option<&Scene>,
+) -> Output {
     let hand = HandShape {
         segments: [[CLOUD_OWN_START.extend(0.01), CLOUD_OWN_END.extend(0.01)]; HAND_SEGMENTS],
     };
@@ -7223,7 +7272,7 @@ fn cloud_own_render(
         device,
         queue,
         &cloud_config(),
-        &scene,
+        scene,
         Vec3::ZERO,
         Vec3::ZERO,
         true,
@@ -7233,7 +7282,7 @@ fn cloud_own_render(
             bridges: [None; 2],
         }),
         [None; 2],
-        None,
+        playzone,
         None,
         false,
         &[],
@@ -7375,6 +7424,182 @@ fn cloud_own_hands_the_late_hand_to_the_key() {
     input.cloud.as_mut().unwrap().shown = false;
     assert!(own_part(&input).iter().all(|&value| value == 0.0));
 }
+
+// Review of `cloud_own` (finding 1): the rule hands the late hand to the key only as far as the room
+// memory knows a surface outside the region on that ray. Where it remembers nothing (it never saw behind
+// the hand) or the box itself (the wheel rim a steering hand uncovers: in the region), the mask and the
+// picture are those of `cloud_own` unset, bit for bit: the rim stays the depth's (solid room) instead of
+// turning into the game. Where it remembers the wall behind (the monitor), the hand goes to the key
+#[test]
+fn cloud_own_keeps_what_the_memory_does_not_know_is_game() {
+    let (device, queue) = gpu_or_skip!();
+    let exact = Some(CaptureHand::Exact);
+    let scene = Scene::new(3.0, [0.3, 0.3, 0.7, 0.7], 0.5);
+    let (u, v) = CLOUD_OWN_ON;
+    for playzone in [None, Some(&scene)] {
+        let render =
+            |own: f32| cloud_own_render_in(&device, &queue, own, [1.0; 2], exact, &scene, playzone);
+        let (unset, moving) = (render(0.0), render(0.02));
+        assert_eq!(mask_texel(&unset.mask, u, v)[0], 255);
+        assert!(moving.mask == unset.mask, "{}", playzone.is_some());
+        assert!(moving.pixels == unset.pixels, "{}", playzone.is_some());
+    }
+    let wall = cloud_own_wall();
+    let moving = cloud_own_render_in(&device, &queue, 0.02, [1.0; 2], exact, &scene, Some(&wall));
+    assert_eq!(mask_texel(&moving.mask, u, v)[0], 0);
+}
+
+// Review of `cloud_own` (finding 2): a late finger (4 x 3 cm at 0.5 m, on the capsule) in front of the wall
+// the memory saw leaves no outline. A texel whose middle depth is the wall while some of its 9 taps are on
+// the finger loses that coverage too: the rule judges the nearest of the 9 depths, not the middle one
+#[test]
+fn cloud_own_leaves_no_outline_of_the_finger() {
+    let (device, queue) = gpu_or_skip!();
+    let exact = Some(CaptureHand::Exact);
+    let finger = Scene::new(3.0, [0.42, 0.485, 0.46, 0.515], 0.5);
+    let wall = cloud_own_wall();
+    let render = |own: f32| {
+        cloud_own_render_in(
+            &device,
+            &queue,
+            own,
+            [1.0, 0.0],
+            exact,
+            &finger,
+            Some(&wall),
+        )
+    };
+    let (unset, moving) = (render(0.0), render(0.04));
+    let covered = |output: &Output| output.mask.iter().filter(|texel| texel[0] > 0).count();
+    assert!(covered(&unset) >= 4, "{}", covered(&unset));
+    assert_eq!(covered(&moving), 0);
+}
+
+// Review of `cloud_own` (finding 1), the room memory: with `cloud_own` it marks the runtime's fill. A hand
+// present from the first depth image (resting on the wheel as the stream starts): behind it the memory only
+// ever got the far fill, marked 0.25 at the first write and 0.75 once kept (still above 0.5: frozen for
+// every reader). Distances, ages and the moving flag are those of `cloud_own` unset, whose b stays 0 or 1;
+// the marks are where unset has 1 (kept) or wrote the fill near the hand. Once the hand has left, the live
+// depth replaces every mark. Seen without the hand first, the kept texels are frozen 1, not marked
+#[test]
+fn memory_marks_the_fill_with_cloud_own() {
+    let (device, queue) = gpu_or_skip!();
+    let camera = level_memory_camera();
+    let removed = Scene::new(3.0, [2.0, 2.0, 2.0, 2.0], 0.5);
+    let hand = memory_hand(
+        Vec3::new(0.0, -0.12, -0.47),
+        Vec3::new(0.0, 0.12, -0.47),
+        0.02,
+    );
+    let count = |memory: &[[f32; 4]], b: f32| memory.iter().filter(|texel| texel[2] == b).count();
+
+    let mut marked = MemoryRig::new(&device);
+    marked.own = 0.02;
+    let mut plain = MemoryRig::new(&device);
+    marked.update(&device, &queue, &removed, &camera, Some(hand));
+    plain.update(&device, &queue, &removed, &camera, Some(hand));
+    let first = marked.read(&device, &queue);
+    assert!(count(&first, MEMORY_FILL_MARK) > 0);
+    assert_eq!(
+        count(&first, MEMORY_FILL_MARK) + count(&first, 0.0),
+        first.len()
+    );
+
+    marked.update(&device, &queue, &removed, &camera, Some(hand));
+    plain.update(&device, &queue, &removed, &camera, Some(hand));
+    let (memory, today) = (marked.read(&device, &queue), plain.read(&device, &queue));
+    assert!(count(&memory, MEMORY_FROZEN_FILL_MARK) > 0);
+    assert_eq!(count(&today, 0.0) + count(&today, 1.0), today.len());
+    for (texel, today) in memory.iter().zip(&today) {
+        assert_eq!(
+            [texel[0], texel[1], texel[3]],
+            [today[0], today[1], today[3]]
+        );
+        let expected = if today[2] == 1.0 {
+            MEMORY_FROZEN_FILL_MARK
+        } else if texel[2] == MEMORY_FILL_MARK {
+            MEMORY_FILL_MARK
+        } else {
+            0.0
+        };
+        assert_eq!(texel[2], expected, "{texel:?} {today:?}");
+    }
+    // Every mark of the first update is still one
+    assert_eq!(
+        count(&memory, MEMORY_FILL_MARK) + count(&memory, MEMORY_FROZEN_FILL_MARK),
+        count(&first, MEMORY_FILL_MARK)
+    );
+
+    // The hand gone: the live depth everywhere, no mark
+    marked.update(&device, &queue, &removed, &camera, None);
+    let gone = marked.read(&device, &queue);
+    assert_eq!(count(&gone, 0.0), gone.len());
+
+    // Seen without the hand first: kept as frozen 1, nothing marked
+    let mut clean = MemoryRig::new(&device);
+    clean.own = 0.02;
+    clean.update(&device, &queue, &removed, &camera, None);
+    for _ in 0..2 {
+        clean.update(&device, &queue, &removed, &camera, Some(hand));
+    }
+    let memory = clean.read(&device, &queue);
+    assert!(count(&memory, 1.0) > 0);
+    assert_eq!(count(&memory, 0.0) + count(&memory, 1.0), memory.len());
+}
+
+// Review of `cloud_own` (finding 1), end to end: the late hand (the box at 0.5 m on the capture-time
+// capsule, in the region) over the memory of a hand resting from the first depth image keeps the mask of
+// the hand at rest (gate 0: today's with the cloud), bit for bit, because there the memory only holds the
+// marked fill; over the memory that saw the wall before the hand came, the hand goes to the key (r 0)
+#[test]
+fn cloud_own_ignores_the_marked_fill() {
+    let (device, queue) = gpu_or_skip!();
+    let camera = level_memory_camera();
+    let removed = Scene::new(3.0, [2.0, 2.0, 2.0, 2.0], 0.5);
+    let late = Scene::new(3.0, [0.45, 0.35, 0.55, 0.65], 0.5);
+    let hand = memory_hand(
+        Vec3::new(0.0, -0.12, -0.47),
+        Vec3::new(0.0, 0.12, -0.47),
+        0.02,
+    );
+    let mask = |rig: &mut MemoryRig, gate: f32| {
+        rig.own_hand = Some((hand, gate));
+        let mask = rig.mask(
+            &device,
+            &queue,
+            &late,
+            memory_key(hand),
+            [None; 2],
+            Some(memory_input(Some(hand), 0.4)),
+            &camera,
+            0.4,
+        );
+        rig.own_hand = None;
+        mask
+    };
+
+    let mut resting = MemoryRig::new(&device);
+    resting.own = 0.04;
+    for _ in 0..3 {
+        resting.update(&device, &queue, &removed, &camera, Some(hand));
+    }
+    let today = mask(&mut resting, 0.0);
+    assert_eq!(mask_at(&today, 0.5, 0.5), 255);
+    assert!(mask(&mut resting, 1.0) == today);
+
+    let mut seen = MemoryRig::new(&device);
+    seen.own = 0.04;
+    seen.update(&device, &queue, &removed, &camera, None);
+    for _ in 0..2 {
+        seen.update(&device, &queue, &removed, &camera, Some(hand));
+    }
+    assert_eq!(mask_at(&mask(&mut seen, 0.0), 0.5, 0.5), 255);
+    assert_eq!(mask_at(&mask(&mut seen, 1.0), 0.5, 0.5), 0);
+}
+
+/// MEMORY_FILL and MEMORY_FROZEN_FILL of depth_common.wgsl
+const MEMORY_FILL_MARK: f32 = 0.25;
+const MEMORY_FROZEN_FILL_MARK: f32 = 0.75;
 
 /// The texel of an `Output` mask at view-space uv (origin top-left)
 fn mask_texel(mask: &[[u8; 4]], u: f32, v: f32) -> [u8; 4] {

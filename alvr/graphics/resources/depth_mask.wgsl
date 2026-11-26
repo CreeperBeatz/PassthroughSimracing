@@ -74,10 +74,9 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     }
 
     var result = current_mask(uv);
-    // `cloud_own`: the depth's surface of this texel, before the cloud writes over g (the proximity, exact
-    // under 3 m) and b (the depth flag)
-    let surface_t = (1.0 - result.g) * 3.0;
-    let surface_known = result.b > 0.5 && result.g > 0.0;
+    // `cloud_own`: how much the nearest of the depths of this texel is a hand itself (current_mask, in a)
+    let own_surface = result.a;
+    result.a = 0.0;
 
     // The depth cloud replaces the proximity, which only the Show depth view reads (the cloud is off
     // with it), and with `cloud_trail` the depth data flag, read by that view only too. Off (the
@@ -94,12 +93,12 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     // capture time is that hand itself, late (the runtime left a fast hand in the depth), while the hand
     // has moved since. Its part of the depth's coverage goes to the colour key (the zone, g), as around
     // the hands everywhere. Before the remembered playzone, which puts back what it holds on this ray,
-    // and the wrist gap, which only adds. Only removes from r, and only where r was set. Off (own.x 0, the
-    // default): nothing is read, the mask is today's
-    if depth_u.cloud.x > 0.5 && depth_u.own.x > 0.0 && surface_known && result.r > 0.0 {
-        let eye = depth_u.eyes[imm.view_idx];
-        let dir = normalize((eye.uv_to_world_dir * vec4f(uv, 1.0, 0.0)).xyz);
-        let own = own_hand(eye.eye_position.xyz + dir * surface_t);
+    // and the wrist gap, which only adds. Only removes from r, and only where r was set. Only as far as the
+    // room memory knows a surface outside the region on this ray (playzone_outside): where it remembers the
+    // rim the hand uncovers, or nothing, or only the runtime's fill, the depth keeps it (today's picture).
+    // Off (own.x 0, the default): nothing is read, the mask is today's
+    if own_surface > 0.0 {
+        let own = own_surface * playzone_outside(uv);
         result.r *= 1.0 - own;
         result.g = max(result.g, own);
     }
@@ -338,23 +337,7 @@ const MEMORY_VIEW_AGE: f32 = 5.0;
 // `mem_moving 1` (2) not those marked moving either (g)
 fn playzone_coverage(uv: vec2f) -> vec2f {
     let view_idx = imm.view_idx;
-    let origin = depth_u.eyes[view_idx].eye_position.xyz;
-    let dir = normalize((depth_u.eyes[view_idx].uv_to_world_dir * vec4f(uv, 1.0, 0.0)).xyz);
-
-    var t = 0.7;
-    for (var i = 0u; i < 2u; i++) {
-        let guess = project_to_playzone(origin + dir * t, view_idx);
-        if !guess.valid {
-            return vec2f(0.0);
-        }
-        let z = load_playzone(vec2i(floor(guess.texel)));
-        if z <= 0.0 {
-            return vec2f(0.0);
-        }
-        t = max(dot(playzone_to_world(guess, z, view_idx) - origin, dir), 0.05);
-    }
-
-    let lookup = project_to_playzone(origin + dir * t, view_idx);
+    let lookup = playzone_ray(uv);
     if !lookup.valid {
         return vec2f(0.0);
     }
@@ -389,6 +372,62 @@ fn playzone_coverage(uv: vec2f) -> vec2f {
     return vec2f(coverage, faded);
 }
 
+// Where the view ray of uv meets the remembered playzone: two fixed-point steps from 0.7 m. Not valid
+// outside the playzone camera or where it remembers nothing
+fn playzone_ray(uv: vec2f) -> DepthLookup {
+    let view_idx = imm.view_idx;
+    let origin = depth_u.eyes[view_idx].eye_position.xyz;
+    let dir = normalize((depth_u.eyes[view_idx].uv_to_world_dir * vec4f(uv, 1.0, 0.0)).xyz);
+
+    var t = 0.7;
+    for (var i = 0u; i < 2u; i++) {
+        let guess = project_to_playzone(origin + dir * t, view_idx);
+        if !guess.valid {
+            return guess;
+        }
+        let z = load_playzone(vec2i(floor(guess.texel)));
+        if z <= 0.0 {
+            var nothing = guess;
+            nothing.valid = false;
+            return nothing;
+        }
+        t = max(dot(playzone_to_world(guess, z, view_idx) - origin, dir), 0.05);
+    }
+
+    return project_to_playzone(origin + dir * t, view_idx);
+}
+
+// `cloud_own`: how much the remembered playzone (the room memory) knows a surface outside the region on
+// the view ray of uv (0..1, its 2 x 2 texels blended as in playzone_coverage): what a late hand covers
+// there is the game. Texels that remember nothing or only the runtime's fill (memory_is_fill) and
+// surface in the region (the rim a steering hand uncovers) give nothing. Without a playzone: 0
+fn playzone_outside(uv: vec2f) -> f32 {
+    if depth_u.playzone.x < 0.5 {
+        return 0.0;
+    }
+    let view_idx = imm.view_idx;
+    let lookup = playzone_ray(uv);
+    if !lookup.valid {
+        return 0.0;
+    }
+    let corner = floor(lookup.texel - 0.5);
+    let f = lookup.texel - 0.5 - corner;
+    var outside = 0.0;
+    for (var y = 0; y < 2; y++) {
+        for (var x = 0; x < 2; x++) {
+            let texel = load_playzone_texel(vec2i(corner) + vec2i(x, y));
+            if texel.r > 0.0 && !memory_is_fill(texel.b) {
+                let weight = mix(1.0 - f.x, f.x, f32(x)) * mix(1.0 - f.y, f.y, f32(y));
+                let point = playzone_to_world(lookup, texel.r, view_idx);
+                outside += weight * (1.0 - region_mask(point, view_idx));
+            }
+        }
+    }
+    return outside;
+}
+
+// The mask from the live depth: r the region coverage, g the proximity, b the depth flag, a with
+// `cloud_own` how much the nearest of the depths is a hand at the capture time (0 without it)
 fn current_mask(uv: vec2f) -> vec4f {
 
     let view_idx = imm.view_idx;
@@ -482,7 +521,15 @@ fn current_mask(uv: vec2f) -> vec4f {
         has_depth = 1.0;
     }
 
-    return vec4f(coverage, proximity, has_depth, 0.0);
+    // `cloud_own`: how much the nearest of the 9 depths is a hand itself (own_hand), so that a texel with
+    // any of a late finger in its taps loses all of it, not only one whose middle depth is on the finger
+    // (else an outline of the finger stays). Off (own.x 0, the default): 0
+    var own = 0.0;
+    if depth_u.cloud.x > 0.5 && depth_u.own.x > 0.0 && coverage > 0.0 {
+        own = own_hand(lookup_to_world(lookup, z_min, view_idx) + displacement);
+    }
+
+    return vec4f(coverage, proximity, has_depth, own);
 }
 
 // Depth values from here on mean "no data"

@@ -410,11 +410,26 @@ exactly that place, so the late copy stays solid room and shows what is behind t
 time* (fading out over the next 15 mm) is the hand. Its part of the mask's coverage is taken out and handed to the
 key (mask g), as everywhere else around a hand: the palm stays solid from the capsules, fingers and edges are
 keyed. The test is in 3D on the depth's own surface point with both sides of the same instant, so a laptop or desk
-beside the hand is not on the capsules. It runs after the cloud's zone and before the remembered playzone, so a
-surface the room memory holds on that ray is put back. Only the coverage of the depth itself is removed, only where
+beside the hand is not on the capsules. The point is the nearest of the 9 depths a mask texel blends, so the edge
+texels of a late finger (middle depth on the monitor, some taps on the finger) lose it too and no outline stays
+(review finding 2). It runs after the cloud's zone and before the remembered playzone.
+
+**Only where the memory knows it is game** (review of 2026-11-26, finding 1). On a moving hand the late depth's
+surface is always the hand, so the rule alone hands to the key whatever is there *now*, also the rim or a spoke the
+steering hand has just uncovered (not skin-coloured: the game). The rule is therefore scaled by how much the room
+memory knows a surface *outside the region* on that view ray (its 2 x 2 texels, `playzone_outside`): over the
+monitor it saw before the hand came, the late hand goes to the key; where it remembers the rim (in the region),
+nothing, or only the runtime's fill, the mask is today's. The fill is told apart by a mark the memory writes only
+while `cloud_own` is set: near a hand where nothing was remembered, the live depth (the runtime's fill, or the hand)
+is written with b 0.25, kept frozen as 0.75 (above 0.5: frozen for every reader), until the live depth is written
+there with no hand near. So hands resting on the wheel from the start of the stream leave only marked fill behind
+them, and the first fast turns keep the rim. Unset: nothing is marked, b is 0 or 1 as before. Not covered: texels
+first written in today's phase of `cloud_ab` are not marked; a spoke that has turned into a ray where the memory
+saw the monitor before the hand came still goes to the key for one depth age. Only the coverage of the depth itself is removed, only where
 there was some (so the active rectangle of `gpu_rect` needs nothing new: its bound of the region coverage already
 holds every texel the rule can open). The capsules come from the room memory (`mem_roll 1`, the hand's own sample
-history at the capture time, "exact"); a hand with "fallback" or no capsules is left alone.
+history at the capture time, "exact"); a hand with "fallback" or no capsules is left alone. Without the memory's
+playzone nothing is known behind the hand and the rule does nothing.
 
 **The gate.** Only while that hand's wrist has moved 1.5 cm or more between the depth's capture and its newest
 sample (full from 3 cm; about 0.25 m/s at the rig's timing). A hand at rest is never touched, so the surface its
@@ -429,8 +444,8 @@ texels per frame under resting fingers; with it 0. A gate on the wrist's speed i
 bare arms only); the larger, still patch beside a still hand or the patch that stays where a hand left (ghost 2 of
 the study, probably the room memory: test it with `mem_roll 0` / `mem_margin_mm 20`); frames without capsules from
 the history; a hand the tracking puts in the wrong place (a hand-shaped piece of whatever is there goes to the key
-while it moves). A hand sliding fast along the wheel rim hands the rim within 2-3.5 cm of where it was 0.1 s ago to
-the key unless the memory holds it: lower to 10 if the rim opens.
+while it moves). The rim beside a fast hand stays where the memory holds it or never saw behind the hand (see
+above); if it still opens at the rig, lower to 10 or leave `cloud_own` off.
 
 **Headset test (20 s gesture, A/B `cloud_own 0` / `20`, with `cloud 1` and `mem_roll 1`).** Seated, game running,
 looking at the dash: (a) right hand 25-35 cm in front of the face, open, still for 3 s; (b) wave it left-right over
