@@ -8,7 +8,7 @@ use alvr_common::{
     AlvrFoveatedEncodingParams, Fov,
     glam::{Quat, UVec2},
 };
-use alvr_graphics::RenderAblation;
+use alvr_graphics::{GpuRectParams, RenderAblation};
 use std::time::Duration;
 
 /// The `perf:` line is logged this often while streaming
@@ -25,6 +25,19 @@ pub fn read_ablation() -> RenderAblation {
         debug_property("debug.alvr.dbg_plain"),
         debug_property("debug.alvr.dbg_no_srgb"),
         debug_property("debug.alvr.dbg_readback_ms"),
+    )
+}
+
+/// Stage S3: `debug.alvr.gpu_rect` (0/1/2) with `debug.alvr.gpu_rect_pad` (thousandths of the view) and
+/// `debug.alvr.fast_srgb` (0/1), polled every 0.5 s with the ablation properties. Unset: (None, false),
+/// today's renderer
+pub fn read_gpu_work() -> (Option<GpuRectParams>, bool) {
+    (
+        alvr_graphics::gpu_rect_params(
+            debug_property("debug.alvr.gpu_rect"),
+            debug_property("debug.alvr.gpu_rect_pad"),
+        ),
+        debug_property("debug.alvr.fast_srgb").is_some_and(|value| value > 0),
     )
 }
 
@@ -132,6 +145,9 @@ pub struct StreamFacts<'a> {
     pub edge_fill: u32,
     /// The custom reprojection path (YVR), where the edge fill is not applied
     pub custom_reprojection: bool,
+    /// Stage S3: `debug.alvr.gpu_rect` (None: off) and `debug.alvr.fast_srgb`
+    pub gpu_rect: Option<GpuRectParams>,
+    pub fast_srgb: bool,
 }
 
 pub fn gl_format_name(format: u32) -> String {
@@ -211,7 +227,7 @@ pub fn stream_text(facts: &StreamFacts) -> String {
     format!(
         "stream: view {}x{}, swapchain {}x{} {}, upscale {upscale}, FFE {ffe}, refresh {refresh}, \
          fov {fov}, depth mask {}x{}, passthrough {}, lighting {lighting}, colour key {key}, {}, {}, \
-         {edge_fill}",
+         {edge_fill}, {}",
         facts.view_resolution.x,
         facts.view_resolution.y,
         facts.swapchain_resolution.x,
@@ -222,6 +238,7 @@ pub fn stream_text(facts: &StreamFacts) -> String {
         facts.passthrough.unwrap_or("off"),
         facts.ablation.text(),
         facts.ffr.text(),
+        alvr_graphics::gpu_work_text(facts.gpu_rect.as_ref(), facts.fast_srgb),
     )
 }
 
@@ -528,6 +545,8 @@ mod tests {
             ffr: &ffr,
             edge_fill: 0,
             custom_reprojection: false,
+            gpu_rect: None,
+            fast_srgb: false,
         });
         for part in [
             "stream: view 2144x2240, swapchain 2144x2240 SRGB8_ALPHA8, upscale off, FFE off",
@@ -535,7 +554,8 @@ mod tests {
             "l -45.8 r 45.8 u 45.8 d -45.8 deg (tan -1.030 1.030 1.030 -1.030)",
             "depth mask 428x448, passthrough Depth, lighting off",
             "colour key on, key_layers 5, key_crop 0",
-            "dbg_readback_ms 2000 (all today's), ffr off (today's), edge_fill off (today's)",
+            "dbg_readback_ms 2000 (all today's), ffr off (today's), edge_fill off (today's), \
+             gpu_rect 0, fast_srgb 0",
         ] {
             assert!(text.contains(part), "{part} not in {text}");
         }
@@ -619,18 +639,20 @@ mod tests {
             ffr: &ffr,
             edge_fill,
             custom_reprojection,
+            gpu_rect: alvr_graphics::gpu_rect_params(Some(1), Some(30)),
+            fast_srgb: true,
         };
         let line = stream_text(&facts(20, false));
         assert!(
-            line.ends_with(", edge_fill 20 (2.0 deg per side)"),
+            line.ends_with(", edge_fill 20 (2.0 deg per side), gpu_rect 1 (pad 30), fast_srgb 1"),
             "{line}"
         );
         let line = stream_text(&facts(20, true));
         assert!(
-            line.ends_with(", edge_fill 20: NOT applied (custom reprojection)"),
+            line.contains(", edge_fill 20: NOT applied (custom reprojection), "),
             "{line}"
         );
         let line = stream_text(&facts(0, true));
-        assert!(line.ends_with(", edge_fill off (today's)"), "{line}");
+        assert!(line.contains(", edge_fill off (today's), "), "{line}");
     }
 }

@@ -498,7 +498,7 @@ pub const MAX_ARM_GAP: f32 = 0.08;
 
 impl ArmGap {
     /// None unless it can be drawn: a finite wrist, a unit axis, a length above 0 (at most `MAX_ARM_GAP`)
-    fn checked(self) -> Option<Self> {
+    pub(crate) fn checked(self) -> Option<Self> {
         let axis = self.axis.try_normalize()?;
         (self.wrist.is_finite() && self.length.is_finite() && self.length > 0.0).then(|| Self {
             axis,
@@ -559,7 +559,7 @@ pub struct LeverWindow {
 
 impl LeverWindow {
     /// None unless it can be drawn: open above 0, finite half extents above 0 and a finite transform
-    fn checked(self) -> Option<Self> {
+    pub(crate) fn checked(self) -> Option<Self> {
         let half = self.region.half_extents;
         (self.open.is_finite()
             && self.open > 0.0
@@ -798,8 +798,38 @@ pub const DEPTH_UNIFORMS_FLOAT_COUNT: usize = 2 * EYE_FLOAT_COUNT
         + 1)
     + AREA_FLOAT_COUNT
     + LEVER_FLOAT_COUNT
-    + GREEN_FLOAT_COUNT;
+    + GREEN_FLOAT_COUNT
+    + GPU_RECT_FLOAT_COUNT;
 pub const DEPTH_UNIFORMS_SIZE: usize = DEPTH_UNIFORMS_FLOAT_COUNT * size_of::<f32>();
+/// Floats of `debug.alvr.gpu_rect` at the very end of the uniform block (gpu_rect.rs): its vector, then the
+/// rectangles of the mask taps and of the focus taps of both eyes. Zeros while it is off
+pub(crate) const GPU_RECT_FLOAT_COUNT: usize = 4 + 2 * 4 + 2 * 4;
+/// Where `key_lower` starts in the uniform block (floats): after the eyes, the area transform, 5 vectors,
+/// the hands, the arms, the gaps, the playzone cameras and the vectors of the playzone, the memory and
+/// the cloud (checked against the shader's layout by a test)
+pub(crate) const KEY_LOWER_FLOAT_OFFSET: usize = 2 * EYE_FLOAT_COUNT
+    + 16
+    + 4 * 5
+    + 4 * (2 + 2 * HAND_SEGMENTS / 4 + 2 + 2 * 2 * HAND_SEGMENTS + 6 + 2 + 2 * 9 + 1 + 1 + 1);
+
+/// Overwrites `key_lower` of a block made by `depth_uniforms` (min and max view uv of each eye)
+pub(crate) fn set_key_lower(
+    uniforms: &mut [f32; DEPTH_UNIFORMS_FLOAT_COUNT],
+    rects: [(Vec2, Vec2); 2],
+) {
+    for (eye, (min, max)) in rects.into_iter().enumerate() {
+        let at = KEY_LOWER_FLOAT_OFFSET + 4 * eye;
+        uniforms[at..at + 4].copy_from_slice(&[min.x, min.y, max.x, max.y]);
+    }
+}
+
+/// The `debug.alvr.gpu_rect` part of a block made by `depth_uniforms` (all zeros there: off)
+pub(crate) fn gpu_rect_uniforms(
+    uniforms: &mut [f32; DEPTH_UNIFORMS_FLOAT_COUNT],
+) -> &mut [f32; GPU_RECT_FLOAT_COUNT] {
+    let start = DEPTH_UNIFORMS_FLOAT_COUNT - GPU_RECT_FLOAT_COUNT;
+    (&mut uniforms[start..]).try_into().unwrap()
+}
 
 pub(crate) fn pose_to_mat4(pose: Pose) -> Mat4 {
     Mat4::from_rotation_translation(pose.orientation, pose.position)
@@ -1083,6 +1113,8 @@ pub fn depth_uniforms(
             data.extend([0.0; LEVER_WINDOW_FLOAT_COUNT]);
         }
     }
+    // `debug.alvr.gpu_rect`: off here, the renderer fills it in while it is on (gpu_rect.rs)
+    data.extend([0.0; GPU_RECT_FLOAT_COUNT]);
 
     data.try_into().unwrap()
 }
@@ -1518,10 +1550,13 @@ mod tests {
                 // The green-screen zone: its vector and 2 boxes as lever windows
                 + 16
                 + 2 * 5 * 16
+                // `gpu_rect`: its vector, the mask and focus rectangles of both eyes
+                + 16
+                + 2 * 2 * 16
         );
         // 28 capsules per hand, the wrist gaps, the bridges from the wrists, the boxes of the play area,
-        // the lever windows, the room memory, the depth cloud, the green-screen zone
-        assert_eq!(DEPTH_UNIFORMS_SIZE, 4704);
+        // the lever windows, the room memory, the depth cloud, the green-screen zone, `gpu_rect`
+        assert_eq!(DEPTH_UNIFORMS_SIZE, 4784);
     }
 
     // Steps 1 and 2 of docs/mask-v2-design.md in the uniform block: off is all zeros, as before
@@ -1759,7 +1794,10 @@ mod tests {
             game_see: 0.0,
         };
         let area_w = 2 * EYE_FLOAT_COUNT + 16 + 3;
-        let levers = DEPTH_UNIFORMS_FLOAT_COUNT - LEVER_FLOAT_COUNT - GREEN_FLOAT_COUNT;
+        let levers = DEPTH_UNIFORMS_FLOAT_COUNT
+            - LEVER_FLOAT_COUNT
+            - GREEN_FLOAT_COUNT
+            - GPU_RECT_FLOAT_COUNT;
         let uniforms =
             |input: &DepthRenderInput| depth_uniforms(&cfg, &[view(), view()], input, None, false);
 
@@ -1832,7 +1870,7 @@ mod tests {
             game_dim: 0.0,
             game_see: 0.0,
         };
-        let green = DEPTH_UNIFORMS_FLOAT_COUNT - GREEN_FLOAT_COUNT;
+        let green = DEPTH_UNIFORMS_FLOAT_COUNT - GREEN_FLOAT_COUNT - GPU_RECT_FLOAT_COUNT;
         let uniforms =
             |input: &DepthRenderInput| depth_uniforms(&cfg, &[view(), view()], input, None, false);
         let off = uniforms(&input);
@@ -2096,9 +2134,12 @@ mod tests {
 
         // One box, centered in that frame
         assert_eq!(&data[base + 16..base + 20], &[1.0, 0.0, 0.0, 0.0]);
-        let boxes =
-            DEPTH_UNIFORMS_FLOAT_COUNT - LEVER_FLOAT_COUNT - GREEN_FLOAT_COUNT - AREA_FLOAT_COUNT
-                + 8;
+        let boxes = DEPTH_UNIFORMS_FLOAT_COUNT
+            - LEVER_FLOAT_COUNT
+            - GREEN_FLOAT_COUNT
+            - GPU_RECT_FLOAT_COUNT
+            - AREA_FLOAT_COUNT
+            + 8;
         assert_eq!(
             &data[boxes..boxes + 8],
             &[0.0, 0.0, 0.0, 0.0, 0.5, 0.5, 1.0, 0.0]
@@ -2162,6 +2203,7 @@ mod tests {
             let boxes = DEPTH_UNIFORMS_FLOAT_COUNT
                 - LEVER_FLOAT_COUNT
                 - GREEN_FLOAT_COUNT
+                - GPU_RECT_FLOAT_COUNT
                 - AREA_FLOAT_COUNT
                 + 8;
             assert_eq!(&data[boxes + 4..boxes + 7], &[0.6, 0.45, 0.5]);

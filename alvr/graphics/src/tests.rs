@@ -172,9 +172,14 @@ fn depth_uniforms_layout_matches_the_shader() {
     };
     let (_, box_size) = struct_of("AreaBox");
     assert_eq!(box_size, 4 * play_area::AREA_BOX_FLOAT_COUNT);
-    // The green-screen zone last (its vector, then its boxes), the lever windows before it, after the
+    // `gpu_rect` last (its vector, then the rectangles of the mask and of the focus taps), the
+    // green-screen zone before it (its vector, then its boxes), the lever windows before that, after the
     // play area
-    let green_start = depth_mask::DEPTH_UNIFORMS_SIZE - 4 * depth_mask::GREEN_FLOAT_COUNT;
+    let gpu_rect_start = depth_mask::DEPTH_UNIFORMS_SIZE - 4 * depth_mask::GPU_RECT_FLOAT_COUNT;
+    assert_eq!(offset("gpu_rect"), gpu_rect_start);
+    assert_eq!(offset("gpu_rect_mask"), gpu_rect_start + 16);
+    assert_eq!(offset("gpu_rect_focus"), gpu_rect_start + 16 + 2 * 16);
+    let green_start = gpu_rect_start - 4 * depth_mask::GREEN_FLOAT_COUNT;
     assert_eq!(offset("green"), green_start);
     assert_eq!(offset("green_windows"), green_start + 16);
     let (_, lever_size) = struct_of("LeverWindow");
@@ -193,7 +198,8 @@ fn depth_uniforms_layout_matches_the_shader() {
     assert_eq!(offset("memory"), offset("playzone") + 16);
     assert_eq!(offset("cloud"), offset("memory") + 16);
     assert_eq!(offset("key_lower"), offset("cloud") + 16);
-    assert_eq!(depth_mask::DEPTH_UNIFORMS_SIZE, 4704);
+    assert_eq!(offset("key_lower"), 4 * depth_mask::KEY_LOWER_FLOAT_OFFSET);
+    assert_eq!(depth_mask::DEPTH_UNIFORMS_SIZE, 4784);
     // Where the box of the settings was: 2 eyes, then the transform and the number of boxes
     let eyes = 2 * 4 * (16 + 4 + 16 + 16 + 4);
     assert_eq!(offset("world_to_area"), eyes);
@@ -7772,3 +7778,7 @@ fn edge_fill_off_is_the_shader_before() {
         }
     }
 }
+
+// Stage S3, `debug.alvr.gpu_rect` and `debug.alvr.fast_srgb`
+#[path = "gpu_rect_tests.rs"]
+mod gpu_rect_tests;

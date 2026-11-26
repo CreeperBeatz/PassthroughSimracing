@@ -5,6 +5,7 @@ mod depth_burst;
 mod depth_dump;
 mod depth_mask;
 mod edge_fill;
+mod gpu_rect;
 mod green_screen;
 mod key_dump;
 mod leak_map;
@@ -34,6 +35,7 @@ pub use depth_burst::{
 pub use depth_dump::{DEPTH_DUMP_TIMEOUT, DepthDumpFiles, DepthDumpRequest, region_json};
 pub use depth_mask::*;
 pub use edge_fill::*;
+pub use gpu_rect::*;
 pub use green_screen::*;
 pub use key_dump::*;
 pub use leak_map::*;

@@ -29,10 +29,11 @@ use alvr_common::{
 use alvr_graphics::{
     ArmGap, ArmMotion, BridgeChoice, BurstArmSample, BurstArmSamples, BurstHand, BurstLut,
     CloudInput, CloudParams, CloudRecord, ColorKeyInput, DepthDumpFiles, DepthDumpRequest,
-    DepthFrame, DepthRenderInput, DumpJoint, EditorHand, EditorInput, GraphicsContext,
-    GreenKeyParams, HAND_SEGMENTS, HandRay, HandShape, HandZones, LeakGains, LeverWindow,
-    MAX_GREEN_WINDOWS, MAX_LEVER_WINDOWS, MemoryInput, MemoryParams, MemoryRecord, OverlaySegment,
-    PlacedArea, RenderAblation, SEGMENT_JOINTS, StreamRenderer, StreamViewParams, WristBridge,
+    DepthFrame, DepthRenderInput, DumpJoint, EditorHand, EditorInput, GpuRectParams,
+    GpuRectRequest, GraphicsContext, GreenKeyParams, HAND_SEGMENTS, HandRay, HandShape, HandZones,
+    LeakGains, LeverWindow, MAX_GREEN_WINDOWS, MAX_LEVER_WINDOWS, MemoryInput, MemoryParams,
+    MemoryRecord, OverlaySegment, PlacedArea, RectFallback, RectStats, RenderAblation,
+    SEGMENT_JOINTS, StreamRenderer, StreamViewParams, WristBridge,
 };
 use alvr_packets::{ClientStreamConfig, RealTimeConfig, TrackingData};
 use alvr_session::{
@@ -548,6 +549,13 @@ pub struct StreamContext {
     // layers' fov is widened by, tenths of a degree, polled with the ablation properties. 0 (the default):
     // the layers have the stream's fov, today's
     edge_fill: u32,
+    // Stage S3 (alvr_graphics gpu_rect.rs, docs/gpu-optimization.md): `debug.alvr.gpu_rect` with its pad
+    // (None: off) and `debug.alvr.fast_srgb`, polled with the ablation properties; the `rect:` line's window
+    // and when it was last written. Unset (the default): today's renderer, no line
+    gpu_rect: Option<GpuRectParams>,
+    fast_srgb: bool,
+    rect_stats: RectStats,
+    last_rect_log: Instant,
     // `debug.alvr.green_boxes` (green_screen.rs): the green-screen key's properties, the camera learner's
     // share, the `green:` line. Unset (the default): nothing per frame
     green: GreenScreen,
@@ -798,6 +806,10 @@ impl StreamContext {
             ablation: RenderAblation::default(),
             last_ablation_poll: Instant::now(),
             edge_fill: 0,
+            gpu_rect: None,
+            fast_srgb: false,
+            rect_stats: RectStats::default(),
+            last_rect_log: Instant::now(),
             green: GreenScreen::default(),
         };
         // From the first frame
@@ -1287,6 +1299,66 @@ impl StreamContext {
             self.renderer
                 .set_edge_fill(edge_fill > 0 && !self.use_custom_reprojection);
         }
+
+        // Stage S3, `debug.alvr.gpu_rect` and `debug.alvr.fast_srgb`: live. The values at the start are on the
+        // `stream:` line, a change is logged (`gpu work:`)
+        let (gpu_rect, fast_srgb) = perf::read_gpu_work();
+        if gpu_rect != self.gpu_rect || fast_srgb != self.fast_srgb {
+            if !start {
+                crate::stream_log(&format!(
+                    "gpu work: {} (new settings)",
+                    alvr_graphics::gpu_work_text(gpu_rect.as_ref(), fast_srgb)
+                ));
+            }
+            if gpu_rect.is_none() {
+                self.renderer.set_gpu_rect(None);
+            }
+            self.gpu_rect = gpu_rect;
+            self.fast_srgb = fast_srgb;
+            self.renderer.set_fast_srgb(fast_srgb);
+            self.rect_stats = RectStats::default();
+            self.last_rect_log = Instant::now();
+        }
+    }
+
+    // `debug.alvr.gpu_rect`: what the renderer is asked for in this frame. The lower key layer is cropped to
+    // the active rectangle only where both game layers are submitted with `key_crop 0` (the crop of
+    // `key_crop` stays as it is), not on the custom reprojection path. The full view while the area editor
+    // is open or a burst runs
+    fn gpu_rect_request(&self, hands_in_view: bool) -> Option<GpuRectRequest> {
+        let params = self.gpu_rect?;
+        let crop_lower = self.color_key.is_some_and(|key| {
+            key.crop == 0 && key.layers != 30 && key.extra_layers(hands_in_view)
+        }) && !self.use_custom_reprojection;
+        let hold = if !self.problem_view_allowed {
+            Some(RectFallback::Editor)
+        } else if self.burst.is_active() {
+            Some(RectFallback::Burst)
+        } else {
+            None
+        };
+        Some(GpuRectRequest {
+            params,
+            crop_lower,
+            hold,
+        })
+    }
+
+    // `debug.alvr.gpu_rect`: the `rect:` line every `PERF_LOG_INTERVAL` while it is on and the stream is Depth
+    fn record_gpu_rect(&mut self) {
+        if self.gpu_rect.is_none() {
+            return;
+        }
+        if let Some(frame) = self.renderer.gpu_rect_frame() {
+            self.rect_stats.add(&frame);
+        }
+        if self.last_rect_log.elapsed() >= perf::PERF_LOG_INTERVAL {
+            self.last_rect_log = Instant::now();
+            if let Some(text) = self.rect_stats.text() {
+                crate::stream_log(&text);
+            }
+            self.rect_stats = RectStats::default();
+        }
     }
 
     // `debug.alvr.edge_fill` as applied: the margin (radians), None: off
@@ -1338,6 +1410,8 @@ impl StreamContext {
             ffr: &self.ffr,
             edge_fill: self.edge_fill,
             custom_reprojection: self.use_custom_reprojection,
+            gpu_rect: self.gpu_rect,
+            fast_srgb: self.fast_srgb,
         });
         crate::stream_log(&text);
     }
@@ -2922,6 +2996,8 @@ impl StreamContext {
         }
 
         self.update_problem_view();
+        self.renderer
+            .set_gpu_rect(self.gpu_rect_request(key_frame.hands_in_view));
         self.renderer.render(
             buffer_ptr,
             [
@@ -2945,6 +3021,14 @@ impl StreamContext {
         );
         self.report_memory(xr_vsync_time, depth_input.as_ref());
         self.report_cloud(xr_vsync_time, depth_input.as_ref());
+        self.record_gpu_rect();
+        // `debug.alvr.gpu_rect`: the lower key layer cropped to the active rectangle (only asked for
+        // without the crop of `key_crop`)
+        let gpu_rect_crops = self
+            .renderer
+            .gpu_rect_frame()
+            .filter(|_| lower_crops.is_none() && self.gpu_rect.is_some())
+            .and_then(|frame| frame.lower_crops);
 
         if let Some((n, result)) = self.renderer.poll_depth_dump() {
             // The dump of the start of a burst goes into its folder
@@ -3037,6 +3121,30 @@ impl StreamContext {
             layer.crop_lower_key_layer([0, 1].map(|i| {
                 let (offset, size, fov) =
                     crops[i].unwrap_or((UVec2::ZERO, resolution, output_view_params[i].fov));
+
+                xr::CompositionLayerProjectionView::new()
+                    .pose(crate::to_xr_pose(output_view_params[i].pose))
+                    .fov(crate::to_xr_fov(fov))
+                    .sub_image(
+                        xr::SwapchainSubImage::new()
+                            .swapchain(&swapchains[i])
+                            .image_array_index(0)
+                            .image_rect(xr::Rect2Di {
+                                offset: xr::Offset2Di {
+                                    x: offset.x as _,
+                                    y: offset.y as _,
+                                },
+                                extent: xr::Extent2Di {
+                                    width: size.x as _,
+                                    height: size.y as _,
+                                },
+                            }),
+                    )
+            }))
+        } else if let Some(crops) = gpu_rect_crops {
+            let swapchains = &self.swapchains;
+            layer.crop_lower_key_layer([0, 1].map(|i| {
+                let (offset, size, fov) = crops[i];
 
                 xr::CompositionLayerProjectionView::new()
                     .pose(crate::to_xr_pose(output_view_params[i].pose))

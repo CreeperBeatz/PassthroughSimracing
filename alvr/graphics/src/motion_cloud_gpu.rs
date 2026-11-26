@@ -12,6 +12,7 @@
 
 use crate::{
     DepthFrame,
+    gpu_rect::RectField,
     motion_cloud::{
         CLOUD_UNIFORMS_SIZE, CloudEyeUniform, CloudImage, CloudInput, CloudPasses, CloudSchedule,
         CloudStatus, cloud_uniforms, field_open, field_stale, lead_ms, plan_eyes, reach_seconds,
@@ -542,6 +543,21 @@ impl MotionCloud {
         self.last_depth = None;
         self.cleared = false;
         self.status.eyes = Default::default();
+    }
+
+    /// `debug.alvr.gpu_rect` (gpu_rect.rs): the field each eye's mask reads in this frame, after `plan`:
+    /// the camera of its depth image, whether it may open its zone (as the uniforms say), whether it was
+    /// built with the region whose `region_signature` is `region`. None: no field (no zone)
+    pub fn rect_fields(&self, display_ns: i64, region: u64) -> [Option<RectField>; 2] {
+        [0, 1].map(|eye| {
+            let source = self.schedule.sources[eye]?;
+            let field = self.eyes[eye]?;
+            Some(RectField {
+                camera: field.field,
+                open: field_open(display_ns, source.capture_ns),
+                same_region: source.region == region,
+            })
+        })
     }
 
     /// The mask's group 2 for this eye: the current field, after this frame's passes

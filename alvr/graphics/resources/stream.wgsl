@@ -19,6 +19,13 @@ const PASSTHROUGH_MODE_RGB_CHROMA_KEY: u32 = 1u;
 const PASSTHROUGH_MODE_HSV_CHROMA_KEY: u32 = 2u;
 const PASSTHROUGH_MODE_DEPTH: u32 = 3u;
 
+// `FAST_SRGB`: ((color + 0.055) / 1.055)^2.4 above THRESHOLD as c3 x^3 + c2 x^2 + c1 x + c0, a minimax fit
+// of the error after the sRGB encoding of the swapchain (the same numbers as `FAST_SRGB_COEFFICIENTS` in
+// gpu_rect.rs)
+const FAST_SRGB_C3: f32 = 0.33069600;
+const FAST_SRGB_C2: f32 = 0.65613381;
+const FAST_SRGB_C1: f32 = 0.014212526;
+const FAST_SRGB_C0: f32 = 0.0015492375;
 const DIV12: f32 = 1.0 / 12.92;
 const DIV1: f32 = 1.0 / 1.055;
 const THRESHOLD: f32 = 0.04045;
@@ -26,6 +33,10 @@ const GAMMA: vec3f = vec3f(2.4);
 
 override ENABLE_SRGB_CORRECTION: bool;
 override ENCODING_GAMMA: f32;
+// `debug.alvr.fast_srgb` (stage S3 of docs/gpu-optimization.md): the upper branch of the sRGB correction
+// is a cubic instead of 3 pow, within a third of an 8-bit step after the swapchain's own sRGB encoding
+// (tests.rs). Off (the default): today's pow
+override FAST_SRGB: bool = false;
 
 override ENABLE_UPSCALING: bool = false;
 override UPSCALE_USE_EDGE_DIRECTION: bool = true;
@@ -99,7 +110,16 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     if ENABLE_SRGB_CORRECTION {
         let condition = vec3f(f32(color.r < THRESHOLD), f32(color.g < THRESHOLD), f32(color.b < THRESHOLD));
         let lowValues = color * DIV12;
-        let highValues = pow((color + vec3f(0.055)) * DIV1, GAMMA);
+        var highValues: vec3f;
+        if FAST_SRGB {
+            let c3 = vec3f(FAST_SRGB_C3);
+            let c2 = vec3f(FAST_SRGB_C2);
+            let c1 = vec3f(FAST_SRGB_C1);
+            let c0 = vec3f(FAST_SRGB_C0);
+            highValues = ((c3 * color + c2) * color + c1) * color + c0;
+        } else {
+            highValues = pow((color + vec3f(0.055)) * DIV1, GAMMA);
+        }
         color = condition * lowValues + (1.0 - condition) * highValues;
     }
 
@@ -167,7 +187,57 @@ fn mask_edge(coverage: f32) -> f32 {
 const CLOUD_MARK_CENTRE: vec2f = vec2f(0.5, 0.4);
 const CLOUD_MARK_SIZE: f32 = 0.02;
 
+// `debug.alvr.gpu_rect`: whether uv lies in a rectangle of depth_u.gpu_rect_mask / gpu_rect_focus (min xy,
+// max zw)
+fn in_gpu_rect(uv: vec2f, rect: vec4f) -> bool {
+    return all(uv >= rect.xy) && all(uv <= rect.zw);
+}
+
+// `debug.alvr.gpu_rect 2` with the Tint mask view: within this of a side of a rectangle (view uv) it is
+// drawn as a line
+const GPU_RECT_LINE: f32 = 0.003;
+
+// `debug.alvr.gpu_rect 2`: whether uv is on the border of a rectangle (the part inside the view)
+fn on_gpu_rect_border(uv: vec2f, rect: vec4f) -> bool {
+    let lo = max(rect.xy, vec2f(0.0));
+    let hi = min(rect.zw, vec2f(1.0));
+    if any(lo > hi) {
+        return false;
+    }
+    let inside = all(uv >= lo - GPU_RECT_LINE) && all(uv <= hi + GPU_RECT_LINE);
+    let near_side = any(abs(uv - lo) < vec2f(GPU_RECT_LINE)) || any(abs(uv - hi) < vec2f(GPU_RECT_LINE));
+    return inside && near_side;
+}
+
 fn depth_passthrough(stream_color: vec3f, uv: vec2f) -> vec4f {
+    // `debug.alvr.gpu_rect` (gpu_rect.rs): outside the rectangle of the mask taps the mask is 0 in every
+    // channel this function reads, outside the one of the focus taps the focus area is 0: the taps are
+    // skipped and their values taken as 0, which gives exactly what the taps would. Outside both, where
+    // nothing but the mask and the focus area could change the pixel (no debug view, no room through the
+    // game, no problem view, no `cloud_ab` mark), the pixel is the game, opaque in both key layers and
+    // premultiplied, as the code below makes it from zeros. Off (the default): both taps, today's
+    var mask_tap = true;
+    var focus_tap = true;
+    if depth_u.gpu_rect.x > 0.5 {
+        mask_tap = in_gpu_rect(uv, depth_u.gpu_rect_mask[imm.view_idx]);
+        focus_tap = in_gpu_rect(uv, depth_u.gpu_rect_focus[imm.view_idx]);
+        if depth_u.gpu_rect.y > 1.5 && depth_u.region.w > 0.5 && depth_u.region.w < 1.5 {
+            if on_gpu_rect_border(uv, depth_u.gpu_rect_mask[imm.view_idx]) {
+                return vec4f(1.0, 0.85, 0.0, 1.0);
+            }
+            if on_gpu_rect_border(uv, depth_u.gpu_rect_focus[imm.view_idx]) {
+                return vec4f(0.0, 0.9, 0.9, 1.0);
+            }
+        }
+        let plain = depth_u.region.w < 0.5
+            && depth_u.area.y <= 0.0
+            && problem_u.anchor.w <= 0.5
+            && depth_u.cloud.y <= 0.5;
+        if !mask_tap && !focus_tap && plain {
+            return vec4f(stream_color * (1.0 - depth_u.lighting2.w), 1.0);
+        }
+    }
+
     let debug_view = u32(depth_u.region.w + 0.5);
     // Dimmed while the play area is edited
     var game_color = stream_color * (1.0 - depth_u.lighting2.w);
@@ -183,7 +253,10 @@ fn depth_passthrough(stream_color: vec3f, uv: vec2f) -> vec4f {
         problem = problem_tint(uv);
     }
 
-    let mask_sample = textureSampleLevel(depth_mask, stream_sampler, uv, 0.0);
+    var mask_sample = vec4f(0.0);
+    if mask_tap {
+        mask_sample = textureSampleLevel(depth_mask, stream_sampler, uv, 0.0);
+    }
     let mask = mask_edge(mask_sample.r);
 
     if debug_view == DEBUG_VIEW_SHOW_DEPTH {
@@ -205,7 +278,10 @@ fn depth_passthrough(stream_color: vec3f, uv: vec2f) -> vec4f {
         // Both alpha values are packed in one channel: 0 in the first holes, 0.5 in the rim, 1
         // elsewhere. They are unpacked by the color scale and bias of the layers (2a and 2a - 1).
         // Alpha is not premultiplied.
-        let hand = textureSampleLevel(focus_area, stream_sampler, uv, 0.0);
+        var hand = vec4f(0.0);
+        if focus_tap {
+            hand = textureSampleLevel(focus_area, stream_sampler, uv, 0.0);
+        }
         let lower_rect = depth_u.key_lower[imm.view_idx];
         let in_lower = all(uv >= lower_rect.xy) && all(uv < lower_rect.zw);
         var focus = hand.r;

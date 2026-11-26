@@ -5,8 +5,9 @@ use crate::{
     depth_dump::{self, DEPTH_DUMP_TIMEOUT, DepthDumpFiles, DepthDumpRequest, DumpReadback},
     depth_mask::{self, DEPTH_UNIFORMS_SIZE, DepthRenderInput},
     edge_fill,
+    gpu_rect::{self, GpuRectFrame, GpuRectRequest, RectCloud, RectFallback, RectInput},
     key_dump::{array, object, string},
-    motion_cloud::{CloudPasses, CloudStatus},
+    motion_cloud::{CloudPasses, CloudStatus, region_signature},
     motion_cloud_gpu::{
         CloudPipelines, MotionCloud, create_cloud_dummy_field, create_cloud_read_bind_group,
         create_cloud_read_layout, create_cloud_uniform_buffer,
@@ -935,6 +936,16 @@ pub struct StreamRenderer {
     // `debug.alvr.edge_fill` (edge_fill.rs): the output views are wider than the stream views, the stream
     // quad grows to cover them. Off (the default): today's quad
     edge_fill: Cell<bool>,
+    // `debug.alvr.gpu_rect` (gpu_rect.rs): what the client asks for, None: off (today's passes and
+    // uniforms); the rectangles of the last frame. `problem_view_on`: the problem view is shown (a
+    // fallback to the full view)
+    gpu_rect: Cell<Option<GpuRectRequest>>,
+    gpu_rect_frame: Cell<Option<GpuRectFrame>>,
+    problem_view_on: Cell<bool>,
+    // `debug.alvr.fast_srgb`: the main pass with the cubic sRGB correction (its pipeline from the first
+    // use). Off (the default): today's pipeline
+    fast_srgb: Cell<bool>,
+    fast_srgb_main: OnceCell<RenderPipeline>,
 }
 
 impl StreamRenderer {
@@ -1151,6 +1162,11 @@ impl StreamRenderer {
             target_format,
             no_srgb_main: OnceCell::new(),
             edge_fill: Cell::new(false),
+            gpu_rect: Cell::new(None),
+            gpu_rect_frame: Cell::new(None),
+            problem_view_on: Cell::new(false),
+            fast_srgb: Cell::new(false),
+            fast_srgb_main: OnceCell::new(),
         }
     }
 
@@ -1166,6 +1182,23 @@ impl StreamRenderer {
         self.edge_fill.set(on);
     }
 
+    /// `debug.alvr.gpu_rect`: the next frames bound the active rectangle and work only inside it, the lower
+    /// key layer cropped to it if `crop_lower` (gpu_rect.rs). None (the default): today's renderer
+    pub fn set_gpu_rect(&self, request: Option<GpuRectRequest>) {
+        self.gpu_rect.set(request);
+    }
+
+    /// `debug.alvr.gpu_rect`: the rectangles of the last frame (None: off or not Depth)
+    pub fn gpu_rect_frame(&self) -> Option<GpuRectFrame> {
+        self.gpu_rect_frame.get()
+    }
+
+    /// `debug.alvr.fast_srgb`: the main pass of the next frames corrects sRGB with a cubic instead of pow
+    /// (a pipeline of its own, built at its first use). False (the default): today's pipeline
+    pub fn set_fast_srgb(&self, on: bool) {
+        self.fast_srgb.set(on);
+    }
+
     /// Size of the depth mask and of the focus area of each eye (texels)
     pub fn depth_mask_resolution(&self) -> UVec2 {
         self.depth_mask_resolution
@@ -1174,6 +1207,21 @@ impl StreamRenderer {
     // The pipeline of the main pass: today's, or with `dbg_no_srgb` the one without the sRGB correction
     // (built at its first use)
     fn main_pipeline(&self, ablation: &RenderAblation) -> &RenderPipeline {
+        // `fast_srgb`: built at its first use. `dbg_no_srgb` wins (no correction at all)
+        if !ablation.no_srgb && self.fast_srgb.get() {
+            return self.fast_srgb_main.get_or_init(|| {
+                create_main_pipeline(
+                    &self.context.device,
+                    [
+                        &self.pipelines.view_layout,
+                        &self.pipelines.depth_layout,
+                        &self.pipelines.problem_layout,
+                    ],
+                    self.target_format,
+                    &fast_srgb_constants(&self.main_constants),
+                )
+            });
+        }
         if !ablation.no_srgb {
             return &self.pipelines.main;
         }
@@ -1195,6 +1243,7 @@ impl StreamRenderer {
     /// `debug.alvr.problem_view`: the leak map as a tint over the room (depth passthrough only), or off
     /// (None, the default). Writes nothing while it stays off.
     pub fn set_problem_view(&self, data: Option<ProblemViewData>) {
+        self.problem_view_on.set(data.is_some());
         self.problem_view.write(&self.context.queue, data);
     }
 
@@ -1479,6 +1528,8 @@ impl StreamRenderer {
         let mut memory_passes = None;
         // `debug.alvr.cloud`: the passes of the depth cloud, None: not running
         let mut cloud_passes = None;
+        // `debug.alvr.gpu_rect`: the rectangles of this frame, None: off (the mask pass is not scissored)
+        let mut rect_frame = None;
         if let Some(config) = depth_config {
             let input = depth.copied().unwrap_or(DepthRenderInput {
                 frame: None,
@@ -1538,17 +1589,12 @@ impl StreamRenderer {
             } else {
                 self.playzone.get().map(|(views, _)| views)
             };
-            let uniforms = depth_mask::depth_uniforms(
+            let mut uniforms = depth_mask::depth_uniforms(
                 config,
                 &stream_views,
                 &input,
                 playzone_views.as_ref(),
                 lighting_response.is_some(),
-            );
-            self.context.queue.write_buffer(
-                &self.depth_uniform_buffer,
-                0,
-                &floats_to_bytes(&uniforms),
             );
             cloud_passes = self.plan_cloud(config, &input, &uniforms);
 
@@ -1574,6 +1620,66 @@ impl StreamRenderer {
                 .to_json();
                 dump = Some((request.n, *frame, json));
             }
+
+            // `debug.alvr.gpu_rect`: the rectangles, the lower layer's crop; both into the uniforms. Off:
+            // they stay as `depth_uniforms` made them
+            rect_frame = self.gpu_rect.get().map(|request| {
+                let hold = self.gpu_rect_hold(&request, &input, dump.is_some(), burst_token);
+                let rect_cloud = cloud_passes.as_ref().and_then(|_| {
+                    let cloud = self.cloud.borrow();
+                    let cloud = cloud.as_ref()?;
+                    let cloud_input = input.cloud?;
+                    Some(RectCloud {
+                        params: cloud_input.params,
+                        eyes: cloud
+                            .rect_fields(cloud_input.display_ns, region_signature(&uniforms)),
+                        depth_size: self.depth_resolution,
+                    })
+                });
+                let eyes = gpu_rect::active_rects(&RectInput {
+                    config,
+                    input: &input,
+                    stream_views: &stream_views,
+                    playzone: playzone_views.is_some(),
+                    cloud: rect_cloud,
+                    hand_rects: hand_rects.unwrap_or([None; 2]),
+                    mask_size: self.depth_mask_resolution,
+                    focus_size: self.focus_area_resolution,
+                    pad: request.params.pad,
+                    hold,
+                });
+                gpu_rect::write_uniforms(
+                    depth_mask::gpu_rect_uniforms(&mut uniforms),
+                    &request.params,
+                    &eyes,
+                );
+                // The lower layer: only where the colour key can act; `key_lower` follows the crop. With the
+                // crop of `key_crop` (set by the client in the input) it is not asked for
+                let lower_crops =
+                    (request.crop_lower && input.key_lower_rects.is_none()).then(|| {
+                        let crops = [0, 1].map(|i| {
+                            gpu_rect::lower_crop(
+                                &eyes[i],
+                                view_params[i].input_view_params.fov,
+                                view_params[i].output_view_params.fov,
+                                self.target_view_resolution,
+                                self.edge_fill.get(),
+                            )
+                        });
+                        depth_mask::set_key_lower(&mut uniforms, crops.map(|(_, uv)| uv));
+                        crops.map(|(crop, _)| crop)
+                    });
+                GpuRectFrame {
+                    eyes,
+                    mask_size: self.depth_mask_resolution,
+                    lower_crops,
+                }
+            });
+            self.context.queue.write_buffer(
+                &self.depth_uniform_buffer,
+                0,
+                &floats_to_bytes(&uniforms),
+            );
         } else {
             // Depth passthrough is off: the depth cloud does not run, its textures are dropped (and
             // `cloud_status` says so)
@@ -1658,9 +1764,10 @@ impl StreamRenderer {
                         rects[view_idx],
                     );
                 }
-                // `dbg_skip_mask` / `dbg_mask_every`: the mask keeps its last content in the frames it skips
+                // `dbg_skip_mask` / `dbg_mask_every`: the mask keeps its last content in the frames it skips.
+                // `gpu_rect`: drawn only in the rectangle (the pass clears all of the texture)
                 if ablation.mask_runs(frame_index, view_idx) {
-                    encode_depth_mask(
+                    encode_depth_mask_scissored(
                         &mut encoder,
                         &self.pipelines,
                         &objects.depth_mask,
@@ -1672,6 +1779,9 @@ impl StreamRenderer {
                             cloud.read_bind_group(view_idx)
                         }),
                         view_idx as u32,
+                        rect_frame
+                            .as_ref()
+                            .map(|frame: &GpuRectFrame| frame.eyes[view_idx].scissor),
                     );
                 }
             }
@@ -1763,6 +1873,7 @@ impl StreamRenderer {
         }
 
         self.context.queue.submit(iter::once(encoder.finish()));
+        self.gpu_rect_frame.set(rect_frame);
 
         // wgpu doesn't look at the GL errors (of an unsupported copy), and the next `check_error` would
         // abort
@@ -1791,6 +1902,32 @@ impl StreamRenderer {
         }
 
         hand_rects
+    }
+
+    // `debug.alvr.gpu_rect`: a reason for the full view in this frame, the client's first. The renderer's: the
+    // problem view, a depth dump or a burst read in this frame, `cloud_ab`'s mark, an ablation that keeps
+    // an older mask or focus area
+    fn gpu_rect_hold(
+        &self,
+        request: &GpuRectRequest,
+        input: &DepthRenderInput,
+        dump: bool,
+        burst_token: Option<u32>,
+    ) -> Option<RectFallback> {
+        let ablation = self.ablation.get();
+        request.hold.or(if self.problem_view_on.get() {
+            Some(RectFallback::ProblemView)
+        } else if dump {
+            Some(RectFallback::Dump)
+        } else if burst_token.is_some() {
+            Some(RectFallback::Burst)
+        } else if input.cloud.is_some_and(|cloud| cloud.params.ab) {
+            Some(RectFallback::CloudAb)
+        } else if ablation.skip_mask || ablation.mask_every > 1 || ablation.skip_focus {
+            Some(RectFallback::Ablation)
+        } else {
+            None
+        })
     }
 
     // Clips the segments for each eye and uploads them. Per eye: the camera, the first segment and
@@ -2045,6 +2182,8 @@ pub(crate) fn create_cloud_dummy_read_bind_group(
     )
 }
 
+// The tests' mask pass (the renderer scissors it with `debug.alvr.gpu_rect`)
+#[cfg(test)]
 pub(crate) fn encode_depth_mask(
     encoder: &mut wgpu::CommandEncoder,
     pipelines: &StreamPipelines,
@@ -2053,6 +2192,31 @@ pub(crate) fn encode_depth_mask(
     playzone_bind_group: &BindGroup,
     cloud_bind_group: &BindGroup,
     view_idx: u32,
+) {
+    encode_depth_mask_scissored(
+        encoder,
+        pipelines,
+        target,
+        depth_bind_group,
+        playzone_bind_group,
+        cloud_bind_group,
+        view_idx,
+        None,
+    );
+}
+
+/// `encode_depth_mask` drawn only in the texels `scissor` (min, max exclusive; `debug.alvr.gpu_rect`): the
+/// clear of the pass still covers the whole texture. None: all of it (today's). Empty: only the clear
+#[expect(clippy::too_many_arguments)]
+pub(crate) fn encode_depth_mask_scissored(
+    encoder: &mut wgpu::CommandEncoder,
+    pipelines: &StreamPipelines,
+    target: &TextureView,
+    depth_bind_group: &BindGroup,
+    playzone_bind_group: &BindGroup,
+    cloud_bind_group: &BindGroup,
+    view_idx: u32,
+    scissor: Option<(UVec2, UVec2)>,
 ) {
     let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
         label: Some("depth mask"),
@@ -2067,6 +2231,12 @@ pub(crate) fn encode_depth_mask(
         })],
         ..Default::default()
     });
+    if let Some((min, max)) = scissor {
+        if !min.cmplt(max).all() {
+            return;
+        }
+        pass.set_scissor_rect(min.x, min.y, max.x - min.x, max.y - min.y);
+    }
     pass.set_pipeline(&pipelines.depth_mask);
     pass.set_bind_group(0, depth_bind_group, &[]);
     pass.set_bind_group(1, playzone_bind_group, &[]);
@@ -2179,17 +2349,9 @@ pub(crate) fn encode_focus_area(
         ..Default::default()
     });
     // Without hands the target is only cleared
-    let Some((min, max)) = rect else {
+    let Some((min, max)) = rect.and_then(|rect| gpu_rect::focus_scissor(rect, resolution)) else {
         return;
     };
-    let min = (min * resolution.as_vec2()).floor().as_uvec2();
-    let max = (max * resolution.as_vec2())
-        .ceil()
-        .as_uvec2()
-        .min(resolution);
-    if !min.cmplt(max).all() {
-        return;
-    }
     pass.set_scissor_rect(min.x, min.y, max.x - min.x, max.y - min.y);
     pass.set_pipeline(&pipelines.focus_area);
     pass.set_bind_group(0, bind_group, &[]);
@@ -2390,6 +2552,15 @@ fn set_passthrough_immediates(render_pass: &mut RenderPass, config: Option<&Pass
             );
         }
     }
+}
+
+// The pipeline constants of the main pass with `debug.alvr.fast_srgb` (the others as given)
+fn fast_srgb_constants(constants: &[(&'static str, f64)]) -> Vec<(&'static str, f64)> {
+    constants
+        .iter()
+        .copied()
+        .chain(iter::once(("FAST_SRGB", 1.0)))
+        .collect()
 }
 
 fn foveated_encoding_data(

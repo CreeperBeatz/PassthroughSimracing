@@ -244,3 +244,171 @@ base again at the end). Keep the judged base properties, then set ONE of these a
 
 Read the `perf:` line next to each row: an ablation must not change `display fps` or `repeated`, else the
 row measures a frame-rate change, not a pass.
+
+### Measured on the headset (2026-11-26, build `e282ddca`)
+
+The judged settings (`cloud 1`, `cloud_window 24`, `cloud_cap 48`, `cloud_trail 24`, `key_auto 1`, `key_layers 5`,
+`key_crop 0`, `mem_roll 1`), no hands in view, GPU level 2. One property set at a time from that base, the
+protocol above.
+
+| Set | App GPU ms | Compositor ms | GPU load | What it says |
+|---|---|---|---|---|
+| Base | 6.69-6.81 | 4.6 | 84-85 % | |
+| `dbg_skip_mask 1` | 4.92 | | | the depth mask pass costs about 1.8 ms |
+| `dbg_mask_every 3` | 5.60 | | | two thirds of the mask's cost gone: it scales with the rate |
+| `dbg_plain 1` | 5.62 | | | the mask tap, the focus tap and the alpha packing of the main pass cost about 1.1 ms |
+| `dbg_no_srgb 1` | 6.35 | | | the 3 `pow` of the sRGB correction cost about 0.4 ms |
+| `dbg_plain 1` + `dbg_no_srgb 1` | 5.39 | | | |
+| `dbg_skip_focus 1` | 6.57 | | | the focus pass: 0.15 ms |
+| `dbg_readback_ms 0` | 6.68 | | | the memory's readback: nothing |
+| all four (`dbg_skip_mask`, `dbg_plain`, `dbg_no_srgb`, `dbg_skip_focus`) | 3.28 | | | the fixed full-resolution part: staging copy + bare main pass |
+| `ffr 1`..`4`, with and without `ffr_scaled_bin` | 6.4-6.7 | | | `applied` in the log, no measurable effect |
+
+- The phase-1 ranking was wrong about the mask: it is the largest single piece (1.8 ms), not 0.3-0.8 ms. The
+  depth-specific work of the main pass (1.1 ms) is second, the sRGB correction (0.4 ms) third.
+- **Foveation as wired does nothing**: the runtime accepts the profile (`applied`), the app time does not move
+  at any level. Either the driver does not foveate a framebuffer that wgpu renders into, or the main pass is
+  not bound by shading in the periphery. Not worth more work before the rest is cut.
+- 3.28 ms is the floor of the current pipeline at this resolution; everything above it is the depth path.
+
+## Stage S3: work removal (2026-11-26, not yet run on the headset)
+
+Three properties, each off by default. With all unset the layers, every shader's output and the picture
+are what they were at `90b11cae` (the uniform block grows by 80 bytes of zeros, the stream shader gets
+branches that are not taken; tests below). Code: `alvr/graphics/src/gpu_rect.rs`, `stream.wgsl`
+(`depth_passthrough`, the sRGB block), `stream.rs` (`render`, `encode_depth_mask_scissored`), the client's
+`stream.rs` (`gpu_rect_request`, the lower layer's crop, the `rect:` line).
+
+| Property | Default | Range | Read | What it does |
+|---|---|---|---|---|
+| `debug.alvr.gpu_rect` | 0 (off) | 0, 1, 2 | live (0.5 s) | 1: the active rectangle (below). 2: as 1, and with the streamer's Tint mask debug view the borders of the rectangles are drawn (yellow: mask taps, cyan: focus taps, about 13 px wide at 2144 px) |
+| `debug.alvr.gpu_rect_pad` | 20 | 0..250 (thousandths of the view per side) | live, with `gpu_rect` | padding of the rectangle before it is rounded out to mask texels |
+| `debug.alvr.fast_srgb` | 0 (off) | 0/1 | live; the pipeline is built at its first use (one hitch) | the sRGB correction's 3 `pow` become a cubic (`dbg_no_srgb` wins if both are set) |
+
+`debug.alvr.fast_mask` (part C, a per-texel early-out inside the mask shader) was not built: see the end.
+
+### The active rectangle (`gpu_rect`)
+
+Per eye and per frame the CPU bounds the part R of the stream view outside which the depth mask is 0 in every
+channel the main pass reads and the focus area is 0. Then:
+1. The depth mask pass is scissored to R rounded out to mask texels. Its `LoadOp::Clear` clears the whole
+   texture every frame (wgpu-hal GLES sets the scissor to the full target before the clear), so the rest is 0.
+2. The main pass takes the mask tap only inside R grown by one mask texel (its bilinear tap reaches the next
+   texel), the focus tap only inside the focus pass's scissor grown by one focus texel. Where a tap is
+   skipped its value is taken as 0, which is exactly what the tap would read. Outside both, with no debug view,
+   no room through the game (area editor), no problem view and no `cloud_ab` mark, the shader returns the
+   game colour with alpha 1 at once, which is what the full path computes from zeros (key path: packed 1 in
+   both layers; premultiplied path: rgb unchanged, alpha 1).
+3. With the colour key's extra layers and `key_crop 0` (the cloud's default; not `key_layers 30`, not on the
+   custom reprojection path) the lower game layer is cropped to the union of both tap rectangles (the
+   existing `crop_view` / `key_lower` machinery). The keyed passthrough can only show where focus > 0 or the
+   cloud zone is (mask g / b), both inside it; outside it the shader's alpha is 1 in both packings, so the
+   picture is the same.
+
+What R contains (each bound in `gpu_rect.rs`; the comment at its top has the derivation):
+- the green-screen boxes and the open lever boxes seen from the eye (slab tests: rays through the box);
+- the region: the depth mask classifies points on ONE ray of the depth camera C (through Q = E + t dir, t the
+  refined distance, at least 0.05 m; with the depth's near plane n at least n cos(asin(|C-E|/0.05)) - |C-E|),
+  each moved by the arm shift D, against the boxes grown by their tallest dome + the feathering. With D = 0
+  the direction of Q - C lies in the cone of C over the grown boxes and the view ray is within asin(|C-E|/t)
+  of it: the cone's rectangle grown by that angle (converted to tangents per axis; a test checks the growth
+  against random directions). The recorded dumps put C 1.4 mm from the eye (median), 7 mm at p90, 23 mm at
+  p99: the angle is 1.6 deg median, 8.5 deg at p90;
+- where D is not 0 (the arm shift, up to 25 cm): the swept arm (four spheres of 14 cm at the wrist end and the
+  weight's end, now and moved back) seen from the eye;
+- the depth cloud's zone and trail (mask g, b): the field's camera C_F over the texels of M grown by the cap
+  (or `cloud_fixed`) + 8 depth texels, seen from the eye at the lookup distance (`cloud_fetch`) with the angle
+  asin(|C_F - E| / fetch); with `cloud 2` also the swept arms;
+- the wrist gaps (a capsule of 5.5 cm around the gap segment);
+- near the hands (focus b, with a playzone): the focus pass's rectangle and one texel.
+
+The full view instead (logged as the reason): the distance region, the Show depth view, the problem view, the
+area editor (also whenever `game_see` > 0), a depth dump or burst in that frame (and while a burst runs), the
+`cloud_ab` mark, `dbg_skip_mask` / `dbg_mask_every` / `dbg_skip_focus` (a texture keeps an older frame),
+the depth camera 5 cm or more from the eye (or too far for the angle bound), the eye within 2 cm of a lever or
+green box, `cloud_cap` / `cloud_fixed` above the window's truncation (2 x `cloud_window` texels: beyond it
+the zone is not tied to an edge; the judged 48 with window 24 is exactly at it), a cloud field of another
+region or whose cone reaches behind the view, a growth angle above 25 deg.
+
+Mask g and b without the cloud hold the proximity and the depth flag everywhere; only the Show depth view
+reads them (a fallback) and the depth dump (a fallback). Outside R the scissored mask holds 0 there instead:
+the picture is unchanged, the texture's content outside R is not.
+
+When the eye is inside (or within centimetres of) a box, rays in every direction can meet surface inside it,
+so R covers the whole view. The play areas of the dumps of 2026-11-24 had the eye inside a box (every dump).
+The rig's area of 2026-11-25 ended with three boxes (wheel and dash, lap, side): whether the eye is outside
+them is what the `rect:` line will show.
+
+### The `rect:` line (`ALVR_CAM`, every 2 s while `gpu_rect` is on and the stream is Depth)
+
+    rect: L u 0.000-1.000 v 0.425-1.000, R u 0.000-0.958 v 0.450-1.000 (last frame, mask pass); share of the view mean 54.3 % max 61.0 % over 144 frames; full view 3 frames (most: depth camera off the eye, 4 eye frames); lower layer cropped 144 frames
+
+- per eye the mask pass's rectangle of the last frame in view uv (or `full (<reason>)`, or `empty`);
+- the share of the mask's texels rendered, mean of both eyes, its mean and maximum over the window (a full
+  view counts as 100 %);
+- how many frames had at least one eye at the full view, and the most frequent reason (counted per eye);
+- in how many frames the lower layer was cropped.
+
+A change of `gpu_rect`, `gpu_rect_pad` or `fast_srgb` logs `gpu work: gpu_rect 1 (pad 20), fast_srgb 1 (new
+settings)`; the `stream:` line ends with the values at the start (`..., gpu_rect 0, fast_srgb 0`).
+
+### `fast_srgb`
+
+stream.wgsl decodes sRGB to linear: below 0.04045 c / 12.92 (unchanged, cheap), above ((c + 0.055) / 1.055)^2.4.
+The upper branch becomes c3 c^3 + c2 c^2 + c1 c + c0 (0.330696, 0.65613381, 0.014212526, 0.0015492375), a
+minimax fit of the error after the swapchain's own sRGB encoding. The suggested polynomial (no constant term,
+over the whole range) is 5 steps off in the dark (0.04-0.1). Largest error over 0..1 in f32: 0.285 of an 8-bit
+step after the encoding, at most 1 step after rounding (`fast_srgb_within_a_step`); on the desktop GPU into an
+`Rgba8UnormSrgb` target over all 256 input levels: 0 steps (`fast_srgb_within_a_step_on_the_gpu`). The
+overlay keeps its `pow` (a few pixels).
+
+### What the tests prove (on the PC: naga and the desktop GPU)
+
+- `gpu_rect_bounds_every_scene`: 400 random scenes (head poses near a rig-like layout of 1-4 boxes with
+  domes and yaw, the depth camera up to 2.5 cm off the eye and turned, random depth images with near surfaces
+  of 10-20 cm, holes and the boxes' faces, near occluders right beside the boxes, hands in and out of view
+  with sweeps and bridges, arm shifts up to 25 cm, wrist gaps, lever windows, a green zone, a cloud field
+  built from a random older image by the reference of field_main with random held speeds, a random playzone /
+  room memory texture, flip_y, edge cut, Tint mask view, `key_crop`, sRGB on and off; two scenes of five
+  bare: only boxes and depth, no pad). In every scene: the mask rendered without the scissor is 0 outside R
+  (r and a always, g with the zone, b with the trail), the scissored mask equals it inside and is 0 outside,
+  the main pass with the rectangles (and the lower layer's crop) writes exactly today's pixels, and today's
+  pixels equal those of the stream shader before stage S3. Last run: 400 scenes, 42 at the full view (34 area
+  editor, 8 cloud reach above its window), 21 empty; the rectangle covered 77.7 % of the view on average and
+  100 % at most (the random scenes are crowded: arms of 14 cm radius moved 25 cm, hands, levers; this is not a
+  measure of the rig).
+- `gpu_rect_holds_a_near_occluder`: the worst case built on purpose (the camera 1.6-2.2 cm off the eye, an
+  occluder 12 cm in front of it beside the box): coverage appears 4 mask texels (about 8 deg) left of the box
+  as the camera sees it; R holds it. With the angle term removed this test fails, and with the one-texel
+  margin of the main pass's taps removed the random scenes fail (both tried, then restored).
+- `gpu_rect_border_in_the_tint_view`: `gpu_rect 2` changes only border pixels, in the two colours.
+- Unit tests of gpu_rect.rs: the hull cut by the near plane holds every point of the box, the angle growth
+  holds every direction within the angle (random directions), the fallbacks, the focus scissor is the focus
+  pass's, the lower crop holds the rectangle, the `rect:` line, the constants mirrored from depth_mask.wgsl.
+- All earlier GPU tests (bit-identical comparisons with the shaders before the edge fill and others) still
+  pass with every property unset.
+
+### What must be measured on the headset
+
+With the judged settings, `gpu_rect 0` then `1` (then `0` again for the drift), and `fast_srgb 0` / `1`, each
+while looking ahead (game), down at the wheel, and up:
+- app GPU time and compositor time (`tools/avg.sh`), GPU load;
+- the `rect:` line: the share of the view and the full-view reasons (if the eye sits in a box, R is the full
+  view and nothing is saved: then shrink the boxes around the head, or see what holds it);
+- the `perf:` line must not change (`display fps`, `repeated`);
+- `gpu_rect 2` with the Tint mask view: the yellow border must enclose every tinted (masked) region at all
+  times, also while turning the head fast; a hole or a cut tint at the border is a bug in the bound;
+- `fast_srgb 1`: a dark gradient (night scene, tunnel) side by side with `0`, no banding.
+
+Expected if R covers the lower half while looking ahead: about 0.9 ms of the mask's 1.8 ms, most of the main
+pass's 1.1 ms outside R, 0.65 ms of compositor time for the lower layer's crop; `fast_srgb` up to 0.4 ms.
+
+### Part C (`fast_mask`), not built
+
+A per-texel early-out in the mask shader (a ray-against-grown-box slab test before the 12 depth loads) is not
+exact: the mask classifies points on the depth camera's ray through the refined point, not on the view ray
+(see the derivation above), so a view ray that misses every grown box still gets coverage beside a close
+occluder (`gpu_rect_holds_a_near_occluder` shows it 8 deg off). An exact per-texel test would be the same cone
+test per texel with the angle asin(|C - E| / t), plus the arm, gap, hand, lever, green and cloud terms; the
+scissor already removes the texels outside their union, so the per-texel version would only save inside R
+between the sources. Left out.

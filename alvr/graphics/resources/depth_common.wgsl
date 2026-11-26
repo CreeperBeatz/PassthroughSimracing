@@ -131,6 +131,14 @@ struct DepthUniforms {
     green: vec4f,
     // Only the first green.x are used, each fully open (half.w 1)
     green_windows: array<LeverWindow, GREEN_WINDOWS>,
+    // `debug.alvr.gpu_rect` (gpu_rect.rs, stage S3 of docs/gpu-optimization.md), all 0 when it is off:
+    // today's. x: on (0/1), y: 2 draws the borders of the rectangles below in the Tint mask view
+    gpu_rect: vec4f,
+    // Of each eye, min xy and max zw view uv: the main pass takes the mask tap only inside the first,
+    // the focus tap only inside the second. Outside them both textures are 0 where stream.wgsl reads
+    // them (gpu_rect.rs bounds every source; the depth mask pass is scissored to the first)
+    gpu_rect_mask: array<vec4f, 2>,
+    gpu_rect_focus: array<vec4f, 2>,
 }
 
 // The depth cloud (`debug.alvr.cloud`, motion_cloud.rs, motion_cloud.wgsl). One eye's field: the camera
