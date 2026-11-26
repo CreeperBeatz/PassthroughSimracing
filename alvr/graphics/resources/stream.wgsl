@@ -6,7 +6,9 @@ struct Immediate {
     view_idx: u32,
     passthrough_mode: u32, // 0: Blend, 1: RGB chroma key, 2: HSV chroma key, 3: Depth
     blend_alpha: f32,
-    _align: u32,
+    // `debug.alvr.edge_fill` (docs/edge-fill.md): how far (stream uv) the stream quad reaches beyond 0..1 on
+    // every side, to cover an output view wider than the stream view. 0: off, today's quad
+    edge_fill: f32,
     ck_channel0: vec4f,
     ck_channel1: vec4f,
     ck_channel2: vec4f,
@@ -65,7 +67,10 @@ struct VertexOutput {
 fn vertex_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     var result: VertexOutput;
 
-    result.uv = vec2f(f32(vertex_index & 1), f32(vertex_index >> 1));
+    let corner = vec2f(f32(vertex_index & 1), f32(vertex_index >> 1));
+    // `edge_fill` 0: exactly the corners. The transform is linear in uv, so the grown quad continues the
+    // stream's image plane; the part outside the target is clipped
+    result.uv = corner + (2.0 * corner - 1.0) * imm.edge_fill;
     result.position = imm.reprojection_transform * vec4f(result.uv.x - 0.5, 0.5 - result.uv.y, 0.0, 1.0);
 
     return result;
@@ -73,7 +78,15 @@ fn vertex_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 
 @fragment
 fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
-    let foveated = decode_foveated_uv(imm.view_idx, uv);
+    // `debug.alvr.edge_fill`: outside the stream view (the margin of the wider output view) there is no game
+    // picture: the colour of the nearest border pixel (clamped before the foveated decode). Off: uv as is
+    var stream_uv = uv;
+    var in_margin = false;
+    if imm.edge_fill > 0.0 {
+        stream_uv = clamp(uv, vec2f(0.0), vec2f(1.0));
+        in_margin = any(stream_uv != uv);
+    }
+    let foveated = decode_foveated_uv(imm.view_idx, stream_uv);
     let corrected_uv = foveated.uv;
 
     var color: vec3f;
@@ -111,6 +124,9 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         alpha = mask;
     } else if imm.passthrough_mode == PASSTHROUGH_MODE_DEPTH {
         // Note: requires premultiplied alpha in the XR layer
+        if in_margin {
+            return edge_fill_margin(color);
+        }
         return depth_passthrough(color, uv);
     }
 
@@ -284,6 +300,16 @@ fn depth_passthrough(stream_color: vec3f, uv: vec2f) -> vec4f {
     }
 
     return vec4f(rgb, 1.0 - shown * brightness);
+}
+
+// `debug.alvr.edge_fill`: a pixel of the margin outside the stream view. Opaque game in every layer (alpha
+// 1 packs to 1 in both key layers and is opaque on the premultiplied path), no mask, focus or zone lookup:
+// no room can show there. Magenta with the Tint mask debug view, to see where the margin shows
+fn edge_fill_margin(stream_color: vec3f) -> vec4f {
+    if u32(depth_u.region.w + 0.5) == DEBUG_VIEW_TINT_MASK {
+        return vec4f(1.0, 0.0, 1.0, 1.0);
+    }
+    return vec4f(stream_color * (1.0 - depth_u.lighting2.w), 1.0);
 }
 
 // The rays of the leak map start at its anchor and see the room this far away, as in leak_map.rs

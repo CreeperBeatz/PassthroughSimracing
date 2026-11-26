@@ -108,6 +108,7 @@ used or the layers submitted change. Example (on):
 - `view L/R`: the zone's rectangle in each eye's view uv (origin top-left), before the pad; `outside` (the eye
   gets a one-pixel under layer: a projection layer needs both views), `full` (a corner is behind or too close to
   the eye plane: the whole view, to be safe).
+  With `debug.alvr.edge_fill` (docs/edge-fill.md) the view is the wider one the layers are submitted with.
 - `under layer`: submitted, uncropped, off (`green_under 0`), or not submitted because the zone is in neither view.
 - `base layer`: green-keyed, or plain (the first frame, or the LUT failed: an error line `green: the green-keyed
   base layer failed: ...` says so).

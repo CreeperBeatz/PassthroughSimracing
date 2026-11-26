@@ -10,6 +10,7 @@ use crate::{
         HandShape, HandSweep, HandZones, LeverWindow, MAX_GREEN_WINDOWS, MAX_LEVER_WINDOWS,
         RegionOverride, SweepParams, WristBridge,
     },
+    edge_fill,
     motion_cloud::{
         CLOUD_EYE_FLOAT_COUNT, CLOUD_SPEED_FLOOR, CLOUD_SPEED_SCALE, CLOUD_TRUNCATION,
         CLOUD_UNIFORMS_SIZE, CLOUD_WINDOW_CELLS, CloudEyeUniform, CloudInput, CloudParams, EyePass,
@@ -735,6 +736,64 @@ struct MaskV2 {
     cloud_probe: bool,
     /// The cell (r: phi, g: held speed) of that field. None: on an edge at the largest speed
     cloud_probe_cell: Option<[u8; 4]>,
+    /// The game image is a ramp (`stream_ramp`) instead of uniform gray
+    stream_ramp: bool,
+    /// `debug.alvr.edge_fill`: the output view's fov (the stream view's is `fov()`, same pose): the main
+    /// pass draws with the transform of the renderer and the quad's extension. None: off, the stream
+    /// quad fills the target as always
+    edge_output_fov: Option<Fov>,
+    /// The main pass uses a pipeline built from the stream shader changed by this. None: the pipeline of
+    /// `StreamPipelines`
+    main_source: Option<fn(String) -> String>,
+}
+
+/// The stream shader as it was before `debug.alvr.edge_fill` (stage S2): its lines taken out again
+fn shader_without_edge_fill(source: String) -> String {
+    let mut source = source;
+    for (new, old) in [
+        ("    edge_fill: f32,\n", "    _align: u32,\n"),
+        (
+            "    result.uv = corner + (2.0 * corner - 1.0) * imm.edge_fill;\n",
+            "    result.uv = corner;\n",
+        ),
+        (
+            "    var stream_uv = uv;\n    var in_margin = false;\n    if imm.edge_fill > 0.0 {\n        \
+             stream_uv = clamp(uv, vec2f(0.0), vec2f(1.0));\n        in_margin = any(stream_uv != uv);\n    \
+             }\n",
+            "    let stream_uv = uv;\n",
+        ),
+        (
+            "        if in_margin {\n            return edge_fill_margin(color);\n        }\n",
+            "",
+        ),
+    ] {
+        assert_eq!(source.matches(new).count(), 1, "{new}");
+        source = source.replace(new, old);
+    }
+    assert!(!source.contains("imm.edge_fill") && !source.contains("in_margin"));
+
+    source
+}
+
+/// Size of the `stream_ramp` image (texels per side)
+const RAMP_SIZE: u32 = 32;
+
+/// The `stream_ramp` image: red grows to the right, green downwards (8 levels per texel), blue 128
+fn stream_ramp_texels() -> Vec<u8> {
+    let mut texels = Vec::with_capacity((RAMP_SIZE * RAMP_SIZE * 4) as usize);
+    for y in 0..RAMP_SIZE {
+        for x in 0..RAMP_SIZE {
+            texels.extend_from_slice(&[(8 * x) as u8, (8 * y) as u8, 128, 255]);
+        }
+    }
+    texels
+}
+
+/// The `stream_ramp` colour (r, g) bilinearly sampled at stream uv (clamped to the edge)
+fn stream_ramp_at(uv: Vec2) -> Vec2 {
+    let texel =
+        (uv * RAMP_SIZE as f32 - 0.5).clamp(Vec2::ZERO, Vec2::splat((RAMP_SIZE - 1) as f32));
+    texel * 8.0
 }
 
 /// `render_with_area` with the edge cut and the wrist gaps
@@ -765,6 +824,19 @@ fn render_v2(
         ("ENABLE_FFE", 0.0),
     ];
     let pipelines = StreamPipelines::new(device, target_format, &constants, false);
+    let main_pipeline = mask_v2.main_source.map(|change| {
+        stream::create_main_pipeline_with_source(
+            device,
+            [
+                &pipelines.view_layout,
+                &pipelines.depth_layout,
+                &pipelines.problem_layout,
+            ],
+            target_format,
+            &constants,
+            change(stream::stream_shader_source()),
+        )
+    });
 
     // Uniform gray game image
     let stream_texture = device.create_texture(&TextureDescriptor {
@@ -781,14 +853,12 @@ fn render_v2(
         usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    write_texture_2d(
-        queue,
-        &stream_texture,
-        &[STREAM_GRAY, STREAM_GRAY, STREAM_GRAY, 255].repeat(32 * 32),
-        32 * 4,
-        32,
-        0,
-    );
+    let stream_texels = if mask_v2.stream_ramp {
+        stream_ramp_texels()
+    } else {
+        [STREAM_GRAY, STREAM_GRAY, STREAM_GRAY, 255].repeat(32 * 32)
+    };
+    write_texture_2d(queue, &stream_texture, &stream_texels, 32 * 4, 32, 0);
     let stream_view = stream_texture.create_view(&TextureViewDescriptor::default());
 
     let sampler = device.create_sampler(&SamplerDescriptor {
@@ -1094,14 +1164,31 @@ fn render_v2(
         });
 
         // Maps the stream quad onto the whole target: uv (0,0) is the top-left corner
-        let transform = Mat4::from_scale(Vec3::new(2.0, 2.0, 1.0));
+        let mut transform = Mat4::from_scale(Vec3::new(2.0, 2.0, 1.0));
+        let mut edge_fill = 0.0_f32;
+        if let Some(output_fov) = mask_v2.edge_output_fov {
+            // The renderer's transform, turned upside down: its projection flips y for the swapchain
+            // (see `projection_from_fov`), the readback here has row 0 at the top
+            let eye = view(eye_position);
+            transform = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))
+                * stream::reprojection_transform(&stream::StreamViewParams {
+                    swapchain_index: 0,
+                    input_view_params: eye,
+                    output_view_params: ViewParams {
+                        pose: eye.pose,
+                        fov: output_fov,
+                    },
+                });
+            edge_fill = edge_fill::edge_fill_quad_extension(fov(), output_fov);
+        }
 
-        // Immediate layout: transform, view_idx, passthrough_mode, blend_alpha
-        pass.set_pipeline(&pipelines.main);
+        // Immediate layout: transform, view_idx, passthrough_mode, blend_alpha, edge_fill
+        pass.set_pipeline(main_pipeline.as_ref().unwrap_or(&pipelines.main));
         pass.set_immediates(0, &floats_to_bytes(&transform.to_cols_array()));
         pass.set_immediates(64, &0_u32.to_le_bytes());
         pass.set_immediates(68, &3_u32.to_le_bytes());
         pass.set_immediates(72, &1_f32.to_le_bytes());
+        pass.set_immediates(stream::EDGE_FILL_CONST_OFFSET, &edge_fill.to_le_bytes());
         pass.set_bind_group(0, &view_bind_group, &[]);
         pass.set_bind_group(1, &depth_bind_group, &[]);
         pass.set_bind_group(2, &problem_view.bind_group, &[]);
@@ -7450,5 +7537,238 @@ fn ablation_no_srgb_changes_only_the_srgb_constant() {
             TextureFormat::Rgba8Unorm,
             &crate::ablation::no_srgb_constants(&constants),
         );
+    }
+}
+
+// `debug.alvr.edge_fill`: the same scene drawn into a wider output view. Inside the stream view the picture
+// is the one of the stream view (mask, hands, packing at the stream uv), resampled; in the margin it is
+// opaque game, the colour of the nearest border pixel of the stream
+#[test]
+fn edge_fill_fills_the_margin_and_keeps_the_view() {
+    let (device, queue) = gpu_or_skip!();
+    let segment = [
+        Vec4::new(-0.1, -0.25, -0.5, 0.05),
+        Vec4::new(0.1, -0.25, -0.5, 0.05),
+    ];
+    let key = ColorKeyInput {
+        hands: [
+            None,
+            Some((
+                HandShape {
+                    segments: [segment; HAND_SEGMENTS],
+                },
+                HandZones {
+                    core: -0.01,
+                    falloff: 0.01,
+                    rim: 0.04,
+                    solid: [1.0; HAND_SEGMENTS],
+                    sweep: HandSweep::NONE,
+                },
+            )),
+        ],
+        leak: [0.0; 2],
+        bridges: [None; 2],
+    };
+    // 6 degrees: about 6 pixels of margin on each side of the 64 px target
+    let output_fov = edge_fill::widen_fov(fov(), edge_fill::edge_fill_radians(60));
+    let pixel = 1.0 / TARGET_SIZE as f32;
+
+    for (debug_view, color_key) in [
+        (DepthPassthroughDebugView::Off, Some(key)),
+        (DepthPassthroughDebugView::Off, None),
+        (DepthPassthroughDebugView::TintMask, Some(key)),
+    ] {
+        let mut config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
+        config.debug_view = debug_view;
+        let draw = |edge_output_fov| {
+            render_v2(
+                &device,
+                &queue,
+                &config,
+                &hand_scene(),
+                Vec3::ZERO,
+                Vec3::ZERO,
+                true,
+                color_key,
+                [None; 2],
+                None,
+                None,
+                false,
+                &[],
+                None,
+                0.0,
+                0.0,
+                MaskV2 {
+                    stream_ramp: true,
+                    edge_output_fov,
+                    ..Default::default()
+                },
+            )
+        };
+        let off = draw(None);
+        let on = draw(Some(output_fov));
+        let case = format!("{debug_view:?}, key {}", color_key.is_some());
+
+        let (mut inner, mut margin, mut differs) = (0, 0, vec![]);
+        for y in 0..TARGET_SIZE {
+            for x in 0..TARGET_SIZE {
+                let output_uv = (Vec2::new(x as f32, y as f32) + 0.5) * pixel;
+                let stream_uv = edge_fill::output_to_stream_uv(fov(), output_fov, output_uv);
+                let got = on.pixels[(y * TARGET_SIZE + x) as usize];
+                if stream_uv.cmpge(Vec2::splat(1.5 * pixel)).all()
+                    && stream_uv.cmple(Vec2::splat(1.0 - 1.5 * pixel)).all()
+                {
+                    // Inside: between the smallest and largest of the off picture's 3 x 3 pixels there
+                    inner += 1;
+                    let centre = (stream_uv * TARGET_SIZE as f32).floor().as_ivec2();
+                    let mut low = [255_u8; 4];
+                    let mut high = [0_u8; 4];
+                    for dy in -1..=1 {
+                        for dx in -1..=1 {
+                            let p = (centre + alvr_common::glam::IVec2::new(dx, dy)).clamp(
+                                alvr_common::glam::IVec2::ZERO,
+                                alvr_common::glam::IVec2::splat(TARGET_SIZE as i32 - 1),
+                            );
+                            let value =
+                                off.pixels[(p.y as u32 * TARGET_SIZE + p.x as u32) as usize];
+                            for c in 0..4 {
+                                low[c] = low[c].min(value[c]);
+                                high[c] = high[c].max(value[c]);
+                            }
+                        }
+                    }
+                    if (0..4).any(|c| {
+                        got[c].saturating_add(3) < low[c] || got[c] > high[c].saturating_add(3)
+                    }) {
+                        differs.push((x, y, got, low, high));
+                    }
+                } else if stream_uv.cmplt(Vec2::splat(-0.5 * pixel)).any()
+                    || stream_uv.cmpgt(Vec2::splat(1.0 + 0.5 * pixel)).any()
+                {
+                    // The margin: opaque game, the border colour of the stream (magenta with Tint mask)
+                    margin += 1;
+                    assert_eq!(got[3], 255, "{case}: alpha at {x}, {y}: {got:?}");
+                    if debug_view == DepthPassthroughDebugView::TintMask {
+                        assert_eq!(&got[..3], &[255, 0, 255], "{case}: at {x}, {y}");
+                    } else {
+                        let expected = stream_ramp_at(stream_uv.clamp(Vec2::ZERO, Vec2::ONE));
+                        assert!(
+                            (f32::from(got[0]) - expected.x).abs() <= 3.0
+                                && (f32::from(got[1]) - expected.y).abs() <= 3.0
+                                && got[2].abs_diff(128) <= 2,
+                            "{case}: colour at {x}, {y}: {got:?}, expected {expected}"
+                        );
+                    }
+                }
+            }
+        }
+        // 64 x 64 output pixels: about 6 rows / columns of margin on each side
+        assert!(margin > 4 * 5 * 52, "{case}: {margin} margin pixels");
+        assert!(inner > 48 * 48, "{case}: {inner} inner pixels");
+        assert!(
+            differs.is_empty(),
+            "{case}: {} of {inner} differ: {:?}",
+            differs.len(),
+            &differs[..differs.len().min(8)]
+        );
+
+        // The off picture has the room and the hands where the scene puts them (the test sees the mask)
+        assert_eq!(off.alpha(0.5, 0.25), 0.0, "{case}");
+        // ... and the on picture too, at the same stream uv
+        let near = edge_fill::stream_to_output_uv(fov(), output_fov, Vec2::new(0.5, 0.25));
+        assert_eq!(on.alpha(near.x, near.y), 0.0, "{case}");
+    }
+}
+
+// `debug.alvr.edge_fill` off (0, every existing test): the main pass is bit for bit the one of the shader
+// before the edge fill, on the colour-key and the premultiplied path, with the Tint mask view, lighting, the
+// lower layer's crop and the editing look
+#[test]
+fn edge_fill_off_is_the_shader_before() {
+    let (device, queue) = gpu_or_skip!();
+    let segment = [
+        Vec4::new(-0.1, -0.25, -0.5, 0.05),
+        Vec4::new(0.1, -0.25, -0.5, 0.05),
+    ];
+    let key = ColorKeyInput {
+        hands: [
+            None,
+            Some((
+                HandShape {
+                    segments: [segment; HAND_SEGMENTS],
+                },
+                HandZones {
+                    core: -0.01,
+                    falloff: 0.01,
+                    rim: 0.04,
+                    solid: [0.5; HAND_SEGMENTS],
+                    sweep: HandSweep::NONE,
+                },
+            )),
+        ],
+        leak: [0.0, 0.5],
+        bridges: [None; 2],
+    };
+    for (debug_view, lighting) in [
+        (DepthPassthroughDebugView::Off, false),
+        (DepthPassthroughDebugView::TintMask, false),
+        (DepthPassthroughDebugView::Off, true),
+    ] {
+        let mut config = base_config(DepthMaskRegion::Distance { max_distance: 0.9 });
+        config.debug_view = debug_view;
+        if lighting {
+            config.lighting = Switch::Enabled(PassthroughLightingConfig {
+                base_brightness: 0.8,
+                strength: 1.0,
+                reference_luminance: 0.3,
+                min_brightness: 0.1,
+                locality: 0.5,
+                response_speed: 1.0,
+            });
+        }
+        for (color_key, lower_rects, look) in [
+            (None, None, 0.0),
+            (Some(key), None, 0.0),
+            (
+                Some(key),
+                Some([(Vec2::new(0.2, 0.5), Vec2::new(0.8, 1.0)); 2]),
+                0.0,
+            ),
+            (None, None, 0.4),
+            (Some(key), None, 0.4),
+        ] {
+            let draw = |main_source| {
+                render_v2(
+                    &device,
+                    &queue,
+                    &config,
+                    &hand_scene(),
+                    Vec3::ZERO,
+                    Vec3::ZERO,
+                    true,
+                    color_key,
+                    [None; 2],
+                    None,
+                    lower_rects,
+                    false,
+                    &[],
+                    None,
+                    look * 0.5,
+                    look,
+                    MaskV2 {
+                        stream_ramp: true,
+                        main_source,
+                        ..Default::default()
+                    },
+                )
+                .pixels
+            };
+            assert!(
+                draw(None) == draw(Some(shader_without_edge_fill)),
+                "{debug_view:?}, lighting {lighting}, key {}, crop {}, look {look}",
+                color_key.is_some(),
+                lower_rects.is_some()
+            );
+        }
     }
 }

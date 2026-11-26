@@ -128,6 +128,10 @@ pub struct StreamFacts<'a> {
     pub key: Option<(i64, i64)>,
     pub ablation: &'a RenderAblation,
     pub ffr: &'a FfrOutcome,
+    /// `debug.alvr.edge_fill` (tenths of a degree, 0: off)
+    pub edge_fill: u32,
+    /// The custom reprojection path (YVR), where the edge fill is not applied
+    pub custom_reprojection: bool,
 }
 
 pub fn gl_format_name(format: u32) -> String {
@@ -195,10 +199,19 @@ pub fn stream_text(facts: &StreamFacts) -> String {
     let key = facts.key.map_or("off".to_string(), |(layers, crop)| {
         format!("on, key_layers {layers}, key_crop {crop}")
     });
+    let edge_fill = match (facts.edge_fill, facts.custom_reprojection) {
+        (0, _) => "edge_fill off (today's)".to_string(),
+        (tenths, false) => format!(
+            "edge_fill {tenths} ({:.1} deg per side)",
+            tenths as f32 * 0.1
+        ),
+        (tenths, true) => format!("edge_fill {tenths}: NOT applied (custom reprojection)"),
+    };
 
     format!(
         "stream: view {}x{}, swapchain {}x{} {}, upscale {upscale}, FFE {ffe}, refresh {refresh}, \
-         fov {fov}, depth mask {}x{}, passthrough {}, lighting {lighting}, colour key {key}, {}, {}",
+         fov {fov}, depth mask {}x{}, passthrough {}, lighting {lighting}, colour key {key}, {}, {}, \
+         {edge_fill}",
         facts.view_resolution.x,
         facts.view_resolution.y,
         facts.swapchain_resolution.x,
@@ -513,6 +526,8 @@ mod tests {
             key: Some((5, 0)),
             ablation: &ablation,
             ffr: &ffr,
+            edge_fill: 0,
+            custom_reprojection: false,
         });
         for part in [
             "stream: view 2144x2240, swapchain 2144x2240 SRGB8_ALPHA8, upscale off, FFE off",
@@ -520,7 +535,7 @@ mod tests {
             "l -45.8 r 45.8 u 45.8 d -45.8 deg (tan -1.030 1.030 1.030 -1.030)",
             "depth mask 428x448, passthrough Depth, lighting off",
             "colour key on, key_layers 5, key_crop 0",
-            "dbg_readback_ms 2000 (all today's), ffr off (today's)",
+            "dbg_readback_ms 2000 (all today's), ffr off (today's), edge_fill off (today's)",
         ] {
             assert!(text.contains(part), "{part} not in {text}");
         }
@@ -581,5 +596,41 @@ mod tests {
         }
         let text = log.text(1.0, Duration::ZERO);
         assert!(text.contains("(10 values past 512 not counted)"), "{text}");
+    }
+
+    #[test]
+    fn stream_line_has_the_edge_fill() {
+        let ablation = RenderAblation::default();
+        let ffr = FfrOutcome::Off;
+        let facts = |edge_fill, custom_reprojection| StreamFacts {
+            view_resolution: UVec2::new(2144, 2240),
+            swapchain_resolution: UVec2::new(2144, 2240),
+            swapchain_format: 0x8C43,
+            upscale_factor: None,
+            foveated_encoding: None,
+            refresh_hint: 72.0,
+            refresh_now: None,
+            fovs: None,
+            mask_size: UVec2::new(428, 448),
+            passthrough: Some("Depth"),
+            lighting: None,
+            key: None,
+            ablation: &ablation,
+            ffr: &ffr,
+            edge_fill,
+            custom_reprojection,
+        };
+        let line = stream_text(&facts(20, false));
+        assert!(
+            line.ends_with(", edge_fill 20 (2.0 deg per side)"),
+            "{line}"
+        );
+        let line = stream_text(&facts(20, true));
+        assert!(
+            line.ends_with(", edge_fill 20: NOT applied (custom reprojection)"),
+            "{line}"
+        );
+        let line = stream_text(&facts(0, true));
+        assert!(line.ends_with(", edge_fill off (today's)"), "{line}");
     }
 }

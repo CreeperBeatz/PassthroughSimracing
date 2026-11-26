@@ -4,6 +4,7 @@ use crate::{
     depth_burst::BurstReadbacks,
     depth_dump::{self, DEPTH_DUMP_TIMEOUT, DepthDumpFiles, DepthDumpRequest, DumpReadback},
     depth_mask::{self, DEPTH_UNIFORMS_SIZE, DepthRenderInput},
+    edge_fill,
     key_dump::{array, object, string},
     motion_cloud::{CloudPasses, CloudStatus},
     motion_cloud_gpu::{
@@ -50,7 +51,9 @@ const TRANSFORM_CONST_OFFSET: u32 = 0;
 const VIEW_INDEX_CONST_OFFSET: u32 = TRANSFORM_SIZE;
 const PASSTHROUGH_MODE_OFFSET: u32 = VIEW_INDEX_CONST_OFFSET + U32_SIZE;
 const ALPHA_CONST_OFFSET: u32 = PASSTHROUGH_MODE_OFFSET + U32_SIZE;
-const CK_CHANNEL0_CONST_OFFSET: u32 = ALPHA_CONST_OFFSET + FLOAT_SIZE + U32_SIZE;
+// `debug.alvr.edge_fill` (edge_fill.rs): the stream quad's extension, stream uv (0: off)
+pub(crate) const EDGE_FILL_CONST_OFFSET: u32 = ALPHA_CONST_OFFSET + FLOAT_SIZE;
+const CK_CHANNEL0_CONST_OFFSET: u32 = EDGE_FILL_CONST_OFFSET + FLOAT_SIZE;
 const CK_CHANNEL1_CONST_OFFSET: u32 = CK_CHANNEL0_CONST_OFFSET + VEC4_SIZE;
 const CK_CHANNEL2_CONST_OFFSET: u32 = CK_CHANNEL1_CONST_OFFSET + VEC4_SIZE;
 const IMMEDIATE_SIZE: u32 = CK_CHANNEL2_CONST_OFFSET + VEC4_SIZE;
@@ -559,8 +562,25 @@ pub(crate) fn create_main_pipeline(
     target_format: TextureFormat,
     constants: &[(&str, f64)],
 ) -> RenderPipeline {
+    create_main_pipeline_with_source(
+        device,
+        layouts,
+        target_format,
+        constants,
+        stream_shader_source(),
+    )
+}
+
+/// `create_main_pipeline` with this shader source (tests: the shader with a feature taken out)
+pub(crate) fn create_main_pipeline_with_source(
+    device: &Device,
+    layouts: [&BindGroupLayout; 3],
+    target_format: TextureFormat,
+    constants: &[(&str, f64)],
+    source: String,
+) -> RenderPipeline {
     let [view_layout, depth_layout, problem_layout] = layouts;
-    let main_module = shader_module(device, "stream", stream_shader_source());
+    let main_module = shader_module(device, "stream", source);
     let compilation_options = PipelineCompilationOptions {
         constants,
         zero_initialize_workgroup_memory: false,
@@ -912,6 +932,9 @@ pub struct StreamRenderer {
     main_constants: Vec<(&'static str, f64)>,
     target_format: TextureFormat,
     no_srgb_main: OnceCell<RenderPipeline>,
+    // `debug.alvr.edge_fill` (edge_fill.rs): the output views are wider than the stream views, the stream
+    // quad grows to cover them. Off (the default): today's quad
+    edge_fill: Cell<bool>,
 }
 
 impl StreamRenderer {
@@ -1127,12 +1150,20 @@ impl StreamRenderer {
             main_constants: constants,
             target_format,
             no_srgb_main: OnceCell::new(),
+            edge_fill: Cell::new(false),
         }
     }
 
     /// `debug.alvr.dbg_*`: what the next frames leave out (the default: nothing, today's renderer)
     pub fn set_ablation(&self, ablation: RenderAblation) {
         self.ablation.set(ablation);
+    }
+
+    /// `debug.alvr.edge_fill`: the output views of the next frames may be wider than the stream views (same
+    /// pose): the stream quad grows to cover them and the margin is filled (edge_fill.rs). Off (the
+    /// default): today's quad, whatever the views
+    pub fn set_edge_fill(&self, on: bool) {
+        self.edge_fill.set(on);
     }
 
     /// Size of the depth mask and of the focus area of each eye (texels)
@@ -1705,6 +1736,15 @@ impl StreamRenderer {
             render_pass.set_bind_group(1, depth_bind_group, &[]);
             render_pass.set_bind_group(2, &self.problem_view.bind_group, &[]);
             set_passthrough_immediates(&mut render_pass, main_passthrough);
+            let edge_fill = if self.edge_fill.get() {
+                edge_fill::edge_fill_quad_extension(
+                    view_params.input_view_params.fov,
+                    view_params.output_view_params.fov,
+                )
+            } else {
+                0.0
+            };
+            render_pass.set_immediates(EDGE_FILL_CONST_OFFSET, &edge_fill.to_le_bytes());
             render_pass.draw(0..4, 0..1);
 
             if let Some(draws) = &overlay_draws

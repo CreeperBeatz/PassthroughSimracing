@@ -544,6 +544,10 @@ pub struct StreamContext {
     last_perf_log: Instant,
     ablation: RenderAblation,
     last_ablation_poll: Instant,
+    // Stage S2, `debug.alvr.edge_fill` (alvr_graphics edge_fill.rs, docs/edge-fill.md): the margin the game
+    // layers' fov is widened by, tenths of a degree, polled with the ablation properties. 0 (the default):
+    // the layers have the stream's fov, today's
+    edge_fill: u32,
     // `debug.alvr.green_boxes` (green_screen.rs): the green-screen key's properties, the camera learner's
     // share, the `green:` line. Unset (the default): nothing per frame
     green: GreenScreen,
@@ -793,6 +797,7 @@ impl StreamContext {
             last_perf_log: Instant::now(),
             ablation: RenderAblation::default(),
             last_ablation_poll: Instant::now(),
+            edge_fill: 0,
             green: GreenScreen::default(),
         };
         // From the first frame
@@ -1263,6 +1268,31 @@ impl StreamContext {
             self.ablation = ablation;
             self.renderer.set_ablation(ablation);
         }
+
+        // `debug.alvr.edge_fill`: live, each frame's layers carry their own fov. The value at the start is
+        // on the `stream:` line, a change is logged. Not on the custom reprojection path (YVR): it draws
+        // into the display-time view, and the layer crops are off there anyway
+        let edge_fill = alvr_graphics::edge_fill_tenths(debug_property("debug.alvr.edge_fill"));
+        if edge_fill != self.edge_fill {
+            if !start {
+                let fov = self.last_good_video_frame_metadata.view_params[0].fov;
+                let known = fov.right > fov.left && fov.up > fov.down;
+                crate::stream_log(&alvr_graphics::edge_fill_text(
+                    edge_fill,
+                    self.use_custom_reprojection,
+                    known.then_some(fov),
+                ));
+            }
+            self.edge_fill = edge_fill;
+            self.renderer
+                .set_edge_fill(edge_fill > 0 && !self.use_custom_reprojection);
+        }
+    }
+
+    // `debug.alvr.edge_fill` as applied: the margin (radians), None: off
+    fn edge_fill_margin(&self) -> Option<f32> {
+        (self.edge_fill > 0 && !self.use_custom_reprojection)
+            .then(|| alvr_graphics::edge_fill_radians(self.edge_fill))
     }
 
     // The `stream:` line, once per stream at its first frame with located views (after 2 s without, with
@@ -1306,6 +1336,8 @@ impl StreamContext {
             key: self.color_key.map(|params| (params.layers, params.crop)),
             ablation: &self.ablation,
             ffr: &self.ffr,
+            edge_fill: self.edge_fill,
+            custom_reprojection: self.use_custom_reprojection,
         });
         crate::stream_log(&text);
     }
@@ -2751,6 +2783,16 @@ impl StreamContext {
             openxr_display_time = vsync_time;
         }
 
+        // `debug.alvr.edge_fill`: the game layers cover a wider fov (same pose, swapchains and sizes); the
+        // renderer draws the stream view inside it and fills the margin. Everything in stream-view uv
+        // that sets a layer's image rect or fov is converted to this view below
+        let edge_fill = self.edge_fill_margin();
+        if let Some(margin) = edge_fill {
+            for view in &mut output_view_params {
+                view.fov = alvr_graphics::widen_fov(view.fov, margin);
+            }
+        }
+
         let mut depth_input = self.update_environment_depth(xr_vsync_time, &current_headset_views);
 
         // Part of each view with the hands, the same as in the renderer
@@ -2776,7 +2818,9 @@ impl StreamContext {
                 *last = rect;
             }
         }
-        // `debug.alvr.green_boxes`: the zone's boxes go to the depth mask while it is on
+        // `debug.alvr.green_boxes`: the zone's boxes go to the depth mask while it is on. Its rects are in
+        // the view the layers are submitted with (with the edge fill the wider one), as is its under
+        // layer's crop
         let green = self.green_frame(&output_view_params);
         if let Some(green) = &green
             && let Ok(windows) = green.state
@@ -2808,6 +2852,12 @@ impl StreamContext {
             [0, 1].map(|i| {
                 self.last_hand_rects[i].map(|rect| {
                     let fov = output_view_params[i].fov;
+                    // The hands' rect is in the stream view: in the output view with the edge fill
+                    let rect = if edge_fill.is_some() {
+                        alvr_graphics::stream_rect_to_output(input_view_params[i].fov, fov, rect)
+                    } else {
+                        rect
+                    };
                     alvr_graphics::crop_view(fov, resolution, rect, KEY_CROP_MARGIN, crop == 2)
                 })
             })
@@ -2821,7 +2871,17 @@ impl StreamContext {
             input.key_lower_rects = Some([0, 1].map(|i| match lower_crops.map(|crops| crops[i]) {
                 _ if !extra_layers => (Vec2::ZERO, Vec2::ZERO),
                 Some(Some((offset, size, _))) => {
-                    alvr_graphics::crop_view_uv(resolution, offset, size, crop == 2)
+                    let rect = alvr_graphics::crop_view_uv(resolution, offset, size, crop == 2);
+                    // The shader compares it with the stream uv
+                    if edge_fill.is_some() {
+                        alvr_graphics::output_rect_to_stream(
+                            input_view_params[i].fov,
+                            output_view_params[i].fov,
+                            rect,
+                        )
+                    } else {
+                        rect
+                    }
                 }
                 _ => (Vec2::ZERO, Vec2::ONE),
             }));
