@@ -1,5 +1,6 @@
 use super::{GraphicsContext, MAX_IMMEDIATE_SIZE, staging::StagingRenderer};
 use crate::{
+    ablation::{self, RenderAblation},
     depth_burst::BurstReadbacks,
     depth_dump::{self, DEPTH_DUMP_TIMEOUT, DepthDumpFiles, DepthDumpRequest, DumpReadback},
     depth_mask::{self, DEPTH_UNIFORMS_SIZE, DepthRenderInput},
@@ -252,49 +253,12 @@ impl StreamPipelines {
 
         let problem_layout = problem_view::problem_view_layout(device);
 
-        let main_module = shader_module(device, "stream", stream_shader_source());
-        let compilation_options = PipelineCompilationOptions {
+        let main = create_main_pipeline(
+            device,
+            [&view_layout, &depth_layout, &problem_layout],
+            target_format,
             constants,
-            zero_initialize_workgroup_memory: false,
-        };
-
-        let main = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: Some("stream"),
-            // Note: Layout cannot be inferred because of a bug with push constants
-            layout: Some(&device.create_pipeline_layout(&PipelineLayoutDescriptor {
-                label: None,
-                bind_group_layouts: &[
-                    Some(&view_layout),
-                    Some(&depth_layout),
-                    Some(&problem_layout),
-                ],
-                immediate_size: IMMEDIATE_SIZE,
-            })),
-            vertex: VertexState {
-                module: &main_module,
-                entry_point: None,
-                compilation_options: compilation_options.clone(),
-                buffers: &[],
-            },
-            primitive: PrimitiveState {
-                topology: PrimitiveTopology::TriangleStrip,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: Default::default(),
-            fragment: Some(FragmentState {
-                module: &main_module,
-                entry_point: None,
-                compilation_options,
-                targets: &[Some(ColorTargetState {
-                    format: target_format,
-                    blend: None,
-                    write_mask: ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        );
 
         let playzone_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("playzone"),
@@ -585,6 +549,56 @@ impl StreamPipelines {
             overlay,
         }
     }
+}
+
+/// The main pass of the stream (stream.wgsl) with these pipeline constants. `layouts`: view, depth and
+/// problem view. Also the pipeline of `debug.alvr.dbg_no_srgb` (other constants, see ablation.rs)
+pub(crate) fn create_main_pipeline(
+    device: &Device,
+    layouts: [&BindGroupLayout; 3],
+    target_format: TextureFormat,
+    constants: &[(&str, f64)],
+) -> RenderPipeline {
+    let [view_layout, depth_layout, problem_layout] = layouts;
+    let main_module = shader_module(device, "stream", stream_shader_source());
+    let compilation_options = PipelineCompilationOptions {
+        constants,
+        zero_initialize_workgroup_memory: false,
+    };
+
+    device.create_render_pipeline(&RenderPipelineDescriptor {
+        label: Some("stream"),
+        // Note: Layout cannot be inferred because of a bug with push constants
+        layout: Some(&device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(view_layout), Some(depth_layout), Some(problem_layout)],
+            immediate_size: IMMEDIATE_SIZE,
+        })),
+        vertex: VertexState {
+            module: &main_module,
+            entry_point: None,
+            compilation_options: compilation_options.clone(),
+            buffers: &[],
+        },
+        primitive: PrimitiveState {
+            topology: PrimitiveTopology::TriangleStrip,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: Default::default(),
+        fragment: Some(FragmentState {
+            module: &main_module,
+            entry_point: None,
+            compilation_options,
+            targets: &[Some(ColorTargetState {
+                format: target_format,
+                blend: None,
+                write_mask: ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
 }
 
 /// For `debug.alvr.key_dump`, created at the first dump. Uses `depth_layout` and `playzone_layout`
@@ -890,6 +904,14 @@ pub struct StreamRenderer {
     cloud: RefCell<Option<MotionCloud>>,
     cloud_dummy_bind_group: BindGroup,
     problem_view: ProblemViewGpu,
+    // `debug.alvr.dbg_*` (ablation.rs): what is left out, the display frames rendered so far (for
+    // `dbg_mask_every`), and for `dbg_no_srgb` the main pipeline's constants, its target format and the
+    // second pipeline from its first use
+    ablation: Cell<RenderAblation>,
+    display_frame: Cell<u64>,
+    main_constants: Vec<(&'static str, f64)>,
+    target_format: TextureFormat,
+    no_srgb_main: OnceCell<RenderPipeline>,
 }
 
 impl StreamRenderer {
@@ -1100,7 +1122,43 @@ impl StreamRenderer {
             cloud: RefCell::new(None),
             cloud_dummy_bind_group,
             problem_view,
+            ablation: Cell::new(RenderAblation::default()),
+            display_frame: Cell::new(0),
+            main_constants: constants,
+            target_format,
+            no_srgb_main: OnceCell::new(),
         }
+    }
+
+    /// `debug.alvr.dbg_*`: what the next frames leave out (the default: nothing, today's renderer)
+    pub fn set_ablation(&self, ablation: RenderAblation) {
+        self.ablation.set(ablation);
+    }
+
+    /// Size of the depth mask and of the focus area of each eye (texels)
+    pub fn depth_mask_resolution(&self) -> UVec2 {
+        self.depth_mask_resolution
+    }
+
+    // The pipeline of the main pass: today's, or with `dbg_no_srgb` the one without the sRGB correction
+    // (built at its first use)
+    fn main_pipeline(&self, ablation: &RenderAblation) -> &RenderPipeline {
+        if !ablation.no_srgb {
+            return &self.pipelines.main;
+        }
+
+        self.no_srgb_main.get_or_init(|| {
+            create_main_pipeline(
+                &self.context.device,
+                [
+                    &self.pipelines.view_layout,
+                    &self.pipelines.depth_layout,
+                    &self.pipelines.problem_layout,
+                ],
+                self.target_format,
+                &ablation::no_srgb_constants(&self.main_constants),
+            )
+        })
     }
 
     /// `debug.alvr.problem_view`: the leak map as a tint over the room (depth passthrough only), or off
@@ -1247,9 +1305,15 @@ impl StreamRenderer {
             ));
         }
 
-        memory
-            .as_mut()
-            .map(|memory| memory.plan(&self.context.queue, memory_input, input.frame.as_ref()))
+        let stats_interval = self.ablation.get().readback_interval();
+        memory.as_mut().map(|memory| {
+            memory.plan(
+                &self.context.queue,
+                memory_input,
+                input.frame.as_ref(),
+                stats_interval,
+            )
+        })
     }
 
     /// How long ago the playzone was remembered. None: there is none
@@ -1329,6 +1393,9 @@ impl StreamRenderer {
         overlay: &[OverlaySegment],
     ) -> Option<[Option<(Vec2, Vec2)>; 2]> {
         let new_frame = !hardware_buffer.is_null();
+        let ablation = self.ablation.get();
+        let frame_index = self.display_frame.get();
+        self.display_frame.set(frame_index.wrapping_add(1));
 
         // if hardware_buffer is available copy stream to staging texture
         if new_frame {
@@ -1543,7 +1610,9 @@ impl StreamRenderer {
                     );
                 }
                 // The depth mask uses the focus area. Without hands it only needs to be cleared once.
+                // `dbg_skip_focus`: not at all (its texture keeps what it has)
                 if let Some(rects) = &hand_rects
+                    && !ablation.skip_focus
                     && !(rects[view_idx].is_none() && self.focus_area_cleared[view_idx].get())
                 {
                     self.focus_area_cleared[view_idx].set(rects[view_idx].is_none());
@@ -1557,19 +1626,22 @@ impl StreamRenderer {
                         rects[view_idx],
                     );
                 }
-                encode_depth_mask(
-                    &mut encoder,
-                    &self.pipelines,
-                    &objects.depth_mask,
-                    depth_bind_group,
-                    memory_read.map_or(&self.playzone_bind_groups[view_idx], |memory| {
-                        memory.read_bind_group(view_idx)
-                    }),
-                    cloud_read.map_or(&self.cloud_dummy_bind_group, |cloud| {
-                        cloud.read_bind_group(view_idx)
-                    }),
-                    view_idx as u32,
-                );
+                // `dbg_skip_mask` / `dbg_mask_every`: the mask keeps its last content in the frames it skips
+                if ablation.mask_runs(frame_index, view_idx) {
+                    encode_depth_mask(
+                        &mut encoder,
+                        &self.pipelines,
+                        &objects.depth_mask,
+                        depth_bind_group,
+                        memory_read.map_or(&self.playzone_bind_groups[view_idx], |memory| {
+                            memory.read_bind_group(view_idx)
+                        }),
+                        cloud_read.map_or(&self.cloud_dummy_bind_group, |cloud| {
+                            cloud.read_bind_group(view_idx)
+                        }),
+                        view_idx as u32,
+                    );
+                }
             }
         }
         let dump = dump.map(|(n, frame, json)| {
@@ -1602,6 +1674,9 @@ impl StreamRenderer {
 
         let overlay_draws = (depth_config.is_some() && !overlay.is_empty())
             .then(|| self.write_overlay(&view_params, depth, overlay));
+        let main_pipeline = self.main_pipeline(&ablation);
+        // `dbg_plain`: the shader's Blend path with alpha 1 (one stream tap, nothing of the depth path)
+        let main_passthrough = if ablation.plain { None } else { passthrough };
 
         for (view_idx, view_params) in view_params.iter().enumerate() {
             let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
@@ -1622,13 +1697,13 @@ impl StreamRenderer {
             let transform = reprojection_transform(view_params);
             let transform_bytes = floats_to_bytes(&transform.to_cols_array());
 
-            render_pass.set_pipeline(&self.pipelines.main);
+            render_pass.set_pipeline(main_pipeline);
             render_pass.set_immediates(TRANSFORM_CONST_OFFSET, &transform_bytes);
             render_pass.set_immediates(VIEW_INDEX_CONST_OFFSET, &(view_idx as u32).to_le_bytes());
             render_pass.set_bind_group(0, &self.views_objects[view_idx].bind_group, &[]);
             render_pass.set_bind_group(1, depth_bind_group, &[]);
             render_pass.set_bind_group(2, &self.problem_view.bind_group, &[]);
-            set_passthrough_immediates(&mut render_pass, passthrough);
+            set_passthrough_immediates(&mut render_pass, main_passthrough);
             render_pass.draw(0..4, 0..1);
 
             if let Some(draws) = &overlay_draws

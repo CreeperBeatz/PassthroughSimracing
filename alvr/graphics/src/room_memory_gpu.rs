@@ -363,12 +363,15 @@ impl RoomMemory {
     }
 
     /// The passes of this frame, and the uniforms they need (written at a new depth image only: eye 1 of
-    /// a depth image is updated on the next frame with the same ones). The anchor is decided here
+    /// a depth image is updated on the next frame with the same ones). The anchor is decided here.
+    /// `stats_interval`: of the statistics readback, `MEMORY_STATS_INTERVAL` today (`debug.alvr.dbg_readback_ms`,
+    /// None: never)
     pub fn plan(
         &mut self,
         queue: &Queue,
         input: &MemoryInput,
         frame: Option<&DepthFrame>,
+        stats_interval: Option<Duration>,
     ) -> MemoryPasses {
         let mut passes = MemoryPasses::default();
         if let Some(frame) = frame {
@@ -417,7 +420,7 @@ impl RoomMemory {
 
         if self.anchor.camera.is_some()
             && matches!(self.stats_readback.state, StatsState::Idle)
-            && self.last_stats_request.elapsed() >= MEMORY_STATS_INTERVAL
+            && stats_interval.is_some_and(|interval| self.last_stats_request.elapsed() >= interval)
         {
             self.last_stats_request = Instant::now();
             passes.stats = true;

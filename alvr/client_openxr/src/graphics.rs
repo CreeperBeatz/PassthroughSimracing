@@ -54,6 +54,131 @@ pub fn create_swapchain(
     session.create_swapchain(&swapchain_info).unwrap()
 }
 
+/// `debug.alvr.ffr` (perf.rs): the fixed foveation profile of each eye swapchain, created at the stream
+/// start from the properties. Err: why not (the runtime lacks an extension or refused the profile)
+pub fn create_foveation_profile(
+    session: &xr::Session<xr::OpenGlEs>,
+    params: &crate::perf::FfrParams,
+) -> Result<xr::FoveationProfileFB, String> {
+    let exts = session.instance().exts();
+    let missing = [
+        ("XR_FB_foveation", exts.fb_foveation.is_some()),
+        (
+            "XR_FB_foveation_configuration",
+            exts.fb_foveation_configuration.is_some(),
+        ),
+        (
+            "XR_FB_swapchain_update_state",
+            exts.fb_swapchain_update_state.is_some(),
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, enabled)| !enabled)
+    .map(|(name, _)| name)
+    .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "the runtime does not list {} (extensions are enabled only if listed)",
+            missing.join(", ")
+        ));
+    }
+
+    session
+        .create_foveation_profile(Some(xr::FoveationLevelProfile {
+            level: xr::FoveationLevelFB::from_raw(params.level),
+            vertical_offset: 0.0,
+            dynamic: if params.dynamic {
+                xr::FoveationDynamicFB::LEVEL_ENABLED
+            } else {
+                xr::FoveationDynamicFB::DISABLED
+            },
+        }))
+        .map_err(|e| format!("xrCreateFoveationProfileFB: {e}"))
+}
+
+/// `debug.alvr.ffr`: like `create_swapchain`, with XrSwapchainCreateInfoFoveationFB chained (flags 0, or
+/// SCALED_BIN with `ffr_scaled_bin`), then the profile applied with xrUpdateSwapchainFB. The `openxr`
+/// crate's `create_swapchain` chains nothing, so the call is made through its function pointers.
+/// Returns the swapchain and an error if the profile is not applied (a swapchain that could not be
+/// created with the chain is created as today)
+pub fn create_foveated_swapchain(
+    session: &xr::Session<xr::OpenGlEs>,
+    gfx_ctx: &GraphicsContext,
+    resolution: UVec2,
+    format: u32,
+    profile: &xr::FoveationProfileFB,
+    scaled_bin: bool,
+) -> (xr::Swapchain<xr::OpenGlEs>, Result<(), String>) {
+    use xr::{Graphics, sys::Handle};
+
+    gfx_ctx.make_current();
+
+    let instance = session.instance();
+    let Some(update_state) = instance.exts().fb_swapchain_update_state else {
+        return (
+            create_swapchain(session, gfx_ctx, resolution, format, None),
+            Err("no XR_FB_swapchain_update_state".into()),
+        );
+    };
+
+    let mut foveation_info = xr::sys::SwapchainCreateInfoFoveationFB {
+        ty: xr::sys::SwapchainCreateInfoFoveationFB::TYPE,
+        next: ptr::null_mut(),
+        flags: if scaled_bin {
+            xr::SwapchainCreateFoveationFlagsFB::SCALED_BIN
+        } else {
+            xr::SwapchainCreateFoveationFlagsFB::EMPTY
+        },
+    };
+    let info = xr::sys::SwapchainCreateInfo {
+        ty: xr::sys::SwapchainCreateInfo::TYPE,
+        next: (&raw mut foveation_info).cast_const().cast(),
+        create_flags: xr::SwapchainCreateFlags::EMPTY,
+        usage_flags: xr::SwapchainUsageFlags::COLOR_ATTACHMENT | xr::SwapchainUsageFlags::SAMPLED,
+        format: xr::OpenGlEs::lower_format(format),
+        sample_count: 1,
+        width: resolution.x,
+        height: resolution.y,
+        face_count: 1,
+        array_size: 1,
+        mip_count: 1,
+    };
+    let mut handle = xr::sys::Swapchain::NULL;
+    // SAFETY: `info` and its chain live through the call, the session is valid
+    let result = unsafe { (instance.fp().create_swapchain)(session.as_raw(), &info, &mut handle) };
+    if result.into_raw() < 0 {
+        return (
+            create_swapchain(session, gfx_ctx, resolution, format, None),
+            Err(format!(
+                "xrCreateSwapchain with XrSwapchainCreateInfoFoveationFB: {result}"
+            )),
+        );
+    }
+    // SAFETY: created above on this session; the wrapper destroys it
+    let swapchain = unsafe { xr::Swapchain::from_raw(session.clone(), handle) };
+
+    let state = xr::sys::SwapchainStateFoveationFB {
+        ty: xr::sys::SwapchainStateFoveationFB::TYPE,
+        next: ptr::null_mut(),
+        flags: xr::SwapchainStateFoveationFlagsFB::EMPTY,
+        profile: profile.as_raw(),
+    };
+    // SAFETY: the state struct starts with the base header, the swapchain is valid
+    let result = unsafe {
+        (update_state.update_swapchain)(
+            swapchain.as_raw(),
+            (&raw const state).cast::<xr::sys::SwapchainStateBaseHeaderFB>(),
+        )
+    };
+    let applied = if result.into_raw() < 0 {
+        Err(format!("xrUpdateSwapchainFB: {result}"))
+    } else {
+        Ok(())
+    };
+
+    (swapchain, applied)
+}
+
 pub struct ProjectionLayerAlphaConfig {
     pub premultiplied: bool,
 }

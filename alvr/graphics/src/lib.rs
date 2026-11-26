@@ -1,3 +1,4 @@
+mod ablation;
 mod area_edit;
 mod color_model;
 mod depth_burst;
@@ -20,6 +21,7 @@ mod stream;
 #[cfg(test)]
 mod tests;
 
+pub use ablation::{DEFAULT_READBACK_MS, MAX_MASK_EVERY, MAX_READBACK_MS, RenderAblation};
 pub use area_edit::*;
 pub use color_model::*;
 pub use depth_burst::{

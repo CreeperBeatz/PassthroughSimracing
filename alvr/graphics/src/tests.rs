@@ -3,6 +3,7 @@
 //! - the depth passthrough shader is run on the desktop GPU against a synthetic depth scene
 
 use crate::{
+    RenderAblation,
     depth_dump::{DumpReadback, DumpSource},
     depth_mask::{
         self, ArmGap, ArmMotion, ColorKeyInput, DepthFrame, DepthRenderInput, HAND_SEGMENTS,
@@ -7203,4 +7204,112 @@ fn cloud_vector_in_the_depth_uniforms() {
         cloud(1, false, true).as_ref(),
         true
     ));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Ablations (`debug.alvr.dbg_*`, ablation.rs)
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn ablation_unset_is_today() {
+    let unset = RenderAblation::from_values(None, None, None, None, None, None);
+    assert_eq!(unset, RenderAblation::default());
+    assert!(!unset.is_active());
+    // Every mask of every frame, the readback every 2 s as before
+    for frame in 0..10 {
+        assert!(unset.mask_runs(frame, 0));
+        assert!(unset.mask_runs(frame, 1));
+    }
+    assert_eq!(
+        unset.readback_interval(),
+        Some(crate::room_memory_gpu::MEMORY_STATS_INTERVAL)
+    );
+    assert!(unset.text().ends_with("(all today's)"));
+    // 0 means off for the switches and every frame for `dbg_mask_every`
+    assert_eq!(
+        RenderAblation::from_values(Some(0), Some(0), Some(0), Some(0), Some(0), None),
+        unset
+    );
+    assert_eq!(
+        RenderAblation::from_values(None, Some(1), None, None, None, Some(2000)),
+        unset
+    );
+}
+
+#[test]
+fn ablation_values_are_clamped() {
+    let set = RenderAblation::from_values(Some(1), Some(100), Some(5), Some(1), Some(1), Some(-5));
+    assert!(set.skip_mask && set.skip_focus && set.plain && set.no_srgb);
+    assert_eq!(set.mask_every, crate::MAX_MASK_EVERY);
+    assert_eq!(set.readback_ms, 0);
+    assert_eq!(set.readback_interval(), None);
+    assert!(set.is_active());
+    let slow = RenderAblation::from_values(None, None, None, None, None, Some(1_000_000));
+    assert_eq!(slow.readback_ms, crate::MAX_READBACK_MS);
+    assert_eq!(
+        slow.readback_interval(),
+        Some(std::time::Duration::from_secs(60))
+    );
+}
+
+#[test]
+fn ablation_mask_schedule() {
+    // Skipped: never, for both eyes
+    let skip = RenderAblation::from_values(Some(1), Some(3), None, None, None, None);
+    assert!((0..20).all(|frame| !skip.mask_runs(frame, 0) && !skip.mask_runs(frame, 1)));
+
+    // Every Nth frame per eye, eye 1 half a period later
+    for every in 2..=crate::MAX_MASK_EVERY {
+        let ablation =
+            RenderAblation::from_values(None, Some(i64::from(every)), None, None, None, None);
+        let period = u64::from(every);
+        for eye in 0..2 {
+            // Once per period
+            let runs: Vec<u64> = (0..8 * period)
+                .filter(|&f| ablation.mask_runs(f, eye))
+                .collect();
+            assert_eq!(runs.len(), 8);
+            assert!(runs.windows(2).all(|w| w[1] - w[0] == period));
+        }
+        let first = |eye| (0..64).find(|&f| ablation.mask_runs(f, eye)).unwrap();
+        assert_eq!(first(0), 0);
+        assert_eq!(first(1), u64::from(every - every / 2));
+    }
+}
+
+#[test]
+fn ablation_no_srgb_changes_only_the_srgb_constant() {
+    let constants = [
+        ("ENABLE_SRGB_CORRECTION", 1.0),
+        ("ENCODING_GAMMA", 2.2),
+        ("ENABLE_FFE", 1.0),
+    ];
+    assert_eq!(
+        crate::ablation::no_srgb_constants(&constants),
+        vec![
+            ("ENABLE_SRGB_CORRECTION", 0.0),
+            ("ENCODING_GAMMA", 2.2),
+            ("ENABLE_FFE", 1.0),
+        ]
+    );
+    // The second pipeline translates like today's
+    translate_to_gles(
+        "stream (dbg_no_srgb)",
+        &stream::stream_shader_source(),
+        &crate::ablation::no_srgb_constants(&constants),
+    );
+    // and builds on the desktop GPU
+    if let Some((device, _queue)) = gpu() {
+        let pipelines = StreamPipelines::new(&device, TextureFormat::Rgba8Unorm, &constants, true);
+        stream::create_main_pipeline(
+            &device,
+            [
+                &pipelines.view_layout,
+                &pipelines.depth_layout,
+                &pipelines.problem_layout,
+            ],
+            TextureFormat::Rgba8Unorm,
+            &crate::ablation::no_srgb_constants(&constants),
+        );
+    }
 }

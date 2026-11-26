@@ -105,3 +105,142 @@ Start the streamer and SteamVR, start the client, then
 `adb shell am broadcast -a com.oculus.vrpowermanager.prox_close` (undo with `prox_open`). Set the
 properties of one row, wait 6 s, then `ANDROID_SERIAL=<serial> sh tools/avg.sh 26 "<label>"` (project
 folder). Repeat the base at the end: the temperature drifts.
+
+## Measuring (2026-11-26)
+
+Stage S0: the client now tells what it streams and how frames arrive, and can leave out one piece of GPU
+work at a time. Nothing is optimised. With every property below unset the layers, the shaders' output
+and the picture are today's (the only change is two more log lines). Not yet run on the headset.
+
+### Properties
+
+| Property | Default | Range | Read | What it removes |
+|---|---|---|---|---|
+| `debug.alvr.dbg_skip_mask` | 0 | 0/1 | live (0.5 s) | the depth mask pass (pass 12 of the phase-1 pass table); the mask textures keep their last content, so the holes freeze where they were |
+| `debug.alvr.dbg_mask_every` | 1 | 1..8 | live | the mask pass of each eye runs only every Nth display frame (eye 1 half a period after eye 0); in between the mask keeps its content |
+| `debug.alvr.dbg_skip_focus` | 0 | 0/1 | live | the hands' focus pass (pass 11; it runs only with the key and a hand in view); the focus textures keep their content |
+| `debug.alvr.dbg_plain` | 0 | 0/1 | live | the depth work of the main pass (pass 14): its immediates select the shader's Blend path with alpha 1, so one stream tap, no mask / focus / probe tap, no alpha packing. Same pipeline, no shader change; the game covers everything |
+| `debug.alvr.dbg_no_srgb` | 0 | 0/1 | live | the 3 `pow` of the sRGB correction in the main pass: a second main pipeline built with `ENABLE_SRGB_CORRECTION` false at its first use (one hitch). Colours wrong |
+| `debug.alvr.dbg_readback_ms` | 2000 | 0..60000 | live | the interval of the room memory's statistics readback (stats pass + copy + `map_async`, `room_memory_gpu.rs`); 0 = never (the `memory:` line then keeps old statistics) |
+| `debug.alvr.ffr` | 0 (off) | 0..4 | stream start | fixed foveated rendering of the eye swapchains: 1 low, 2 medium, 3 high, 4 high-top (Meta's fifth level, given to the runtime as the raw value 4) |
+| `debug.alvr.ffr_dynamic` | 0 | 0/1 | stream start | with `ffr`: `XR_FOVEATION_DYNAMIC_LEVEL_ENABLED_FB`, the runtime may lower the level while there is headroom |
+| `debug.alvr.ffr_scaled_bin` | 0 | 0/1 | stream start | with `ffr`: create the swapchains with `XR_SWAPCHAIN_CREATE_FOVEATION_SCALED_BIN_BIT_FB` (what upstream ALVR used, see below); 0 chains the create info with no flag |
+
+No `dbg_skip_memory` / `dbg_skip_cloud`: the existing switches already remove those passes completely.
+- `mem_roll 0` (or unset): `room_memory::read_params` is None, `plan_memory` drops the memory and its
+  textures, so the memory's clear / reproject / update / stats passes and the readback do not run. Side
+  effect: today's playzone copy comes back (only on a capture) and the mask reads the copy instead of the
+  memory.
+- `cloud 0` (or unset): `cloud_input` is None, `plan_cloud` drops the cloud, its mark / rows / field passes
+  do not run and the mask reads the 1 x 1 dummy field. Side effect: `cloud 0` flips the defaults of
+  `key_layers` (5 -> 4) and `key_crop` (0 -> 1), which changes the compositor layers. Set `key_layers 5`
+  and `key_crop 0` explicitly when the cloud's app cost is wanted alone (the table above did).
+
+### Log lines (tag `ALVR_CAM`)
+
+`stream:` once at every stream start, at the first frame with located views (illustrative numbers):
+
+    stream: view 2144x2240, swapchain 2144x2240 SRGB8_ALPHA8, upscale off, FFE on (encoded 1472x1536, center size 0.45/0.40, center shift L 0.40/0.10 R -0.40/0.10, edge ratio 4.0/5.0, view ratio 0.687/0.686), refresh 72 Hz (72 asked), fov L l -51.0 r 41.0 u 43.0 d -52.0 deg (tan -1.235 0.869 0.933 -1.280), R l -41.0 r 51.0 u 43.0 d -52.0 deg (tan -0.869 1.235 0.933 -1.280), depth mask 428x448, passthrough Depth, lighting off, colour key on, key_layers 5, key_crop 0, dbg_skip_mask 0, dbg_mask_every 1, dbg_skip_focus 0, dbg_plain 0, dbg_no_srgb 0, dbg_readback_ms 2000 (all today's), ffr off (today's)
+
+- view: the server's `view_resolution`; swapchain: the eye swapchains (view x `upscale_factor` only with
+  upscaling) and their GL format; FFE: the negotiated foveated encoding (the staging texture has the
+  encoded size); refresh: the runtime's current rate and the one asked for; fov: the located views
+  (degrees and tangents); depth mask: per eye (view / 5); lighting: the server setting of the depth
+  passthrough (`-` when not depth); colour key: its layer mode at the first frame (`off` if the key was
+  not on yet; the `key:` line follows it); then the values of this stage's properties and what became of
+  `ffr` (`applied`, or `NOT applied, <why>`).
+
+`ablation:` on each change of a `dbg_*` property, with all their values:
+
+    ablation: dbg_skip_mask 1, dbg_mask_every 1, dbg_skip_focus 0, dbg_plain 0, dbg_no_srgb 0, dbg_readback_ms 2000 (new settings)
+
+`perf:` every 2 s while streaming (illustrative numbers):
+
+    perf: display 72.0 fps, new frames 71.5 fps, repeated 1 of 144 display frames, frame age at display 3.1 ms p90 16.9, head turn render->display 0.42 deg p90 1.30, new frame interval at display 13.9 ms p90 13.9 max 27.8, timestamps 13.9 ms p90 14.0 max 27.9, decode 4.2 ms p90 6.0, decoder queue 0.6 ms p90 1.4, total latency 58 ms p90 64, prediction 55.0 ms
+
+- display / new frames: `render` calls and new decoded frames per second; repeated: display frames that
+  drew the previous decoded frame again (out of all display frames of the window).
+- frame age at display: the display (vsync) time minus the drawn frame's timestamp. The timestamp is the
+  time the PC rendered for: the client's poll time plus its prediction offset. So about 0 means the
+  prediction hit the display time; a repeated frame adds one display interval; a steady positive value
+  means the prediction is too short.
+- head turn render->display: the angle between the orientation the frame was rendered for (the server's
+  view pose, left eye) and the one located for the display time. It is what the compositor's
+  reprojection has to correct, and what opens a gap at the picture's border.
+- new frame interval at display: between the display times of consecutive new frames (what the eye
+  sees: 13.9 ms at 72 Hz, 27.8 = one repeat). timestamps: between the frames' own timestamps (the PC's
+  pacing). A clean timestamp series with a rough display series points at the network or the decoder.
+- decode, decoder queue, total latency: `alvr_client_core`'s statistics of each new frame, the ones it
+  sends to the streamer (read through a new read-only accessor `frame_statistics`; nothing sent changed).
+  prediction: the head prediction offset in use.
+- Fixed arrays of 512 values per measure, no allocation per frame; values past 512 in a window are
+  counted at the end of the line.
+
+### Fixed foveation of the eye swapchains: why it was dead, how it is wired now
+
+History (`git log -S`, `git blame` of `client_openxr/src/graphics.rs`):
+- `27c86ca8` (#1646, 2023-05-30) added client-side foveation: `create_swapchain_with_foveation(info,
+  SCALED_BIN)` and `swapchain.update_foveation(profile)`. Both were functions of ALVR's own fork of the
+  `openxr` crate (`alvr-org/openxrs` rev `f1f47ff`); the renderer was then the C++ GLES one.
+- `707b41a6` (#2366, 2024-08-31, "Move extra xr ext wrappers in-tree") switched to upstream
+  `Ralith/openxrs` 0.19, which has neither function. The branch was deleted, `create_swapchain` got
+  `#[allow(unused_variables)]` and kept the `foveation` argument. The profile is still created in
+  `stream.rs` from the server setting `clientside_foveation`, and nothing uses it. No comment in the code
+  or the commit says this was meant; it reads as a casualty of the crate switch.
+- The crate in use (0.21.1) still chains nothing in `Session::create_swapchain` (`next: null`), but has the
+  raw types and function pointers (`sys::SwapchainCreateInfoFoveationFB`, `sys::SwapchainStateFoveationFB`,
+  `exts().fb_swapchain_update_state.update_swapchain`) and `Session::create_foveation_profile`.
+
+Now (`perf.rs`, `graphics.rs`), with `debug.alvr.ffr` set at stream start the client
+1. creates a profile from the properties (`XrFoveationLevelProfileCreateInfoFB`: level, vertical offset 0,
+   dynamic), only if XR_FB_foveation, XR_FB_foveation_configuration and XR_FB_swapchain_update_state are
+   enabled. They are requested at instance creation as before (`lib.rs`: `selected_exts` intersected with
+   what the runtime lists), so nothing changes there when `ffr` is unset;
+2. creates both eye swapchains through the raw `xrCreateSwapchain` with `XrSwapchainCreateInfoFoveationFB`
+   chained (flags 0, or SCALED_BIN with `ffr_scaled_bin 1`); if that fails, as today without the chain;
+3. applies the profile with `xrUpdateSwapchainFB` (`XrSwapchainStateFoveationFB`), then drops it (Meta's
+   samples destroy the profile after the update too).
+
+The `stream:` line says `applied` or `NOT applied, <why>` (missing extension, profile refused, create or
+update error). Unset: the swapchains are created exactly as before, the server's unused profile included.
+The lobby's swapchains never get it. Whether the Quest driver applies the foveation to a swapchain that
+wgpu renders into through its own framebuffer is not known until it is measured: compare app GPU time.
+
+What foveation does to this renderer (to look for on the headset):
+- Only the main pass renders into the swapchain, so only it is foveated: in the periphery the driver
+  shades bins at a lower resolution (QCOM texture foveation) and upscales them. The staging copy, the
+  mask, focus, memory and cloud passes render into their own textures and cost the same.
+- The alpha channel is not a plain coverage: with the colour key it packs two layers' alphas (0 hole,
+  0.5 rim, 1 game, `stream.wgsl`), unpacked by the scale/bias of the two game layers. Where a bin is
+  upscaled, alphas between packed levels get interpolated: a 0 -> 1 edge passes 0.5, which unpacks as
+  "rim" (lower layer opaque, upper open), a thin band where the keyed passthrough shows; a 0.5 -> 1 edge
+  gives 0.75 (upper layer half open). Expect faint keyed fringes along hole edges in the periphery, mostly
+  invisible where the key keeps nothing. Without the key (premultiplied alpha, `1 - shown`) the
+  interpolation is only a softer edge.
+- The mask edge gets coarser in the periphery: the mask is sampled per shaded pixel, and with fewer shaded
+  pixels its smoothstep edge is resolved on the coarser grid (stair steps of the bin's scale). The rig's
+  edges near the view's lower border (wheel rim, forearms) sit in the periphery of the higher levels.
+- The game image in the periphery is already low resolution from FFE (foveated encoding); FFR on top
+  costs little visible game detail there, but its centre is the lens centre, not FFE's shifted centre.
+- `ffr_dynamic 1` lets the level change at runtime: compare timings only with it off.
+
+### Measurement recipe
+
+Same protocol as "How to measure again" (prox_close, one row's properties, 6 s, `tools/avg.sh 26`, the
+base again at the end). Keep the judged base properties, then set ONE of these at a time:
+
+| Set | Isolates | Expected if the phase-1 ranking holds |
+|---|---|---|
+| `dbg_skip_mask 1` | the depth mask pass | app GPU -0.3..0.8 ms |
+| `dbg_mask_every 2`, then `3` | how the mask cost scales with its rate | about 1/2, then 2/3 of the `dbg_skip_mask` saving |
+| `dbg_skip_focus 1` (hands in view) | the focus pass | small |
+| `dbg_plain 1` | the depth-specific work of the main pass (mask and focus taps, alpha packing) | -0.3..0.8 ms |
+| `dbg_no_srgb 1` | the sRGB `pow` of the main pass | -0.1..0.3 ms |
+| `dbg_plain 1` + `dbg_no_srgb 1` | what is left: the bare full-resolution stream copy (staging + main pass) | about 2.5-3 ms remain |
+| `mem_roll 0` | the room memory's passes and readback | measured about 0 (table above) |
+| `cloud 0` with `key_layers 5`, `key_crop 0` | the cloud's passes | measured -0.45 ms |
+| `dbg_readback_ms 0`, then `100` | whether the readback stalls the queue | look at the GPU % peaks, not the mean |
+| `ffr 1..4` (a new stream each) | the main pass at full resolution under foveation | the larger part of the fixed full-resolution cost if it dominates |
+
+Read the `perf:` line next to each row: an ablation must not change `display fps` or `repeated`, else the
+row measures a frame-rate change, not a pass.

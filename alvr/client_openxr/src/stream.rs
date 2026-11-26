@@ -9,6 +9,7 @@ use crate::{
     lever::{LeverHand, LeverParams, LeverWindows},
     motion_cloud::{self, CloudLog, CloudOff},
     passthrough::{self, ColorKeyParams, ProblemViewParams, debug_property},
+    perf::{self, FfrOutcome, FfrParams, FrameLatencies, PerfLog, StreamFacts},
     room_memory::{self, MemoryLog},
 };
 use alvr_client_core::{
@@ -29,8 +30,8 @@ use alvr_graphics::{
     CloudInput, CloudParams, CloudRecord, ColorKeyInput, DepthDumpFiles, DepthDumpRequest,
     DepthFrame, DepthRenderInput, DumpJoint, EditorHand, EditorInput, GraphicsContext,
     HAND_SEGMENTS, HandRay, HandShape, HandZones, LeakGains, LeverWindow, MAX_LEVER_WINDOWS,
-    MemoryInput, MemoryParams, MemoryRecord, OverlaySegment, PlacedArea, SEGMENT_JOINTS,
-    StreamRenderer, StreamViewParams, WristBridge,
+    MemoryInput, MemoryParams, MemoryRecord, OverlaySegment, PlacedArea, RenderAblation,
+    SEGMENT_JOINTS, StreamRenderer, StreamViewParams, WristBridge,
 };
 use alvr_packets::{ClientStreamConfig, RealTimeConfig, TrackingData};
 use alvr_session::{
@@ -528,6 +529,17 @@ pub struct StreamContext {
         ProblemViewParams,
     )>,
     problem_view_on: bool,
+    // Stage S0 (perf.rs): the swapchain format, `debug.alvr.ffr` at the start, whether the `stream:` line
+    // was written (and the frames it waited for located views), the `perf:` line's window, the ablation
+    // properties (`debug.alvr.dbg_*`) and when they were polled
+    swapchain_format: u32,
+    ffr: FfrOutcome,
+    stream_logged: bool,
+    stream_log_waits: u32,
+    perf_log: Box<PerfLog>,
+    last_perf_log: Instant,
+    ablation: RenderAblation,
+    last_ablation_poll: Instant,
 }
 
 impl StreamContext {
@@ -585,22 +597,44 @@ impl StreamContext {
         );
         let format = graphics::swapchain_format(&gfx_ctx, &xr_session, config.enable_hdr);
 
-        let swapchains = [
-            graphics::create_swapchain(
+        // `debug.alvr.ffr` (perf.rs): the fixed foveation of the eye swapchains, an experiment. Unset: the
+        // swapchains as today (the profile of the server setting above stays unused, as it is since
+        // upstream moved to the `openxr` crate without foveated swapchains, see docs/gpu-optimization.md)
+        let ffr_params = FfrParams::read();
+        let ffr_profile =
+            ffr_params.map(|params| graphics::create_foveation_profile(&xr_session, &params));
+        let mut ffr_errors = Vec::new();
+        let swapchains = [0, 1].map(|_| match &ffr_profile {
+            Some(Ok(profile)) => {
+                let (swapchain, applied) = graphics::create_foveated_swapchain(
+                    &xr_session,
+                    &gfx_ctx,
+                    target_view_resolution,
+                    format,
+                    profile,
+                    ffr_params.is_some_and(|params| params.scaled_bin),
+                );
+                if let Err(e) = applied {
+                    ffr_errors.push(e);
+                }
+                swapchain
+            }
+            _ => graphics::create_swapchain(
                 &xr_session,
                 &gfx_ctx,
                 target_view_resolution,
                 format,
                 foveation_profile.as_ref(),
             ),
-            graphics::create_swapchain(
-                &xr_session,
-                &gfx_ctx,
-                target_view_resolution,
-                format,
-                foveation_profile.as_ref(),
-            ),
-        ];
+        });
+        let ffr = match (ffr_params, ffr_profile) {
+            (None, _) | (_, None) => FfrOutcome::Off,
+            (Some(params), Some(Err(e))) => FfrOutcome::NotApplied(params, e),
+            (Some(params), Some(Ok(_))) if !ffr_errors.is_empty() => {
+                FfrOutcome::NotApplied(params, ffr_errors.join("; "))
+            }
+            (Some(params), Some(Ok(_))) => FfrOutcome::Applied(params),
+        };
 
         let renderer = StreamRenderer::new(
             Rc::clone(&gfx_ctx),
@@ -744,7 +778,17 @@ impl StreamContext {
             #[cfg(target_os = "android")]
             problem_view_shown: None,
             problem_view_on: false,
+            swapchain_format: format,
+            ffr,
+            stream_logged: false,
+            stream_log_waits: 0,
+            perf_log: Box::default(),
+            last_perf_log: Instant::now(),
+            ablation: RenderAblation::default(),
+            last_ablation_poll: Instant::now(),
         };
+        // From the first frame
+        this.poll_ablation(true);
 
         this.update_reference_space(None);
 
@@ -1164,6 +1208,112 @@ impl StreamContext {
             self.burst_dump = Some(n);
             self.burst.set_dump(format!("alvr_dump_{n}_depth.json"));
             self.burst.set_key_lut(self.published_lut.clone());
+        }
+    }
+
+    // `debug.alvr.dbg_*` (perf.rs, alvr_graphics::RenderAblation): every 0.5 s, in any passthrough mode, given
+    // to the renderer at once. A change is logged (`ablation:`); the values at the start are in the
+    // `stream:` line
+    fn poll_ablation(&mut self, start: bool) {
+        if !start && self.last_ablation_poll.elapsed() < PROPERTY_POLL_INTERVAL {
+            return;
+        }
+        self.last_ablation_poll = Instant::now();
+        let ablation = perf::read_ablation();
+        if ablation != self.ablation {
+            if !start {
+                crate::stream_log(&format!("ablation: {} (new settings)", ablation.text()));
+            }
+            self.ablation = ablation;
+            self.renderer.set_ablation(ablation);
+        }
+    }
+
+    // The `stream:` line, once per stream at its first frame with located views (after 2 s without, with
+    // the fov "not located")
+    fn log_stream_facts(&mut self, views: Option<&[xr::View]>) {
+        if self.stream_logged {
+            return;
+        }
+        self.stream_log_waits += 1;
+        if views.is_none() && self.stream_log_waits < 144 {
+            return;
+        }
+        self.stream_logged = true;
+
+        let exts = self.xr_session.instance().exts();
+        let refresh_now = exts
+            .fb_display_refresh_rate
+            .and_then(|_| self.xr_session.get_display_refresh_rate().ok());
+        let depth = alvr_graphics::depth_passthrough_config(self.config.passthrough.as_ref());
+        let text = perf::stream_text(&StreamFacts {
+            view_resolution: self.config.view_resolution,
+            swapchain_resolution: self.target_view_resolution,
+            swapchain_format: self.swapchain_format,
+            upscale_factor: self
+                .config
+                .upscaling
+                .as_ref()
+                .map(|upscaling| upscaling.upscale_factor),
+            foveated_encoding: self.config.foveated_encoding_config.as_ref(),
+            refresh_hint: self.config.refresh_rate_hint,
+            refresh_now,
+            fovs: views.map(|views| [0, 1].map(|i| crate::from_xr_fov(views[i].fov))),
+            mask_size: self.renderer.depth_mask_resolution(),
+            passthrough: self.config.passthrough.as_ref().map(|mode| match mode {
+                PassthroughMode::Blend { .. } => "Blend",
+                PassthroughMode::RgbChromaKey(_) => "RgbChromaKey",
+                PassthroughMode::HsvChromaKey(_) => "HsvChromaKey",
+                PassthroughMode::Depth(_) => "Depth",
+            }),
+            lighting: depth.map(|config| config.lighting.as_option().is_some()),
+            key: self.color_key.map(|params| (params.layers, params.crop)),
+            ablation: &self.ablation,
+            ffr: &self.ffr,
+        });
+        crate::stream_log(&text);
+    }
+
+    // The `perf:` line: this display frame (`new_frame`: the timestamp of a new decoded frame), the
+    // client's statistics of a new frame, the line every `PERF_LOG_INTERVAL`
+    fn record_perf(
+        &mut self,
+        vsync_time: Duration,
+        new_frame: Option<Duration>,
+        rendered: &[ViewParams; 2],
+        views: Option<&[xr::View]>,
+    ) {
+        // The drawn frame's pose is known once a frame was drawn (before: the dummy views)
+        let has_frame = new_frame.is_some() || self.perf_log.has_frame();
+        let turn = views.filter(|_| has_frame).map(|views| {
+            perf::turn_deg(
+                rendered[0].pose.orientation,
+                crate::from_xr_quat(views[0].pose.orientation),
+            )
+        });
+        self.perf_log.display_frame(
+            vsync_time.as_nanos() as i64,
+            new_frame.map(|timestamp| timestamp.as_nanos() as i64),
+            turn,
+        );
+        if let Some(timestamp) = new_frame
+            && let Some(stats) = self.core_context.frame_statistics(timestamp)
+        {
+            self.perf_log.latencies(&FrameLatencies {
+                decode: stats.video_decode,
+                decoder_queue: stats.video_decoder_queue,
+                total: stats.total_pipeline_latency,
+            });
+        }
+
+        let elapsed = self.last_perf_log.elapsed();
+        if elapsed >= perf::PERF_LOG_INTERVAL {
+            self.last_perf_log = Instant::now();
+            let text = self.perf_log.text(
+                elapsed.as_secs_f32(),
+                self.core_context.get_total_prediction_offset(),
+            );
+            crate::stream_log(&text);
         }
     }
 
@@ -2470,6 +2620,7 @@ impl StreamContext {
         vsync_time: Duration,
     ) -> (ProjectionLayerBuilder<'_>, Duration, ColorKeyFrame) {
         let xr_vsync_time = xr::Time::from_nanos(vsync_time.as_nanos() as _);
+        self.poll_ablation(false);
         let frame_poll_deadline = Instant::now()
             + Duration::from_secs_f32(
                 frame_interval.as_secs_f32() * DECODER_MAX_TIMEOUT_MULTIPLIER,
@@ -2523,11 +2674,14 @@ impl StreamContext {
             )
             .unwrap();
 
-        let current_headset_views = if flags.contains(xr::ViewStateFlags::ORIENTATION_VALID) {
+        let views_located = flags.contains(xr::ViewStateFlags::ORIENTATION_VALID);
+        let current_headset_views = if views_located {
             maybe_views
         } else {
             vec![crate::default_view(), crate::default_view()]
         };
+        let located_views = views_located.then_some(current_headset_views.as_slice());
+        self.log_stream_facts(located_views);
 
         // The poses and FoVs we received from the PC runtime, which may differ and/or include
         // altered FoVs based on settings and view conversions done for canting.
@@ -2716,6 +2870,12 @@ impl StreamContext {
                 vsync_time.saturating_sub(Duration::from_nanos(xr_now.as_nanos() as u64)),
             );
         }
+        self.record_perf(
+            vsync_time,
+            (!buffer_ptr.is_null()).then_some(timestamp),
+            &input_view_params,
+            located_views,
+        );
 
         let rect = xr::Rect2Di {
             offset: xr::Offset2Di { x: 0, y: 0 },

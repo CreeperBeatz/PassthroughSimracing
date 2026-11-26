@@ -24,7 +24,8 @@ use alvr_common::{
     warn,
 };
 use alvr_packets::{
-    BatteryInfo, ButtonEntry, ClientControlPacket, ClientStreamConfig, RealTimeConfig, TrackingData,
+    BatteryInfo, ButtonEntry, ClientControlPacket, ClientStatistics, ClientStreamConfig,
+    RealTimeConfig, TrackingData,
 };
 use alvr_session::CodecType;
 use alvr_system_info::Platform;
@@ -316,6 +317,17 @@ impl ClientCoreContext {
                 }
             }
         }
+    }
+
+    /// The statistics of the frame with this timestamp as they were collected for the streamer (after
+    /// `report_submit` they are the ones sent). Read only: for the client's own log. None: not known
+    /// (no connection, or the frame left the history)
+    pub fn frame_statistics(&self, timestamp: Duration) -> Option<ClientStatistics> {
+        self.connection_context
+            .statistics_manager
+            .lock()
+            .as_ref()?
+            .summary(timestamp)
     }
 
     pub fn platform(&self) -> Platform {

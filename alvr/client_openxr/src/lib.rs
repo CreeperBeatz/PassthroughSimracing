@@ -15,6 +15,7 @@ mod lobby;
 mod marker_region;
 mod motion_cloud;
 mod passthrough;
+mod perf;
 mod room_memory;
 mod stream;
 
