@@ -26,6 +26,12 @@ pub struct PassthroughLayer<'a> {
     // `debug.alvr.green_layer`: how that layer is made, and the calls until the property is read again
     green_mode: GreenLayerMode,
     green_mode_poll: u32,
+    // The hand key's table as last given (`hand_lut`), and what the runtime got: that table with the
+    // green rule's alpha multiplied in while the green zone is on (`debug.alvr.green_hand_cut`, unset or
+    // 1: on, 0: off), so monitor green is see-through in the hand-key layer too
+    hand_lut: Vec<u8>,
+    hand_sent: Vec<u8>,
+    green_hand_cut: bool,
     _marker: PhantomData<&'a ()>,
 }
 
@@ -51,19 +57,29 @@ impl PassthroughLayer<'_> {
             green_lut: Vec::new(),
             green_mode: GreenLayerMode::default(),
             green_mode_poll: 0,
+            hand_lut: Vec::new(),
+            hand_sent: Vec::new(),
+            green_hand_cut: true,
             _marker: PhantomData,
         })
     }
 
     /// Apply or remove the color key. Returns whether the passthrough is color keyed.
     pub fn update_color_key(&mut self, key: Option<&ColorKey>) -> bool {
-        let Some(handle) = &mut self.handle_fb else {
+        if self.handle_fb.is_none() {
             return false;
-        };
+        }
 
         let version = key.map_or(0, |key| key.version);
         if version != self.color_key_version {
-            match handle.set_color_key(key.map(|key| key.lut.as_slice())) {
+            if let Some(key) = key {
+                self.hand_lut.clone_from(&key.lut);
+                self.fill_hand_sent();
+            }
+            let Some(handle) = &mut self.handle_fb else {
+                return false;
+            };
+            match handle.set_color_key(key.map(|_| self.hand_sent.as_slice())) {
                 Ok(()) => (),
                 Err(e) => error!("Passthrough color key: {e}"),
             }
@@ -71,13 +87,40 @@ impl PassthroughLayer<'_> {
             self.color_key_version = version;
         }
 
-        handle.color_key_layer().is_some()
+        self.handle_fb
+            .as_ref()
+            .is_some_and(|handle| handle.color_key_layer().is_some())
     }
 
     /// Replace the colors of the key, until the next change of its version
     pub fn set_color_key_lut(&mut self, lut: &[u8]) {
+        self.hand_lut.clear();
+        self.hand_lut.extend_from_slice(lut);
+        self.send_hand_lut();
+    }
+
+    /// The green rule's table while it cuts into the hand key, else None
+    fn green_cut_lut(&self) -> Option<&[u8]> {
+        (self.green_hand_cut && self.green_key.is_some() && self.green_lut.len() == COLOR_KEY_SIZE)
+            .then_some(self.green_lut.as_slice())
+    }
+
+    /// `hand_sent` = `hand_lut` with the green cut (while it is on)
+    fn fill_hand_sent(&mut self) {
+        let mut sent = std::mem::take(&mut self.hand_sent);
+        hand_with_green_cut(&self.hand_lut, self.green_cut_lut(), &mut sent);
+        self.hand_sent = sent;
+    }
+
+    /// `hand_lut` with the green cut to the hand-key layer's LUT (if that layer exists)
+    fn send_hand_lut(&mut self) {
+        if self.hand_lut.len() != COLOR_KEY_SIZE {
+            return;
+        }
+        self.fill_hand_sent();
         if let Some(handle) = &mut self.handle_fb
-            && let Err(e) = handle.update_color_key(lut)
+            && handle.color_key_layer().is_some()
+            && let Err(e) = handle.update_color_key(&self.hand_sent)
         {
             error!("Passthrough color key update: {e}");
         }
@@ -96,6 +139,11 @@ impl PassthroughLayer<'_> {
     /// is logged and not retried until the rule changes. Returns whether the green-keyed base layer is
     /// in use (then `base_layer` is it)
     pub fn update_green_key(&mut self, params: Option<GreenKeyParams>) -> bool {
+        if self.handle_fb.is_none() {
+            return false;
+        }
+        let cut_before = self.green_cut_lut().is_some();
+        let key_before = self.green_key;
         let Some(handle) = &mut self.handle_fb else {
             return false;
         };
@@ -104,6 +152,12 @@ impl PassthroughLayer<'_> {
         if self.green_mode_poll == 0 {
             self.green_mode_poll = 36;
             let mode = GreenLayerMode::from_property(debug_property("debug.alvr.green_layer"));
+            let hand_cut =
+                debug_property("debug.alvr.green_hand_cut").is_none_or(|value| value != 0);
+            if hand_cut != self.green_hand_cut {
+                self.green_hand_cut = hand_cut;
+                crate::stream_log(&format!("green: cut into the hand key {hand_cut}"));
+            }
             if mode != self.green_mode {
                 self.green_mode = mode;
                 if self.green_key.is_some() {
@@ -136,8 +190,16 @@ impl PassthroughLayer<'_> {
             }
             self.green_key = params;
         }
+        let in_use = handle.green_layer().is_some();
 
-        handle.green_layer().is_some()
+        // The hand key follows the green rule (on, off or new thresholds)
+        if self.green_cut_lut().is_some() != cut_before
+            || (self.green_cut_lut().is_some() && self.green_key != key_before)
+        {
+            self.send_hand_lut();
+        }
+
+        in_use
     }
 
     /// The bottom passthrough layer: the green-keyed one while `update_green_key` says it is in use,
@@ -147,6 +209,19 @@ impl PassthroughLayer<'_> {
             unsafe { &*ptr::from_ref(layer).cast() }
         } else {
             self
+        }
+    }
+}
+
+/// The hand key's LUT as the runtime gets it: `hand`, with each texel's alpha multiplied by the green
+/// rule's (`green`, same layout: 0 for monitor green), so green is see-through in the hand-key layer
+/// as in the base layer. RGB is kept. Without `green`, a copy
+fn hand_with_green_cut(hand: &[u8], green: Option<&[u8]>, out: &mut Vec<u8>) {
+    out.clear();
+    out.extend_from_slice(hand);
+    if let Some(green) = green.filter(|green| green.len() == hand.len()) {
+        for (texel, green) in out.chunks_exact_mut(4).zip(green.chunks_exact(4)) {
+            texel[3] = ((u16::from(texel[3]) * u16::from(green[3]) + 127) / 255) as u8;
         }
     }
 }
@@ -768,5 +843,22 @@ mod tests {
             auto_bias_text(true, Some(&status)),
             ", auto bias 0.62 (cand 0.60, skin 0.76 leak 0.01)"
         );
+    }
+
+    #[test]
+    fn green_cut_into_the_hand_key() {
+        // Two texels: the first is monitor green (green alpha 0), the second is not (255)
+        let hand = [10, 20, 30, 255, 40, 50, 60, 200];
+        let green = [0, 255, 0, 0, 1, 2, 3, 255];
+        let mut out = Vec::new();
+        hand_with_green_cut(&hand, Some(&green), &mut out);
+        assert_eq!(out, [10, 20, 30, 0, 40, 50, 60, 200]);
+        hand_with_green_cut(&hand, Some(&[0, 0, 0, 128, 0, 0, 0, 128]), &mut out);
+        assert_eq!(out, [10, 20, 30, 128, 40, 50, 60, 100]);
+        hand_with_green_cut(&hand, None, &mut out);
+        assert_eq!(out, hand);
+        // A table of another size is not applied
+        hand_with_green_cut(&hand, Some(&green[..4]), &mut out);
+        assert_eq!(out, hand);
     }
 }
