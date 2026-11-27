@@ -4,10 +4,7 @@ use alvr_common::{
     BodySkeleton, DeviceMotion, ViewParams,
     glam::{IVec2, Mat4, Quat, UVec2, Vec3},
 };
-use glyph_brush_layout::{
-    FontId, GlyphPositioner, HorizontalAlign, Layout, SectionGeometry, SectionText, VerticalAlign,
-    ab_glyph::{Font, FontRef, ScaleFont},
-};
+use glyph_brush_layout::{HorizontalAlign, Layout, SectionGeometry, VerticalAlign};
 use std::{f32::consts::FRAC_PI_2, mem, rc::Rc};
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
@@ -213,6 +210,50 @@ pub struct LobbyViewParams {
     pub view_params: ViewParams,
 }
 
+/// The HUD message as an RGBA8 image of `HUD_TEXTURE_SIDE` squared: white text (colour = coverage) with a
+/// dark border (alpha = the largest coverage within `MAX_BORDER_OFFSET`)
+fn hud_message_buffer(message: &str) -> Vec<u8> {
+    let mut buffer = vec![0; HUD_TEXTURE_SIDE * HUD_TEXTURE_SIDE * 4];
+
+    crate::text_coverage(
+        message,
+        FONT_SIZE,
+        Layout::default()
+            .h_align(HorizontalAlign::Center)
+            .v_align(VerticalAlign::Center),
+        &SectionGeometry {
+            screen_position: (
+                HUD_TEXTURE_SIDE as f32 / 2_f32,
+                HUD_TEXTURE_SIDE as f32 / 2_f32,
+            ),
+            ..Default::default()
+        },
+        |x, y, alpha| {
+            if x >= MAX_BORDER_OFFSET
+                && y >= MAX_BORDER_OFFSET
+                && x < HUD_TEXTURE_SIDE as i32 - MAX_BORDER_OFFSET
+                && y < HUD_TEXTURE_SIDE as i32 - MAX_BORDER_OFFSET
+            {
+                let coord = (y as usize * HUD_TEXTURE_SIDE + x as usize) * 4;
+                let value = (alpha * 255.0) as u8;
+
+                buffer[coord] = value;
+                buffer[coord + 1] = value;
+                buffer[coord + 2] = value;
+
+                // Render opacity with border
+                for offset in &FAST_BORDER_OFFSETS {
+                    let coord =
+                        ((y + offset.y) as usize * HUD_TEXTURE_SIDE + (x + offset.x) as usize) * 4;
+                    buffer[coord + 3] = u8::max(buffer[coord + 3], value);
+                }
+            }
+        },
+    );
+
+    buffer
+}
+
 pub struct LobbyRenderer {
     context: Rc<GraphicsContext>,
     quad_pipeline: RenderPipeline,
@@ -317,63 +358,7 @@ impl LobbyRenderer {
     }
 
     pub fn update_hud_message(&self, message: &str) {
-        let ubuntu_font =
-            FontRef::try_from_slice(include_bytes!("../resources/Ubuntu-Medium.ttf")).unwrap();
-
-        let section_glyphs = Layout::default()
-            .h_align(HorizontalAlign::Center)
-            .v_align(VerticalAlign::Center)
-            .calculate_glyphs(
-                &[&ubuntu_font],
-                &SectionGeometry {
-                    screen_position: (
-                        HUD_TEXTURE_SIDE as f32 / 2_f32,
-                        HUD_TEXTURE_SIDE as f32 / 2_f32,
-                    ),
-                    ..Default::default()
-                },
-                &[SectionText {
-                    text: message,
-                    scale: FONT_SIZE.into(),
-                    font_id: FontId(0),
-                }],
-            );
-
-        let scaled_font = ubuntu_font.as_scaled(FONT_SIZE);
-
-        let mut buffer = vec![0; HUD_TEXTURE_SIDE * HUD_TEXTURE_SIDE * 4];
-
-        for section_glyph in section_glyphs {
-            if let Some(outlined) = scaled_font.outline_glyph(section_glyph.glyph) {
-                let bounds = outlined.px_bounds();
-
-                outlined.draw(|x, y, alpha| {
-                    let x = x as i32 + bounds.min.x as i32;
-                    let y = y as i32 + bounds.min.y as i32;
-
-                    if x >= MAX_BORDER_OFFSET
-                        && y >= MAX_BORDER_OFFSET
-                        && x < HUD_TEXTURE_SIDE as i32 - MAX_BORDER_OFFSET
-                        && y < HUD_TEXTURE_SIDE as i32 - MAX_BORDER_OFFSET
-                    {
-                        let coord = (y as usize * HUD_TEXTURE_SIDE + x as usize) * 4;
-                        let value = (alpha * 255.0) as u8;
-
-                        buffer[coord] = value;
-                        buffer[coord + 1] = value;
-                        buffer[coord + 2] = value;
-
-                        // Render opacity with border
-                        for offset in &FAST_BORDER_OFFSETS {
-                            let coord = ((y + offset.y) as usize * HUD_TEXTURE_SIDE
-                                + (x + offset.x) as usize)
-                                * 4;
-                            buffer[coord + 3] = u8::max(buffer[coord + 3], value);
-                        }
-                    }
-                });
-            }
-        }
+        let buffer = hud_message_buffer(message);
 
         self.context.queue.write_texture(
             TexelCopyTextureInfo {
@@ -615,5 +600,91 @@ impl LobbyRenderer {
         }
 
         self.context.queue.submit(Some(encoder.finish()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use glyph_brush_layout::{
+        FontId, GlyphPositioner, SectionText,
+        ab_glyph::{Font, FontRef, ScaleFont},
+    };
+
+    // `update_hud_message` as it was before the text was drawn by `text_panel`
+    fn hud_message_buffer_before(message: &str) -> Vec<u8> {
+        let ubuntu_font =
+            FontRef::try_from_slice(include_bytes!("../resources/Ubuntu-Medium.ttf")).unwrap();
+
+        let section_glyphs = Layout::default()
+            .h_align(HorizontalAlign::Center)
+            .v_align(VerticalAlign::Center)
+            .calculate_glyphs(
+                &[&ubuntu_font],
+                &SectionGeometry {
+                    screen_position: (
+                        HUD_TEXTURE_SIDE as f32 / 2_f32,
+                        HUD_TEXTURE_SIDE as f32 / 2_f32,
+                    ),
+                    ..Default::default()
+                },
+                &[SectionText {
+                    text: message,
+                    scale: FONT_SIZE.into(),
+                    font_id: FontId(0),
+                }],
+            );
+
+        let scaled_font = ubuntu_font.as_scaled(FONT_SIZE);
+
+        let mut buffer = vec![0; HUD_TEXTURE_SIDE * HUD_TEXTURE_SIDE * 4];
+
+        for section_glyph in section_glyphs {
+            if let Some(outlined) = scaled_font.outline_glyph(section_glyph.glyph) {
+                let bounds = outlined.px_bounds();
+
+                outlined.draw(|x, y, alpha| {
+                    let x = x as i32 + bounds.min.x as i32;
+                    let y = y as i32 + bounds.min.y as i32;
+
+                    if x >= MAX_BORDER_OFFSET
+                        && y >= MAX_BORDER_OFFSET
+                        && x < HUD_TEXTURE_SIDE as i32 - MAX_BORDER_OFFSET
+                        && y < HUD_TEXTURE_SIDE as i32 - MAX_BORDER_OFFSET
+                    {
+                        let coord = (y as usize * HUD_TEXTURE_SIDE + x as usize) * 4;
+                        let value = (alpha * 255.0) as u8;
+
+                        buffer[coord] = value;
+                        buffer[coord + 1] = value;
+                        buffer[coord + 2] = value;
+
+                        for offset in &FAST_BORDER_OFFSETS {
+                            let coord = ((y + offset.y) as usize * HUD_TEXTURE_SIDE
+                                + (x + offset.x) as usize)
+                                * 4;
+                            buffer[coord + 3] = u8::max(buffer[coord + 3], value);
+                        }
+                    }
+                });
+            }
+        }
+
+        buffer
+    }
+
+    #[test]
+    fn hud_message_is_drawn_as_before() {
+        for message in [
+            "",
+            "Waiting for the server...",
+            "ALVR v20\nhostname: quest.client.local\nIP: 192.168.1.20\n\nStreamer: connected",
+            &"a very long line that runs off the side of the texture ".repeat(4),
+        ] {
+            let buffer = hud_message_buffer(message);
+            assert_eq!(buffer.len(), HUD_TEXTURE_SIDE * HUD_TEXTURE_SIDE * 4);
+            assert!(buffer == hud_message_buffer_before(message), "{message}");
+        }
+        assert!(hud_message_buffer("Hello").iter().any(|&value| value > 0));
     }
 }

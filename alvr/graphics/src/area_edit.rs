@@ -1221,6 +1221,11 @@ pub struct EditorHand {
     pub palm_normal: Vec3,
     /// Both tips tracked, not only estimated
     pub tracked: bool,
+    /// Along the fingers (from the wrist towards the middle fingertip; -Z of the palm joint of
+    /// XR_EXT_hand_tracking), unit, zero when unknown. Used by the praying-hands gesture of the tuning
+    /// menu (`tuning::praying_pose`); while zero it falls back to the direction from the palm to the
+    /// index tip
+    pub finger_direction: Vec3,
     /// The aim pose of the runtime (XR_FB_hand_tracking_aim, the ray of the system pointer). None: not
     /// available, `ray` estimates one
     pub aim: Option<HandRay>,
@@ -1400,13 +1405,20 @@ impl HoldTimer {
 
     /// Returns how far it is (0..1) and whether it fired in this update
     pub fn update(&mut self, held: bool, now: f64) -> (f32, bool) {
+        self.update_for(held, now, GESTURE_HOLD_S)
+    }
+
+    /// `update` with another hold time (seconds; the praying hands of the tuning menu hold for
+    /// `tuning::PRAY_HOLD_S`). The tolerance for short drops stays `GESTURE_TOLERANCE_S`
+    pub fn update_for(&mut self, held: bool, now: f64, hold_s: f64) -> (f32, bool) {
+        let hold_s = hold_s.max(1e-3);
         if held {
             self.last_held = Some(now);
             if self.fired {
                 return (0.0, false);
             }
             let start = *self.start.get_or_insert(now);
-            let progress = ((now - start) / GESTURE_HOLD_S).min(1.0) as f32;
+            let progress = ((now - start) / hold_s).min(1.0) as f32;
             if progress >= 1.0 {
                 self.fired = true;
                 self.start = None;
@@ -1421,9 +1433,9 @@ impl HoldTimer {
             self.start = None;
             self.fired = false;
         }
-        let progress = self.start.map_or(0.0, |start| {
-            ((now - start) / GESTURE_HOLD_S).min(0.999) as f32
-        });
+        let progress = self
+            .start
+            .map_or(0.0, |start| ((now - start) / hold_s).min(0.999) as f32);
         (progress, false)
     }
 }
@@ -1460,7 +1472,7 @@ impl UndoStack {
 }
 
 // FNV-1a, 32 bits
-fn fnv1a(bytes: &[u8]) -> u32 {
+pub(crate) fn fnv1a(bytes: &[u8]) -> u32 {
     bytes.iter().fold(0x811c_9dc5, |hash, &byte| {
         (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
     })
@@ -1473,7 +1485,17 @@ pub fn area_file_name(payload: Option<&str>) -> String {
     let Some(payload) = payload else {
         return "area-no-payload.txt".into();
     };
-    let name = payload
+    format!(
+        "area-{}-{:08x}.txt",
+        file_safe_payload(payload),
+        fnv1a(payload.as_bytes())
+    )
+}
+
+/// A payload as a part of a file name: letters, digits, - and _ kept, other characters replaced by
+/// _, at most 40 characters
+pub(crate) fn file_safe_payload(payload: &str) -> String {
+    payload
         .chars()
         .take(40)
         .map(|c| {
@@ -1483,8 +1505,7 @@ pub fn area_file_name(payload: Option<&str>) -> String {
                 '_'
             }
         })
-        .collect::<String>();
-    format!("area-{name}-{:08x}.txt", fnv1a(payload.as_bytes()))
+        .collect()
 }
 
 /// The pose of the code a layout was saved with: stage position (meters) and heading yaw (radians, see
@@ -1586,6 +1607,7 @@ mod tests {
             palm: cursor + Vec3::new(0.0, -0.03, 0.04),
             palm_normal,
             tracked: true,
+            finger_direction: Vec3::ZERO,
             aim: None,
         }
     }

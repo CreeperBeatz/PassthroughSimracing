@@ -1034,11 +1034,14 @@ impl StreamContext {
                 return None;
             }
             // The palm faces its -Y (XR_EXT_hand_tracking: +Y out of the back of the hand)
-            let palm_normal = if has(&palm, xr::SpaceLocationFlags::ORIENTATION_VALID) {
-                crate::from_xr_quat(palm.pose.orientation) * Vec3::NEG_Y
-            } else {
-                Vec3::ZERO
-            };
+            // ... and its fingers point along its -Z
+            let (palm_normal, finger_direction) =
+                if has(&palm, xr::SpaceLocationFlags::ORIENTATION_VALID) {
+                    let orientation = crate::from_xr_quat(palm.pose.orientation);
+                    (orientation * Vec3::NEG_Y, orientation * Vec3::NEG_Z)
+                } else {
+                    (Vec3::ZERO, Vec3::ZERO)
+                };
 
             Some(EditorHand {
                 thumb_tip: crate::from_xr_vec3(thumb.pose.position),
@@ -1049,6 +1052,7 @@ impl StreamContext {
                 tracked: [&thumb, &index]
                     .iter()
                     .all(|&joint| has(joint, xr::SpaceLocationFlags::POSITION_TRACKED)),
+                finger_direction,
                 // The pointer looks along -Z of the aim pose
                 aim: aim.filter(|aim| aim.valid).and_then(|aim| {
                     HandRay::new(

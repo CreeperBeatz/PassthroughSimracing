@@ -20,6 +20,8 @@ mod room_memory;
 mod room_memory_gpu;
 mod staging;
 mod stream;
+mod text_panel;
+mod tuning;
 
 #[cfg(test)]
 mod tests;
@@ -47,6 +49,8 @@ pub use play_area::*;
 pub use problem_view::*;
 pub use room_memory::*;
 pub use stream::*;
+pub use text_panel::*;
+pub use tuning::*;
 
 use alvr_common::{
     DeviceMotion, Fov, Pose,
