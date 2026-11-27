@@ -7,10 +7,15 @@ use alvr_graphics::{GreenKeyParams, HandSweep, HandZones, SweepParams};
 use alvr_system_info::Platform;
 use openxr::{self as xr};
 use std::{
+    collections::BTreeMap,
     fs,
     marker::PhantomData,
     ops::Deref,
     ptr,
+    sync::{
+        RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -714,42 +719,147 @@ fn load_color_key(version: u32) -> Option<ColorKey> {
     None
 }
 
-/// Integer Android system property. `debug.*` properties can be set with adb.
-#[allow(unused_variables)]
-pub fn debug_property(name: &str) -> Option<i64> {
-    #[cfg(target_os = "android")]
-    {
-        let name = std::ffi::CString::new(name).unwrap();
-        let mut value = [0_u8; libc::PROP_VALUE_MAX as usize];
-        let length =
-            unsafe { libc::__system_property_get(name.as_ptr(), value.as_mut_ptr().cast()) };
+// The tuning menu's values (tuning_mode.rs), which win over the system properties: full property name
+// (`debug.alvr.<name>`, as the callers of `debug_property` pass it) to its text. An empty text reads as
+// unset. `OVERRIDES_IN_USE`: the table is not empty, so that a read without overrides takes no lock
+static TUNING_OVERRIDES: RwLock<BTreeMap<String, String>> = RwLock::new(BTreeMap::new());
+static OVERRIDES_IN_USE: AtomicBool = AtomicBool::new(false);
 
-        String::from_utf8_lossy(&value[..length.max(0) as usize])
-            .trim()
-            .parse()
-            .ok()
-    }
-    #[cfg(not(target_os = "android"))]
-    None
+fn read_overrides() -> std::sync::RwLockReadGuard<'static, BTreeMap<String, String>> {
+    TUNING_OVERRIDES
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Text Android system property, trimmed. None if it is not set or empty
-#[allow(unused_variables)]
+fn write_overrides() -> std::sync::RwLockWriteGuard<'static, BTreeMap<String, String>> {
+    TUNING_OVERRIDES
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The menu's value of `name` (full property name), None: no override
+pub fn tuning_override(name: &str) -> Option<String> {
+    if !OVERRIDES_IN_USE.load(Ordering::Acquire) {
+        return None;
+    }
+    read_overrides().get(name).cloned()
+}
+
+/// All overrides (full property names)
+pub fn tuning_overrides() -> BTreeMap<String, String> {
+    read_overrides().clone()
+}
+
+// `name` without `debug.alvr.`, for the log
+fn short_name(name: &str) -> &str {
+    name.strip_prefix(alvr_graphics::PROPERTY_PREFIX)
+        .unwrap_or(name)
+}
+
+// The value in effect, for the log
+fn effective_text(name: &str) -> String {
+    match tuning_override(name).or_else(|| system_property_string(name)) {
+        Some(text) if text.trim().is_empty() => "(empty)".into(),
+        Some(text) => text.trim().to_owned(),
+        // A property of the tuning menu: its client default
+        None => alvr_graphics::property_default(short_name(name))
+            .map_or_else(|| "unset".into(), |value| value.to_string()),
+    }
+}
+
+/// Sets the menu's value of `name` (full property name): `debug_property*` read it instead of the system
+/// property. Logs `tune: <prop> <old> -> <new>` (the values in effect) with `why` after it, unless `why`
+/// is None (the steps of a drag; the drag is logged when it ends)
+pub fn set_tuning_override(name: &str, value: &str, why: Option<&str>) {
+    let old = why.map(|_| effective_text(name));
+    {
+        let mut overrides = write_overrides();
+        overrides.insert(name.to_owned(), value.to_owned());
+        OVERRIDES_IN_USE.store(true, Ordering::Release);
+    }
+    if let (Some(old), Some(why)) = (old, why) {
+        log_tuning_change(name, &old, &effective_text(name), why);
+    }
+}
+
+/// Removes the menu's value of `name`: the system property (or the default) is in effect again. Logged
+/// as `set_tuning_override`. Nothing if there is none
+pub fn clear_tuning_override(name: &str, why: Option<&str>) {
+    if tuning_override(name).is_none() {
+        return;
+    }
+    let old = why.map(|_| effective_text(name));
+    {
+        let mut overrides = write_overrides();
+        overrides.remove(name);
+        OVERRIDES_IN_USE.store(!overrides.is_empty(), Ordering::Release);
+    }
+    if let (Some(old), Some(why)) = (old, why) {
+        log_tuning_change(name, &old, &effective_text(name), why);
+    }
+}
+
+/// `tune: <prop> <old> -> <new>` on ALVR_CAM, `why` in parentheses after it if not empty
+pub fn log_tuning_change(name: &str, old: &str, new: &str, why: &str) {
+    crate::stream_log(&tuning_change_text(name, old, new, why));
+}
+
+fn tuning_change_text(name: &str, old: &str, new: &str, why: &str) -> String {
+    let mut text = format!("tune: {} {old} -> {new}", short_name(name));
+    if !why.is_empty() {
+        text.push_str(&format!(" ({why})"));
+    }
+    text
+}
+
+/// Integer Android system property. `debug.*` properties can be set with adb. The tuning menu's value
+/// wins over it (`set_tuning_override`)
+pub fn debug_property(name: &str) -> Option<i64> {
+    if OVERRIDES_IN_USE.load(Ordering::Acquire)
+        && let Some(value) = read_overrides().get(name)
+    {
+        return value.trim().parse().ok();
+    }
+    system_property(name)
+}
+
+/// Text Android system property, trimmed. None if it is not set or empty. The tuning menu's value wins
+/// over it (`set_tuning_override`)
 pub fn debug_property_string(name: &str) -> Option<String> {
+    if OVERRIDES_IN_USE.load(Ordering::Acquire)
+        && let Some(value) = read_overrides().get(name)
+    {
+        let text = value.trim();
+        return (!text.is_empty()).then(|| text.to_owned());
+    }
+    system_property_string(name)
+}
+
+// The system property's text, trimmed, given to `read`. None: not set (or no system properties)
+#[allow(unused_variables)]
+fn with_system_property<T>(name: &str, read: impl FnOnce(&str) -> Option<T>) -> Option<T> {
     #[cfg(target_os = "android")]
     {
         let name = std::ffi::CString::new(name).ok()?;
         let mut value = [0_u8; libc::PROP_VALUE_MAX as usize];
         let length =
             unsafe { libc::__system_property_get(name.as_ptr(), value.as_mut_ptr().cast()) };
-        let text = String::from_utf8_lossy(&value[..length.clamp(0, value.len() as i32) as usize])
-            .trim()
-            .to_owned();
+        let text = String::from_utf8_lossy(&value[..length.clamp(0, value.len() as i32) as usize]);
 
-        (!text.is_empty()).then_some(text)
+        read(text.trim())
     }
     #[cfg(not(target_os = "android"))]
     None
+}
+
+/// `debug_property` without the tuning menu: the system property as set with setprop
+pub fn system_property(name: &str) -> Option<i64> {
+    with_system_property(name, |text| text.parse().ok())
+}
+
+/// `debug_property_string` without the tuning menu
+pub fn system_property_string(name: &str) -> Option<String> {
+    with_system_property(name, |text| (!text.is_empty()).then(|| text.to_owned()))
 }
 
 impl<'a> Deref for PassthroughLayer<'a> {
@@ -769,6 +879,58 @@ impl<'a> Deref for PassthroughLayer<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The table is shared by all tests: each uses names of its own
+
+    #[test]
+    fn tuning_override_wins_and_clears() {
+        let name = "debug.alvr.test_override_a";
+        assert_eq!(debug_property(name), None);
+        set_tuning_override(name, "42", Some("test"));
+        assert_eq!(debug_property(name), Some(42));
+        assert_eq!(debug_property_string(name).as_deref(), Some("42"));
+        assert_eq!(tuning_override(name).as_deref(), Some("42"));
+        assert!(tuning_overrides().contains_key(name));
+        // Quiet (a drag step) still applies
+        set_tuning_override(name, " 43 ", None);
+        assert_eq!(debug_property(name), Some(43));
+        clear_tuning_override(name, Some("test"));
+        assert_eq!(debug_property(name), None);
+        assert_eq!(tuning_override(name), None);
+        // Clearing what is not there is nothing
+        clear_tuning_override(name, Some("test"));
+        assert_eq!(debug_property(name), None);
+    }
+
+    #[test]
+    fn tuning_override_text_and_numbers() {
+        let name = "debug.alvr.test_override_b";
+        // Text that is no number: the integer read is None, the text read has it
+        set_tuning_override(name, "0 1", None);
+        assert_eq!(debug_property(name), None);
+        assert_eq!(debug_property_string(name).as_deref(), Some("0 1"));
+        // Empty: reads as unset for both (the green key suspended)
+        set_tuning_override(name, "", None);
+        assert_eq!(debug_property(name), None);
+        assert_eq!(debug_property_string(name), None);
+        assert_eq!(tuning_override(name).as_deref(), Some(""));
+        // Other names are not touched
+        assert_eq!(debug_property("debug.alvr.test_override_other"), None);
+        clear_tuning_override(name, None);
+        assert_eq!(tuning_override(name), None);
+    }
+
+    #[test]
+    fn tuning_change_lines() {
+        assert_eq!(
+            tuning_change_text("debug.alvr.key_bias", "150", "300", ""),
+            "tune: key_bias 150 -> 300"
+        );
+        assert_eq!(
+            tuning_change_text("debug.alvr.green_boxes", "0", "(empty)", "green page"),
+            "tune: green_boxes 0 -> (empty) (green page)"
+        );
+    }
 
     #[test]
     fn problem_view_params_defaults_and_clamps() {

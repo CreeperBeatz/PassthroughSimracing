@@ -93,13 +93,15 @@ impl AreaOverlay {
 
     /// The lines to draw in this frame, in stage space. Empty: nothing is shown. `region`: the play
     /// area of the marker the mask uses (None: no area). `depth_passthrough`: the stream uses
-    /// Passthrough = Depth. `editor`: its handles are drawn over the outline
+    /// Passthrough = Depth. `editor`: its handles are drawn over the outline. `forced`: why the outline
+    /// must show besides the editor (the tuning menu's green page), whatever `area_show` says
     pub fn update(
         &mut self,
         marker_region: &MarkerRegion,
         region: Option<PlacedArea>,
         depth_passthrough: bool,
         editor: &AreaEditor,
+        forced: Option<&'static str>,
     ) -> &[OverlaySegment] {
         self.poll_properties();
 
@@ -128,6 +130,7 @@ impl AreaOverlay {
         let shown = match self.show {
             _ if region.is_none() || !depth_passthrough => None,
             _ if editor.forced_show().is_some() => editor.forced_show(),
+            _ if forced.is_some() => forced,
             Some(false) => None,
             Some(true) => Some("area_show 1"),
             None => self

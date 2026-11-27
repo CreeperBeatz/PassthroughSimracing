@@ -495,6 +495,69 @@ impl GraphicsContext {
         first
     }
 
+    /// Writes `pixels` (RGBA8, `width` x `height`, the FIRST row at the BOTTOM as GL has it) into the 2D
+    /// GL texture `texture` (a swapchain image of the tuning menu's quad layer, tuning_mode.rs), and
+    /// flushes. The texture binding of the active unit and the unpack state are put back as they were,
+    /// so that wgpu's GL backend finds them unchanged. Returns the GL error, if any
+    pub fn upload_rgba8(
+        &self,
+        texture: u32,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+    ) -> Option<u32> {
+        let texture = std::num::NonZeroU32::new(texture)?;
+        if pixels.len() < (width * height * 4) as usize {
+            return None;
+        }
+        self.make_current();
+        let gl = &self.gl_context;
+        unsafe {
+            // Errors from before are not this upload's (one flag per kind of error)
+            for _ in 0..8 {
+                if gl.get_error() == glow::NO_ERROR {
+                    break;
+                }
+            }
+
+            let bound = gl.get_parameter_i32(gl::TEXTURE_BINDING_2D);
+            let unpack_buffer = gl.get_parameter_i32(gl::PIXEL_UNPACK_BUFFER_BINDING);
+            let alignment = gl.get_parameter_i32(gl::UNPACK_ALIGNMENT);
+            let row_length = gl.get_parameter_i32(gl::UNPACK_ROW_LENGTH);
+
+            gl.bind_buffer(gl::PIXEL_UNPACK_BUFFER, None);
+            gl.pixel_store_i32(gl::UNPACK_ALIGNMENT, 4);
+            gl.pixel_store_i32(gl::UNPACK_ROW_LENGTH, 0);
+            gl.bind_texture(gl::TEXTURE_2D, Some(gl::NativeTexture(texture)));
+            gl.tex_sub_image_2d(
+                gl::TEXTURE_2D,
+                0,
+                0,
+                0,
+                width as i32,
+                height as i32,
+                gl::RGBA,
+                gl::UNSIGNED_BYTE,
+                gl::PixelUnpackData::Slice(Some(pixels)),
+            );
+            let error = gl.get_error();
+
+            gl.bind_texture(
+                gl::TEXTURE_2D,
+                std::num::NonZeroU32::new(bound as u32).map(gl::NativeTexture),
+            );
+            gl.bind_buffer(
+                gl::PIXEL_UNPACK_BUFFER,
+                std::num::NonZeroU32::new(unpack_buffer as u32).map(gl::NativeBuffer),
+            );
+            gl.pixel_store_i32(gl::UNPACK_ALIGNMENT, alignment);
+            gl.pixel_store_i32(gl::UNPACK_ROW_LENGTH, row_length);
+            gl.flush();
+
+            (error != glow::NO_ERROR).then_some(error)
+        }
+    }
+
     /// Make sure an external depth texture array can be read with texelFetch: no depth comparison
     /// (required for non-shadow samplers) and no mipmapping (texture completeness).
     pub fn prepare_external_depth_texture(&self, texture: u32) {

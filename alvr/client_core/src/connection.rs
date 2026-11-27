@@ -152,6 +152,8 @@ fn connection_pipeline(
         }
     };
 
+    crate::set_server_ip(server_ip);
+
     let mut connection_state_lock = ctx.state.write();
     let disconnect_notif = Arc::new(Condvar::new());
 

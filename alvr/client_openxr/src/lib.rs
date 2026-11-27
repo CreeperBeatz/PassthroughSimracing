@@ -17,8 +17,10 @@ mod marker_region;
 mod motion_cloud;
 mod passthrough;
 mod perf;
+mod rig_link;
 mod room_memory;
 mod stream;
+mod tuning_mode;
 
 use crate::stream::ParsedStreamConfig;
 use alvr_client_core::{ClientCapabilities, ClientCoreContext, ClientCoreEvent};
@@ -52,6 +54,10 @@ use std::{
     time::{Duration, Instant},
 };
 use stream::StreamContext;
+
+// The QR payload asked for on the rig monitor while no payload is known (`debug.alvr.marker_id` unset,
+// no code seen)
+const DEFAULT_QR_PAYLOAD: &str = "SCR1";
 
 fn from_xr_vec3(v: xr::Vector3f) -> Vec3 {
     Vec3::new(v.x, v.y, v.z)
@@ -556,6 +562,12 @@ pub fn entry_point() {
         let mut area_overlay = AreaOverlay::new();
         // The play area edited with the hands, and its layout file
         let mut area_editor = AreaEditor::new();
+        // The tuning menu (praying hands), the messages to green_patch.py on the rig PC, the QR code
+        // shown there while the area is edited
+        let mut tuning = tuning_mode::TuningMode::new();
+        let mut rig_link = rig_link::RigLink::new();
+        let mut area_qr = rig_link::AreaQr::default();
+        let qr_start = Instant::now();
 
         let mut event_storage = xr::EventDataBuffer::new();
         let mut headset_is_worn = true;
@@ -864,15 +876,44 @@ pub fn entry_point() {
             // The layout file of the code and the edits replace the box of the properties
             let editor_input = stream_context
                 .as_ref()
-                .filter(|_| marker_region.is_enabled())
+                .filter(|_| marker_region.is_enabled() || tuning.wants_input())
                 .and_then(|stream| stream.editor_input(frame_state.predicted_display_time));
+            // "Edit boxes" of the tuning menu
+            if tuning.take_edit_boxes() {
+                area_editor.request_edit("tuning menu, Edit boxes");
+            }
+            // While the tuning menu is open its pinches are not the editor's
             let region_override = area_editor.update(
                 &marker_region,
                 region_override,
                 frame_state.predicted_display_time,
-                editor_input.as_ref(),
+                editor_input
+                    .as_ref()
+                    .filter(|_| marker_region.is_enabled() && !tuning.is_active()),
                 depth_passthrough,
             );
+            tuning.update(
+                &tuning_mode::TuneInput {
+                    input: editor_input.as_ref(),
+                    stream: depth_passthrough,
+                    area_editing: area_editor.is_editing(),
+                    payload: marker_region.payload(),
+                    pinch: area_editor.pinch_thresholds(),
+                },
+                &mut rig_link,
+            );
+            // The QR code on the rig monitor while the area is edited
+            let qr = area_qr.update(
+                area_editor.is_editing(),
+                marker_region.payload().unwrap_or(DEFAULT_QR_PAYLOAD),
+                qr_start.elapsed().as_secs_f64(),
+            );
+            if let Some(line) = &qr.log {
+                stream_log(line);
+            }
+            for message in &qr.messages {
+                rig_link.send(message);
+            }
             if let Some(stream) = &mut stream_context {
                 // While editing the hands are not cut to the area: the handles are on and outside it
                 stream.set_region_override(
@@ -882,8 +923,8 @@ pub fn entry_point() {
                 stream.set_game_dim(area_editor.game_dim());
                 stream.set_game_see(area_editor.game_see());
                 stream.allow_problem_view(!area_editor.is_editing());
-                // The pinches of the editor are not sent to the PC
-                stream.withhold_hands(area_editor.withholds_hands());
+                // The pinches of the editor and of the tuning menu are not sent to the PC
+                stream.withhold_hands(area_editor.withholds_hands() || tuning.withholds_hands());
             }
             // The box applies only to a stream with Passthrough = Depth
             let used = region_override.map(|_| {
@@ -906,6 +947,7 @@ pub fn entry_point() {
                 region_override,
                 depth_passthrough,
                 &area_editor,
+                tuning.forced_outline(),
             );
             if let Some(stream) = &mut stream_context {
                 stream.set_area_overlay(outline);
@@ -955,6 +997,12 @@ pub fn entry_point() {
             }
 
             let key_params = color_key.map(|key| key.params);
+
+            // The tuning menu's panel, drawn when it changed (its quad layer goes on top below)
+            if tuning.is_active() {
+                let stage_space = stream_context.as_ref().map(StreamContext::stage_space);
+                tuning.render(&xr_session, &graphics_context, stage_space);
+            }
 
             // todo: allow rendering lobby and stream layers at the same time and add cross fade
             let (layer, display_time, key_frame) = if let Some(stream) = &mut stream_context {
@@ -1015,14 +1063,21 @@ pub fn entry_point() {
                     Plain => plain_layer.as_deref(),
                 }
             };
-            let mut layer_refs = [None; green_screen::MAX_LAYERS];
+            // The tuning menu's panel over everything, while it is open
+            let menu_layer = tuning.layer();
+            let mut layer_refs = [None; green_screen::MAX_LAYERS + 1];
             let mut layer_count = 0;
-            for layer in order.as_slice().iter().filter_map(|&kind| resolve(kind)) {
+            for layer in order
+                .as_slice()
+                .iter()
+                .filter_map(|&kind| resolve(kind))
+                .chain(menu_layer.as_deref())
+            {
                 layer_refs[layer_count] = Some(layer);
                 layer_count += 1;
             }
             let layer_list: [&xr::CompositionLayerBase<'_, xr::OpenGlEs>;
-                green_screen::MAX_LAYERS];
+                green_screen::MAX_LAYERS + 1];
             let layers: &[&xr::CompositionLayerBase<_>] = match layer_refs[0] {
                 Some(first) => {
                     layer_list = layer_refs.map(|layer| layer.unwrap_or(first));

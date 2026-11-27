@@ -260,10 +260,32 @@ pub fn render_menu(content: &MenuContent, width: u32, height: u32) -> Vec<u8> {
     canvas.pixels
 }
 
+/// The rows of an RGBA8 image of `width` x `height` in the other order (row 0 at the top as
+/// `render_menu` draws it, row 0 at the bottom as a GL texture upload takes it)
+pub fn flip_rows(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let stride = width as usize * 4;
+    let rows = height as usize;
+    let mut flipped = Vec::with_capacity(stride * rows);
+    for row in pixels.chunks_exact(stride).take(rows).rev() {
+        flipped.extend_from_slice(row);
+    }
+    flipped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tuning::{MenuRow, MenuTab};
+
+    #[test]
+    fn rows_flip() {
+        let pixels = (0..24).collect::<Vec<u8>>();
+        let flipped = flip_rows(&pixels, 2, 3);
+        assert_eq!(&flipped[..8], &pixels[16..24]);
+        assert_eq!(&flipped[8..16], &pixels[8..16]);
+        assert_eq!(&flipped[16..], &pixels[..8]);
+        assert_eq!(flip_rows(&flipped, 2, 3), pixels);
+    }
     use alvr_common::glam::Vec2;
 
     #[test]
@@ -303,6 +325,40 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(lit.len() > 100);
         assert!(lit.iter().all(|&x| (8..120).contains(&x)));
+    }
+
+    #[test]
+    fn the_widest_footer_fits_the_texture() {
+        use crate::tuning::{MENU_TEXTURE_HEIGHT, MENU_TEXTURE_WIDTH, TuneStats};
+        let stats = TuneStats {
+            skin_kept: Some(1.0),
+            background_kept: Some(1.0),
+            scene_kept: Some(1.0),
+            auto_bias: Some(10.0),
+            green_share: Some(1.0),
+        };
+        let (w, h) = (MENU_TEXTURE_WIDTH as f32, MENU_TEXTURE_HEIGHT as f32);
+        let mut right = 0;
+        text_coverage(
+            &stats.text(),
+            (h * 0.045).max(8.0) * 0.85,
+            Layout::default_single_line()
+                .h_align(HorizontalAlign::Left)
+                .v_align(VerticalAlign::Center),
+            &SectionGeometry {
+                screen_position: (ROW_LABEL_LEFT * w, h * 0.94),
+                ..Default::default()
+            },
+            |x, _, coverage| {
+                if coverage > 0.0 {
+                    right = right.max(x);
+                }
+            },
+        );
+        assert!(
+            right > 0 && right < MENU_TEXTURE_WIDTH as i32 - 8,
+            "{right}"
+        );
     }
 
     #[test]

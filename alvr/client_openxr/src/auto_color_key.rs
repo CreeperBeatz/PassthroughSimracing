@@ -591,6 +591,15 @@ fn learn_loop(context: &Context) {
                 } else {
                     String::new()
                 };
+                // The footer of the tuning menu (tuning_mode.rs)
+                let kept =
+                    |colors: &[[u8; 3]]| (!colors.is_empty()).then(|| model.kept_fraction(colors));
+                crate::tuning_mode::publish_key_stats(
+                    kept(&samples.skin),
+                    kept(&samples.background),
+                    kept(&samples.scene),
+                    model.auto_bias_status().map(|status| status.bias),
+                );
                 let auto_log = crate::passthrough::auto_bias_text(
                     model.auto_bias.is_some(),
                     model.auto_bias_status().as_ref(),

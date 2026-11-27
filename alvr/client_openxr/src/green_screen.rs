@@ -514,6 +514,14 @@ impl GreenScreen {
         self.logged = Some(summary);
         self.last_log = Instant::now();
         let stats = self.camera.lock().stats;
+        // The footer of the tuning menu (tuning_mode.rs): the share of the zone's pixels that are green
+        if let Some((time, stats)) = stats
+            && time.elapsed() <= CAMERA_STATS_MAX_AGE
+            && stats.in_image
+            && stats.pixels > 0
+        {
+            crate::tuning_mode::publish_green_share(stats.green as f32 / stats.pixels as f32);
+        }
         crate::stream_log(&log_text(
             &self.params,
             frame,

@@ -40,6 +40,23 @@ use storage::Config;
 
 pub use logging_backend::init_logging;
 
+// The address the streamer connected from, last connection
+static SERVER_IP: std::sync::Mutex<Option<std::net::IpAddr>> = std::sync::Mutex::new(None);
+
+/// The IP address of the streamer of the last connection (None: none yet), for messages to tools on the
+/// PC (the green patch, alvr_client_openxr tuning_mode.rs)
+pub fn server_ip() -> Option<std::net::IpAddr> {
+    *SERVER_IP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+pub(crate) fn set_server_ip(ip: std::net::IpAddr) {
+    *SERVER_IP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ip);
+}
+
 pub enum ClientCoreEvent {
     UpdateHudMessage(String),
     StreamingStarted(Box<ClientStreamConfig>),

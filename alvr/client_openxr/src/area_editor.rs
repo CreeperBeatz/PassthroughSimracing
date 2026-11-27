@@ -134,8 +134,8 @@ const RAY_WIDTH: f32 = 0.5;
 
 const HAND_NAMES: [&str; 2] = ["left", "right"];
 
-// The two folders of the layout files
-fn area_dirs() -> [String; 2] {
+// The two folders of the layout files (also of the tuning profiles, tuning_mode.rs)
+pub(crate) fn area_dirs() -> [String; 2] {
     [
         format!("{}/areas", passthrough::FILES_DIR),
         "/data/local/tmp/alvr-areas".into(),
@@ -296,6 +296,8 @@ pub struct AreaEditor {
     // `debug.alvr.area_edit` as last read, and a change of it not handled yet (true: start)
     edit_property: Option<i64>,
     edit_request: Option<bool>,
+    // Why editing is requested (for the log): `area_edit 1`, or the tuning menu's "Edit boxes"
+    edit_reason: &'static str,
     pinch_on: f32,
     pinch_off: f32,
     dim: f32,
@@ -375,6 +377,7 @@ impl AreaEditor {
             // A value left from before is not a request
             edit_property: debug_property("debug.alvr.area_edit"),
             edit_request: None,
+            edit_reason: "area_edit 1",
             pinch_on: DEFAULT_PINCH_ON_MM as f32 / 1000.0,
             pinch_off: DEFAULT_PINCH_OFF_MM as f32 / 1000.0,
             dim: DEFAULT_DIM_PERCENT as f32 / 100.0,
@@ -436,7 +439,10 @@ impl AreaEditor {
         if edit != self.edit_property {
             self.edit_property = edit;
             match edit {
-                Some(1) => self.edit_request = Some(true),
+                Some(1) => {
+                    self.edit_request = Some(true);
+                    self.edit_reason = "area_edit 1";
+                }
                 Some(0) => self.edit_request = Some(false),
                 _ => (),
             }
@@ -555,6 +561,19 @@ impl AreaEditor {
     /// Editing: the hands are not limited to the play area then (the handles are on and outside it)
     pub fn is_editing(&self) -> bool {
         self.mode == Mode::Editing
+    }
+
+    /// Editing starts at the next update, as with `debug.alvr.area_edit 1` (the tuning menu's "Edit
+    /// boxes"); `reason` is logged
+    pub fn request_edit(&mut self, reason: &'static str) {
+        self.edit_request = Some(true);
+        self.edit_reason = reason;
+    }
+
+    /// The gaps of the thumb and index tips below which a pinch closes and above which it opens
+    /// (meters, `debug.alvr.area_pinch_on` / `area_pinch_off`)
+    pub fn pinch_thresholds(&self) -> (f32, f32) {
+        (self.pinch_on, self.pinch_off)
     }
 
     /// The hands are not sent to the PC: while editing, unless `area_edit_hands_pc 1`
@@ -741,12 +760,13 @@ impl AreaEditor {
             match (start, self.mode == Mode::Editing) {
                 (true, false) => match (placed, anchor) {
                     (Some(placed), Some(anchor)) if depth_passthrough => {
-                        self.enter("area_edit 1", &placed, (anchor, placement), now);
+                        self.enter(self.edit_reason, &placed, (anchor, placement), now);
                     }
-                    _ => crate::stream_log(
-                        "area editor: can't edit (area_edit 1): no play area (marker_box off, no \
-                         code seen and no saved anchor, or Passthrough is not Depth)",
-                    ),
+                    _ => crate::stream_log(&format!(
+                        "area editor: can't edit ({}): no play area (marker_box off, no code seen \
+                         and no saved anchor, or Passthrough is not Depth)",
+                        self.edit_reason
+                    )),
                 },
                 (false, true) => self.leave("area_edit 0"),
                 _ => (),
@@ -1999,11 +2019,7 @@ fn save_loop(receiver: &mpsc::Receiver<SaveJob>) {
         }
         for (dir, failed) in area_dirs().into_iter().zip(failed.iter_mut()) {
             let path = format!("{dir}/{}", job.name);
-            let result = fs::create_dir_all(&dir).and_then(|()| {
-                let temporary = format!("{path}.tmp");
-                fs::write(&temporary, &job.text)?;
-                fs::rename(&temporary, &path)
-            });
+            let result = write_through_temporary(&dir, &path, &job.text);
             match result {
                 Ok(()) => {
                     *failed = false;
@@ -2020,6 +2036,14 @@ fn save_loop(receiver: &mpsc::Receiver<SaveJob>) {
             }
         }
     }
+}
+
+/// Writes `text` to `path` in `dir` (made if missing) through a temporary file
+pub(crate) fn write_through_temporary(dir: &str, path: &str, text: &str) -> io::Result<()> {
+    fs::create_dir_all(dir)?;
+    let temporary = format!("{path}.tmp");
+    fs::write(&temporary, text)?;
+    fs::rename(&temporary, path)
 }
 
 // The payload of the newest layout file of the two folders, for the restore before any code is seen

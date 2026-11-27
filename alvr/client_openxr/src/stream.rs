@@ -985,6 +985,11 @@ impl StreamContext {
         self.problem_view_on = true;
     }
 
+    /// The stage space the stream locates the hands in (`editor_input`), for the tuning menu's panel
+    pub fn stage_space(&self) -> Arc<xr::Space> {
+        Arc::clone(&self.stage_reference_space)
+    }
+
     /// While true the tracked hands are not sent to the PC: no hand skeletons, and no hand pose of a
     /// hand that is tracked as a hand (controllers are sent as before). The PC then sees the hands as
     /// not tracked, as when they are out of view: its hand gestures (hand_tracking_interaction) and the

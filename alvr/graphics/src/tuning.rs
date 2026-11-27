@@ -34,7 +34,7 @@
 
 use crate::{
     DEFAULT_PINCH_OFF, DEFAULT_PINCH_ON, EditorHand, EditorInput, GRAB_LOST_HOLD_S,
-    HAND_LOST_HOLD_S, HandRay, HoldTimer, Pinch, PinchEvent,
+    HAND_LOST_HOLD_S, HandRay, HoldTimer, Pinch, PinchEvent, RELEASE_LOOKBACK_S,
     area_edit::{file_safe_payload, fnv1a},
 };
 use alvr_common::glam::{Mat3, Quat, Vec2, Vec3};
@@ -635,14 +635,19 @@ pub fn spot_at(uv: Vec2, rows: usize) -> PanelSpot {
 
 // --- Dragging a value -----------------------------------------------------------------------------
 
-/// Along the panel's x axis a pinch moves this much (fraction of its width) before a value changes
-pub const DRAG_DEAD_U: f32 = 0.01;
+/// Along the panel's x axis a pinch moves this much (fraction of its width, 8 mm of the panel) before a
+/// value changes: closing the fingers moves the ray a little
+pub const DRAG_DEAD_U: f32 = 0.02;
 
 /// The value `start` dragged from u `start_u` to `u`: the full width of the panel is the full range,
-/// after `DRAG_DEAD_U`, snapped and clamped
+/// after `DRAG_DEAD_U`, snapped and clamped. Within the dead zone `start` as it is (not snapped: a
+/// pinch without a move changes nothing)
 pub fn dragged_value(range: &ValueRange, start: f32, start_u: f32, u: f32) -> f32 {
     let moved = u - start_u;
-    let moved = moved.signum() * (moved.abs() - DRAG_DEAD_U).max(0.0);
+    if moved.abs() <= DRAG_DEAD_U || !moved.is_finite() {
+        return start;
+    }
+    let moved = moved.signum() * (moved.abs() - DRAG_DEAD_U);
     range.snap(start + moved * (range.max - range.min))
 }
 
@@ -1061,20 +1066,28 @@ pub const DEFAULT_PROFILE_FILE: &str = "tune-default.txt";
 /// The key of the cap in a profile: `patch_cap=cx,cy,r,cut`
 pub const PROFILE_CAP_KEY: &str = "patch_cap";
 
-/// Name of the profile of a place: `tune-<payload>.txt`, the payload with characters other than letters,
-/// digits, - and _ replaced by _ (at most 40, as `area_file_name`); when that changed the payload, a hash
-/// of the whole payload follows, so that payloads that look alike get their own files. None:
-/// `DEFAULT_PROFILE_FILE`
+/// Name of the profile of a place: `tune-<payload>-<hash>.txt`, the payload with characters other than
+/// letters, digits, - and _ replaced by _ (at most 40), then a hash of the whole payload (as
+/// `area_file_name`), so that payloads that look alike (or differ only in case, on a storage that ignores
+/// it, or are named "default") get their own files. None: `DEFAULT_PROFILE_FILE`
 pub fn profile_file_name(payload: Option<&str>) -> String {
     let Some(payload) = payload.filter(|payload| !payload.is_empty()) else {
         return DEFAULT_PROFILE_FILE.into();
     };
-    let name = file_safe_payload(payload);
-    if name == payload {
-        format!("tune-{name}.txt")
-    } else {
-        format!("tune-{name}-{:08x}.txt", fnv1a(payload.as_bytes()))
-    }
+    format!(
+        "tune-{}-{:08x}.txt",
+        file_safe_payload(payload),
+        fnv1a(payload.as_bytes())
+    )
+}
+
+// A payload in the header comment: one line, control characters replaced, at most 80 characters
+fn header_payload(payload: &str) -> String {
+    payload
+        .chars()
+        .take(80)
+        .map(|c| if c.is_control() { '_' } else { c })
+        .collect()
 }
 
 /// The menu's values of a place
@@ -1095,7 +1108,7 @@ pub fn profile_text(profile: &TuneProfile, payload: Option<&str>) -> String {
     let _ = writeln!(
         text,
         "# Place: {}. One key=value per line; unknown keys are ignored",
-        payload.unwrap_or("(no marker)")
+        payload.map_or_else(|| "(no marker)".to_string(), header_payload)
     );
     for (property, value) in &profile.overrides {
         let _ = writeln!(text, "{property}={value}");
@@ -1275,6 +1288,9 @@ enum HandRole {
     Patch,
 }
 
+// Value changes kept for the rewind on release (more than the frames of `RELEASE_LOOKBACK_S`)
+const DRAG_HISTORY: usize = 16;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ValueDrag {
     hand: usize,
@@ -1283,6 +1299,32 @@ struct ValueDrag {
     start_u: f32,
     start: f32,
     last: f32,
+    // The last value changes (time, the value before the change), oldest first, `changes` of them
+    history: [(f64, f32); DRAG_HISTORY],
+    changes: usize,
+}
+
+impl ValueDrag {
+    fn record(&mut self, now: f64, value: f32) {
+        if self.changes == DRAG_HISTORY {
+            self.history.copy_within(1.., 0);
+            self.changes -= 1;
+        }
+        self.history[self.changes] = (now, self.last);
+        self.changes += 1;
+        self.last = value;
+    }
+
+    // The value `RELEASE_LOOKBACK_S` before `now`: opening the fingers moves the ray, that move is not
+    // kept (as the release of a grab of the area editor)
+    fn release_value(&self, now: f64) -> f32 {
+        let before = now - RELEASE_LOOKBACK_S;
+        // The first change after `before`: the value before it was in effect then
+        self.history[..self.changes]
+            .iter()
+            .find(|(time, _)| *time > before)
+            .map_or(self.last, |(_, value)| *value)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1383,6 +1425,12 @@ impl TuneMenu {
             return events;
         }
         self.end_drag(&mut events);
+        // A pinch closed on the old page does nothing on the new one until it opens
+        for role in &mut self.roles {
+            if matches!(role, HandRole::Press(_)) {
+                *role = HandRole::Ignored;
+            }
+        }
         self.page = page;
         events.push(TuneEvent::Page(page));
         if page != TunePage::GreenScreen && self.patch_mode {
@@ -1404,10 +1452,12 @@ impl TuneMenu {
     ) -> Vec<TuneEvent> {
         let mut events = Vec::new();
         let rows = self.page.rows().len();
+        let mut usable_hands = [false; 2];
 
-        for index in 0..2 {
+        for (index, hand_usable) in usable_hands.iter_mut().enumerate() {
             let hand = input.and_then(|input| input.hands[index].map(|hand| (input, hand)));
             let usable = hand.filter(|(input, hand)| hand.usable(input.eye, input.forward));
+            *hand_usable = usable.is_some();
             let ray =
                 usable.and_then(|(input, hand)| hand.ray(input.eye, input.forward, index == 0));
             let uv = ray.and_then(|ray| self.panel.hit(&ray));
@@ -1431,7 +1481,7 @@ impl TuneMenu {
                 PinchEvent::Opened | PinchEvent::Lost => {
                     self.last_activity = Some(now);
                     let role = std::mem::replace(&mut self.roles[index], HandRole::Open);
-                    self.open(index, role, event == PinchEvent::Opened, &mut events);
+                    self.open(index, role, event == PinchEvent::Opened, now, &mut events);
                 }
                 PinchEvent::None => {
                     if self.roles[index] == HandRole::Ignored
@@ -1451,13 +1501,13 @@ impl TuneMenu {
                 if value != drag.last {
                     self.last_activity = Some(now);
                     self.apply_value(&drag.spec, value, &mut events);
-                    drag.last = value;
+                    drag.record(now, value);
                     self.drag = Some(drag);
                 }
             }
         }
 
-        self.update_patch(input, now, &mut events);
+        self.update_patch(input, usable_hands, now, &mut events);
         events
     }
 
@@ -1485,6 +1535,8 @@ impl TuneMenu {
                             start_u: uv.x,
                             start,
                             last: start,
+                            history: [(0.0, start); DRAG_HISTORY],
+                            changes: 0,
                         });
                         if spec.property.is_none() {
                             self.patch_from.get_or_insert(self.cap);
@@ -1500,11 +1552,25 @@ impl TuneMenu {
     }
 
     // A pinch opened (`released`: not lost)
-    fn open(&mut self, hand: usize, role: HandRole, released: bool, events: &mut Vec<TuneEvent>) {
+    fn open(
+        &mut self,
+        hand: usize,
+        role: HandRole,
+        released: bool,
+        now: f64,
+        events: &mut Vec<TuneEvent>,
+    ) {
         match role {
             HandRole::Open | HandRole::Ignored | HandRole::Patch => (),
             HandRole::Drag => {
-                if self.drag.is_some_and(|drag| drag.hand == hand) {
+                if let Some(mut drag) = self.drag.filter(|drag| drag.hand == hand) {
+                    // Let go: the value from before the fingers opened (a lost hand keeps the last)
+                    let value = drag.release_value(now);
+                    if released && value != drag.last {
+                        self.apply_value(&drag.spec, value, events);
+                        drag.last = value;
+                        self.drag = Some(drag);
+                    }
                     self.end_drag(events);
                 }
             }
@@ -1655,13 +1721,21 @@ impl TuneMenu {
         }
     }
 
-    // The hands that move / size the cap
-    fn update_patch(&mut self, input: Option<&EditorInput>, now: f64, events: &mut Vec<TuneEvent>) {
+    // The hands that move / size the cap. `usable`: of each hand in this update; a hand that is not (its
+    // pinch held while it is lost or out of view) holds the cap where it is
+    fn update_patch(
+        &mut self,
+        input: Option<&EditorInput>,
+        usable: [bool; 2],
+        now: f64,
+        events: &mut Vec<TuneEvent>,
+    ) {
         let holding = [0, 1]
             .map(|hand| self.roles[hand] == HandRole::Patch && self.pinches[hand].is_closed());
         let cursor = |hand: usize| {
             input
                 .and_then(|input| input.hands[hand])
+                .filter(|_| usable[hand])
                 .map(|h| h.cursor())
         };
 
@@ -2042,11 +2116,14 @@ mod tests {
         let range = KEY_BIAS.range;
         // Within the dead zone: unchanged
         assert_eq!(dragged_value(&range, 150.0, 0.5, 0.505), 150.0);
+        // ... also a value off the step or out of the range (a property set with setprop): not snapped
+        assert_eq!(dragged_value(&range, 155.0, 0.5, 0.5 + DRAG_DEAD_U), 155.0);
+        assert_eq!(dragged_value(&range, 1200.0, 0.5, 0.49), 1200.0);
         // A tenth of the width beyond the dead zone: a tenth of 0..1000
-        assert_eq!(dragged_value(&range, 150.0, 0.5, 0.61), 250.0);
-        assert_eq!(dragged_value(&range, 150.0, 0.5, 0.39), 50.0);
+        assert_eq!(dragged_value(&range, 150.0, 0.5, 0.62), 250.0);
+        assert_eq!(dragged_value(&range, 150.0, 0.5, 0.38), 50.0);
         // Snapped to the step of 10
-        assert_eq!(dragged_value(&range, 150.0, 0.5, 0.5434), 180.0);
+        assert_eq!(dragged_value(&range, 150.0, 0.5, 0.5534), 180.0);
         // Clamped
         assert_eq!(dragged_value(&range, 150.0, 0.5, 2.0), 1000.0);
         assert_eq!(dragged_value(&range, 150.0, 0.5, -1.0), 0.0);
@@ -2155,6 +2232,8 @@ mod tests {
             for step in 1..=10 {
                 events.extend(self.right(from.lerp(to, step as f32 / 10.0), true, 1));
             }
+            // Held there before the fingers open (the release rewinds `RELEASE_LOOKBACK_S`)
+            events.extend(self.right(to, true, 12));
             events.extend(self.right(to, false, 12));
             events
         }
@@ -2178,7 +2257,7 @@ mod tests {
         assert!(!content.rows[1].overridden);
 
         // Dragging it changes key_bias: 0.2 of the width (after the dead zone) is 200
-        let events = driver.drag(row_uv(1, 0.4), row_uv(1, 0.61));
+        let events = driver.drag(row_uv(1, 0.4), row_uv(1, 0.62));
         assert!(events.contains(&TuneEvent::Committed {
             property: "key_bias",
             from: 150,
@@ -2205,7 +2284,7 @@ mod tests {
         assert_eq!(content.rows[1].label, "Room strictness");
         assert_eq!(content.rows[1].value, "300 %");
         assert!(!content.rows[1].overridden);
-        let events = driver.drag(row_uv(1, 0.5), row_uv(1, 0.4));
+        let events = driver.drag(row_uv(1, 0.5), row_uv(1, 0.39));
         assert!(events.contains(&TuneEvent::Committed {
             property: "key_auto_weight",
             from: 300,
@@ -2433,6 +2512,116 @@ mod tests {
     }
 
     #[test]
+    fn a_pinch_without_a_move_changes_nothing() {
+        // A property off the step and beyond the range of the row stays as it is
+        let mut driver = Driver::new(TuneValues::default());
+        driver.menu.set_prop("key_unknown", Some(7));
+        driver.tap(tab_uv(TunePage::ArmsInMotion));
+        driver.menu.set_prop("cloud_cap", Some(64));
+        let events = driver.tap(row_uv(1, 0.5));
+        assert!(events.is_empty(), "{events:?}");
+        driver.tap(tab_uv(TunePage::HandsVsRoom));
+        let events = driver.tap(row_uv(2, 0.5));
+        assert!(events.is_empty(), "{events:?}");
+        assert!(driver.menu.values().overrides.is_empty());
+        assert_eq!(driver.menu.values().value("key_unknown"), 7);
+        // The cut too
+        driver.tap(tab_uv(TunePage::GreenScreen));
+        driver.menu.set_cap(PatchCap {
+            cut: 0.123,
+            ..PatchCap::default()
+        });
+        let events = driver.tap(row_uv(3, 0.5));
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(driver.menu.cap().cut, 0.123);
+    }
+
+    #[test]
+    fn the_release_keeps_the_value_from_before_the_fingers_opened() {
+        let mut driver = Driver::new(TuneValues::default());
+        let (from, to) = (row_uv(2, 0.5), row_uv(2, 0.72));
+        driver.right(from, false, 2);
+        driver.right(from, true, 4);
+        for step in 1..=10 {
+            driver.right(from.lerp(to, step as f32 / 10.0), true, 1);
+        }
+        driver.right(to, true, 12);
+        let held = driver.menu.values().value("key_unknown");
+        assert_eq!(held, 30);
+        // Opening the fingers swings the ray on: the value follows until the pinch opens, then goes back
+        let mut events = Vec::new();
+        for step in 1..=12 {
+            let uv = to + Vec2::new(0.02 * step as f32, 0.0);
+            events.extend(driver.right(uv, false, 1));
+        }
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, TuneEvent::Set { new, .. } if *new > held)),
+            "{events:?}"
+        );
+        assert_eq!(driver.menu.values().value("key_unknown"), held);
+        assert_eq!(
+            events.last(),
+            Some(&TuneEvent::Committed {
+                property: "key_unknown",
+                from: 10,
+                to: held,
+            })
+        );
+    }
+
+    #[test]
+    fn a_press_does_not_carry_over_to_another_page() {
+        let mut driver = Driver::new(TuneValues::default());
+        driver.drag(row_uv(2, 0.5), row_uv(2, 0.7));
+        assert!(driver.menu.values().is_overridden("key_unknown"));
+        // The left hand pinches "Reset page" (row 4), the right one picks the depth page, whose row 4 is
+        // "Reset all"; the left one lets go there: nothing
+        let both = |driver: &mut Driver, left: bool, right: Option<bool>, frames: usize| {
+            let panel = driver.menu.panel;
+            let l = pointing(&panel, row_uv(4, 0.2), left);
+            let r = right.map(|pinched| pointing(&panel, tab_uv(TunePage::DepthEdge), pinched));
+            (0..frames)
+                .flat_map(|_| driver.frame([Some(l), r]))
+                .collect::<Vec<_>>()
+        };
+        both(&mut driver, false, None, 2);
+        both(&mut driver, true, None, 4);
+        both(&mut driver, true, Some(false), 2);
+        both(&mut driver, true, Some(true), 4);
+        let events = both(&mut driver, true, Some(false), 12);
+        assert_eq!(events, vec![TuneEvent::Page(TunePage::DepthEdge)]);
+        let events = both(&mut driver, false, None, 12);
+        assert!(events.is_empty(), "{events:?}");
+        assert!(driver.menu.values().is_overridden("key_unknown"));
+    }
+
+    #[test]
+    fn a_hand_that_is_not_usable_holds_the_cap() {
+        let mut driver = Driver::new(TuneValues::default());
+        driver.tap(tab_uv(TunePage::GreenScreen));
+        driver.tap(row_uv(4, 0.5));
+        assert!(driver.menu.patch_mode());
+        let below = Vec2::new(0.5, 2.0);
+        let hand = pointing(&driver.menu.panel, below, true);
+        driver.right(below, false, 2);
+        driver.right(below, true, 4);
+        let before = driver.menu.cap();
+        // Not tracked: its pinch is kept a while, its positions are not used
+        let lost = EditorHand {
+            tracked: false,
+            thumb_tip: hand.thumb_tip + Vec3::new(0.2, 0.1, 0.0),
+            index_tip: hand.index_tip + Vec3::new(0.2, 0.1, 0.0),
+            ..hand
+        };
+        for _ in 0..10 {
+            driver.frame([None, Some(lost)]);
+        }
+        assert_eq!(driver.menu.cap(), before);
+    }
+
+    #[test]
     fn messages_encode_and_parse() {
         let cap = PatchCap {
             cx: 0.5,
@@ -2535,9 +2724,20 @@ mod tests {
         assert_eq!(parse_profile(""), TuneProfile::default());
 
         // File names
-        assert_eq!(profile_file_name(Some("SCR1")), "tune-SCR1.txt");
+        let scr1 = profile_file_name(Some("SCR1"));
+        assert!(
+            scr1.starts_with("tune-SCR1-") && scr1.ends_with(".txt"),
+            "{scr1}"
+        );
+        assert_eq!(scr1, profile_file_name(Some("SCR1")));
+        assert_ne!(scr1, profile_file_name(Some("scr1")));
         assert_eq!(profile_file_name(None), DEFAULT_PROFILE_FILE);
         assert_eq!(profile_file_name(Some("")), "tune-default.txt");
+        assert_ne!(profile_file_name(Some("default")), DEFAULT_PROFILE_FILE);
+        // A newline in the payload does not end the header comment
+        let text = profile_text(&TuneProfile::default(), Some("A\nkey_unknown=50"));
+        assert_eq!(parse_profile(&text), TuneProfile::default());
+        assert_eq!(text.lines().count(), 2);
         let a = profile_file_name(Some("../a b"));
         assert!(a.starts_with("tune-___a_b-") && a.ends_with(".txt"), "{a}");
         assert_ne!(a, profile_file_name(Some("___a_b")));
