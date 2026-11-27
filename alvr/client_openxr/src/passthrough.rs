@@ -1,4 +1,6 @@
-use crate::extra_extensions::{COLOR_KEY_SIZE, GreenLayerMode, PassthroughFB, PassthroughHTC};
+use crate::extra_extensions::{
+    COLOR_KEY_SIZE, GreenLayerMode, LutProbe, PassthroughFB, PassthroughHTC,
+};
 use alvr_common::{
     anyhow::{Result, bail},
     error,
@@ -154,6 +156,12 @@ impl PassthroughLayer<'_> {
             let mode = GreenLayerMode::from_property(debug_property("debug.alvr.green_layer"));
             let hand_cut =
                 debug_property("debug.alvr.green_hand_cut").is_none_or(|value| value != 0);
+            // `debug.alvr.lut_probe` (extra_extensions/passthrough_fb.rs `LutProbe`)
+            let probe = LutProbe::from_property(debug_property("debug.alvr.lut_probe"));
+            if probe != handle.lut_probe() {
+                let text = handle.set_lut_probe(probe);
+                crate::stream_log(&format!("lut probe: {text}"));
+            }
             if hand_cut != self.green_hand_cut {
                 self.green_hand_cut = hand_cut;
                 crate::stream_log(&format!("green: cut into the hand key {hand_cut}"));
@@ -202,10 +210,25 @@ impl PassthroughLayer<'_> {
         in_use
     }
 
+    /// A frame was refused by the runtime: `debug.alvr.lut_probe 2` (twin) is switched off until the
+    /// property changes, so a runtime that rejects one layer handle submitted twice is not left black
+    pub fn end_frame_failed(&mut self) {
+        if let Some(handle) = &mut self.handle_fb
+            && handle.lut_probe() == LutProbe::Twin
+        {
+            handle.set_lut_probe(LutProbe::Off);
+            crate::stream_log("lut probe: twin: the frame was refused, the probe is off now");
+        }
+    }
+
     /// The bottom passthrough layer: the green-keyed one while `update_green_key` says it is in use,
     /// else the plain one (`Deref`)
     pub fn base_layer(&self) -> &xr::CompositionLayerBase<'_, xr::OpenGlEs> {
-        if let Some(layer) = self.handle_fb.as_ref().and_then(PassthroughFB::green_layer) {
+        let handle = self.handle_fb.as_ref();
+        if let Some(layer) = handle
+            .and_then(PassthroughFB::green_layer)
+            .or_else(|| handle.and_then(PassthroughFB::twin_layer))
+        {
             unsafe { &*ptr::from_ref(layer).cast() }
         } else {
             self

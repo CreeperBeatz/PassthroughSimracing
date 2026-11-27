@@ -1067,6 +1067,9 @@ pub fn entry_point() {
             if let Err(e) = res {
                 let time = to_xr_time(display_time);
                 error!("End frame failed! {e}, timestamp: {display_time:?}, time: {time:?}");
+                if let Some(passthrough_layer) = &mut passthrough_layer {
+                    passthrough_layer.end_frame_failed();
+                }
 
                 if !platform.is_vive() {
                     xr_frame_stream

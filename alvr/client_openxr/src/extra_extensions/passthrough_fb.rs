@@ -18,7 +18,42 @@ pub struct PassthroughFB {
     key: Option<KeyedLayer>,
     // `debug.alvr.green_boxes`: the base layer keyed by monitor green, see `set_green_key`
     green: Option<GreenLayer>,
+    // `debug.alvr.lut_probe` (see `LutProbe`), and the alpha scale / bias chained to the hand-key layer
+    // for values 3 and 4 (boxed: the layer's `next` points at it)
+    probe: LutProbe,
+    probe_alpha: Box<sys::CompositionLayerColorScaleBiasKHR>,
     session: sys::Session,
+}
+
+/// `debug.alvr.lut_probe` (design/green-hand-one-lut-20261127.md, stage 0): what the Quest does with
+/// colour LUTs on more than one passthrough layer. Unset or 0: off (today's layers)
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum LutProbe {
+    #[default]
+    Off,
+    /// 1: the base layer is styled with the hand-key layer's own LUT object (green off)
+    Share,
+    /// 2: the hand-key layer is submitted at the base position too, the plain base is left out (green off)
+    Twin,
+    /// 3: the hand-key layer gets alpha scale 0.5 (XR_KHR_composition_layer_color_scale_bias)
+    Scale,
+    /// 4: the hand-key layer gets alpha bias -0.5
+    Bias,
+    /// 5: the hand-key layer is styled again after the green-keyed base (green on, `green_layer` 1)
+    Restyle,
+}
+
+impl LutProbe {
+    pub fn from_property(value: Option<i64>) -> Self {
+        match value {
+            Some(1) => Self::Share,
+            Some(2) => Self::Twin,
+            Some(3) => Self::Scale,
+            Some(4) => Self::Bias,
+            Some(5) => Self::Restyle,
+            _ => Self::Off,
+        }
+    }
 }
 
 struct KeyedLayer {
@@ -122,6 +157,18 @@ impl PassthroughFB {
             lut_fns: session.instance().exts().meta_passthrough_color_lut,
             key: None,
             green: None,
+            probe: LutProbe::Off,
+            probe_alpha: Box::new(sys::CompositionLayerColorScaleBiasKHR {
+                ty: sys::CompositionLayerColorScaleBiasKHR::TYPE,
+                next: ptr::null(),
+                color_scale: sys::Color4f {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: 1.0,
+                },
+                color_bias: sys::Color4f::default(),
+            }),
             session: session.as_raw(),
         })
     }
@@ -133,14 +180,90 @@ impl PassthroughFB {
         self.lut_fns
             .ok_or(sys::Result::ERROR_EXTENSION_NOT_PRESENT)?;
 
+        // The base layer must not refer to the LUT about to be destroyed (probe 1)
+        self.undo_probe();
         self.destroy_color_key();
 
         let Some(data) = data else {
             return Ok(());
         };
         self.key = Some(self.create_lut_layer(data)?);
+        self.apply_probe();
 
         Ok(())
+    }
+
+    /// `debug.alvr.lut_probe`: switch to this probe (undoes the one before). Returns a text for the log
+    pub fn set_lut_probe(&mut self, probe: LutProbe) -> String {
+        self.undo_probe();
+        self.probe = probe;
+        self.apply_probe()
+    }
+
+    pub fn lut_probe(&self) -> LutProbe {
+        self.probe
+    }
+
+    // Puts the probe's state on the layers; probes that need the hand-key layer wait for it
+    fn apply_probe(&mut self) -> String {
+        let Some(key) = &mut self.key else {
+            return format!("{:?}: waiting for the hand-key layer", self.probe);
+        };
+        let (key_handle, key_lut) = (key.layer_handle, key.lut);
+        let text = match self.probe {
+            LutProbe::Off => "off".to_string(),
+            LutProbe::Share if self.green.is_some() => "share: not with green on".into(),
+            LutProbe::Share => match self.set_layer_style(self.layer_handle, Some(key_lut)) {
+                Ok(()) => "share: base layer styled with the hand-key LUT".into(),
+                Err(e) => format!("share: styling the base layer failed: {e}"),
+            },
+            LutProbe::Twin => "twin: the hand-key layer is submitted as the base too".into(),
+            LutProbe::Scale | LutProbe::Bias => {
+                let (scale, bias) = if self.probe == LutProbe::Scale {
+                    (0.5, 0.0)
+                } else {
+                    (1.0, -0.5)
+                };
+                self.probe_alpha.color_scale.a = scale;
+                self.probe_alpha.color_bias.a = bias;
+                let key = self.key.as_mut().unwrap();
+                key.layer.next = ptr::from_ref(&*self.probe_alpha).cast();
+                format!("alpha scale {scale} bias {bias} on the hand-key layer")
+            }
+            LutProbe::Restyle => match self.set_layer_style(key_handle, Some(key_lut)) {
+                Ok(()) => format!(
+                    "restyle: hand-key layer styled again (green {})",
+                    if self.green.is_some() {
+                        "on"
+                    } else {
+                        "off: set it"
+                    }
+                ),
+                Err(e) => format!("restyle failed: {e}"),
+            },
+        };
+        text
+    }
+
+    fn undo_probe(&mut self) {
+        match self.probe {
+            LutProbe::Share if self.green.is_none() && self.key.is_some() => {
+                self.set_layer_style(self.layer_handle, None).ok();
+            }
+            LutProbe::Scale | LutProbe::Bias => {
+                if let Some(key) = &mut self.key {
+                    key.layer.next = ptr::null();
+                }
+            }
+            _ => (),
+        }
+    }
+
+    /// Probe 2: the layer submitted at the base position (the hand-key layer), else None
+    pub fn twin_layer(&self) -> Option<&sys::CompositionLayerPassthroughFB> {
+        (self.probe == LutProbe::Twin && self.green.is_none())
+            .then(|| self.color_key_layer())
+            .flatten()
     }
 
     /// Replace the LUT of the color keyed layer, if it exists
@@ -165,9 +288,11 @@ impl PassthroughFB {
             .lut_fns
             .ok_or(sys::Result::ERROR_EXTENSION_NOT_PRESENT)?;
 
+        self.undo_probe();
         self.destroy_green_key();
 
         let Some(data) = data else {
+            self.apply_probe();
             return Ok(());
         };
         self.green = Some(match mode {
@@ -190,6 +315,7 @@ impl PassthroughFB {
                 GreenLayer::Separate { keyed, base_paused }
             }
         });
+        self.apply_probe();
 
         Ok(())
     }
