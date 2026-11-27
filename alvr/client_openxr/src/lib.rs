@@ -597,6 +597,14 @@ pub fn entry_point() {
                         xr::SessionState::STOPPING => {
                             session_running = false;
 
+                            // No frames follow for a while: the menu closes (saved, the green key
+                            // back), the QR code on the rig monitor is hidden at once
+                            tuning.stop("session stopping");
+                            if let Some(hide) = area_qr.hide_now() {
+                                stream_log("area: qr hide (session stopping)");
+                                rig_link.send(&hide);
+                            }
+
                             passthrough_layer = None;
                             // Its handles must go before the session ends
                             marker_tracker = None;
@@ -608,6 +616,12 @@ pub fn entry_point() {
                         xr::SessionState::EXITING | xr::SessionState::LOSS_PENDING => {
                             // Its handles must go before the session
                             drop(marker_tracker.take());
+
+                            tuning.stop("session exiting");
+                            if let Some(hide) = area_qr.hide_now() {
+                                stream_log("area: qr hide (session exiting)");
+                                rig_link.send(&hide);
+                            }
 
                             break 'render_loop;
                         }

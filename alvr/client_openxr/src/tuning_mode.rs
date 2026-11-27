@@ -16,9 +16,13 @@
 //! the override of `green_boxes` as it was.
 //!
 //! Profiles: `tune-<payload>-<hash>.txt` of the code the box is placed from (`tune-default.txt` while no
-//! payload is known), in the two folders of the layout files (area_editor.rs). Read at the start and
-//! when the payload changes (not while the menu is open), applied to the override table; written when
-//! the menu closes, from a thread.
+//! payload is known at the start), in the two folders of the layout files (area_editor.rs). Read at the
+//! start and when the payload changes to another one (not while the menu is open; a payload that is lost
+//! keeps the profile in use), applied to the override table; written when the menu closes, from a
+//! thread.
+//!
+//! Last writer wins: a property set with setprop to a new value replaces the menu's value of it (logged
+//! as `tune: setprop <prop>=<v> replaces menu value <z>`; the next profile no longer has it).
 //!
 //! Experimental, controlled with adb (polled about twice a second):
 //! - `debug.alvr.tune`: a change to 1 opens the menu, a change to 0 closes it (the value at the start
@@ -41,9 +45,13 @@ use openxr as xr;
 use std::{
     collections::BTreeMap,
     fs, io,
-    sync::{Arc, Mutex, PoisonError, mpsc},
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const PROPERTY_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -53,9 +61,93 @@ pub const IDLE_TIMEOUT_S: f64 = 120.0;
 const STATS_INTERVAL_S: f64 = 0.5;
 // Stats older than this are not shown
 const STATS_MAX_AGE: Duration = Duration::from_secs(5);
-// The panel is drawn again at most this often while it changes (seconds): the cursors move every frame
+// The panel is drawn again at most this often while it changes (seconds), and while only the cursors
+// move (they move every frame)
 const REDRAW_INTERVAL_S: f64 = 0.05;
+const CURSOR_REDRAW_INTERVAL_S: f64 = 0.1;
+// The cursors are drawn on a grid of this many texels: the jitter of a ray does not draw the panel again
+const CURSOR_GRID_TEXELS: f32 = 4.0;
 const GREEN_BOXES: &str = "debug.alvr.green_boxes";
+
+// The number of the last cap message sent to green_patch.py, for the whole run
+static LAST_PATCH_SEQ: AtomicU64 = AtomicU64::new(0);
+
+// The first number of a new cap link: the Unix time in milliseconds (newer than any of an earlier run),
+// and after the last one of this run
+fn patch_seq_start() -> u64 {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |time| time.as_millis() as u64);
+    now_ms.max(LAST_PATCH_SEQ.load(Ordering::Relaxed))
+}
+
+// The green key suspended by the green page: the override of `green_boxes` before it. For the whole run,
+// so that a new `TuningMode` (a new session) still puts it back
+static GREEN_SUSPENDED: Mutex<Option<Option<String>>> = Mutex::new(None);
+
+fn suspend_green() {
+    let mut suspended = GREEN_SUSPENDED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if suspended.is_some() {
+        return;
+    }
+    *suspended = Some(passthrough::tuning_override(GREEN_BOXES));
+    set_tuning_override(GREEN_BOXES, "", Some("green page: the green key is off"));
+}
+
+fn restore_green(why: &str) {
+    let Some(saved) = GREEN_SUSPENDED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+    else {
+        return;
+    };
+    match saved {
+        Some(value) => set_tuning_override(GREEN_BOXES, &value, Some(why)),
+        None => clear_tuning_override(GREEN_BOXES, Some(why)),
+    }
+}
+
+// The properties whose value set with setprop changed since `last` (a property read for the first time
+// is no change)
+fn changed_properties(
+    last: &BTreeMap<&'static str, Option<i64>>,
+    current: &BTreeMap<&'static str, Option<i64>>,
+) -> Vec<&'static str> {
+    current
+        .iter()
+        .filter(|(property, value)| last.get(*property).is_some_and(|last| last != *value))
+        .map(|(property, _)| *property)
+        .collect()
+}
+
+// The cursors on a grid of `CURSOR_GRID_TEXELS`
+fn snap_cursors(content: &mut MenuContent) {
+    let grid = alvr_common::glam::Vec2::new(
+        CURSOR_GRID_TEXELS / MENU_TEXTURE_WIDTH as f32,
+        CURSOR_GRID_TEXELS / MENU_TEXTURE_HEIGHT as f32,
+    );
+    for cursor in &mut content.cursors {
+        *cursor = (*cursor / grid).round() * grid;
+    }
+}
+
+// How soon the panel may be drawn again for `content`: None, it shows that already
+fn redraw_interval(drawn: Option<&MenuContent>, content: &MenuContent) -> Option<f64> {
+    match drawn {
+        Some(drawn) if drawn == content => None,
+        Some(drawn)
+            if drawn.tabs == content.tabs
+                && drawn.rows == content.rows
+                && drawn.footer == content.footer =>
+        {
+            Some(CURSOR_REDRAW_INTERVAL_S)
+        }
+        _ => Some(REDRAW_INTERVAL_S),
+    }
+}
 
 // --- The stats of the footer ----------------------------------------------------------------------
 
@@ -148,21 +240,42 @@ fn read_profile(name: &str) -> Option<(String, TuneProfile)> {
         .map(|(_, path, text)| (path, parse_profile(&text)))
 }
 
-// Writes a profile to both folders from a thread of its own
+// The saver thread of the run (one: two saves never write the same file at once)
+static SAVER: Mutex<Option<mpsc::Sender<(String, String)>>> = Mutex::new(None);
+
+// Writes a profile to both folders, on the saver thread
 fn save_profile(name: String, text: String) {
-    let spawned = thread::Builder::new()
-        .name("tune saver".into())
-        .spawn(move || {
-            for dir in area_editor::area_dirs() {
-                let path = format!("{dir}/{name}");
-                match area_editor::write_through_temporary(&dir, &path, &text) {
-                    Ok(()) => crate::stream_log(&format!("tune: saved {path}")),
-                    Err(e) => crate::stream_log(&format!("tune: could not save {path}: {e}")),
+    let mut saver = SAVER.lock().unwrap_or_else(PoisonError::into_inner);
+    if saver.is_none() {
+        let (sender, receiver) = mpsc::channel::<(String, String)>();
+        let spawned = thread::Builder::new()
+            .name("tune saver".into())
+            .spawn(move || {
+                while let Ok((name, text)) = receiver.recv() {
+                    for dir in area_editor::area_dirs() {
+                        let path = format!("{dir}/{name}");
+                        match area_editor::write_through_temporary(&dir, &path, &text) {
+                            Ok(()) => crate::stream_log(&format!("tune: saved {path}")),
+                            Err(e) => {
+                                crate::stream_log(&format!("tune: could not save {path}: {e}"));
+                            }
+                        }
+                    }
                 }
+            });
+        match spawned {
+            Ok(_) => *saver = Some(sender),
+            Err(e) => {
+                crate::stream_log(&format!("tune: not saved, no saver thread: {e}"));
+                return;
             }
-        });
-    if let Err(e) = spawned {
-        crate::stream_log(&format!("tune: not saved, no saver thread: {e}"));
+        }
+    }
+    if let Some(sender) = saver.as_ref()
+        && sender.send((name, text)).is_err()
+    {
+        crate::stream_log("tune: not saved, the saver thread stopped");
+        *saver = None;
     }
 }
 
@@ -178,8 +291,12 @@ struct MenuPanel {
     // An image was released: the layer can be submitted
     ready: bool,
     jobs: mpsc::Sender<MenuContent>,
-    // The worker's newest image, rows from the bottom (GL)
+    // A content could not be given to the worker (logged once)
+    jobs_failed: bool,
+    // The worker's newest image, rows from the bottom (GL), and a buffer it may draw into (uploaded
+    // ones come back: no new 3 MB per drawing)
     done: Arc<Mutex<Option<Vec<u8>>>>,
+    free: Arc<Mutex<Option<Vec<u8>>>>,
     upload_failed: bool,
 }
 
@@ -219,7 +336,8 @@ impl MenuPanel {
 
         let (jobs, receiver) = mpsc::channel::<MenuContent>();
         let done = Arc::new(Mutex::new(None));
-        let worker_done = Arc::clone(&done);
+        let free = Arc::new(Mutex::new(None));
+        let (worker_done, worker_free) = (Arc::clone(&done), Arc::clone(&free));
         thread::Builder::new()
             .name("tune panel".into())
             .spawn(move || {
@@ -228,14 +346,31 @@ impl MenuPanel {
                     while let Ok(newer) = receiver.try_recv() {
                         content = newer;
                     }
-                    let pixels = alvr_graphics::render_menu(
+                    let mut pixels: Vec<u8> = worker_free
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .take()
+                        .unwrap_or_default();
+                    alvr_graphics::render_menu_into(
                         &content,
                         MENU_TEXTURE_WIDTH,
                         MENU_TEXTURE_HEIGHT,
+                        &mut pixels,
                     );
-                    let pixels =
-                        alvr_graphics::flip_rows(&pixels, MENU_TEXTURE_WIDTH, MENU_TEXTURE_HEIGHT);
-                    *worker_done.lock().unwrap_or_else(PoisonError::into_inner) = Some(pixels);
+                    alvr_graphics::flip_rows_in_place(
+                        &mut pixels,
+                        MENU_TEXTURE_WIDTH,
+                        MENU_TEXTURE_HEIGHT,
+                    );
+                    // One not uploaded yet is replaced; its buffer is drawn into next time
+                    let replaced = worker_done
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .replace(pixels);
+                    if let Some(replaced) = replaced {
+                        *worker_free.lock().unwrap_or_else(PoisonError::into_inner) =
+                            Some(replaced);
+                    }
                 }
             })
             .map_err(|e| format!("no panel thread: {e}"))?;
@@ -250,9 +385,39 @@ impl MenuPanel {
             images,
             ready: false,
             jobs,
+            jobs_failed: false,
             done,
+            free,
             upload_failed: false,
         })
+    }
+
+    // A new menu: nothing of the last one is shown or uploaded
+    fn reset(&mut self) {
+        self.ready = false;
+        let stale = self
+            .done
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if stale.is_some() {
+            *self.free.lock().unwrap_or_else(PoisonError::into_inner) = stale;
+        }
+    }
+
+    fn draw(&mut self, content: MenuContent) -> bool {
+        match self.jobs.send(content) {
+            Ok(()) => true,
+            Err(_) => {
+                if !self.jobs_failed {
+                    self.jobs_failed = true;
+                    crate::stream_log(
+                        "tune: the panel thread stopped, the panel is not drawn (logged once)",
+                    );
+                }
+                false
+            }
+        }
     }
 
     // The worker's newest image into the next swapchain image
@@ -278,18 +443,21 @@ impl MenuPanel {
             self.swapchain.release_image().ok();
             return;
         }
-        if let Some(error) = gfx.upload_rgba8(
+        let uploaded = gfx.upload_rgba8(
             self.images.get(index).copied().unwrap_or(0),
             MENU_TEXTURE_WIDTH,
             MENU_TEXTURE_HEIGHT,
             &pixels,
-        ) {
-            self.log_failure(&format!("GL error 0x{error:x} in the upload"));
+        );
+        if let Err(e) = &uploaded {
+            self.log_failure(&format!("upload: {e}"));
         }
         match self.swapchain.release_image() {
-            Ok(()) => self.ready = true,
+            // Only an image that was written is shown
+            Ok(()) => self.ready |= uploaded.is_ok(),
             Err(e) => self.log_failure(&format!("release: {e}")),
         }
+        *self.free.lock().unwrap_or_else(PoisonError::into_inner) = Some(pixels);
     }
 
     fn log_failure(&mut self, text: &str) {
@@ -331,9 +499,12 @@ pub struct TuningMode {
     profile_for: Option<Option<String>>,
     // The cap of the green patch as last known (profile, green_patch.py, the menu)
     cap: Option<PatchCap>,
-    // On the green page: the override of `green_boxes` before it was suspended
-    green_saved: Option<Option<String>>,
+    // One for the run (its numbers go on over the visits of the green page)
     patch_link: PatchLink,
+    // The values set with setprop of the menu's properties, as last read (None: not yet)
+    system_values: Option<BTreeMap<&'static str, Option<i64>>>,
+    // `RigLink::hint`, for the footer of the green page
+    rig_hint: Option<&'static str>,
     // A `get` was sent, its reply not yet logged
     awaiting_reply: bool,
     reply_error_logged: bool,
@@ -351,6 +522,8 @@ pub struct TuningMode {
 
 impl TuningMode {
     pub fn new() -> Self {
+        // A green key suspended by the menu of a session before
+        restore_green("left from the last session: the green key is back");
         Self {
             start: Instant::now(),
             last_poll: None,
@@ -363,8 +536,9 @@ impl TuningMode {
             entered_at: 0.0,
             profile_for: None,
             cap: None,
-            green_saved: None,
-            patch_link: PatchLink::default(),
+            patch_link: PatchLink::starting_at(patch_seq_start()),
+            system_values: None,
+            rig_hint: None,
             awaiting_reply: false,
             reply_error_logged: false,
             stats: TuneStats::default(),
@@ -434,18 +608,42 @@ impl TuningMode {
             });
         }
 
-        // The properties as set with setprop, for the values without an override
-        if let Some(menu) = &mut self.menu {
-            for property in tuned_properties() {
-                menu.set_prop(property, system_property(&full_property(property)));
+        // The properties as set with setprop: for the values without an override, and a new value set
+        // with setprop replaces the menu's (last writer wins)
+        let current = tuned_properties()
+            .into_iter()
+            .map(|property| (property, system_property(&full_property(property))))
+            .collect::<BTreeMap<_, _>>();
+        if let Some(last) = &self.system_values {
+            for property in changed_properties(last, &current) {
+                let name = full_property(property);
+                let Some(menu_value) = passthrough::tuning_override(&name) else {
+                    continue;
+                };
+                clear_tuning_override(&name, None);
+                if let Some(menu) = &mut self.menu {
+                    menu.forget_override(property);
+                }
+                crate::stream_log(&format!(
+                    "tune: setprop {property}={} replaces menu value {}",
+                    current[property].map_or("(unset)".into(), |value| value.to_string()),
+                    menu_value.trim()
+                ));
             }
         }
+        if let Some(menu) = &mut self.menu {
+            for (property, value) in &current {
+                menu.set_prop(property, *value);
+            }
+        }
+        self.system_values = Some(current);
     }
 
     /// One frame, before the frame is rendered
     pub fn update(&mut self, frame: &TuneInput<'_>, rig: &mut RigLink) {
         let now = self.start.elapsed().as_secs_f64();
         self.poll_properties();
+        self.rig_hint = rig.hint();
         if self.menu.is_none() {
             self.follow_payload(frame.payload);
         }
@@ -472,7 +670,7 @@ impl TuningMode {
                 None
             };
             if let Some(reason) = reason {
-                self.leave(reason, frame.payload);
+                self.leave(reason);
                 return;
             }
             self.update_menu(frame, rig, now);
@@ -524,20 +722,40 @@ impl TuningMode {
         ));
         self.entered_at = now;
         self.drawn = None;
+        self.last_draw = f64::NEG_INFINITY;
         self.last_stats = f64::NEG_INFINITY;
-        self.patch_link = PatchLink::default();
+        if let Some(panel) = &mut self.panel {
+            panel.reset();
+        }
         crate::stream_log(&format!(
             "tune: on ({why}), profile {}, {overrides} values set by the menu",
-            profile_file_name(payload)
+            profile_file_name(self.profile_payload(payload).as_deref())
         ));
     }
 
-    fn leave(&mut self, why: &str, payload: Option<&str>) {
+    // The payload of the profile in use (the one read last), else `payload`
+    fn profile_payload(&self, payload: Option<&str>) -> Option<String> {
+        match &self.profile_for {
+            Some(loaded) => loaded.clone(),
+            None => payload.map(str::to_owned),
+        }
+    }
+
+    /// The session stops (or the stream goes with it): the menu closes as with Done
+    pub fn stop(&mut self, why: &str) {
+        self.leave(why);
+        restore_green(why);
+    }
+
+    // Saved under the profile in use
+    fn leave(&mut self, why: &str) {
         if self.menu.take().is_none() {
             return;
         }
-        self.restore_green();
+        restore_green("menu closed: the green key is back");
         self.space = None;
+        let payload = self.profile_payload(None);
+        let payload = payload.as_deref();
         let profile = TuneProfile {
             overrides: current_overrides(),
             cap: self.cap,
@@ -551,8 +769,6 @@ impl TuningMode {
                 .map_or(String::new(), |cap| format!(", cap {}", cap_text(&cap)))
         ));
         save_profile(name, profile_text(&profile, payload));
-        // The payload whose profile is in the table now
-        self.profile_for = Some(payload.map(str::to_owned));
     }
 
     // The profile of the payload, when it changed (not while the menu is open)
@@ -562,6 +778,10 @@ impl TuningMode {
             .as_ref()
             .is_some_and(|loaded| loaded.as_deref() == payload)
         {
+            return;
+        }
+        // A payload that is lost keeps the profile in use: tune-default.txt only at the start
+        if payload.is_none() && self.profile_for.is_some() {
             return;
         }
         let first = self.profile_for.is_none();
@@ -649,14 +869,14 @@ impl TuningMode {
         };
         let events = menu.update(frame.input, now, frame.pinch.0, frame.pinch.1);
         for event in events {
-            self.handle(event, rig, now, frame.payload);
+            self.handle(event, rig, now);
             if self.menu.is_none() {
                 return;
             }
         }
     }
 
-    fn handle(&mut self, event: TuneEvent, rig: &mut RigLink, now: f64, payload: Option<&str>) {
+    fn handle(&mut self, event: TuneEvent, rig: &mut RigLink, now: f64) {
         match event {
             TuneEvent::Set { property, new, .. } => set_tuning_override(
                 &full_property(property),
@@ -675,12 +895,14 @@ impl TuningMode {
             TuneEvent::Cap { new, .. } => {
                 self.cap = Some(new);
                 if let Some(message) = self.patch_link.message(&new, now, false) {
+                    LAST_PATCH_SEQ.store(self.patch_link.seq(), Ordering::Relaxed);
                     rig.send(&message);
                 }
             }
             TuneEvent::CapCommitted { from, to } => {
                 self.cap = Some(to);
                 if let Some(message) = self.patch_link.message(&to, now, true) {
+                    LAST_PATCH_SEQ.store(self.patch_link.seq(), Ordering::Relaxed);
                     rig.send(&message);
                 }
                 passthrough::log_tuning_change(
@@ -693,11 +915,11 @@ impl TuningMode {
             TuneEvent::Page(page) => {
                 crate::stream_log(&format!("tune: page {}", page.title()));
                 if page == TunePage::GreenScreen {
-                    self.suspend_green();
+                    suspend_green();
                     self.awaiting_reply = true;
                     rig.send(PATCH_GET_MESSAGE);
                 } else {
-                    self.restore_green();
+                    restore_green("green page left: the green key is back");
                 }
             }
             TuneEvent::PatchMode(on) => crate::stream_log(if on {
@@ -705,33 +927,12 @@ impl TuningMode {
             } else {
                 "tune: moving / sizing the patch by hand: off"
             }),
-            TuneEvent::Action(TuneAction::Done) => self.leave("Done", payload),
+            TuneEvent::Action(TuneAction::Done) => self.leave("Done"),
             TuneEvent::Action(TuneAction::EditBoxes) => {
-                self.leave("Edit boxes", payload);
+                self.leave("Edit boxes");
                 self.edit_boxes = true;
             }
             TuneEvent::Action(action) => crate::stream_log(&format!("tune: {action:?}")),
-        }
-    }
-
-    // The green page: the green key off, so that the real cap is seen
-    fn suspend_green(&mut self) {
-        if self.green_saved.is_some() {
-            return;
-        }
-        self.green_saved = Some(passthrough::tuning_override(GREEN_BOXES));
-        set_tuning_override(GREEN_BOXES, "", Some("green page: the green key is off"));
-    }
-
-    // Leaving the green page: the override of `green_boxes` as it was
-    fn restore_green(&mut self) {
-        let Some(saved) = self.green_saved.take() else {
-            return;
-        };
-        let why = Some("green page left: the green key is back");
-        match saved {
-            Some(value) => set_tuning_override(GREEN_BOXES, &value, why),
-            None => clear_tuning_override(GREEN_BOXES, why),
         }
     }
 
@@ -761,10 +962,18 @@ impl TuningMode {
         };
 
         let now = self.start.elapsed().as_secs_f64();
-        let content = menu.content(&self.stats);
-        if self.drawn.as_ref() != Some(&content) && now - self.last_draw >= REDRAW_INTERVAL_S {
+        let mut content = menu.content(&self.stats);
+        snap_cursors(&mut content);
+        if menu.page() == TunePage::GreenScreen
+            && let Some(hint) = self.rig_hint
+        {
+            content.footer = hint.to_owned();
+        }
+        if let Some(interval) = redraw_interval(self.drawn.as_ref(), &content)
+            && now - self.last_draw >= interval
+        {
             self.last_draw = now;
-            if panel.jobs.send(content.clone()).is_ok() {
+            if panel.draw(content.clone()) {
                 self.drawn = Some(content);
             }
         }
@@ -806,9 +1015,74 @@ impl TuningMode {
     }
 }
 
+impl Drop for TuningMode {
+    // The session loop ends: the menu's values saved, the green key back
+    fn drop(&mut self) {
+        self.stop("the session ended");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alvr_common::glam::Vec2;
+
+    #[test]
+    fn setprop_changes_are_found() {
+        let last = BTreeMap::from([("key_bias", Some(150)), ("cloud_own", None)]);
+        let same = last.clone();
+        assert!(changed_properties(&last, &same).is_empty());
+        let current = BTreeMap::from([
+            ("key_bias", Some(200)),
+            ("cloud_own", None),
+            // Read for the first time: no change
+            ("edge_cut", Some(40)),
+        ]);
+        assert_eq!(changed_properties(&last, &current), vec!["key_bias"]);
+        // Unset again is a change too
+        let unset = BTreeMap::from([("key_bias", None), ("cloud_own", Some(20))]);
+        assert_eq!(
+            changed_properties(&last, &unset),
+            vec!["cloud_own", "key_bias"]
+        );
+    }
+
+    #[test]
+    fn cursors_snap_and_redraws_wait() {
+        let mut content = MenuContent {
+            footer: "x".into(),
+            cursors: vec![Vec2::new(0.5001, 0.3002)],
+            ..MenuContent::default()
+        };
+        snap_cursors(&mut content);
+        let mut jittered = content.clone();
+        jittered.cursors = vec![Vec2::new(0.5006, 0.3008)];
+        snap_cursors(&mut jittered);
+        assert_eq!(content, jittered);
+
+        assert_eq!(redraw_interval(None, &content), Some(REDRAW_INTERVAL_S));
+        assert_eq!(redraw_interval(Some(&content), &content), None);
+        let mut moved = content.clone();
+        moved.cursors = vec![Vec2::new(0.6, 0.3)];
+        assert_eq!(
+            redraw_interval(Some(&content), &moved),
+            Some(CURSOR_REDRAW_INTERVAL_S)
+        );
+        moved.footer = "y".into();
+        assert_eq!(
+            redraw_interval(Some(&content), &moved),
+            Some(REDRAW_INTERVAL_S)
+        );
+    }
+
+    #[test]
+    fn cap_numbers_start_after_now_and_the_last() {
+        let before = patch_seq_start();
+        assert!(before > 1_700_000_000_000);
+        LAST_PATCH_SEQ.store(before + 1_000_000, Ordering::Relaxed);
+        assert_eq!(patch_seq_start(), before + 1_000_000);
+        LAST_PATCH_SEQ.store(0, Ordering::Relaxed);
+    }
 
     #[test]
     fn switches_are_logged_at_once() {

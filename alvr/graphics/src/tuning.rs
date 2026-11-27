@@ -745,13 +745,21 @@ pub fn patch_state_message(seq: u64, cap: &PatchCap, visible: bool) -> String {
 /// Asks `green_patch.py` for its state (the reply: `parse_patch_reply`)
 pub const PATCH_GET_MESSAGE: &str = "{\"get\":1}";
 
-/// Shows (or hides) the QR code with `payload` on the rig monitor
+/// A show request of the QR code holds this long on the PC (seconds): without a new one in that time
+/// `green_patch.py` hides it (the headset repeats it every 2 s while the area is edited)
+pub const QR_LEASE_S: u32 = 6;
+
+/// Shows (or hides) the QR code with `payload` on the rig monitor: `{"qr":p,"show":1,"lease":6}`,
+/// `{"qr":p,"show":0}`
 pub fn qr_message(payload: &str, show: bool) -> String {
-    format!(
-        "{{\"qr\":{},\"show\":{}}}",
-        json_string(payload),
-        u8::from(show)
-    )
+    if show {
+        format!(
+            "{{\"qr\":{},\"show\":1,\"lease\":{QR_LEASE_S}}}",
+            json_string(payload)
+        )
+    } else {
+        format!("{{\"qr\":{},\"show\":0}}", json_string(payload))
+    }
 }
 
 /// The caps to send while one is dragged: a changed cap at most every `PATCH_SEND_INTERVAL_S`, and the
@@ -764,6 +772,16 @@ pub struct PatchLink {
 }
 
 impl PatchLink {
+    /// The first message gets `seq + 1`. `green_patch.py` ignores a number at or up to 1000 below the
+    /// last one it applied: the client starts from the Unix time in milliseconds, so that a new run (or
+    /// a new link) is always newer
+    pub fn starting_at(seq: u64) -> Self {
+        Self {
+            seq,
+            ..Self::default()
+        }
+    }
+
     /// The message to send now, if any. `force`: whenever `cap` is not the one sent last
     pub fn message(&mut self, cap: &PatchCap, now: f64, force: bool) -> Option<String> {
         if self.sent == Some(*cap) {
@@ -1395,6 +1413,12 @@ impl TuneMenu {
             Some(value) => self.values.props.insert(property.to_owned(), value),
             None => self.values.props.remove(property),
         };
+    }
+
+    /// The menu's value of `property` goes without an event (a newer setprop replaces it, the client
+    /// logs it). Returns the value it had
+    pub fn forget_override(&mut self, property: &str) -> Option<i64> {
+        self.values.overrides.remove(property)
     }
 
     pub fn cap(&self) -> PatchCap {
@@ -2537,6 +2561,18 @@ mod tests {
     }
 
     #[test]
+    fn a_setprop_can_replace_the_menu_value() {
+        let mut driver = Driver::new(TuneValues::default());
+        driver.drag(row_uv(2, 0.5), row_uv(2, 0.72));
+        assert_eq!(driver.menu.values().value("key_unknown"), 30);
+        driver.menu.set_prop("key_unknown", Some(55));
+        assert_eq!(driver.menu.forget_override("key_unknown"), Some(30));
+        assert_eq!(driver.menu.values().value("key_unknown"), 55);
+        assert!(!driver.menu.content(&TuneStats::default()).rows[2].overridden);
+        assert_eq!(driver.menu.forget_override("key_unknown"), None);
+    }
+
+    #[test]
     fn the_release_keeps_the_value_from_before_the_fingers_opened() {
         let mut driver = Driver::new(TuneValues::default());
         let (from, to) = (row_uv(2, 0.5), row_uv(2, 0.72));
@@ -2634,7 +2670,10 @@ mod tests {
             r#"{"seq":7,"shape":"cap","cap":[0.5000,0.6200,0.1800,-0.2500],"visible":true}"#
         );
         assert_eq!(PATCH_GET_MESSAGE, r#"{"get":1}"#);
-        assert_eq!(qr_message("SCR1", true), r#"{"qr":"SCR1","show":1}"#);
+        assert_eq!(
+            qr_message("SCR1", true),
+            r#"{"qr":"SCR1","show":1,"lease":6}"#
+        );
         assert_eq!(qr_message("a\"b\\c", false), r#"{"qr":"a\"b\\c","show":0}"#);
 
         // The message reads back as a reply
@@ -2693,6 +2732,15 @@ mod tests {
         let forced = link.message(&last, 1.09, true).unwrap();
         assert!(forced.starts_with(r#"{"seq":3,"#));
         assert_eq!(link.seq(), 3);
+
+        // Started from a Unix time in milliseconds: the numbers go on from there
+        let mut link = PatchLink::starting_at(1_795_000_000_000);
+        let first = link.message(&cap, 0.0, false).unwrap();
+        assert!(first.starts_with(r#"{"seq":1795000000001,"#), "{first}");
+        assert_eq!(
+            parse_patch_reply(&first).unwrap().seq,
+            Some(1_795_000_000_001)
+        );
     }
 
     #[test]

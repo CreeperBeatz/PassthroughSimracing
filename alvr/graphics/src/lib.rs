@@ -497,21 +497,35 @@ impl GraphicsContext {
 
     /// Writes `pixels` (RGBA8, `width` x `height`, the FIRST row at the BOTTOM as GL has it) into the 2D
     /// GL texture `texture` (a swapchain image of the tuning menu's quad layer, tuning_mode.rs), and
-    /// flushes. The texture binding of the active unit and the unpack state are put back as they were,
-    /// so that wgpu's GL backend finds them unchanged. Returns the GL error, if any
+    /// flushes. The texture binding of the active unit and the unpack state (buffer, alignment, row
+    /// length, skipped rows / pixels / images, image height) are put back as they were, so that wgpu's
+    /// GL backend finds them unchanged. Err: nothing was written (no texture, too few pixels) or the GL
+    /// error
     pub fn upload_rgba8(
         &self,
         texture: u32,
         width: u32,
         height: u32,
         pixels: &[u8],
-    ) -> Option<u32> {
-        let texture = std::num::NonZeroU32::new(texture)?;
+    ) -> Result<(), String> {
+        let texture = std::num::NonZeroU32::new(texture).ok_or_else(|| "no texture".to_string())?;
         if pixels.len() < (width * height * 4) as usize {
-            return None;
+            return Err(format!(
+                "{} bytes for {width}x{height} pixels",
+                pixels.len()
+            ));
         }
         self.make_current();
         let gl = &self.gl_context;
+        // The unpack parameters set for this upload, the others as they are
+        const UNPACK: [(u32, i32); 6] = [
+            (gl::UNPACK_ALIGNMENT, 4),
+            (gl::UNPACK_ROW_LENGTH, 0),
+            (gl::UNPACK_SKIP_ROWS, 0),
+            (gl::UNPACK_SKIP_PIXELS, 0),
+            (gl::UNPACK_SKIP_IMAGES, 0),
+            (gl::UNPACK_IMAGE_HEIGHT, 0),
+        ];
         unsafe {
             // Errors from before are not this upload's (one flag per kind of error)
             for _ in 0..8 {
@@ -522,12 +536,12 @@ impl GraphicsContext {
 
             let bound = gl.get_parameter_i32(gl::TEXTURE_BINDING_2D);
             let unpack_buffer = gl.get_parameter_i32(gl::PIXEL_UNPACK_BUFFER_BINDING);
-            let alignment = gl.get_parameter_i32(gl::UNPACK_ALIGNMENT);
-            let row_length = gl.get_parameter_i32(gl::UNPACK_ROW_LENGTH);
+            let saved = UNPACK.map(|(name, _)| (name, gl.get_parameter_i32(name)));
 
             gl.bind_buffer(gl::PIXEL_UNPACK_BUFFER, None);
-            gl.pixel_store_i32(gl::UNPACK_ALIGNMENT, 4);
-            gl.pixel_store_i32(gl::UNPACK_ROW_LENGTH, 0);
+            for (name, value) in UNPACK {
+                gl.pixel_store_i32(name, value);
+            }
             gl.bind_texture(gl::TEXTURE_2D, Some(gl::NativeTexture(texture)));
             gl.tex_sub_image_2d(
                 gl::TEXTURE_2D,
@@ -550,11 +564,16 @@ impl GraphicsContext {
                 gl::PIXEL_UNPACK_BUFFER,
                 std::num::NonZeroU32::new(unpack_buffer as u32).map(gl::NativeBuffer),
             );
-            gl.pixel_store_i32(gl::UNPACK_ALIGNMENT, alignment);
-            gl.pixel_store_i32(gl::UNPACK_ROW_LENGTH, row_length);
+            for (name, value) in saved {
+                gl.pixel_store_i32(name, value);
+            }
             gl.flush();
 
-            (error != glow::NO_ERROR).then_some(error)
+            if error == glow::NO_ERROR {
+                Ok(())
+            } else {
+                Err(format!("GL error 0x{error:x}"))
+            }
         }
     }
 

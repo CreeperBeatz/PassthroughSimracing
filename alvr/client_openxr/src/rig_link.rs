@@ -4,6 +4,9 @@
 //!
 //! - `debug.alvr.patch_host <ip>` or `<ip>:<port>`: where to send (unset: the streamer's address of the
 //!   last connection, port 9945). Read about once a second; the destination is logged when it changes.
+//!   A wired stream (USB, adb forwarding) has the streamer at a loopback address, and adb reverse does
+//!   not carry UDP: then nothing is sent until `patch_host` names the rig PC's LAN address (the
+//!   headset's Wi-Fi on the same network; the stream itself may stay wired).
 //!
 //! The socket is made on the first message, non-blocking; replies are read each frame while tuning.
 
@@ -19,8 +22,13 @@ const RESOLVE_INTERVAL: Duration = Duration::from_secs(1);
 // Replies read per poll at most
 const MAX_REPLIES: usize = 16;
 
+/// Why nothing is sent while the stream is wired
+pub const WIRED_TEXT: &str =
+    "streamer is wired (loopback); set debug.alvr.patch_host to the rig PC's LAN IP";
+
 /// Where the datagrams go: `debug.alvr.patch_host` (an IP address, with or without a port), else the
-/// streamer's address with `PATCH_UDP_PORT`. Err: the property does not read (the text for the log)
+/// streamer's address with `PATCH_UDP_PORT` unless it is a loopback one (`WIRED_TEXT`). Err: why there
+/// is none (the text for the log)
 pub fn destination(
     host: Option<&str>,
     server: Option<IpAddr>,
@@ -34,7 +42,10 @@ pub fn destination(
             })
             .map(Some)
             .map_err(|_| format!("debug.alvr.patch_host {host:?} is no IP address (or ip:port)")),
-        None => Ok(server.map(|ip| SocketAddr::new(ip, PATCH_UDP_PORT))),
+        None => match server {
+            Some(ip) if ip.is_loopback() => Err(WIRED_TEXT.into()),
+            server => Ok(server.map(|ip| SocketAddr::new(ip, PATCH_UDP_PORT))),
+        },
     }
 }
 
@@ -48,6 +59,8 @@ pub struct RigLink {
     logged: Option<Result<Option<SocketAddr>, String>>,
     // A send failed: logged once until one works again
     send_failed: bool,
+    // The stream is wired and `patch_host` is unset
+    wired: bool,
 }
 
 impl RigLink {
@@ -59,7 +72,15 @@ impl RigLink {
             last_resolve: None,
             logged: None,
             send_failed: false,
+            wired: false,
         }
+    }
+
+    /// A short hint for the tuning menu when nothing can be sent: the stream is wired and
+    /// `debug.alvr.patch_host` is unset
+    pub fn hint(&self) -> Option<&'static str> {
+        self.wired
+            .then_some("wired stream: setprop debug.alvr.patch_host <rig PC LAN IP>")
     }
 
     fn resolve(&mut self) -> Option<SocketAddr> {
@@ -82,6 +103,7 @@ impl RigLink {
                 });
                 self.logged = Some(result.clone());
             }
+            self.wired = result.as_ref().is_err_and(|e| e == WIRED_TEXT);
             self.destination = result.ok().flatten();
         }
         self.destination
@@ -163,7 +185,7 @@ pub struct QrStep {
 }
 
 /// The QR code on the rig monitor while the play area is edited (any way it was opened): show requests
-/// while editing, a hide request when it ends
+/// while editing (with a lease, `QR_LEASE_S`), a hide request when it ends
 #[derive(Default)]
 pub struct AreaQr {
     // The payload asked for while editing
@@ -210,6 +232,14 @@ impl AreaQr {
         }
         QrStep { messages, log }
     }
+
+    /// The session stops: the hide request to send at once (one), if the code is asked for. The PC also
+    /// hides it when the lease of the last show request runs out
+    pub fn hide_now(&mut self) -> Option<String> {
+        let shown = self.shown.take()?;
+        self.pending.clear();
+        Some(qr_message(&shown, false))
+    }
 }
 
 #[cfg(test)]
@@ -237,6 +267,20 @@ mod tests {
             Ok(Some("192.168.1.20:9945".parse().unwrap()))
         );
         assert!(destination(Some("rig-pc"), Some(server)).is_err());
+        // Wired (adb forwarding): not the loopback address, unless the property names one
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        assert_eq!(
+            destination(None, Some(loopback)),
+            Err(WIRED_TEXT.to_string())
+        );
+        assert_eq!(
+            destination(Some("192.168.8.3"), Some(loopback)),
+            Ok(Some("192.168.8.3:9945".parse().unwrap()))
+        );
+        assert_eq!(
+            destination(Some("127.0.0.1:9945"), Some(loopback)),
+            Ok(Some("127.0.0.1:9945".parse().unwrap()))
+        );
     }
 
     #[test]
@@ -274,5 +318,9 @@ mod tests {
         // A frame that skips ahead sends what is due at once
         qr.update(true, "B", 10.0);
         assert_eq!(qr.update(true, "B", 10.5).messages.len(), 2);
+        // The session stops while editing: one hide at once, nothing more after
+        assert_eq!(qr.hide_now(), Some(qr_message("B", false)));
+        assert_eq!(qr.hide_now(), None);
+        assert_eq!(qr.update(false, "B", 11.0), QrStep::default());
     }
 }

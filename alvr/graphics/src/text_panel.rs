@@ -166,8 +166,22 @@ const MENU_CURSOR_RING: Rgba = [0.0, 0.0, 0.0, 0.8];
 /// same ones its hit test uses: the tab strip, the rows (label, value, bar, override mark), the stats
 /// footer, the cursors of the hands
 pub fn render_menu(content: &MenuContent, width: u32, height: u32) -> Vec<u8> {
+    let mut pixels = Vec::new();
+    render_menu_into(content, width, height, &mut pixels);
+    pixels
+}
+
+/// `render_menu` into `pixels` (resized to the image, its memory reused)
+pub fn render_menu_into(content: &MenuContent, width: u32, height: u32, pixels: &mut Vec<u8>) {
     let (w, h) = (width as f32, height as f32);
-    let mut canvas = Canvas::new(width as usize, height as usize);
+    let mut buffer = std::mem::take(pixels);
+    buffer.clear();
+    buffer.resize(width as usize * height as usize * 4, 0);
+    let mut canvas = Canvas {
+        width: width as usize,
+        height: height as usize,
+        pixels: buffer,
+    };
     canvas.fill_rect(0.0, 0.0, w, h, MENU_BACKGROUND);
 
     // Tabs
@@ -257,7 +271,17 @@ pub fn render_menu(content: &MenuContent, width: u32, height: u32) -> Vec<u8> {
         canvas.fill_circle(x, y, radius, MENU_CURSOR);
     }
 
-    canvas.pixels
+    *pixels = canvas.pixels;
+}
+
+/// `flip_rows` in place
+pub fn flip_rows_in_place(pixels: &mut [u8], width: u32, height: u32) {
+    let stride = width as usize * 4;
+    let rows = (height as usize).min(pixels.len() / stride.max(1));
+    for row in 0..rows / 2 {
+        let (top, bottom) = pixels.split_at_mut((rows - 1 - row) * stride);
+        top[row * stride..(row + 1) * stride].swap_with_slice(&mut bottom[..stride]);
+    }
 }
 
 /// The rows of an RGBA8 image of `width` x `height` in the other order (row 0 at the top as
@@ -285,6 +309,22 @@ mod tests {
         assert_eq!(&flipped[8..16], &pixels[8..16]);
         assert_eq!(&flipped[16..], &pixels[..8]);
         assert_eq!(flip_rows(&flipped, 2, 3), pixels);
+        for rows in [1, 2, 3, 4] {
+            let pixels = (0..(8 * rows) as u8).collect::<Vec<u8>>();
+            let mut in_place = pixels.clone();
+            flip_rows_in_place(&mut in_place, 2, rows);
+            assert_eq!(in_place, flip_rows(&pixels, 2, rows));
+        }
+        // Into a buffer that is reused: the same image as a new one
+        let content = MenuContent {
+            footer: "skin 90 %".into(),
+            ..MenuContent::default()
+        };
+        let mut buffer = vec![7; 10];
+        render_menu_into(&content, 64, 48, &mut buffer);
+        assert_eq!(buffer, render_menu(&content, 64, 48));
+        render_menu_into(&content, 64, 48, &mut buffer);
+        assert_eq!(buffer, render_menu(&content, 64, 48));
     }
     use alvr_common::glam::Vec2;
 
